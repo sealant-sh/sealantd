@@ -13,6 +13,7 @@ workspace = true
 sealant-protocol = { workspace = true }
 sealant-runtime-core = { workspace = true }
 sealant-telemetry = { workspace = true }
+sealant-eventlog = { workspace = true }
 sealant-process = { workspace = true }
 sealant-pty = { workspace = true }
 sealant-control = { workspace = true }

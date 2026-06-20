@@ -513,8 +513,11 @@ dependencies = [
 name = "sealant-telemetry"
 version = "0.0.0"
 dependencies = [
+ "sealant-eventlog",
  "sealant-protocol",
  "sealant-runtime-core",
+ "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
 ]
@@ -536,6 +539,7 @@ version = "0.0.0"
 dependencies = [
  "clap",
  "sealant-control",
+ "sealant-eventlog",
  "sealant-process",
  "sealant-protocol",
  "sealant-pty",

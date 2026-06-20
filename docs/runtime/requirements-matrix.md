@@ -79,10 +79,28 @@ tests on macOS, 57 on linux/amd64. Implemented & Validated:
 Exit gate (plan §22 Phase 3): interactive shell under a real tty ✅; resize propagates ✅;
 input/output binary-safe ✅; resources released after exit ✅.
 
-Still **Designed-only** (future phases): durable spool/retry (SPOOL-*, PIPE durability), filesystem
-telemetry (FS-*), network telemetry (NET-*), security hardening (SEC-*: peer-cred validation,
-capability drop, fuzzers). Optional: full-screen-app soak, per-process pidfd signalling, resource
-sampling, pty.input redaction (Phase 7).
+**Phase 4 — Durable telemetry pipeline (complete; exit gate met).** New crate `sealant-eventlog`
+plus a durable delivery mode in `sealant-telemetry`. 75 tests on linux/amd64.
+- **SPOOL** (`sealant-eventlog`): length-prefixed CRC32 record codec + segmented `Spool` with
+  rotation, configurable fsync, **self-healing crash recovery** (truncate partial/corrupt tails),
+  in-order replay, ack-based segment deletion, and disk-limit eviction with loss accounting. Full
+  §16 failure matrix (16 tests): truncated/corrupt/oversized records, rotation, idempotent replay,
+  restart survival, disk-limit eviction.
+- **PIPE**: durable, spool-backed `EventBus` mode (optimistic broadcast-ack) — `publish` → bounded
+  queue → delivery task spools (write-ahead) → broadcasts → periodic flush+ack; **replays un-acked
+  events on restart**. Priority backpressure: low/normal dropped with `telemetry.dropped` accounting,
+  **critical delivered inline (never silently lost)**. Single-point sequencing retained.
+- **Wiring**: `--spool-dir` enables durability; `health`/`getRuntimeMetrics` report dropped /
+  queueDepth / spoolBytes. Smoke-verified end-to-end (spool segment written, events stream).
+
+Exit gate (plan §22 Phase 4): slow sinks don't grow memory (bounded queue + drop-by-priority) ✅;
+restart replays un-acked events ✅; corrupt/partial records deterministic ✅; critical loss never
+silent ✅.
+
+Still **Designed-only** (future phases): filesystem telemetry (FS-*), network telemetry (NET-*),
+security hardening (SEC-*: peer-cred validation, capability drop, fuzzers). Optional: client-ack
+true-at-least-once, retry/backoff to an external sink, full-screen-app soak, per-process pidfd
+signalling, resource sampling, pty.input redaction (Phase 7).
 
 ---
 

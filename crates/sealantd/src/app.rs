@@ -26,6 +26,9 @@ struct Cli {
     /// Workspace / repository root.
     #[arg(long)]
     workspace: Option<PathBuf>,
+    /// Durable telemetry spool directory (enables crash-safe at-least-once delivery).
+    #[arg(long)]
+    spool_dir: Option<PathBuf>,
     /// Bound sandbox id.
     #[arg(long)]
     sandbox_id: Option<String>,
@@ -53,6 +56,9 @@ fn build_config(cli: &Cli) -> RuntimeConfig {
     }
     if let Some(workspace) = &cli.workspace {
         config.workspace_root = workspace.clone();
+    }
+    if let Some(spool_dir) = &cli.spool_dir {
+        config.spool_dir = Some(spool_dir.clone());
     }
     if let Some(sandbox_id) = &cli.sandbox_id {
         config.sandbox_id = Some(sandbox_id.clone());
@@ -167,6 +173,8 @@ async fn serve(cli: Cli, runtime: Arc<Runtime>) -> ExitCode {
     spawn_heartbeat(runtime.clone());
     // Reap descendants that reparent to us as subreaper / PID 1 (no-op off Linux).
     sealant_process::platform::spawn_orphan_reaper(runtime.process_registry());
+    // Start durable telemetry delivery: replay the spool, then deliver live events.
+    runtime.start_telemetry();
 
     // Startup validation is complete; announce healthy before accepting work.
     runtime.mark_healthy();

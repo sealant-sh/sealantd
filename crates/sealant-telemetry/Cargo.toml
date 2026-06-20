@@ -12,5 +12,10 @@ workspace = true
 [dependencies]
 sealant-protocol = { workspace = true }
 sealant-runtime-core = { workspace = true }
+sealant-eventlog = { workspace = true }
 tokio = { workspace = true }
+serde_json = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -6,6 +6,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use sealant_control::ControlService;
+use sealant_eventlog::{FsyncPolicy, Spool, SpoolConfig};
 use sealant_process::{ProcessRegistry, ProcessRuntime};
 use sealant_protocol::{
     Capabilities, Command, CommandResult, Confidence, ControlError, ControlRequest,
@@ -34,6 +35,48 @@ fn default_feature_states() -> HashMap<Feature, bool> {
     ])
 }
 
+/// Build the event bus: durable (spool-backed) when a spool directory is configured, otherwise a
+/// direct broadcast bus. Falls back to direct mode if the spool cannot be opened.
+fn build_bus(
+    config: &Arc<RuntimeConfig>,
+    clock: &Arc<Clock>,
+    idgen: &Arc<IdGenerator>,
+) -> Arc<EventBus> {
+    let capacity = usize::try_from(config.limits.event_queue_capacity).unwrap_or(4096);
+    let direct = || {
+        Arc::new(EventBus::new(
+            config.runtime_id.clone(),
+            clock.clone(),
+            idgen.clone(),
+            capacity,
+        ))
+    };
+    let Some(dir) = &config.spool_dir else {
+        return direct();
+    };
+    let spool_config = SpoolConfig {
+        dir: dir.clone(),
+        segment_bytes: (config.limits.spool_limit_bytes / 8).clamp(1 << 20, 64 << 20),
+        disk_limit_bytes: config.limits.spool_limit_bytes,
+        max_payload_bytes: config.limits.max_frame_bytes,
+        fsync: FsyncPolicy::Never,
+    };
+    match Spool::open(spool_config) {
+        Ok(spool) => Arc::new(EventBus::durable(
+            config.runtime_id.clone(),
+            clock.clone(),
+            idgen.clone(),
+            capacity,
+            spool,
+            Duration::from_millis(1000),
+        )),
+        Err(error) => {
+            tracing::warn!(%error, dir = %dir.display(), "spool open failed; telemetry durability disabled");
+            direct()
+        }
+    }
+}
+
 /// The composed runtime. Shared via `Arc` and used as the control service.
 #[derive(Debug)]
 pub struct Runtime {
@@ -59,12 +102,7 @@ impl Runtime {
         let clock = Arc::new(Clock::new());
         let idgen = Arc::new(IdGenerator::new(&config.runtime_id));
         let status = Arc::new(RuntimeStatus::new());
-        let bus = Arc::new(EventBus::new(
-            config.runtime_id.clone(),
-            clock.clone(),
-            idgen.clone(),
-            usize::try_from(config.limits.event_queue_capacity).unwrap_or(4096),
-        ));
+        let bus = build_bus(&config, &clock, &idgen);
         let processes = ProcessRuntime {
             registry: Arc::new(ProcessRegistry::new()),
             bus: bus.clone(),
@@ -138,6 +176,12 @@ impl Runtime {
             Confidence::Observed,
             EventPayload::RuntimeStateChanged(RuntimeStateChanged { state, reason }),
         );
+    }
+
+    /// Start the durable telemetry delivery task (replays the spool, then delivers live events).
+    /// No-op for a direct (non-durable) bus. Requires a Tokio runtime.
+    pub fn start_telemetry(&self) {
+        self.bus.start_delivery();
     }
 
     /// Transition to healthy after startup validation. Emits `runtime.stateChanged`.
@@ -216,13 +260,13 @@ impl Runtime {
             active_executions: executions,
             active_sessions: sessions,
             active_processes: processes,
-            queue_depth: 0,
+            queue_depth: self.bus.queue_depth(),
             queue_capacity: self.config.limits.event_queue_capacity,
-            spool_bytes: 0,
+            spool_bytes: self.bus.spool_bytes(),
             spool_limit_bytes: self.config.limits.spool_limit_bytes,
             retry_count: 0,
             last_delivery_at: None,
-            dropped_events: 0,
+            dropped_events: self.bus.dropped(),
             redacted_events: 0,
             coalesced_events: 0,
             truncated_events: 0,
@@ -260,10 +304,10 @@ impl Runtime {
         RuntimeMetrics {
             uptime_millis: self.clock.uptime_millis(),
             events_emitted: self.bus.emitted(),
-            events_delivered: self.bus.emitted(),
-            dropped_events: 0,
-            queue_depth: 0,
-            spool_bytes: 0,
+            events_delivered: self.bus.emitted().saturating_sub(self.bus.dropped()),
+            dropped_events: self.bus.dropped(),
+            queue_depth: self.bus.queue_depth(),
+            spool_bytes: self.bus.spool_bytes(),
             active_processes: processes,
             active_sessions: sessions,
         }
