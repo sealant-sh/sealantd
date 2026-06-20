@@ -428,6 +428,15 @@ dependencies = [
 [[package]]
 name = "sealant-pty"
 version = "0.0.0"
+dependencies = [
+ "libc",
+ "nix",
+ "sealant-protocol",
+ "sealant-runtime-core",
+ "sealant-telemetry",
+ "tokio",
+ "tracing",
+]
 
 [[package]]
 name = "sealant-runtime-core"
@@ -472,6 +481,7 @@ dependencies = [
  "sealant-control",
  "sealant-process",
  "sealant-protocol",
+ "sealant-pty",
  "sealant-runtime-core",
  "sealant-telemetry",
  "serde_json",

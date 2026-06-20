@@ -11,9 +11,9 @@ use sealant_protocol::{
     Capabilities, Command, CommandResult, Confidence, ControlError, ControlRequest,
     ControlResponse, EventEnvelope, EventPayload, ExecutionId, Feature, FeatureMatrix,
     FeatureState, HealthReport, NetworkMode, ProcessList, ProcessState, RuntimeHeartbeat,
-    RuntimeMetrics, RuntimeState, RuntimeStateChanged, SCHEMA_VERSION, SessionList,
-    ShutdownAccepted, Signal,
+    RuntimeMetrics, RuntimeState, RuntimeStateChanged, SCHEMA_VERSION, ShutdownAccepted, Signal,
 };
+use sealant_pty::{SessionRegistry, SessionRuntime};
 use sealant_runtime_core::{Clock, IdGenerator, RuntimeConfig, RuntimeStatus};
 use sealant_telemetry::{Correlation, EventBus};
 use tokio::sync::broadcast;
@@ -44,6 +44,7 @@ pub struct Runtime {
     status: Arc<RuntimeStatus>,
     bus: Arc<EventBus>,
     processes: ProcessRuntime,
+    sessions: SessionRuntime,
     shutdown: Arc<ShutdownSignal>,
     features: Mutex<HashMap<Feature, bool>>,
     pidfd_supported: bool,
@@ -72,6 +73,14 @@ impl Runtime {
             clock: clock.clone(),
             config: config.clone(),
         };
+        let sessions = SessionRuntime {
+            registry: Arc::new(SessionRegistry::new()),
+            bus: bus.clone(),
+            idgen: idgen.clone(),
+            status: status.clone(),
+            clock: clock.clone(),
+            config: config.clone(),
+        };
         // Become a child subreaper so double-forked orphans reparent here (and the reaper can
         // collect them). Harmless and idempotent; a no-op off Linux.
         let subreaper = sealant_process::platform::set_child_subreaper();
@@ -83,6 +92,7 @@ impl Runtime {
             status,
             bus,
             processes,
+            sessions,
             shutdown,
             features: Mutex::new(default_feature_states()),
             pidfd_supported,
@@ -166,7 +176,11 @@ impl Runtime {
                 Duration::from_millis(self.shutdown.grace_ms()),
             )
         };
-        self.processes.terminate_all(signal, grace).await;
+        // Terminate interactive sessions and managed processes concurrently.
+        tokio::join!(
+            self.sessions.terminate_all(grace),
+            self.processes.terminate_all(signal, grace),
+        );
     }
 
     /// Finish shutdown: mark stopped.
@@ -230,7 +244,7 @@ impl Runtime {
             daemon_version: DAEMON_VERSION.to_owned(),
             features: FeatureMatrix {
                 io_capture: true,
-                pty: false,
+                pty: true,
                 filesystem: false,
                 network: NetworkMode::Off,
                 privileged: false,
@@ -341,12 +355,16 @@ impl Runtime {
                         Err(error) => ControlResponse::error(rid, error),
                     }
                 }
-                (None, Some(_session_id)) => ControlResponse::error(
-                    rid,
-                    ControlError::feature_unavailable(
-                        "PTY sessions are not yet available".to_owned(),
-                    ),
-                ),
+                (None, Some(session_id)) => {
+                    match self
+                        .sessions
+                        .write_input(&session_id, args.data.as_slice())
+                        .await
+                    {
+                        Ok(()) => ControlResponse::accepted(rid),
+                        Err(error) => ControlResponse::error(rid, error),
+                    }
+                }
                 _ => ControlResponse::error(
                     rid,
                     ControlError::invalid_argument(
@@ -360,18 +378,25 @@ impl Runtime {
                     Err(error) => ControlResponse::error(rid, error),
                 }
             }
-            Command::ListSessions => ControlResponse::ok_with(
-                rid,
-                CommandResult::SessionList(SessionList { sessions: vec![] }),
-            ),
-            Command::OpenSession(_) | Command::CloseSession { .. } | Command::ResizePty { .. } => {
-                ControlResponse::error(
-                    rid,
-                    ControlError::feature_unavailable(
-                        "PTY sessions are not yet available".to_owned(),
-                    ),
-                )
+            Command::ListSessions => {
+                ControlResponse::ok_with(rid, CommandResult::SessionList(self.sessions.list()))
             }
+            Command::OpenSession(args) => match self.sessions.open(args) {
+                Ok(opened) => ControlResponse::ok_with(rid, CommandResult::SessionOpened(opened)),
+                Err(error) => ControlResponse::error(rid, error),
+            },
+            Command::CloseSession { session_id } => match self.sessions.close(&session_id) {
+                Ok(()) => ControlResponse::accepted(rid),
+                Err(error) => ControlResponse::error(rid, error),
+            },
+            Command::ResizePty {
+                session_id,
+                cols,
+                rows,
+            } => match self.sessions.resize(&session_id, cols, rows) {
+                Ok(()) => ControlResponse::accepted(rid),
+                Err(error) => ControlResponse::error(rid, error),
+            },
             Command::SetFeatureState { feature, enabled } => {
                 self.set_feature(feature, enabled);
                 ControlResponse::accepted(rid)

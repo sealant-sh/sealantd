@@ -222,3 +222,131 @@ async fn binary_stdio_roundtrips_binary_unsafe_output_and_shuts_down() {
         .expect("wait");
     assert!(status.success());
 }
+
+async fn read_pty_until<R: AsyncRead + Unpin>(reader: &mut R, needle: &str) -> bool {
+    let mut acc = String::new();
+    let scan = async {
+        loop {
+            if let ServerMessage::Event(e) = recv_message(reader).await
+                && let EventPayload::IoChunk(c) = &e.payload
+                && c.stream == StreamKind::PtyOutput
+                && let Some(content) = &c.content
+            {
+                acc.push_str(&String::from_utf8_lossy(content.as_slice()));
+                if acc.contains(needle) {
+                    return true;
+                }
+            }
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(8), scan)
+        .await
+        .unwrap_or(false)
+}
+
+#[tokio::test]
+async fn in_process_session_open_write_resize_close() {
+    let mut config = RuntimeConfig::new(new_runtime_id());
+    config.workspace_root = std::env::temp_dir();
+    config.default_shell = "/bin/sh".to_owned();
+    let runtime = Runtime::new(config, Arc::new(ShutdownSignal::new(1000)));
+    runtime.mark_healthy();
+
+    let (_sd_tx, sd_rx) = watch::channel(false);
+    let (mut client, server) = tokio::io::duplex(1 << 20);
+    let (server_read, server_write) = tokio::io::split(server);
+    let conn = tokio::spawn(handle_connection(
+        runtime.clone(),
+        server_read,
+        server_write,
+        sd_rx,
+    ));
+
+    // Open an interactive session.
+    send_request(
+        &mut client,
+        ControlRequest::new(
+            RequestId::new("s1"),
+            Command::OpenSession(sealant_protocol::OpenSessionArgs {
+                execution_id: None,
+                shell: None,
+                args: vec![],
+                cwd: None,
+                env: vec![],
+                cols: 80,
+                rows: 24,
+                term: None,
+            }),
+        ),
+    )
+    .await;
+    let session_id = {
+        let find = async {
+            loop {
+                if let ServerMessage::Response(r) = recv_message(&mut client).await
+                    && r.request_id == RequestId::new("s1")
+                {
+                    match r.outcome {
+                        ResponseOutcome::Ok {
+                            result: Some(CommandResult::SessionOpened(s)),
+                        } => return s.session_id,
+                        other => panic!("expected SessionOpened, got {other:?}"),
+                    }
+                }
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), find)
+            .await
+            .expect("session opened")
+    };
+
+    let type_line = |id: sealant_protocol::SessionId| {
+        Command::WriteStdin(sealant_protocol::WriteStdinArgs {
+            process_id: None,
+            session_id: Some(id),
+            data: sealant_protocol::Base64Bytes::new(b"stty size\n".to_vec()),
+        })
+    };
+
+    send_request(
+        &mut client,
+        ControlRequest::new(RequestId::new("s2"), type_line(session_id.clone())),
+    )
+    .await;
+    assert!(read_pty_until(&mut client, "24 80").await, "initial size");
+
+    // Resize and confirm the session sees the new dimensions.
+    send_request(
+        &mut client,
+        ControlRequest::new(
+            RequestId::new("s3"),
+            Command::ResizePty {
+                session_id: session_id.clone(),
+                cols: 132,
+                rows: 50,
+            },
+        ),
+    )
+    .await;
+    send_request(
+        &mut client,
+        ControlRequest::new(RequestId::new("s4"), type_line(session_id.clone())),
+    )
+    .await;
+    assert!(read_pty_until(&mut client, "50 132").await, "resized size");
+
+    // Close the session.
+    send_request(
+        &mut client,
+        ControlRequest::new(
+            RequestId::new("s5"),
+            Command::CloseSession {
+                session_id: session_id.clone(),
+            },
+        ),
+    )
+    .await;
+
+    drop(client);
+    let _ = tokio::time::timeout(Duration::from_secs(5), conn).await;
+}

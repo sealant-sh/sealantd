@@ -60,10 +60,29 @@ down ✅; invalid UTF-8 / NUL round-trip ✅; protocol output never mixed with d
 Exit gate (plan §22 Phase 2): no zombies/managed-orphans ✅; SIGTERM escalation ✅; PID-reuse ops use
 pidfd-or-documented-fallback ✅; shutdown works with active process trees ✅.
 
-Still **Designed-only** (future phases): PTY/sessions (PTY-*), durable spool/retry (SPOOL-*, PIPE
-durability), filesystem telemetry (FS-*), network telemetry (NET-*), security hardening
-(SEC-*: peer-cred validation, capability drop, fuzzers). Optional: per-process pidfd signalling,
-resource sampling.
+**Phase 3 — PTY & interactive sessions (complete; exit gate met).** New crate `sealant-pty`. 55
+tests on macOS, 57 on linux/amd64. Implemented & Validated:
+- **PTY-1..N**: allocate a PTY master/slave (`openpty`), start the shell as a session leader with
+  the slave as its controlling terminal (`setsid` + `TIOCSCTTY` in a minimal documented
+  `pre_exec`), advertise `TERM`, and run async master I/O via `AsyncFd`.
+- **Capture**: `pty.output` and forwarded `pty.input` as binary-safe `io.chunk` events (NUL /
+  non-UTF-8 round-trip proven).
+- **Resize**: `resizePty` → `TIOCSWINSZ` (a live session observes the new `stty size`).
+- **Session API**: `openSession`/`writeStdin(sessionId)`/`resizePty`/`closeSession`/`listSessions`
+  wired through control dispatch — the in-sandbox half of the ssh-gateway boundary (brief §3).
+  `closeSession` hangs up via `SIGHUP`; shutdown terminates sessions + processes concurrently.
+- **Cleanup**: a wait task reaps the leader and publishes `process.exited`; all PTY fds release on
+  normal/abnormal exit. `capabilities.features.pty` now reports `true`.
+- Tests: `crates/sealant-pty/src/session.rs` (tty/winsize/binary-safe/resize+close),
+  `crates/sealantd/tests/e2e.rs::in_process_session_open_write_resize_close` (protocol round-trip).
+
+Exit gate (plan §22 Phase 3): interactive shell under a real tty ✅; resize propagates ✅;
+input/output binary-safe ✅; resources released after exit ✅.
+
+Still **Designed-only** (future phases): durable spool/retry (SPOOL-*, PIPE durability), filesystem
+telemetry (FS-*), network telemetry (NET-*), security hardening (SEC-*: peer-cred validation,
+capability drop, fuzzers). Optional: full-screen-app soak, per-process pidfd signalling, resource
+sampling, pty.input redaction (Phase 7).
 
 ---
 
