@@ -622,6 +622,30 @@ mod tests {
         }
     }
 
+    /// Whether `pid` is a live, running process — not gone and not a zombie.
+    fn is_running(pid: i32) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+                Err(_) => false, // gone
+                Ok(stat) => {
+                    // Format: "pid (comm) state ...". comm may contain spaces and ')', so the state
+                    // char is the first non-space after the LAST ')'.
+                    let state = stat
+                        .rsplit(')')
+                        .next()
+                        .and_then(|rest| rest.trim_start().chars().next());
+                    !matches!(state, Some('Z') | None)
+                }
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            // No /proc; macOS reaps zombies promptly, so existence ≈ running.
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok()
+        }
+    }
+
     #[tokio::test]
     async fn killing_process_group_reaps_grandchild() {
         use nix::sys::signal::kill;
@@ -671,16 +695,21 @@ mod tests {
             }
         }
 
-        // The grandchild must be reaped by the process-group kill: no orphan.
-        let mut reaped = false;
-        for _ in 0..100 {
-            if kill(Pid::from_raw(grandchild), None).is_err() {
-                reaped = true;
+        // The grandchild must be terminated by the process-group kill — no orphan left running.
+        // Under PID 1 (e.g. a container with no reaper) a killed orphan can briefly remain a
+        // zombie; a zombie is terminated, not running, so gone-or-zombie both pass.
+        let mut terminated = false;
+        for _ in 0..200 {
+            if !is_running(grandchild) {
+                terminated = true;
                 break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        assert!(reaped, "grandchild {grandchild} should be reaped");
+        assert!(
+            terminated,
+            "grandchild {grandchild} should be terminated by the group kill"
+        );
         assert_eq!(rt.registry.len(), 0);
     }
 

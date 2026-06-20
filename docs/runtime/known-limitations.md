@@ -169,14 +169,15 @@ event. The default unprivileged target is `metadata` + explicit `proxy`; the
   `process.started.pidfd` and `capabilities.features.pidfd` report `false` until a
   Linux pidfd path lands (ADR-0006). (REQ-PROC, Phase 2.)
 
-### Adopted-orphan reaping (subreaper / PID 1) is deferred
-- **Limitation.** A managed process that double-forks an orphan that then exits can
-  leave a zombie unless something reaps it. We do not yet install
-  `PR_SET_CHILD_SUBREAPER` + a reaper, nor a PID-1 init.
-- **Why.** A global `waitpid(-1)` reaper conflicts with Tokio's own child reaping
-  (it would steal Tokio's children); doing this correctly needs a registry-guarded
-  reaper or a non-Tokio managed-child model, and must be validated on Linux/PID 1.
-- **What we do instead.** On terminate/timeout/shutdown we `SIGKILL` the whole
-  *process group*, so orphans are *killed* (not left running) even when their
-  zombie reaping depends on the environment's init. Full subreaper + PID-1 reaping
-  is the next dedicated Phase 2 increment (ADR-0006), validated via docker. (REQ-PROC.)
+### Adopted-orphan reaping is registry-guarded (not a global waitpid)
+- **Limitation.** A naive global `waitpid(-1)` reaper would steal the children Tokio
+  owns and reaps itself, corrupting managed-process results.
+- **Why.** Tokio already reaps its own children; a second unconditional reaper races it.
+- **What we do instead (implemented, Linux).** The daemon sets
+  `PR_SET_CHILD_SUBREAPER` so double-forked orphans reparent to it, and a
+  SIGCHLD-driven reaper uses `waitid(…, WNOWAIT)` to *peek* each waitable child:
+  Tokio-owned pids (present in the process registry) are left for Tokio, and only
+  genuine adopted orphans are reaped via `waitpid`. A 2 s sweep catches anything
+  queued behind a Tokio-owned zombie. This also covers the **PID 1** case (daemon as
+  container init). Validated by `crates/sealant-process/tests/orphan_reaping.rs`
+  (run on Linux via `scripts/linux-test.sh`). (REQ-PROC, ADR-0006.)

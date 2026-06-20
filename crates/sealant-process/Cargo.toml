@@ -16,3 +16,6 @@ sealant-telemetry = { workspace = true }
 tokio = { workspace = true }
 nix = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

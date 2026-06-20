@@ -165,6 +165,8 @@ async fn serve(cli: Cli, runtime: Arc<Runtime>) -> ExitCode {
 
     spawn_signal_listener(runtime.shutdown().clone());
     spawn_heartbeat(runtime.clone());
+    // Reap descendants that reparent to us as subreaper / PID 1 (no-op off Linux).
+    sealant_process::platform::spawn_orphan_reaper(runtime.process_registry());
 
     // Startup validation is complete; announce healthy before accepting work.
     runtime.mark_healthy();

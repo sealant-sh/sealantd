@@ -201,4 +201,12 @@ impl ProcessRegistry {
             .cloned()
             .collect()
     }
+
+    /// Whether any managed process currently has the given OS pid.
+    ///
+    /// Used by the orphan reaper to avoid reaping a Tokio-owned child out from under it.
+    #[must_use]
+    pub fn contains_pid(&self, pid: i32) -> bool {
+        self.lock().values().any(|e| e.pid == pid)
+    }
 }

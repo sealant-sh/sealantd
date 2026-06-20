@@ -46,6 +46,8 @@ pub struct Runtime {
     processes: ProcessRuntime,
     shutdown: Arc<ShutdownSignal>,
     features: Mutex<HashMap<Feature, bool>>,
+    pidfd_supported: bool,
+    subreaper: bool,
 }
 
 impl Runtime {
@@ -70,6 +72,10 @@ impl Runtime {
             clock: clock.clone(),
             config: config.clone(),
         };
+        // Become a child subreaper so double-forked orphans reparent here (and the reaper can
+        // collect them). Harmless and idempotent; a no-op off Linux.
+        let subreaper = sealant_process::platform::set_child_subreaper();
+        let pidfd_supported = sealant_process::platform::pidfd_supported();
         Arc::new(Self {
             config,
             clock,
@@ -79,7 +85,15 @@ impl Runtime {
             processes,
             shutdown,
             features: Mutex::new(default_feature_states()),
+            pidfd_supported,
+            subreaper,
         })
+    }
+
+    /// The managed-process registry (used to start the adopted-orphan reaper).
+    #[must_use]
+    pub fn process_registry(&self) -> Arc<ProcessRegistry> {
+        self.processes.registry.clone()
     }
 
     /// The configured Unix control-socket path.
@@ -220,8 +234,8 @@ impl Runtime {
                 filesystem: false,
                 network: NetworkMode::Off,
                 privileged: false,
-                pidfd: false,
-                subreaper: false,
+                pidfd: self.pidfd_supported,
+                subreaper: self.subreaper,
             },
             limits: self.config.limits,
         }

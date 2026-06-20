@@ -42,9 +42,28 @@ Exit gate (plan §22 Phase 1): TS starts the daemon, execs, streams events, gets
 down ✅; invalid UTF-8 / NUL round-trip ✅; protocol output never mixed with diagnostics ✅
 (`crates/sealantd/tests/e2e.rs`, `packages/runtime-client/test/e2e.test.ts`).
 
+**Phase 2 — Correct process lifecycle (complete; exit gate met).** Development moved Linux-first
+(the binary only runs in Linux containers); `scripts/linux-test.sh` is the authoritative gate and
+**52 tests pass on linux/amd64**. Implemented & Validated:
+- **PROC adversarial matrix** (plan §24): stdin streaming, grandchild/orphan reaping via
+  process-group kill, SIGTERM-ignore → SIGKILL escalation, concurrent stdout/stderr, large-output
+  chunking with contiguous offsets, command-not-found, nonzero exit, timeout.
+- **PROC-6 subreaper + reaping**: `PR_SET_CHILD_SUBREAPER` + a SIGCHLD-driven, registry-guarded
+  orphan reaper (`waitid(WNOWAIT)` peek; never steals Tokio-owned children; 2 s sweep) — covers
+  double-fork adopted descendants and the PID-1 (container init) case
+  (`crates/sealant-process/tests/orphan_reaping.rs`).
+- **pidfd**: kernel capability detected (`/proc/sys/kernel/osrelease` ≥ 5.3) and reported in
+  `capabilities.features.pidfd`/`subreaper`; signalling still uses `killpg` while the process is
+  live (documented PID-reuse-safe fallback, plan §10.4). `process.started.pidfd` stays `false` until
+  per-process pidfd signalling lands.
+
+Exit gate (plan §22 Phase 2): no zombies/managed-orphans ✅; SIGTERM escalation ✅; PID-reuse ops use
+pidfd-or-documented-fallback ✅; shutdown works with active process trees ✅.
+
 Still **Designed-only** (future phases): PTY/sessions (PTY-*), durable spool/retry (SPOOL-*, PIPE
 durability), filesystem telemetry (FS-*), network telemetry (NET-*), security hardening
-(SEC-*: peer-cred validation, capability drop, fuzzers), pidfd/subreaper (PROC pidfd).
+(SEC-*: peer-cred validation, capability drop, fuzzers). Optional: per-process pidfd signalling,
+resource sampling.
 
 ---
 
