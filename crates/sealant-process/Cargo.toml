@@ -1,0 +1,18 @@
+[package]
+name = "sealant-process"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Process execution, registry, process groups, pidfds, and reaping."
+
+[lints]
+workspace = true
+
+[dependencies]
+sealant-protocol = { workspace = true }
+sealant-runtime-core = { workspace = true }
+sealant-telemetry = { workspace = true }
+tokio = { workspace = true }
+nix = { workspace = true }
+tracing = { workspace = true }

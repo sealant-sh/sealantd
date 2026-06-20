@@ -1,0 +1,89 @@
+# sealantd Integration Brief (grounded in /Users/yiannis/Developer/oss/Selant/sealant-core + /Users/yiannis/Developer/oss/Selant/sealantd)
+
+> Status note: Every Rust crate under `/Users/yiannis/Developer/oss/Selant/sealantd/crates/*/src/lib.rs` is currently a single doc-comment stub (e.g. `sealant-control/src/lib.rs`, `sealant-protocol/src/lib.rs`, `sealant-pty/src/lib.rs` are one line each). `/Users/yiannis/Developer/oss/Selant/sealantd/docs/adr` and `docs/runtime` are empty, and `/Users/yiannis/Developer/oss/Selant/sealantd/packages` does not exist. So there is **no existing protocol, no Unix-socket framing, and no TypeScript SDK yet** — everything below is the contract surface sealantd must align to, not code that already calls it. The Cargo workspace and dependency stack are real (`/Users/yiannis/Developer/oss/Selant/sealantd/Cargo.toml`: tokio, tokio-util codec, serde/serde_json/schemars, thiserror, tracing, nix/rustix/libc, clap; edition 2024, stable toolchain).
+
+## 1. How a command/run executes today, and where sealantd inserts itself
+
+**Today's flow (build → launch → connect):**
+1. `SandboxAttempt` row is created `queued`; an `OciImageBuildJob` is enqueued to RabbitMQ (`SandboxBuildJobPublisher`, `/Users/yiannis/Developer/oss/Selant/sealant-core/apps/api/src/lib/create-sandbox-build-job-publisher.ts`).
+2. The worker (`/Users/yiannis/Developer/oss/Selant/sealant-core/apps/worker/src/index.ts` → `workers/sandboxes.ts`) consumes `sandbox-build-job.requested` and runs `processSandboxBuildJob` (`/Users/yiannis/Developer/oss/Selant/sealant-core/packages/sandboxes/src/worker/process-sandbox-build-job.ts`).
+3. `compileSandboxBuildSpec` renders a `Containerfile` + `entrypoint.sh` (`/Users/yiannis/Developer/oss/Selant/sealant-core/packages/sandboxes/src/buildkit/buildkit-builder.ts`, `renderContainerfile` line 1042, `renderSandboxEntrypoint` line 673), `docker build` then `docker save`, then `RegistryClient` pushes to Zot returning a `digestReference`.
+4. `selectRuntimeAdapter().launch()` (`/Users/yiannis/Developer/oss/Selant/sealant-core/packages/sandboxes/src/runtime/runtime-adapter.ts`; only `DockerRuntimeAdapter` is functional, k8s/k3s throw) `docker run`s the image and resolves `ssh://root@{host}:{port}` (`docker-runtime-adapter.ts` lines 369-370 / 434-435).
+5. **Command execution is fully delegated**: the image's entrypoint starts an in-container `sshd` (`distroDefinitions[...].sshdPath` = `/usr/sbin/sshd`, nix `/root/.nix-profile/bin/sshd`) launched with `ForceCommand /usr/local/bin/sandbox-ssh-shell` (`buildkit-builder.ts` lines 819-838). The ssh-gateway opens an upstream SSH session to that sshd and pipes channels (`/Users/yiannis/Developer/oss/Selant/sealant-core/apps/ssh-gateway/src/gateway-server.ts`). **No per-process / PTY / stdin-stdout-stderr / fs / network capture exists anywhere today.**
+
+**Precise insertion point for sealantd:** sealantd replaces (or wraps) the in-container `sshd`/`sandbox-ssh-shell` foreground role established in `renderSandboxEntrypoint` (`buildkit-builder.ts` ~lines 819-840). Two seams:
+- **Binary copy** in `renderContainerfile` immediately after `COPY entrypoint.sh /usr/local/bin/sandbox-entrypoint` (line 1060) — add `COPY sealantd /usr/local/bin/sealantd`.
+- **Daemon launch** in the entrypoint, before the sshd block (line 838) and before the foreground harness command (line 842 `printf "$HARNESS_BANNER"`), so sealantd owns the PTY/process lifecycle and the gateway's upstream shell/exec lands on a sealantd-spawned process rather than a bare login shell. sealantd should bind a Unix socket (e.g. `/run/sealantd.sock`, perms `0600`) as the SDK/control entry point.
+
+## 2. Canonical identifiers sealantd must correlate
+
+| Identifier | Existing string format | Defined at |
+|---|---|---|
+| `sandboxId` | `text` PK, opaque/UUID-like; SSH carries it as `sbx-{id}` in username (regex `/^[A-Za-z0-9][A-Za-z0-9_.-]*$/`) | `packages/db/src/schema/control-plane.ts` sandboxes table (≈759); `apps/ssh-gateway/src/sandbox-target.ts` (`parseSandboxIdFromUsername`); contract `sandboxSshTargetSchema.sandboxId` (`packages/api-contracts/src/core-api/sandboxes.ts:25`) |
+| `attemptId` / `runId` (same value) | `text` PK, opaque/UUID-like. **This is the per-run correlation key** — `sandbox_runtime_instances.run_id` is its PK (1:1) | `control-plane.ts` sandboxAttempts (≈699); `sandbox-build-jobs.ts:23,67` (`run_id`); `sandboxSshTargetSchema.attemptId` (`sandboxes.ts:26`) |
+| `jobId` | `text` PK; RabbitMQ message `{ kind:"sandbox-build-job.requested", jobId }` | `sandbox-build-jobs.ts:22`; `packages/validators/src/sandboxes/messages.ts` |
+| `resourceId` | `text` = docker container ID / pod ID | `sandbox-build-jobs.ts:72` (`resource_id`); `runtimeAdapterLaunchResultSchema.resourceId` (`runtime-adapter.ts`) |
+| `reference` / `digestReference` / `digest` | `repo:tag`, `repo@sha256:…`, `sha256:…` | `sandbox-build-jobs.ts:42-44,73`; `publishedImageSchema`/`sandboxPublishedImageSchema` (`runtime-adapter.ts`; `sandboxes.ts:37-41`) |
+| `adapter` | enum `"docker" \| "k8s" \| "k3s"` | `runtimeAdapterIdSchema` (`runtime-adapter.ts`); `sandbox-build-jobs.ts:71` |
+| `endpoint` | `ssh://{user}@{host}:{port}` (default `ssh://root@…`) | `docker-runtime-adapter.ts:370,435`; `sandbox_runtime_instances.endpoint` (`sandbox-build-jobs.ts:74`) |
+| `workerId` | `text`, default `worker-{hostname}-{pid}` | `packages/validators/src/env.ts` (≈212); `oci_image_build_jobs.worker_id` |
+
+**No process-, PTY-, session-, or event-ID format exists yet** (process IDs, PTY/session IDs, eventIds for I/O chunks). The only event ID precedent is `sandboxEventSchema.eventId: NonEmptyTrimmedString` (`sandboxes.ts:195`) — bare non-empty string, **no prefix convention** (`sbx_`/`run_` appear only in tests, not in schema). sealantd must mint its own session/process/event IDs and bind every event to `runId`(=attemptId) + `sandboxId`.
+
+## 3. ssh-gateway → sealantd session boundary
+
+**Auth is owned entirely by the gateway, not sealantd.** `gateway-server.ts` `incomingConnection.on("authentication")` (line 151) enforces publickey-only, derives `sandboxId` from `sbx-{id}` username (line 158), and verifies signatures against an allowlist (`authorized-keys.ts`, lines 170-199). Upstream auth to the container uses a single gateway-held `upstreamPrivateKey` (`connectToUpstream`, line 104). So sealantd does **not** authenticate end users — it trusts the gateway's already-authenticated upstream SSH connection (or, in the replacement model, a control-socket caller). **PTY/process ownership is what moves to sealantd**: today the upstream sshd allocates the PTY; sealantd must take over `pty/exec/shell/resize/signal`.
+
+The exact gateway call sites that a sealantd session API must service (these are what `openSession/writeStdin/resizePty/closeSession` map onto):
+- **`openSession` (shell)** ← `session.on("shell")` → `upstream.shell(shellWindow, { env }, cb)` (`gateway-server.ts:259`), where `shellWindow` carries `{ cols, rows, width, height, modes }` from the stored `sessionPty` (lines 248-257).
+- **`openSession` (exec, optional PTY)** ← `session.on("exec")` → `upstream.exec(info.command, { env, pty? }, cb)` (line 296); exit code returns via `upstreamChannel.on("exit", code)` → `incomingChannel.exit(code)` (lines 318-322). sealantd must surface real exit codes here.
+- **`writeStdin` / stdout-stderr** ← `pipeStreams(incomingChannel, upstreamChannel)` (lines 273, 316, 362) — bidirectional, **must be binary-safe** (Buffers, no UTF-8 mangling, no line buffering).
+- **`resizePty`** ← `session.on("window-change")` → `activeUpstreamChannel.setWindow(rows, cols, height, width)` (line 225). sealantd applies `TIOCSWINSZ`.
+- **signal** ← `session.on("signal")` → `activeUpstreamChannel.signal(info.name)` (line 231). sealantd translates SSH signal name → OS signal.
+- **`closeSession`** ← `incomingConnection.on("close")` → `upstream.end()` (lines 418-428), plus per-stream `close`/`error` teardown in `pipeStreams` (lines 50-62).
+- Also forwarded and must coexist: `subsystem` (SFTP, line 347 `upstream.subsys`) and `tcpip`/`forwardOut` for VS Code Remote dynamic forwarding (line 382).
+
+## 4. Telemetry / event / DB surfaces to feed or align with (real names)
+
+- **`sandbox_runtime_instances`** (`packages/db/src/schema/sandbox-build-jobs.ts:64-91`) — 1:1 with `run_id`(=attemptId). Columns sealantd's launch path drives: `status` (`pending|running|failed|stopped`), `adapter`, `resource_id`, `reference`, `endpoint`, `error_code`, `error_message`, `launched_at`, `finished_at`.
+- **`sandbox_attempts`** (`control-plane.ts` ≈696-754) — `status` (`queued|running|succeeded|failed|cancelled`), `triggerType` (`manual|issue|schedule|api|retry`), `triggerRef`, `retryOfRunId`, `queuedAt/startedAt/finishedAt`, `durationMs`.
+- **`oci_image_build_jobs`** (`sandbox-build-jobs.ts:19-62`) — `status` (`queued|running|succeeded|failed`), `attempt_count`/`max_attempts`, lease fields `claimed_at`/`lease_expires_at`/`worker_id`, `error_code`/`error_message`, `result_payload`, `published_reference`/`published_digest`.
+- **`sandbox_attempt_snapshots`** (`control-plane.ts` ≈820-834) — immutable `userSpecPayload`/`resolvedSpecPayload`/`blueprintPayload` sealantd reads as the run's input-of-record.
+- **API event surface to extend**: `sandboxEventSchema` + `sandboxEventTypeSchema` (`packages/api-contracts/src/core-api/sandboxes.ts:179-203`) with types `sandbox.created`, `attempt.{queued,running,succeeded,failed,cancelled}`, `image.published`, `runtime.{pending,running,failed,stopped}`, exposed via `GET /v1/sandboxes/{sandboxId}/events`. sealantd's finer events (`process.spawned`, `pty.created/resized`, `stdout.chunk`, `exit`, fs/network) fit this `{ eventId, sandboxId, attemptId?, type, occurredAt, message?, data }` envelope (with `data: Schema.Unknown` for binary-safe/offset payloads).
+- **Precedent for richer telemetry tables** (issue-workflows side, to mirror, not reuse): `issue_workflow_execution_events` (`sequence`, `phase`, `level: debug|info|warn|error`, `eventType`, `payload jsonb`, `occurredAt`), `issue_workflow_execution_artifacts` (`kind: log|trace|diff|…`, `storageBackend: inline|database|s3|…`). **No process/PTY/binary-I/O/fs/network tables exist** — sealantd's evidence trail needs new tables (e.g. `sandbox_execution_events`, `sandbox_process_telemetry`, `sandbox_io_events`) following the conventions in §5.
+
+DB conventions to mirror (from `db/src/schema/README.md` + schema): `text()` PKs (not uuid type), `snake_case` columns via drizzle casing, `timestamp({ withTimezone: true })`, `jsonb` payloads, `text({ enum: [...] as const })`, composite/compound indexes on `(status, timestamp)`, FK `onDelete: 'cascade'` for ownership / `'set null'` for optional, `$defaultFn(() => new Date())` + `$onUpdate(...)`, `export type X = typeof t.$inferSelect`.
+
+## 5. TypeScript contract conventions for `runtime-protocol` + `runtime-client`
+
+From `packages/api-contracts/src/core-api/sandboxes.ts` and `package.json` files:
+- **Effect Schema, not raw types**: `Schema.NonEmptyTrimmedString` for IDs (aliased `const NonEmptyString`), `Schema.Literal(...)` for enums (not `Schema.String`), `Schema.optional(X)` for nullable (never `Schema.Union(X, Schema.Null)`), `Schema.Struct` with camelCase fields mirroring snake_case DB columns. Export both `const xSchema` and `export type X = typeof xSchema.Type`.
+- **Tagged error unions**: `class FooError extends Schema.TaggedError<FooError>("FooError")("FooError", { message: Schema.String }, HttpApiSchema.annotations({ status: NNN })) {}` — see the 8 `Sandbox*Error` classes (`sandboxes.ts:215-293`, statuses 400/401/403/404/409/500/502/503). The runtime-protocol's error codes should be a closed `Schema.Literal` set deserializable by the client.
+- **HttpApi composition** (if exposed over HTTP at all): `HttpApiEndpoint.{get,post,patch}` chained `.setHeaders/.setPayload/.setUrlParams/.addSuccess/.addError`, grouped via `HttpApiGroup.make(...).add(...).annotate(OpenApi.Description, ...)`, versioned by `.prefix("/v1/...")` (`api-contracts/src/core-api/control-plane.ts`). Path params via `HttpApiSchema.param("name", Schema)`.
+- **Packaging** (`api-contracts/package.json`, root `package.json`, `pnpm-workspace.yaml`): name `@sealant/runtime-protocol` / `@sealant/runtime-client`, `"version": "0.0.0"`, `"private": true`, `"type": "module"`, `"exports": { ".": "./src/index.ts" }` (source-exported, no build step). Scripts: `"lint": "oxlint ."`, `"typecheck": "tsgo -p tsconfig.json --noEmit"`. Deps use `"effect": "catalog:"` / `"@effect/platform": "catalog:"` (catalog pinned in `pnpm-workspace.yaml`: effect `^3.21.0`, @effect/platform `^0.96.0`, zod `^4.1.12`). Internal deps use `"@sealant/db": "workspace:*"`, devDep `"@sealant/typescript": "workspace:*"`. Import style is always `@sealant/<pkg>`.
+- Note `api-contracts` uses Effect Schema, but the lower runtime libs (`packages/sandboxes`, `packages/validators`, `runtime-adapter.ts`) use **zod v4** (`z.strictObject`, `z.enum`, `z.discriminatedUnion`, `z.infer`). For a wire-facing protocol consumed by an Effect API, mirror `api-contracts` (Effect Schema). Tests use vitest.
+
+## 6. Build/deploy: getting the compiled binary into the image
+
+- **Copy**: extend `renderContainerfile` (`buildkit-builder.ts:1042-1067`) to stage `sealantd` into the build context (alongside `entrypoint.sh` written by `writeBuildContext`, ~lines 1079-1098) and add `COPY sealantd /usr/local/bin/sealantd` + `RUN chmod 755 …` after line 1060. Build is `DOCKER_BUILDKIT=1 docker build` then `docker save` (lines 1124-1141).
+- **Target arch(es)**: builds are effectively **amd64**. `--platform linux/amd64` is only added for `archlinux` today (`buildkit-builder.ts:1124`, `platformArgs = osFamily === "arch" ? ["--platform","linux/amd64"] : []`); fedora (`fedora:41`) and nix (`nixos/nix:latest`) inherit host arch. arm64 is **not** a planned matrix yet — ship amd64 first; arm64 needs cross-compiled binaries + blueprint arch field (does not exist).
+- **Runtime deps / linking**: three distinct base images per `distroDefinitions` (`buildkit-builder.ts` ≈187/212/237) — Fedora (glibc), Arch (glibc), Nix (`nixos/nix`, non-FHS, no `/usr/sbin`). A **single statically-linked binary (musl)** is the safest single-artifact path across all three; a glibc binary risks breaking on the Nix image's nonstandard layout. The binary must be self-contained (no dynamic distro libs) and must own a writable runtime dir analogous to today's `$SSH_RUNTIME_DIR` for its socket.
+- **Privileges**: containers run via plain `docker run`; PTY allocation (`openpty`/`TIOCSWINSZ` via the `nix`/`rustix` term features in Cargo.toml) works unprivileged, but any **syscall-level fs/network capture (eBPF/ptrace) would need elevated capabilities** that the blueprint→adapter path does not currently convey — favor in-process instrumentation unless capabilities are added.
+
+## 7. Top 15 testable requirements (drop-in matrix rows)
+
+1. sealantd MUST bind a Unix domain socket at a configurable path (default `/run/sealantd.sock`) with permissions `0600` before accepting any control request.
+2. sealantd MUST allocate a PTY per interactive session and apply client-supplied `{cols, rows, width, height, modes}` exactly as forwarded by `gateway-server.ts:248-257`.
+3. sealantd MUST handle resize requests mapping `setWindow(rows, cols, height, width)` (`gateway-server.ts:225`) to `TIOCSWINSZ` on the session PTY.
+4. sealantd MUST translate SSH signal names (`gateway-server.ts:231`) to OS signals and deliver them to the session's process group.
+5. sealantd MUST transport stdin/stdout/stderr as binary-safe byte streams with no UTF-8 transformation, no line buffering, and preserved chunk boundaries metadata.
+6. For exec sessions sealantd MUST capture and return the process exit code so the gateway's `incomingChannel.exit(code)` path (`gateway-server.ts:318-322`) reports it accurately.
+7. Every telemetry event sealantd emits MUST carry `runId`(=attemptId) and `sandboxId` correlation keys matching the `text` formats in `control-plane.ts`/`sandbox-build-jobs.ts`.
+8. sealantd MUST mint stable session/process/event identifiers as non-empty strings compatible with `sandboxEventSchema.eventId` (`api-contracts/.../sandboxes.ts:195`).
+9. sealantd's launch/runtime reporting MUST be expressible as `sandbox_runtime_instances` transitions `pending→running→failed|stopped` (`sandbox-build-jobs.ts:10-15`) including `endpoint`, `resource_id`, `reference`, `error_code/error_message`.
+10. sealantd's event types MUST extend, and be serializable into, the `{ eventId, sandboxId, attemptId?, type, occurredAt, message?, data }` envelope (`sandboxes.ts:194-203`).
+11. The runtime-protocol MUST define a version field/handshake negotiated on socket connect (no negotiation mechanism exists today and must be designed).
+12. The `@sealant/runtime-protocol` package MUST model errors as `Schema.TaggedError` classes with a closed code set, mirroring the `Sandbox*Error` pattern (`sandboxes.ts:215-293`).
+13. The `@sealant/runtime-protocol`/`@sealant/runtime-client` packages MUST use `"version":"0.0.0"`, `"type":"module"`, source `exports`, `effect`/`@effect/platform` via `catalog:`, and internal deps via `workspace:*`.
+14. The compiled `sealantd` binary MUST run unprivileged on Fedora-41, Arch, and `nixos/nix` base images (`buildkit-builder.ts` distroDefinitions) from a single linux/amd64 artifact, with no dynamic dependency on distro-specific shared libraries.
+15. The Containerfile/entrypoint generated by `buildkit-builder.ts` MUST copy `sealantd` (after line 1060) and start it before the harness foreground command (`buildkit-builder.ts:842`), and the sandbox MUST fail closed (refuse the session) if the sealantd socket is unreachable at session-open time.

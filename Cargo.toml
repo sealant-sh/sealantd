@@ -1,0 +1,60 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.96"
+license = "Apache-2.0"
+repository = "https://github.com/get-sealant/sealant"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+unreachable_pub = "warn"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+# Runtime crates additionally opt into clippy::unwrap_used / expect_used via crate-level
+# attributes; we do not deny them workspace-wide so that test code can use them freely.
+todo = "warn"
+
+[workspace.dependencies]
+# async runtime
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "io-std", "sync", "time", "process", "signal", "fs"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+futures = "0.3"
+# serde / schema
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+schemars = "0.8"
+# errors / logging
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+# bytes / encoding / hashing
+bytes = "1"
+base64 = "0.22"
+crc32fast = "1"
+hex = "0.4"
+sha2 = "0.10"
+getrandom = "0.2"
+# linux syscalls (prefer rustix/nix over raw libc)
+nix = { version = "0.29", features = ["process", "signal", "term", "fs", "user", "poll", "ioctl"] }
+rustix = { version = "0.38", features = ["process", "fs", "termios", "pipe", "stdio"] }
+libc = "0.2"
+# cli
+clap = { version = "4", features = ["derive"] }
+# internal crates
+sealant-protocol = { path = "crates/sealant-protocol" }
+sealant-runtime-core = { path = "crates/sealant-runtime-core" }
+sealant-process = { path = "crates/sealant-process" }
+sealant-pty = { path = "crates/sealant-pty" }
+sealant-telemetry = { path = "crates/sealant-telemetry" }
+sealant-eventlog = { path = "crates/sealant-eventlog" }
+sealant-fs = { path = "crates/sealant-fs" }
+sealant-network = { path = "crates/sealant-network" }
+sealant-control = { path = "crates/sealant-control" }
+
+[profile.release]
+debug = "line-tables-only"

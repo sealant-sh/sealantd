@@ -1,0 +1,1859 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Comprehensive implementation plan and coding-agent prompt for building sealantd in Rust.">
+  <title>sealantd — Comprehensive Rust Implementation Plan</title>
+  <style>
+    :root {
+      --bg: #0b1020;
+      --panel: #11182b;
+      --panel-2: #17213a;
+      --text: #e8edf8;
+      --muted: #aeb9d0;
+      --line: #2d3b61;
+      --accent: #74a7ff;
+      --accent-2: #7ce0c3;
+      --warn: #ffcf70;
+      --danger: #ff8d9c;
+      --ok: #8fe7a4;
+      --code: #090d18;
+      --shadow: 0 14px 35px rgba(0,0,0,.26);
+      --radius: 14px;
+      --max: 1220px;
+    }
+    @media (prefers-color-scheme: light) {
+      :root {
+        --bg: #f4f6fb;
+        --panel: #ffffff;
+        --panel-2: #eef3fb;
+        --text: #172033;
+        --muted: #536178;
+        --line: #d7deea;
+        --accent: #245ec7;
+        --accent-2: #087d68;
+        --warn: #8a5c00;
+        --danger: #b5293f;
+        --ok: #167338;
+        --code: #f7f9fc;
+        --shadow: 0 12px 30px rgba(23,32,51,.09);
+      }
+    }
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      line-height: 1.62;
+    }
+    a { color: var(--accent); }
+    header.hero {
+      background:
+        radial-gradient(circle at 10% 0%, rgba(116,167,255,.22), transparent 38%),
+        radial-gradient(circle at 90% 0%, rgba(124,224,195,.14), transparent 34%),
+        var(--panel);
+      border-bottom: 1px solid var(--line);
+      padding: 58px 24px 42px;
+    }
+    .hero-inner, .layout, footer .inner {
+      max-width: var(--max);
+      margin: 0 auto;
+    }
+    .eyebrow {
+      display: inline-flex;
+      gap: .5rem;
+      align-items: center;
+      padding: .32rem .64rem;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      color: var(--accent-2);
+      font-size: .86rem;
+      letter-spacing: .04em;
+      text-transform: uppercase;
+      background: rgba(124,224,195,.06);
+    }
+    h1 {
+      font-size: clamp(2.15rem, 5vw, 4.65rem);
+      line-height: 1.05;
+      margin: 1rem 0 .8rem;
+      letter-spacing: -.04em;
+    }
+    .subtitle {
+      max-width: 900px;
+      font-size: clamp(1.05rem, 2vw, 1.28rem);
+      color: var(--muted);
+      margin: 0;
+    }
+    .chips {
+      display: flex;
+      flex-wrap: wrap;
+      gap: .55rem;
+      margin-top: 1.35rem;
+    }
+    .chip {
+      border: 1px solid var(--line);
+      background: var(--panel-2);
+      border-radius: 999px;
+      padding: .34rem .68rem;
+      font-size: .88rem;
+      color: var(--muted);
+    }
+    .layout {
+      display: grid;
+      grid-template-columns: 280px minmax(0, 1fr);
+      gap: 28px;
+      padding: 28px 24px 70px;
+      align-items: start;
+    }
+    nav.toc {
+      position: sticky;
+      top: 18px;
+      max-height: calc(100vh - 36px);
+      overflow: auto;
+      border: 1px solid var(--line);
+      background: var(--panel);
+      border-radius: var(--radius);
+      padding: 16px;
+      box-shadow: var(--shadow);
+    }
+    .toc strong {
+      display: block;
+      margin-bottom: .7rem;
+      font-size: .92rem;
+      text-transform: uppercase;
+      letter-spacing: .06em;
+      color: var(--accent-2);
+    }
+    .toc a {
+      display: block;
+      text-decoration: none;
+      color: var(--muted);
+      padding: .27rem .25rem;
+      border-radius: 7px;
+      font-size: .9rem;
+    }
+    .toc a:hover { background: var(--panel-2); color: var(--text); }
+    main { min-width: 0; }
+    section, .card {
+      border: 1px solid var(--line);
+      background: var(--panel);
+      border-radius: var(--radius);
+      padding: clamp(20px, 3.5vw, 36px);
+      margin-bottom: 24px;
+      box-shadow: var(--shadow);
+    }
+    section h2 {
+      margin: 0 0 1rem;
+      font-size: clamp(1.55rem, 2.8vw, 2.15rem);
+      line-height: 1.15;
+      letter-spacing: -.025em;
+    }
+    h3 {
+      margin-top: 2rem;
+      margin-bottom: .7rem;
+      font-size: 1.28rem;
+      color: var(--accent-2);
+    }
+    h4 {
+      margin: 1.4rem 0 .55rem;
+      font-size: 1.05rem;
+      color: var(--accent);
+    }
+    p { margin: .65rem 0 1rem; }
+    ul, ol { padding-left: 1.35rem; }
+    li { margin: .36rem 0; }
+    code {
+      font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+      background: var(--code);
+      border: 1px solid var(--line);
+      padding: .1rem .3rem;
+      border-radius: 5px;
+      font-size: .92em;
+    }
+    pre {
+      overflow-x: auto;
+      background: var(--code);
+      color: var(--text);
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 16px;
+      line-height: 1.45;
+      font-size: .9rem;
+    }
+    pre code { border: 0; padding: 0; background: transparent; }
+    .callout {
+      border-left: 4px solid var(--accent);
+      background: var(--panel-2);
+      padding: 14px 16px;
+      border-radius: 0 10px 10px 0;
+      margin: 1rem 0;
+    }
+    .callout.warn { border-left-color: var(--warn); }
+    .callout.danger { border-left-color: var(--danger); }
+    .callout.ok { border-left-color: var(--ok); }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 16px;
+      margin: 1rem 0;
+    }
+    .mini {
+      border: 1px solid var(--line);
+      background: var(--panel-2);
+      border-radius: 11px;
+      padding: 16px;
+    }
+    .mini h4 { margin-top: 0; }
+    .table-wrap {
+      width: 100%;
+      overflow-x: auto;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      margin: 1rem 0;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      min-width: 760px;
+      font-size: .93rem;
+      background: var(--panel);
+    }
+    th, td {
+      border-bottom: 1px solid var(--line);
+      border-right: 1px solid var(--line);
+      padding: 11px 12px;
+      vertical-align: top;
+      text-align: left;
+    }
+    tr:last-child td { border-bottom: 0; }
+    th:last-child, td:last-child { border-right: 0; }
+    th {
+      background: var(--panel-2);
+      color: var(--accent-2);
+      font-weight: 700;
+    }
+    details {
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      margin: .8rem 0;
+      background: var(--panel-2);
+    }
+    summary {
+      cursor: pointer;
+      font-weight: 700;
+      padding: 13px 15px;
+      color: var(--accent);
+    }
+    details > div { padding: 0 15px 15px; }
+    .phase {
+      border-left: 4px solid var(--accent-2);
+    }
+    .workflow {
+      border-left: 4px solid var(--accent);
+    }
+    .status {
+      font-size: .78rem;
+      text-transform: uppercase;
+      letter-spacing: .05em;
+      font-weight: 700;
+      white-space: nowrap;
+    }
+    .must { color: var(--danger); }
+    .should { color: var(--warn); }
+    .may { color: var(--accent-2); }
+    .checklist {
+      list-style: none;
+      padding-left: 0;
+    }
+    .checklist li {
+      position: relative;
+      padding-left: 1.7rem;
+      margin: .48rem 0;
+    }
+    .checklist li::before {
+      content: "□";
+      position: absolute;
+      left: 0;
+      color: var(--accent-2);
+      font-size: 1.1rem;
+      line-height: 1.2;
+    }
+    .actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: .7rem;
+      margin-top: 1.3rem;
+    }
+    button {
+      appearance: none;
+      border: 1px solid var(--line);
+      border-radius: 9px;
+      padding: .72rem 1rem;
+      background: var(--accent);
+      color: #071124;
+      font-weight: 800;
+      cursor: pointer;
+    }
+    button.secondary { background: var(--panel-2); color: var(--text); }
+    .small { font-size: .9rem; color: var(--muted); }
+    footer {
+      border-top: 1px solid var(--line);
+      padding: 26px 24px 40px;
+      color: var(--muted);
+      background: var(--panel);
+    }
+    @media (max-width: 980px) {
+      .layout { grid-template-columns: 1fr; }
+      nav.toc { position: static; max-height: none; }
+      .grid { grid-template-columns: 1fr; }
+    }
+    @media print {
+      nav.toc, .actions { display: none; }
+      body { background: #fff; color: #111; }
+      section, .card { box-shadow: none; break-inside: avoid; }
+      .layout { display: block; }
+      a { color: #111; text-decoration: none; }
+    }
+  </style>
+</head>
+<body>
+<header class="hero">
+  <div class="hero-inner">
+    <span class="eyebrow">Coding-agent implementation brief</span>
+    <h1>Build <code>sealantd</code> in Rust</h1>
+    <p class="subtitle">
+      A comprehensive, production-oriented plan for the authoritative runtime daemon inside
+      Sealant sandboxes. This document is deliberately detailed: it defines responsibilities,
+      architecture, protocol, process and PTY behavior, telemetry, durability, security,
+      TypeScript integration, multi-agent workflows, and the validation loop required to prove
+      the daemon works.
+    </p>
+    <div class="chips">
+      <span class="chip">Rust 2024</span>
+      <span class="chip">Linux-first</span>
+      <span class="chip">Tokio orchestration</span>
+      <span class="chip">Unix socket control API</span>
+      <span class="chip">TypeScript SDK</span>
+      <span class="chip">Bounded telemetry</span>
+      <span class="chip">Failure-injection tests</span>
+    </div>
+    <div class="actions">
+      <button onclick="copyPlan()">Copy implementation brief</button>
+      <button class="secondary" onclick="window.print()">Print / Save PDF</button>
+    </div>
+    <p id="copy-status" class="small" aria-live="polite"></p>
+  </div>
+</header>
+
+<div class="layout">
+  <nav class="toc" aria-label="Table of contents">
+    <strong>Contents</strong>
+    <a href="#agent-role">1. Agent role</a>
+    <a href="#context">2. Product context</a>
+    <a href="#outcomes">3. Primary outcomes</a>
+    <a href="#principles">4. Engineering principles</a>
+    <a href="#architecture">5. Architecture</a>
+    <a href="#repository">6. Repository discovery</a>
+    <a href="#workspace">7. Workspace layout</a>
+    <a href="#protocol">8. Protocol and control API</a>
+    <a href="#configuration">9. Runtime configuration</a>
+    <a href="#process">10. Process runtime</a>
+    <a href="#pty">11. PTY and sessions</a>
+    <a href="#io">12. I/O telemetry</a>
+    <a href="#filesystem">13. Filesystem telemetry</a>
+    <a href="#network">14. Network telemetry</a>
+    <a href="#pipeline">15. Telemetry pipeline</a>
+    <a href="#spool">16. Durable spool</a>
+    <a href="#health">17. Health and metrics</a>
+    <a href="#security">18. Security</a>
+    <a href="#typescript">19. TypeScript integration</a>
+    <a href="#packaging">20. Packaging</a>
+    <a href="#workflows">21. Multi-agent workflows</a>
+    <a href="#phases">22. Implementation phases</a>
+    <a href="#validation">23. Validation loop</a>
+    <a href="#tests">24. Adversarial test matrix</a>
+    <a href="#performance">25. Performance and soak</a>
+    <a href="#deliverables">26. Final deliverables</a>
+    <a href="#reporting">27. Reporting behavior</a>
+  </nav>
+
+  <main id="agent-prompt">
+    <section id="agent-role">
+      <h2>1. Agent role and operating mandate</h2>
+      <div class="callout ok">
+        <strong>You are the lead systems engineer responsible for designing and implementing
+        <code>sealantd</code>.</strong>
+      </div>
+      <p>
+        <code>sealantd</code> is the authoritative runtime daemon that runs inside Sealant Linux
+        sandboxes and development containers. Build it in Rust and integrate it with the existing
+        TypeScript codebase through a versioned, typed protocol.
+      </p>
+      <p>
+        Do not treat this as a toy CLI, a single <code>exec</code> wrapper, or a code-generation
+        exercise. Treat it as production-oriented systems software whose value depends on
+        trustworthy observation, correct process control, bounded resource use, explicit failure
+        semantics, and reproducible validation.
+      </p>
+      <p>
+        Proceed independently through discovery, architecture, vertical slices, hardening,
+        integration, and final validation. Ask one consolidated question only when a true product
+        decision blocks implementation. Otherwise, make conservative assumptions, record them in
+        ADRs, and continue.
+      </p>
+    </section>
+
+    <section id="context">
+      <h2>2. Product context and responsibility boundary</h2>
+      <p>
+        Sealant provides customized development sandboxes for LLM-driven software work. A sandbox
+        can contain a checked-out repository, shell configuration, dotfiles, language runtimes,
+        package managers, LLM harnesses, coding agents, tests, linters, development servers, and
+        user-defined tools.
+      </p>
+      <p>
+        The daemon must create a reliable factual record of what happened during an execution so
+        the TypeScript SDK can power modules such as issue-to-PR analysis, replay, auditing,
+        debugging, source attribution, and high-quality user feedback.
+      </p>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th><code>sealantd</code> owns</th>
+              <th><code>sealantd</code> does not own</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Runtime behavior after sandbox startup</td>
+              <td>Image building and BuildKit orchestration</td>
+            </tr>
+            <tr>
+              <td>Process, PTY, session, and signal management</td>
+              <td>Docker/Kubernetes/backend selection and scheduling</td>
+            </tr>
+            <tr>
+              <td>Binary-safe stdin/stdout/stderr capture</td>
+              <td>Product workflow policy and business orchestration</td>
+            </tr>
+            <tr>
+              <td>Filesystem and network evidence collection</td>
+              <td>Long-term product data storage and analytics</td>
+            </tr>
+            <tr>
+              <td>Bounded buffering, local spooling, retries, and health</td>
+              <td>External SSH authentication and internet-facing edge transport</td>
+            </tr>
+            <tr>
+              <td>Runtime policy gates, redaction, and capability reporting</td>
+              <td>Semantic interpretation of what the LLM “meant” or “cited”</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>Questions the emitted evidence must enable</h3>
+      <ul>
+        <li>Which commands and processes ran, in what lifecycle state, and with what exit result?</li>
+        <li>What bytes were written to stdin, stdout, stderr, and PTY streams?</li>
+        <li>What happened in interactive or proxied SSH-backed sessions?</li>
+        <li>Which files were added, modified, renamed, deleted, or had metadata changes?</li>
+        <li>Which network destinations, hostnames, and observable web sources were accessed?</li>
+        <li>Which process or session was associated with an event, where attribution is possible?</li>
+        <li>Was data truncated, redacted, dropped, delayed, coalesced, or unavailable?</li>
+        <li>Why did the runtime, execution, process, session, watcher, or collector degrade or fail?</li>
+      </ul>
+    </section>
+
+    <section id="outcomes">
+      <h2>3. Primary outcomes</h2>
+      <p>The implementation is not complete until it provides all of the following:</p>
+      <ol>
+        <li>A stable, versioned local control API.</li>
+        <li>Non-interactive process execution with process-tree cleanup.</li>
+        <li>Interactive PTY sessions suitable for shells and terminal applications.</li>
+        <li>Full binary-safe capture of stdin, stdout, stderr, PTY input, and PTY output.</li>
+        <li>Stable logical identifiers and normalized lifecycle telemetry.</li>
+        <li>Filesystem snapshot, live observation, final diff, and overflow recovery.</li>
+        <li>Network metadata, proxy evidence, optional privileged collection, and source normalization.</li>
+        <li>Bounded queues, event priority, durable local spool, retry, and explicit backpressure policy.</li>
+        <li>Health states, heartbeats, metrics, degradation reasons, and feature kill switches.</li>
+        <li>Secret isolation, redaction, input validation, capability minimization, and a threat model.</li>
+        <li>A typed TypeScript client generated from or contract-checked against the Rust schema.</li>
+        <li>Unit, integration, container, failure-injection, fuzz, soak, and contract tests.</li>
+        <li>Architecture, protocol, operational, security, configuration, and limitation documentation.</li>
+      </ol>
+    </section>
+
+    <section id="principles">
+      <h2>4. Non-negotiable engineering principles</h2>
+
+      <h3>4.1 Stable Rust and restrained complexity</h3>
+      <ul>
+        <li>Use stable Rust and Rust 2024 unless repository constraints require otherwise.</li>
+        <li>Use Tokio for asynchronous orchestration, timers, channels, and socket I/O.</li>
+        <li>Do not force blocking kernel interfaces, hashing, compression, or filesystem walks into async code; use dedicated blocking tasks or threads.</li>
+        <li>Keep core state machines and domain logic independent of Tokio where practical.</li>
+      </ul>
+
+      <h3>4.2 Safe Rust by default</h3>
+      <ul>
+        <li>Prefer <code>rustix</code> or <code>nix</code> over raw <code>libc</code> when they model the required behavior correctly.</li>
+        <li>Every <code>unsafe</code> block must be minimal, wrapped behind a safe API, documented with a <code>// SAFETY:</code> invariant, and covered by focused tests.</li>
+        <li>Do not use <code>unwrap()</code> or <code>expect()</code> in daemon runtime paths.</li>
+        <li>Never use unsafe code merely to avoid redesigning ownership or state boundaries.</li>
+      </ul>
+
+      <h3>4.3 Bounded resource use</h3>
+      <p>No queue, map, frame, payload, retry buffer, spool, process registry, or artifact store may grow without a configured limit.</p>
+      <div class="grid">
+        <div class="mini">
+          <h4>Memory and protocol limits</h4>
+          <ul>
+            <li>Maximum control-frame size</li>
+            <li>I/O chunk size</li>
+            <li>Event queue capacity</li>
+            <li>Per-execution buffered bytes</li>
+            <li>Maximum inline event payload</li>
+          </ul>
+        </div>
+        <div class="mini">
+          <h4>Runtime and storage limits</h4>
+          <ul>
+            <li>Maximum processes and sessions</li>
+            <li>Spool disk limit and segment size</li>
+            <li>Maximum diff/artifact size</li>
+            <li>Watch roots and ignore rules</li>
+            <li>Shutdown grace and retry age</li>
+          </ul>
+        </div>
+      </div>
+
+      <h3>4.4 Explicit degradation and failure policy</h3>
+      <ul>
+        <li>Every subsystem must define fail-open versus fail-closed behavior.</li>
+        <li>No telemetry loss may be silent.</li>
+        <li>When data is dropped, truncated, redacted, coalesced, or unavailable, emit a normalized event or counter.</li>
+        <li>High-priority lifecycle events must receive stronger preservation guarantees than verbose high-volume events.</li>
+      </ul>
+
+      <h3>4.5 Binary safety</h3>
+      <p>
+        Process and terminal streams are arbitrary bytes. Never assume UTF-8. JSON transports must
+        use base64 and record the original byte count. Binary transports should use byte fields.
+      </p>
+
+      <h3>4.6 Honest observability</h3>
+      <div class="callout warn">
+        Do not claim that the runtime can observe information hidden by encryption or unavailable
+        under the current Linux privilege and namespace model.
+      </div>
+      <ul>
+        <li>TCP metadata reveals addresses and ports, not encrypted application paths.</li>
+        <li>DNS telemetry may reveal queried names.</li>
+        <li>An explicit HTTP proxy can observe request metadata.</li>
+        <li>HTTPS CONNECT normally reveals destination host and port, not encrypted URL paths or bodies.</li>
+        <li>Process attribution for network traffic may require eBPF, cgroup hooks, netlink, or privileged access.</li>
+        <li>Inotify can overflow and does not provide perfect process attribution.</li>
+        <li>Separate stdout and stderr pipes do not establish perfect causal ordering across streams.</li>
+      </ul>
+    </section>
+
+    <section id="architecture">
+      <h2>5. Target architecture</h2>
+      <pre><code>TypeScript orchestrator / SDK / modules
+                │
+                │ typed, versioned local protocol
+                ▼
+      Unix socket / optional stdio adapter
+                │
+                ▼
+┌──────────────────────────────────────────────────────────┐
+│                       sealantd                            │
+│                                                          │
+│  Control server ──► command dispatcher ──► state machines│
+│         │                       │                         │
+│         │             ┌─────────┴─────────┐               │
+│         │             ▼                   ▼               │
+│         │       process runtime       PTY sessions        │
+│         │             │                   │               │
+│         ├─────────────┴───────────────┬───┤               │
+│         ▼                             ▼   ▼               │
+│  filesystem collector        network collectors          │
+│         │                             │                   │
+│         └──────────────┬──────────────┘                   │
+│                        ▼                                  │
+│       validation → redaction → sequencing → batching      │
+│                        │                                  │
+│                        ▼                                  │
+│       bounded queues → durable spool → delivery sink      │
+│                        │                                  │
+│                        ▼                                  │
+│                health / metrics / drops                   │
+└──────────────────────────────────────────────────────────┘</code></pre>
+
+      <h3>Core architectural rules</h3>
+      <ul>
+        <li>The daemon emits facts; the TypeScript SDK performs higher-level interpretation.</li>
+        <li>Protocol and telemetry types are versioned and shared, not manually duplicated.</li>
+        <li>Final event sequencing occurs at one deterministic point per execution.</li>
+        <li>Capture producers never synchronously depend on a slow remote sink.</li>
+        <li>Optional privileged collectors must not force the entire daemon to run permanently as root.</li>
+        <li>Large data is stored as artifacts and referenced by content-addressed identifiers.</li>
+      </ul>
+    </section>
+
+    <section id="repository">
+      <h2>6. Initial repository workflow</h2>
+      <p>Before implementation, perform repository discovery and create traceable planning artifacts.</p>
+      <ol>
+        <li>Inspect the monorepo structure, package manager, CI, TypeScript conventions, Docker/BuildKit setup, protocol packages, and deployment assumptions.</li>
+        <li>Search for all existing references to sandboxes, execution IDs, sessions, SSH proxying, telemetry, networking, and wrapper/orchestrator behavior.</li>
+        <li>Create the required documents:
+          <ul>
+            <li><code>docs/runtime/requirements-matrix.md</code></li>
+            <li><code>docs/runtime/architecture.md</code></li>
+            <li><code>docs/runtime/threat-model.md</code></li>
+            <li><code>docs/runtime/protocol.md</code></li>
+            <li><code>docs/runtime/validation-plan.md</code></li>
+            <li><code>docs/runtime/known-limitations.md</code></li>
+            <li><code>docs/adr/</code></li>
+          </ul>
+        </li>
+        <li>Populate a requirement row for every responsibility in this plan.</li>
+      </ol>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Requirement-matrix field</th>
+              <th>Purpose</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr><td>Requirement ID and description</td><td>Stable traceability from design through validation.</td></tr>
+            <tr><td>Priority</td><td>Must, should, or later capability.</td></tr>
+            <tr><td>Owning crate/workflow</td><td>Avoid ambiguous ownership.</td></tr>
+            <tr><td>Implementation status</td><td>Designed, in progress, implemented, validated, or blocked.</td></tr>
+            <tr><td>Unit/integration test IDs</td><td>Code existence is not completion.</td></tr>
+            <tr><td>Capability/privilege requirements</td><td>Expose environment-dependent behavior honestly.</td></tr>
+            <tr><td>Known limitations</td><td>Prevent accidental overclaiming.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>Mandatory ADR subjects</h3>
+      <ul>
+        <li>Wire schema and framing</li>
+        <li>Unix socket versus stdio responsibilities</li>
+        <li>Event sequencing and stream offsets</li>
+        <li>Durable spool format and acknowledgement model</li>
+        <li>PTY implementation and process-group semantics</li>
+        <li>pidfd, subreaper, and PID 1 strategy</li>
+        <li>Filesystem snapshot/watcher hybrid</li>
+        <li>Network collector backends and privilege separation</li>
+        <li>TypeScript type generation and compatibility policy</li>
+      </ul>
+    </section>
+
+    <section id="workspace">
+      <h2>7. Recommended Rust workspace shape</h2>
+      <p>Adapt this to the repository rather than imposing it blindly.</p>
+      <pre><code>crates/
+  sealant-protocol/       typed commands, events, IDs, versions, error codes
+  sealant-runtime-core/   configuration, state machines, policy, health
+  sealant-process/        exec, registry, process groups, pidfds, reaping
+  sealant-pty/            PTY allocation, sessions, input/output, resize
+  sealant-telemetry/      event bus, sequencing, priority, batching, sinks
+  sealant-eventlog/       append-only spool, checksums, recovery, rotation
+  sealant-fs/             snapshots, hashing, watcher, coalescing, diffs
+  sealant-network/        collectors, DNS, proxy, privileged backends
+  sealant-control/        Unix socket, stdio adapter, framing, dispatch
+  sealantd/               binary composition and lifecycle
+  sealantctl/             debug and integration-test client
+
+packages/
+  runtime-protocol/       generated or contract-checked TypeScript types
+  runtime-client/         ergonomic TypeScript SDK client</code></pre>
+      <p>Avoid circular dependencies. Keep <code>sealant-protocol</code> lightweight and usable by tests, tools, and SDK generation.</p>
+    </section>
+
+    <section id="protocol">
+      <h2>8. Protocol, identifiers, and control API</h2>
+
+      <h3>8.1 Transport and framing</h3>
+      <ul>
+        <li>Primary transport: Unix domain socket.</li>
+        <li>Optional transport: stdio adapter for wrappers and deterministic integration tests.</li>
+        <li>Use explicit framing; never assume one <code>read()</code> equals one message.</li>
+        <li>Enforce a configurable maximum frame size before allocation.</li>
+        <li>When using stdio, protocol output goes only to stdout and human diagnostics go only to stderr.</li>
+        <li>Restrict socket permissions and validate Linux peer credentials where appropriate.</li>
+        <li>Handle stale socket paths without blindly unlinking arbitrary files.</li>
+      </ul>
+
+      <h3>8.2 Schema strategy</h3>
+      <p>
+        Evaluate protobuf versus a versioned framed JSON protocol. Record the choice in an ADR.
+        The initial developer mode must remain inspectable. Rust and TypeScript must derive from or
+        validate against a single schema source.
+      </p>
+
+      <h3>8.3 Typed identifiers</h3>
+      <p>Use Rust newtypes internally:</p>
+      <pre><code>RuntimeId
+ExecutionId
+SessionId
+ProcessId
+RequestId
+EventId
+Sequence</code></pre>
+      <p>Never use the OS PID as the stable product-level <code>ProcessId</code>. Include PID, PGID, and pidfd-related metadata separately.</p>
+
+      <h3>8.4 Event envelope</h3>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>Field</th><th>Meaning</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><code>schemaVersion</code></td><td>Wire compatibility version.</td></tr>
+            <tr><td><code>eventId</code></td><td>Globally unique idempotency key.</td></tr>
+            <tr><td><code>runtimeId</code></td><td>Daemon instance identity.</td></tr>
+            <tr><td><code>executionId</code></td><td>Task/execution correlation.</td></tr>
+            <tr><td><code>sessionId</code></td><td>PTY or interactive session correlation.</td></tr>
+            <tr><td><code>processId</code></td><td>Stable logical process identifier.</td></tr>
+            <tr><td><code>requestId</code></td><td>Control request correlation.</td></tr>
+            <tr><td><code>sequence</code></td><td>Monotonic order within the defined sequence domain.</td></tr>
+            <tr><td><code>observedAt</code></td><td>Wall-clock timestamp.</td></tr>
+            <tr><td><code>monotonicTimestamp</code></td><td>Duration-safe local ordering reference.</td></tr>
+            <tr><td><code>eventType</code></td><td>Typed event discriminator.</td></tr>
+            <tr><td><code>captureMethod</code></td><td>Pipe, PTY, proxy, inotify, snapshot, eBPF, and so on.</td></tr>
+            <tr><td><code>confidence</code></td><td>Certainty of inferred or best-effort attribution.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>
+        Define sequence semantics precisely: event sequence represents the order observed or
+        enqueued by Sealant, not unknowable kernel causality. I/O events also require monotonic
+        <code>streamOffset</code> values per stream.
+      </p>
+
+      <h3>8.5 Required commands</h3>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>Category</th><th>Commands</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Runtime lifecycle</td>
+              <td><code>runtime.health</code>, <code>runtime.getCapabilities</code>, <code>runtime.gracefulShutdown</code>, <code>runtime.kill</code></td>
+            </tr>
+            <tr>
+              <td>Executions</td>
+              <td><code>execution.start</code>, <code>execution.stop</code></td>
+            </tr>
+            <tr>
+              <td>Processes</td>
+              <td><code>exec</code>, <code>signalProcess</code>, <code>killProcess</code>, <code>listProcesses</code>, <code>writeStdin</code>, <code>closeStdin</code></td>
+            </tr>
+            <tr>
+              <td>Sessions</td>
+              <td><code>openSession</code>, <code>closeSession</code>, <code>resizePty</code>, <code>listSessions</code></td>
+            </tr>
+            <tr>
+              <td>Policy and metrics</td>
+              <td><code>setFeatureState</code>, <code>getRuntimeMetrics</code></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>8.6 Acknowledgement contract</h3>
+      <ul>
+        <li>Every request receives exactly one acknowledgement or typed control error.</li>
+        <li>Long-running work is represented by later telemetry events, not an ambiguous hanging response.</li>
+        <li>Use <code>requestId</code> for correlation and duplicate-request handling.</li>
+        <li>Define deterministic error-code union types.</li>
+      </ul>
+
+      <details>
+        <summary>Required initial error codes</summary>
+        <div>
+          <pre><code>invalid-json
+unsupported-version
+frame-too-large
+unknown-command
+invalid-argument
+missing-command
+execution-not-found
+session-not-found
+process-not-found
+process-start-failed
+pty-allocation-failed
+permission-denied
+policy-denied
+feature-unavailable
+capability-unavailable
+queue-full
+runtime-shutting-down
+internal-error</code></pre>
+        </div>
+      </details>
+    </section>
+
+    <section id="configuration">
+      <h2>9. Runtime configuration</h2>
+      <p>Accept validated configuration from a file, environment, or boot payload.</p>
+      <div class="grid">
+        <div class="mini">
+          <h4>Identity and execution</h4>
+          <ul>
+            <li>Runtime and execution identity</li>
+            <li>Workspace/repository scope</li>
+            <li>Default shell</li>
+            <li>Child user and group</li>
+            <li>Child base environment</li>
+          </ul>
+        </div>
+        <div class="mini">
+          <h4>Capture and policy</h4>
+          <ul>
+            <li>I/O, filesystem, and network flags</li>
+            <li>Payload-capture policy</li>
+            <li>Redaction and suppression rules</li>
+            <li>Fail-open/fail-closed policy</li>
+            <li>Feature kill switches</li>
+          </ul>
+        </div>
+        <div class="mini">
+          <h4>Capacity and durability</h4>
+          <ul>
+            <li>Queue capacities</li>
+            <li>Spool directory and disk limit</li>
+            <li>Retry/backoff settings</li>
+            <li>Artifact thresholds</li>
+            <li>Process/session limits</li>
+          </ul>
+        </div>
+        <div class="mini">
+          <h4>Operations</h4>
+          <ul>
+            <li>Heartbeat interval</li>
+            <li>Shutdown grace period</li>
+            <li>Sink configuration</li>
+            <li>Logging level</li>
+            <li>Filesystem include/ignore rules</li>
+          </ul>
+        </div>
+      </div>
+      <ul>
+        <li>Validate configuration before reporting healthy.</li>
+        <li>Emit a sanitized configuration summary and deterministic config hash.</li>
+        <li>Never emit credentials, tokens, private keys, or secret values.</li>
+      </ul>
+    </section>
+
+    <section id="process">
+      <h2>10. Process execution and lifecycle</h2>
+
+      <h3>10.1 Non-PTY execution</h3>
+      <p><code>exec</code> must support:</p>
+      <ul>
+        <li>Executable and argument vector</li>
+        <li>Working directory</li>
+        <li>Validated environment overlay</li>
+        <li>Optional stdin stream</li>
+        <li>Separate stdout and stderr</li>
+        <li>Foreground and background execution</li>
+        <li>Timeout and cancellation</li>
+        <li>Execution/session association</li>
+        <li>Optional resource sampling</li>
+        <li>Graceful signal followed by forced termination</li>
+      </ul>
+      <div class="callout danger">
+        Do not accept an unsafe shell string as the only execution model. Shell execution must be
+        explicit, for example <code>/bin/bash -lc ...</code>.
+      </div>
+
+      <h3>10.2 Managed process record</h3>
+      <p>Every managed command must track:</p>
+      <ul>
+        <li>Logical <code>ProcessId</code>, OS PID, process group ID, and pidfd where available</li>
+        <li>Parent logical process where observable</li>
+        <li>Execution and session association</li>
+        <li>Command, arguments, working directory, and sanitized metadata</li>
+        <li>Start time, current state, cancellation handle, and completion notification</li>
+        <li>stdin/stdout/stderr stream offsets</li>
+        <li>Exit code, signal, reason, duration, and final timestamps</li>
+      </ul>
+
+      <h3>10.3 State machine</h3>
+      <pre><code>created → starting → running → terminating → exited
+                     │             │
+                     ├─────────────┴────→ signaled
+                     └──────────────────→ failed</code></pre>
+      <p>Reject invalid state transitions and unit-test the transition table.</p>
+
+      <h3>10.4 Process groups, pidfds, subreaping, and PID 1</h3>
+      <ul>
+        <li>Create process groups deliberately so signals target the managed tree rather than only the direct child.</li>
+        <li>Investigate Linux pidfds to reduce PID-reuse races; provide a documented fallback.</li>
+        <li>Investigate <code>PR_SET_CHILD_SUBREAPER</code> to adopt and reap orphaned descendants.</li>
+        <li>If the daemon may run as PID 1, implement PID 1 signal handling and child reaping correctly.</li>
+        <li>Use close-on-exec on daemon-only descriptors.</li>
+      </ul>
+
+      <h3>10.5 Cancellation and shutdown sequence</h3>
+      <ol>
+        <li>Stop accepting new work.</li>
+        <li>Mark the process or execution as terminating.</li>
+        <li>Send the configured graceful signal to the process group.</li>
+        <li>Wait for the configured grace period.</li>
+        <li>Send <code>SIGKILL</code> when necessary.</li>
+        <li>Reap direct and adopted descendants.</li>
+        <li>Drain/finalize streams according to policy.</li>
+        <li>Emit final lifecycle and telemetry-loss events.</li>
+      </ol>
+    </section>
+
+    <section id="pty">
+      <h2>11. PTY and interactive session runtime</h2>
+      <p>Implement Linux pseudoterminal-backed interactive sessions.</p>
+      <ul>
+        <li>Allocate PTY master/slave pair.</li>
+        <li>Create a session and controlling terminal where appropriate.</li>
+        <li>Configure foreground process groups correctly.</li>
+        <li>Start the configured shell or command.</li>
+        <li>Capture PTY output and forwarded input as raw bytes.</li>
+        <li>Forward terminal resize events and dimensions.</li>
+        <li>Model terminal-generated signal behavior accurately.</li>
+        <li>Close and release all resources after normal or abnormal termination.</li>
+        <li>Record final process/session result.</li>
+      </ul>
+
+      <h3>SSH proxy integration boundary</h3>
+      <ul>
+        <li>The external proxy owns SSH authentication and edge transport.</li>
+        <li><code>sealantd</code> owns the in-sandbox PTY and shell/session lifecycle.</li>
+        <li>The proxy calls <code>openSession</code>, <code>writeStdin</code>, <code>resizePty</code>, and <code>closeSession</code>.</li>
+        <li>All proxied bytes must retain execution and session correlation.</li>
+        <li>Do not build a second internet-facing SSH authentication server unless an existing repository requirement demands it.</li>
+      </ul>
+      <div class="callout">
+        The daemon is not a terminal emulator. It captures and forwards PTY bytes.
+      </div>
+    </section>
+
+    <section id="io">
+      <h2>12. I/O telemetry</h2>
+      <p>Capture all configured streams:</p>
+      <ul>
+        <li>Non-PTY stdin, stdout, and stderr</li>
+        <li>PTY input and PTY output</li>
+      </ul>
+
+      <h3>Required chunk metadata</h3>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Field</th><th>Requirement</th></tr></thead>
+          <tbody>
+            <tr><td>Stream kind</td><td><code>stdin</code>, <code>stdout</code>, <code>stderr</code>, <code>pty.input</code>, or <code>pty.output</code>.</td></tr>
+            <tr><td>Encoding</td><td>Base64 for JSON; raw bytes for binary schema.</td></tr>
+            <tr><td>Byte count</td><td>Original number of bytes observed.</td></tr>
+            <tr><td>Stream offset</td><td>Monotonic per-stream byte position.</td></tr>
+            <tr><td>Capture time</td><td>Wall and/or monotonic timestamp.</td></tr>
+            <tr><td>Content</td><td>Inline bytes or content-addressed artifact reference.</td></tr>
+            <tr><td>Transformation metadata</td><td>Redaction, truncation, suppression, or coalescing.</td></tr>
+            <tr><td>Correlation</td><td>Execution, session, process, and request identifiers.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>Required data path</h3>
+      <pre><code>child pipe / PTY
+      ↓
+bounded capture queue
+      ↓
+validation and redaction
+      ↓
+deterministic sequencing
+      ↓
+durable spool or event writer
+      ↓
+delivery sink</code></pre>
+
+      <p>Queue-full behavior must be policy-driven and observable:</p>
+      <ul>
+        <li>Block producers</li>
+        <li>Spill to disk</li>
+        <li>Drop eligible low-priority events</li>
+        <li>Terminate the execution</li>
+        <li>Mark the runtime degraded</li>
+      </ul>
+
+      <h3>Capture modes</h3>
+      <ul>
+        <li>Full capture</li>
+        <li>Metadata only</li>
+        <li>Disabled</li>
+        <li>Pattern redaction</li>
+        <li>Environment-key redaction</li>
+        <li>Path redaction</li>
+        <li>Sensitive-input suppression where configured</li>
+      </ul>
+      <p>Preserve original byte counts and offsets when content is transformed; do not make redacted offsets ambiguous.</p>
+    </section>
+
+    <section id="filesystem">
+      <h2>13. Filesystem telemetry</h2>
+      <p>Use a hybrid correctness strategy:</p>
+      <ol>
+        <li>Baseline snapshot</li>
+        <li>Live event observation</li>
+        <li>Final snapshot and diff</li>
+        <li>Overflow/uncertainty recovery through rescan</li>
+      </ol>
+
+      <h3>Normalized events</h3>
+      <pre><code>file.added
+file.modified
+file.deleted
+file.renamed
+file.metadataChanged
+file.watchOverflow
+file.snapshotCompleted
+file.diffAvailable</code></pre>
+
+      <h3>Snapshot metadata</h3>
+      <ul>
+        <li>Path and file type</li>
+        <li>Size and modification time</li>
+        <li>Permissions</li>
+        <li>Optional content hash</li>
+        <li>Symlink target</li>
+      </ul>
+
+      <h3>Required protections and behavior</h3>
+      <ul>
+        <li>Restrict observation to configured workspace roots.</li>
+        <li>Protect against symlink loops and path escape.</li>
+        <li>Handle special files and very large files safely.</li>
+        <li>Batch/coalesce editor temp-file patterns and repetitive metadata noise.</li>
+        <li>Apply ignore rules to generated trees such as <code>node_modules</code>.</li>
+        <li>Add watches for new directories and handle deleted directory trees.</li>
+        <li>Emit an explicit overflow event and trigger a rescan when the watcher cannot guarantee completeness.</li>
+      </ul>
+
+      <h3>Diffs and artifacts</h3>
+      <ul>
+        <li>Generate text patches only under configured type and size limits.</li>
+        <li>Store large patches and binary content as separate artifacts.</li>
+        <li>Use content-addressed artifact references.</li>
+        <li>Redact sensitive paths and content according to policy.</li>
+        <li>State whether rename detection is certain or inferred.</li>
+        <li>Do not claim reliable per-process attribution from inotify alone.</li>
+      </ul>
+    </section>
+
+    <section id="network">
+      <h2>14. Network telemetry and source attribution</h2>
+
+      <h3>14.1 Capability-aware modes</h3>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Mode</th><th>Behavior</th></tr></thead>
+          <tbody>
+            <tr><td><code>off</code></td><td>No network observation; expose disabled capability.</td></tr>
+            <tr><td><code>metadata</code></td><td>Best-effort DNS and connection metadata without elevated privilege.</td></tr>
+            <tr><td><code>proxy</code></td><td>Explicit local egress proxy with observable HTTP/CONNECT metadata.</td></tr>
+            <tr><td><code>privileged</code></td><td>Optional eBPF, cgroup hook, netlink/conntrack, packet, or transparent-proxy backend.</td></tr>
+            <tr><td><code>payload</code></td><td>Explicitly policy-gated and subject to separate privacy/security review.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>14.2 Metadata mode</h3>
+      <ul>
+        <li>DNS observations where available</li>
+        <li>Local and remote addresses and ports</li>
+        <li>Protocol and direction</li>
+        <li>Open/close timestamps</li>
+        <li>Bytes sent/received where observable</li>
+        <li>Execution, session, and process attribution where observable</li>
+      </ul>
+
+      <h3>14.3 Proxy mode</h3>
+      <ul>
+        <li>Scheme where known</li>
+        <li>Host and port</li>
+        <li>HTTP method and URL/path only when observable</li>
+        <li>Response status and byte counts when observable</li>
+        <li>Timing and process/session attribution when possible</li>
+        <li>For HTTPS CONNECT, record destination host and port without pretending encrypted paths are known.</li>
+      </ul>
+      <div class="callout danger">
+        TLS interception, response-body capture, credential capture, or payload capture requires
+        explicit product policy and a separate threat/privacy review. It is not enabled by default.
+      </div>
+
+      <h3>14.4 Privileged mode</h3>
+      <ul>
+        <li>Investigate eBPF, cgroup socket hooks, netlink/conntrack, packet capture, and transparent proxying.</li>
+        <li>Detect kernel features and Linux capabilities at startup.</li>
+        <li>Degrade cleanly when the backend cannot attach.</li>
+        <li>Do not make the entire daemon permanently privileged for an optional collector.</li>
+        <li>Consider a separate privileged collector process with a narrow IPC contract.</li>
+      </ul>
+
+      <h3>14.5 Source normalization</h3>
+      <p>Emit an evidence event such as <code>network.sourceObserved</code> containing:</p>
+      <ul>
+        <li>Hostname, resolved IPs, port, and scheme when known</li>
+        <li>URL/path only when actually observable</li>
+        <li>First and last observation times</li>
+        <li>Associated process/session identifiers</li>
+        <li>Observation method and confidence</li>
+        <li>Evidence event IDs</li>
+      </ul>
+      <p>The daemon emits evidence. The TypeScript SDK decides whether that evidence represents a source used by an LLM task.</p>
+    </section>
+
+    <section id="pipeline">
+      <h2>15. Telemetry pipeline</h2>
+      <p>Implement a typed, bounded, observable pipeline with these stages:</p>
+      <ol>
+        <li>Event production</li>
+        <li>Validation</li>
+        <li>Redaction and policy</li>
+        <li>Sequence assignment</li>
+        <li>Batching</li>
+        <li>Durable local spool</li>
+        <li>Delivery</li>
+        <li>Acknowledgement</li>
+        <li>Retry or acknowledged deletion</li>
+      </ol>
+
+      <h3>Required properties</h3>
+      <ul>
+        <li>Event IDs and idempotent delivery keys</li>
+        <li>Bounded memory queues</li>
+        <li>Event priority classes</li>
+        <li>Explicit backpressure behavior</li>
+        <li>Batch size and time thresholds</li>
+        <li>Exponential backoff with jitter</li>
+        <li>Sink disconnect/reconnect handling</li>
+        <li>Duplicate-safe resend</li>
+        <li>Drop counters and degradation events</li>
+        <li>Graceful drain on shutdown</li>
+      </ul>
+
+      <h3>Priority guidance</h3>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Priority</th><th>Examples</th><th>Expected handling</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Critical</td>
+              <td>Control errors, runtime state changes, process start/exit, session close, drop events, corruption</td>
+              <td>Spool before delivery; never silently discard.</td>
+            </tr>
+            <tr>
+              <td>Normal</td>
+              <td>I/O chunks, filesystem mutations, network connections</td>
+              <td>Bounded buffering, spill or configured degradation.</td>
+            </tr>
+            <tr>
+              <td>Low</td>
+              <td>Repeated metrics, verbose watcher noise, optional payload details</td>
+              <td>First candidates for coalescing or dropping with counters.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <p>Assign final sequence values at one deterministic point per execution, not independently in every producer task.</p>
+    </section>
+
+    <section id="spool">
+      <h2>16. Durable spool and event log</h2>
+      <p>Implement an append-only local spool suitable for crash recovery and at-least-once delivery.</p>
+
+      <h3>Record requirements</h3>
+      <pre><code>magic / format version
+record length
+event ID
+execution sequence
+timestamp
+typed payload
+checksum</code></pre>
+
+      <h3>Required behavior</h3>
+      <ul>
+        <li>Append and flush</li>
+        <li>Configurable fsync policy</li>
+        <li>Replay after restart</li>
+        <li>Recovery from a partial final record</li>
+        <li>Checksum and corruption detection</li>
+        <li>Disk-limit enforcement</li>
+        <li>Segment rotation</li>
+        <li>Acknowledged-segment deletion</li>
+        <li>Explicit reporting of unrecoverable loss</li>
+      </ul>
+
+      <h3>Mandatory failure tests</h3>
+      <ul>
+        <li>Truncated final record</li>
+        <li>Corrupt checksum</li>
+        <li>Disk full and permission failure</li>
+        <li>Crash between write and fsync</li>
+        <li>Duplicate replay</li>
+        <li>Sequence gap</li>
+        <li>Oversized record</li>
+        <li>Rotation during active writes</li>
+      </ul>
+      <p>Large output, patches, packet captures, and other blobs should use content-addressed artifact storage referenced by telemetry events.</p>
+    </section>
+
+    <section id="health">
+      <h2>17. Health, capabilities, and metrics</h2>
+      <h3>Runtime states</h3>
+      <pre><code>starting
+healthy
+degraded
+unhealthy
+shuttingDown
+stopped</code></pre>
+      <p>Emit heartbeats only after startup validation completes.</p>
+      <h3>Health response fields</h3>
+      <ul>
+        <li>Queue depth and capacity</li>
+        <li>Spool usage and disk limit</li>
+        <li>Retry count and last successful delivery</li>
+        <li>Dropped, redacted, coalesced, and truncated event counters</li>
+        <li>Active executions, sessions, and processes</li>
+        <li>Filesystem watcher and snapshot status</li>
+        <li>Network collector backend and capability state</li>
+        <li>Sink connectivity</li>
+        <li>Feature kill-switch states</li>
+        <li>Concrete degradation reasons</li>
+      </ul>
+      <h3>Kill switches</h3>
+      <ul>
+        <li>Filesystem diffing</li>
+        <li>Live filesystem watching</li>
+        <li>Network collection</li>
+        <li>Payload capture</li>
+        <li>Verbose I/O capture</li>
+        <li>Resource sampling</li>
+      </ul>
+    </section>
+
+    <section id="security">
+      <h2>18. Security and threat model</h2>
+      <p>Assume sandbox workloads can be buggy, hostile, evasive, or intentionally resource-exhausting.</p>
+
+      <h3>Security design goals</h3>
+      <ul>
+        <li>Run the daemon under a protected identity and child workloads under a separate unprivileged UID where practical.</li>
+        <li>Use restrictive socket permissions and peer credential validation.</li>
+        <li>Exclude runtime secrets from child environments.</li>
+        <li>Minimize Linux capabilities and drop privilege after initialization.</li>
+        <li>Set close-on-exec on daemon-only descriptors.</li>
+        <li>Use validated paths and symlink-safe operations.</li>
+        <li>Do not construct shell commands through string concatenation.</li>
+        <li>Protect against fork bombs, output floods, event storms, and oversized protocol frames.</li>
+        <li>Consider <code>PR_SET_DUMPABLE</code> and ptrace restrictions where appropriate.</li>
+      </ul>
+
+      <h3>Required threat matrix</h3>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Threat</th><th>Questions to answer</th></tr></thead>
+          <tbody>
+            <tr><td>Child kills daemon</td><td>Does UID/capability separation prevent signaling? What is the degradation story?</td></tr>
+            <tr><td>Child reads secrets</td><td>Are env vars, descriptors, files, proc entries, and logs isolated?</td></tr>
+            <tr><td>Unauthorized control client</td><td>How are socket mode, ownership, and peer credentials validated?</td></tr>
+            <tr><td>Fake telemetry injection</td><td>Can workloads write directly to the spool or event transport?</td></tr>
+            <tr><td>Spool tampering</td><td>Are ownership, checksums, permissions, and corruption events sufficient?</td></tr>
+            <tr><td>Resource exhaustion</td><td>What limits exist for output, forks, file events, sockets, memory, and disk?</td></tr>
+            <tr><td>Proxy bypass</td><td>Is enforcement possible in the current network namespace and privilege mode?</td></tr>
+            <tr><td>Root workload</td><td>What guarantees become impossible when workload and daemon share a privileged namespace?</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="callout warn">
+        Do not describe same-namespace observation as tamper-proof unless the architecture actually
+        provides a stronger privilege or isolation boundary.
+      </div>
+
+      <h3>Environment isolation</h3>
+      <ul>
+        <li>Create an explicit child base environment; do not blindly pass <code>std::env::vars()</code>.</li>
+        <li>Remove telemetry credentials, control tokens, internal endpoints, spool keys, and debug secrets.</li>
+        <li>Validate environment keys.</li>
+        <li>Emit only allowlisted and redacted environment metadata.</li>
+      </ul>
+
+      <h3>Logging versus telemetry</h3>
+      <ul>
+        <li>Use structured <code>tracing</code> diagnostics for daemon operations.</li>
+        <li>Diagnostics go to stderr or a dedicated logging sink.</li>
+        <li>Product telemetry goes through the typed event pipeline.</li>
+        <li>Never duplicate secrets into diagnostic logs.</li>
+      </ul>
+    </section>
+
+    <section id="typescript">
+      <h2>19. TypeScript integration</h2>
+      <p>The Rust runtime must feel native to TypeScript consumers without relying on in-process FFI.</p>
+
+      <h3>Required SDK shape</h3>
+      <pre><code>health()
+getCapabilities()
+startExecution()
+exec()
+openSession()
+writeStdin()
+resizePty()
+signalProcess()
+closeSession()
+shutdown()
+events(): AsyncIterable&lt;TelemetryEvent&gt;</code></pre>
+
+      <h3>Contract requirements</h3>
+      <ul>
+        <li>Generate or validate Rust and TypeScript types from the same schema.</li>
+        <li>Expose exact error-code unions.</li>
+        <li>Provide binary payload helpers.</li>
+        <li>Define reconnection and duplicate-request behavior.</li>
+        <li>Support forward-compatible event decoding.</li>
+        <li>Generate Rust fixtures consumed by TypeScript and TypeScript fixtures consumed by Rust.</li>
+        <li>Run end-to-end tests from the TypeScript client through the real daemon.</li>
+      </ul>
+      <p>Use IPC as the primary language boundary. Do not make Rust-to-Node FFI the runtime-control architecture.</p>
+    </section>
+
+    <section id="packaging">
+      <h2>20. Packaging and deployment</h2>
+      <p>Produce:</p>
+      <ul>
+        <li><code>sealantd</code> daemon binary</li>
+        <li><code>sealantctl</code> debug/integration client</li>
+        <li>Linux x86_64 and arm64 artifacts</li>
+        <li>Build metadata and <code>--version</code></li>
+        <li><code>--check-config</code> and <code>--print-capabilities</code></li>
+        <li>BuildKit-friendly build stage and artifact copy step</li>
+        <li>Minimal runtime dependencies</li>
+        <li>Debug symbols or a separate symbol artifact</li>
+      </ul>
+      <p>
+        Prefer portable/static artifacts where practical, but do not break PTY behavior, NSS,
+        TLS, or privileged collection just to claim a fully static binary.
+      </p>
+
+      <h3>Explicit non-goals</h3>
+      <ul>
+        <li>Image builder, Docker replacement, or Kubernetes scheduler</li>
+        <li>Control-plane workflow engine</li>
+        <li>Terminal emulator</li>
+        <li>External SSH authentication service</li>
+        <li>Semantic LLM reasoning engine</li>
+        <li>TLS interception by default</li>
+        <li>General-purpose kernel monitoring suite</li>
+      </ul>
+    </section>
+
+    <section id="workflows">
+      <h2>21. Multi-workflow and subagent plan</h2>
+      <p>
+        Use a coordinator plus focused subagents/workstreams. Avoid concurrent edits to the same
+        module until interfaces are agreed. Use isolated branches or worktrees where supported.
+      </p>
+
+      <details class="workflow" open>
+        <summary>Workflow 1 — Architecture and protocol</summary>
+        <div>
+          <ul>
+            <li>Requirements matrix and ADRs</li>
+            <li>Crate boundaries and state machines</li>
+            <li>Protocol schema, event envelope, identifiers, and error codes</li>
+            <li>TypeScript generation strategy</li>
+          </ul>
+        </div>
+      </details>
+
+      <details class="workflow">
+        <summary>Workflow 2 — Process and PTY runtime</summary>
+        <div>
+          <ul>
+            <li>Process registry and state machine</li>
+            <li>Process groups, pidfds, subreaper/PID 1 behavior</li>
+            <li>Signals, non-PTY exec, stdin/stdout/stderr</li>
+            <li>PTY sessions, resize, and cleanup</li>
+          </ul>
+        </div>
+      </details>
+
+      <details class="workflow">
+        <summary>Workflow 3 — Telemetry and durability</summary>
+        <div>
+          <ul>
+            <li>Event bus, priority, and final sequence assignment</li>
+            <li>Backpressure, batching, retry, and drop accounting</li>
+            <li>Append-only spool, checksums, rotation, recovery</li>
+            <li>Artifact storage</li>
+          </ul>
+        </div>
+      </details>
+
+      <details class="workflow">
+        <summary>Workflow 4 — Filesystem telemetry</summary>
+        <div>
+          <ul>
+            <li>Snapshots, hashing, and final diff</li>
+            <li>Watcher, recursive scope, coalescing, and overflow fallback</li>
+            <li>Ignore rules and artifact generation</li>
+          </ul>
+        </div>
+      </details>
+
+      <details class="workflow">
+        <summary>Workflow 5 — Network telemetry</summary>
+        <div>
+          <ul>
+            <li>Collector abstraction and capability detection</li>
+            <li>Metadata and proxy modes</li>
+            <li>Privileged backend and graceful degradation</li>
+            <li>DNS, connection, and source-normalization events</li>
+          </ul>
+        </div>
+      </details>
+
+      <details class="workflow">
+        <summary>Workflow 6 — Security and reliability</summary>
+        <div>
+          <ul>
+            <li>Threat model and privilege boundaries</li>
+            <li>Socket authentication and environment isolation</li>
+            <li>Redaction, unsafe-code review, and input limits</li>
+            <li>Failure injection and resource limits</li>
+          </ul>
+        </div>
+      </details>
+
+      <details class="workflow">
+        <summary>Workflow 7 — TypeScript SDK and contracts</summary>
+        <div>
+          <ul>
+            <li>Generated types and exact error unions</li>
+            <li>Runtime client and async event stream</li>
+            <li>Binary helpers, reconnection, and compatibility</li>
+            <li>End-to-end example module integration</li>
+          </ul>
+        </div>
+      </details>
+
+      <details class="workflow">
+        <summary>Workflow 8 — Integration and QA</summary>
+        <div>
+          <ul>
+            <li>Container harness and local fixtures</li>
+            <li>Rootless and privileged test suites</li>
+            <li>PTY, network, failure, soak, and benchmark testing</li>
+            <li>Final requirement traceability</li>
+          </ul>
+        </div>
+      </details>
+
+      <h3>Subagent completion report</h3>
+      <p>Every subagent must return:</p>
+      <ol>
+        <li>Scope completed</li>
+        <li>Files changed</li>
+        <li>Design decisions</li>
+        <li>Tests added</li>
+        <li>Commands run and results</li>
+        <li>Risks and known limitations</li>
+        <li>Required integration follow-up</li>
+      </ol>
+
+      <p>
+        The coordinator reviews every change before integration. High-risk work—process cleanup,
+        PTY setup, unsafe code, spool recovery, backpressure, socket permissions, and privileged
+        network collection—requires an independent review workflow.
+      </p>
+    </section>
+
+    <section id="phases">
+      <h2>22. Implementation phases and exit gates</h2>
+
+      <details class="phase" open>
+        <summary>Phase 0 — Discovery and architecture</summary>
+        <div>
+          <p><strong>Deliver:</strong> repository analysis, requirements matrix, architecture, threat model, protocol ADR, validation plan, and workspace scaffold.</p>
+          <p><strong>Exit gate:</strong></p>
+          <ul>
+            <li>Every requirement has an owner and test strategy.</li>
+            <li>Rust and TypeScript agree on protocol version 1.</li>
+            <li>No major subsystem lacks an explicit failure policy.</li>
+          </ul>
+        </div>
+      </details>
+
+      <details class="phase">
+        <summary>Phase 1 — Small end-to-end vertical slice</summary>
+        <div>
+          <p><strong>Implement:</strong> daemon startup, Unix socket, health, one non-PTY exec, stdout/stderr capture, exit event, graceful shutdown, and minimal TypeScript client.</p>
+          <p><strong>Exit gate:</strong></p>
+          <ul>
+            <li>TypeScript starts the daemon, executes a command, streams events, receives the correct result, and shuts it down.</li>
+            <li>Invalid UTF-8 and NUL bytes round-trip correctly.</li>
+            <li>Protocol output is never mixed with diagnostics.</li>
+          </ul>
+        </div>
+      </details>
+
+      <details class="phase">
+        <summary>Phase 2 — Correct process lifecycle</summary>
+        <div>
+          <p><strong>Implement:</strong> registry, logical IDs, process groups, signals, timeout, grandchild cleanup, subreaper/PID 1 behavior, stdin, background commands, and optional resource metrics.</p>
+          <p><strong>Exit gate:</strong></p>
+          <ul>
+            <li>No zombies or managed-process orphans in the process matrix.</li>
+            <li><code>SIGTERM</code> escalation works.</li>
+            <li>PID-reuse-sensitive operations use pidfds or a documented safe fallback.</li>
+            <li>Runtime shutdown works with active process trees.</li>
+          </ul>
+        </div>
+      </details>
+
+      <details class="phase">
+        <summary>Phase 3 — PTY and session runtime</summary>
+        <div>
+          <p><strong>Implement:</strong> PTY shell, input/output capture, resize, signal behavior, session close, and SSH-proxy API.</p>
+          <p><strong>Exit gate:</strong></p>
+          <ul>
+            <li>Interactive shell and full-screen application work.</li>
+            <li>Resize propagates correctly.</li>
+            <li>Input/output replay is binary-safe.</li>
+            <li>Resources are released after normal and abnormal exits.</li>
+          </ul>
+        </div>
+      </details>
+
+      <details class="phase">
+        <summary>Phase 4 — Durable telemetry pipeline</summary>
+        <div>
+          <p><strong>Implement:</strong> bounded queues, priorities, sequencing, spool, checksums, recovery, retry, acknowledgements, and degradation/drop events.</p>
+          <p><strong>Exit gate:</strong></p>
+          <ul>
+            <li>Slow sinks do not create unbounded memory growth.</li>
+            <li>Restart replays unacknowledged events safely.</li>
+            <li>Corrupt and partial records are deterministic.</li>
+            <li>Critical event loss is never silent.</li>
+          </ul>
+        </div>
+      </details>
+
+      <details class="phase">
+        <summary>Phase 5 — Filesystem telemetry</summary>
+        <div>
+          <p><strong>Implement:</strong> baseline snapshot, live watcher, coalescing, final diff, artifacts, and overflow recovery.</p>
+          <p><strong>Exit gate:</strong></p>
+          <ul>
+            <li>Create/modify/delete/rename cases pass.</li>
+            <li>Editor temp-file patterns are normalized reasonably.</li>
+            <li>Overflow emits an event and triggers rescan.</li>
+            <li>Symlink and path-boundary tests pass.</li>
+          </ul>
+        </div>
+      </details>
+
+      <details class="phase">
+        <summary>Phase 6 — Network telemetry</summary>
+        <div>
+          <p><strong>Implement:</strong> capability detection, metadata mode, proxy mode, supported privileged backend, source normalization, and degraded fallback.</p>
+          <p><strong>Exit gate:</strong></p>
+          <ul>
+            <li>Local DNS, HTTP, HTTPS CONNECT, TCP, and UDP fixtures produce correct evidence.</li>
+            <li>Attribution uncertainty is represented honestly.</li>
+            <li>Missing privilege never crashes the daemon.</li>
+          </ul>
+        </div>
+      </details>
+
+      <details class="phase">
+        <summary>Phase 7 — Security and hardening</summary>
+        <div>
+          <p><strong>Implement:</strong> identity strategy, environment isolation, peer validation, capability minimization, redaction, limits, and feature kill switches.</p>
+          <p><strong>Exit gate:</strong></p>
+          <ul>
+            <li>Threat-model tests pass.</li>
+            <li>Daemon secrets do not leak through env or inherited descriptors.</li>
+            <li>Unauthorized clients are rejected.</li>
+            <li>Protocol and spool fuzzers find no obvious crashes.</li>
+          </ul>
+        </div>
+      </details>
+
+      <details class="phase">
+        <summary>Phase 8 — Packaging and final integration</summary>
+        <div>
+          <p><strong>Deliver:</strong> multi-architecture artifacts, BuildKit stage, TypeScript package, examples, operational docs, benchmark report, and complete requirements traceability.</p>
+        </div>
+      </details>
+    </section>
+
+    <section id="validation">
+      <h2>23. Required validation loop</h2>
+      <ol>
+        <li>Define one concrete behavior and its acceptance test.</li>
+        <li>Update the typed protocol and requirement matrix.</li>
+        <li>Write focused tests before or alongside implementation.</li>
+        <li>Implement the smallest complete vertical slice.</li>
+        <li>Run formatting, linting, unit, and type checks.</li>
+        <li>Run subsystem integration tests.</li>
+        <li>Run container-level tests.</li>
+        <li>Inject realistic failures.</li>
+        <li>Request an independent high-risk review where appropriate.</li>
+        <li>Fix all blocking findings.</li>
+        <li>Update architecture, protocol, limitations, and requirement status.</li>
+        <li>Commit only after the acceptance gate passes.</li>
+      </ol>
+      <div class="callout ok">
+        A requirement is not complete because code exists. It is complete when observable behavior
+        matches the contract under normal, failure, and shutdown scenarios.
+      </div>
+
+      <h3>Quality commands</h3>
+      <pre><code>cargo fmt --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace
+
+# Plus repository-equivalent commands for:
+TypeScript typecheck
+TypeScript unit tests
+Rust/TypeScript contract tests
+Rootless container integration tests
+Privileged integration tests</code></pre>
+
+      <h3>Additional tools where appropriate</h3>
+      <ul>
+        <li>Miri for unsafe-adjacent pure Rust</li>
+        <li>Loom or model-based tests for concurrency-sensitive state</li>
+        <li>Fuzzing for frame decoders, log parsers, and untrusted protocol inputs</li>
+        <li>Coverage, dependency audit, and license checks</li>
+        <li><code>strace -ff</code>, <code>/proc</code>, <code>ps</code>, and <code>lsof</code></li>
+        <li>Sanitizer-compatible test builds where practical</li>
+      </ul>
+    </section>
+
+    <section id="tests">
+      <h2>24. Mandatory adversarial test matrix</h2>
+
+      <details open>
+        <summary>Process tests</summary>
+        <div>
+          <ul class="checklist">
+            <li>Command not found</li>
+            <li>Immediate exit, exit 0, and exit 42</li>
+            <li>Killed by SIGTERM and SIGKILL</li>
+            <li>Child ignores SIGTERM</li>
+            <li>Child spawns grandchildren</li>
+            <li>Double-fork and adopted descendant</li>
+            <li>Grandchild inherits stdout/stderr descriptors</li>
+            <li>Large stdout and large stderr</li>
+            <li>Concurrent stdout and stderr</li>
+            <li>NUL bytes and invalid UTF-8</li>
+            <li>stdin close and broken pipe</li>
+            <li>Timeout and runtime shutdown during execution</li>
+            <li>PID reuse risk and zombie detection</li>
+          </ul>
+        </div>
+      </details>
+
+      <details>
+        <summary>PTY tests</summary>
+        <div>
+          <ul class="checklist">
+            <li>Interactive shell</li>
+            <li>Echoed and raw input</li>
+            <li>ANSI and binary-safe output</li>
+            <li>Full-screen terminal application</li>
+            <li>Resize</li>
+            <li>Ctrl+C and terminal signal behavior</li>
+            <li>Session close and unexpected child exit</li>
+            <li>Proxy disconnect</li>
+            <li>Recording and replay</li>
+          </ul>
+        </div>
+      </details>
+
+      <details>
+        <summary>Telemetry and spool tests</summary>
+        <div>
+          <ul class="checklist">
+            <li>Slow and disconnected sink</li>
+            <li>Queue full and spool full</li>
+            <li>Disk full and permission failure</li>
+            <li>Corrupt and truncated records</li>
+            <li>Duplicate delivery and restart replay</li>
+            <li>Sequence ordering and gaps</li>
+            <li>Drop reporting and critical-event preservation</li>
+          </ul>
+        </div>
+      </details>
+
+      <details>
+        <summary>Filesystem tests</summary>
+        <div>
+          <ul class="checklist">
+            <li>Create, modify, delete, and rename</li>
+            <li>Directory create/delete</li>
+            <li>Symlink and symlink loop</li>
+            <li>Large and binary files</li>
+            <li>Ignore rules</li>
+            <li>Editor temp-file save pattern</li>
+            <li>Watcher overflow</li>
+            <li>Path traversal and workspace escape attempts</li>
+          </ul>
+        </div>
+      </details>
+
+      <details>
+        <summary>Network tests</summary>
+        <div>
+          <ul class="checklist">
+            <li>DNS lookup</li>
+            <li>HTTP request</li>
+            <li>HTTPS CONNECT</li>
+            <li>TCP and UDP traffic</li>
+            <li>Connection failure</li>
+            <li>Proxy bypass attempt</li>
+            <li>Missing Linux capabilities</li>
+            <li>Privileged collector startup failure</li>
+            <li>Source normalization and unknown hostname</li>
+            <li>Multiple IPs for one host</li>
+          </ul>
+        </div>
+      </details>
+
+      <details>
+        <summary>Security tests</summary>
+        <div>
+          <ul class="checklist">
+            <li>Child tries to read daemon environment</li>
+            <li>Child tries to access the control socket</li>
+            <li>Child sends signals to the daemon</li>
+            <li>Child attempts ptrace where applicable</li>
+            <li>Oversized and malformed control frames</li>
+            <li>Invalid path and signal input</li>
+            <li>Secret-like output redaction</li>
+            <li>Runtime-only environment leakage</li>
+            <li>Excessive forks, output, and file events</li>
+          </ul>
+        </div>
+      </details>
+    </section>
+
+    <section id="performance">
+      <h2>25. Performance, resource, and soak validation</h2>
+      <p>Create repeatable measurements rather than making speculative performance claims.</p>
+      <ul>
+        <li>Stream a large amount of stdout to a fast sink.</li>
+        <li>Repeat with a deliberately slow sink.</li>
+        <li>Verify resident memory remains bounded.</li>
+        <li>Run many concurrent short-lived processes.</li>
+        <li>Run multiple long-lived PTY sessions.</li>
+        <li>Generate filesystem-event bursts and watcher overflow.</li>
+        <li>Generate many network connections.</li>
+        <li>Exercise spool rotation and replay over an extended run.</li>
+        <li>Repeatedly shut down under active load.</li>
+        <li>Record CPU, memory, disk, queue, and latency measurements with the exact configuration.</li>
+      </ul>
+    </section>
+
+    <section id="deliverables">
+      <h2>26. Final deliverables and definition of done</h2>
+      <ul class="checklist">
+        <li>Working Rust <code>sealantd</code> binary</li>
+        <li>Working <code>sealantctl</code> client</li>
+        <li>Typed TypeScript runtime client</li>
+        <li>Shared versioned schema and compatibility policy</li>
+        <li>Control API documentation</li>
+        <li>Telemetry event catalogue</li>
+        <li>Architecture and ADRs</li>
+        <li>Threat model and security limitations</li>
+        <li>Operational and configuration guides</li>
+        <li>BuildKit/container integration</li>
+        <li>Unit and subsystem tests</li>
+        <li>Rust/TypeScript contract tests</li>
+        <li>Container and failure-injection tests</li>
+        <li>Rootless and privileged test results</li>
+        <li>Benchmark and soak report</li>
+        <li>Example execution trace</li>
+        <li>Known-limitations document</li>
+        <li>Completed requirements matrix</li>
+      </ul>
+    </section>
+
+    <section id="reporting">
+      <h2>27. Reporting behavior</h2>
+      <p>At the end of every phase, report:</p>
+      <ol>
+        <li>What was built</li>
+        <li>Which requirements were completed</li>
+        <li>Which tests passed and failed</li>
+        <li>Architecture decisions made</li>
+        <li>Security and observability limitations</li>
+        <li>The next highest-risk item</li>
+      </ol>
+
+      <p>Clearly distinguish:</p>
+      <ul>
+        <li><strong>Implemented and validated</strong></li>
+        <li><strong>Implemented but environment-dependent</strong></li>
+        <li><strong>Degraded fallback implemented</strong></li>
+        <li><strong>Designed but not implemented</strong></li>
+        <li><strong>Blocked by kernel, runtime, or privilege capabilities</strong></li>
+      </ul>
+
+      <div class="callout ok">
+        Begin with repository discovery, the requirements matrix, architecture decisions, and the
+        smallest end-to-end vertical slice. Continue phase by phase without sacrificing process
+        cleanup, bounded resource use, telemetry integrity, testability, or honest capability
+        reporting.
+      </div>
+    </section>
+  </main>
+</div>
+
+<footer>
+  <div class="inner">
+    <strong>sealantd implementation brief</strong>
+    <p class="small">Standalone HTML document. No external stylesheets, fonts, or network resources are required.</p>
+  </div>
+</footer>
+
+<script>
+  async function copyPlan() {
+    const node = document.getElementById('agent-prompt');
+    const status = document.getElementById('copy-status');
+    try {
+      await navigator.clipboard.writeText(node.innerText);
+      status.textContent = 'Implementation brief copied to clipboard.';
+    } catch (err) {
+      status.textContent = 'Clipboard access was unavailable. Select the document text manually.';
+    }
+  }
+</script>
+</body>
+</html>

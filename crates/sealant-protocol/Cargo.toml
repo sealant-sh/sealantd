@@ -1,0 +1,20 @@
+[package]
+name = "sealant-protocol"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Typed commands, events, identifiers, versions, and error codes for the sealantd control protocol."
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+schemars = { workspace = true }
+thiserror = { workspace = true }
+base64 = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

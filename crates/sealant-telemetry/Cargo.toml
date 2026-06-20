@@ -1,0 +1,16 @@
+[package]
+name = "sealant-telemetry"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Event bus, sequencing, priority, batching, and delivery sinks."
+
+[lints]
+workspace = true
+
+[dependencies]
+sealant-protocol = { workspace = true }
+sealant-runtime-core = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }

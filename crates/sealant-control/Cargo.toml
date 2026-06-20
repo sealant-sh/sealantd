@@ -1,0 +1,18 @@
+[package]
+name = "sealant-control"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Unix socket and stdio control transport, framing, and dispatch."
+
+[lints]
+workspace = true
+
+[dependencies]
+sealant-protocol = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }

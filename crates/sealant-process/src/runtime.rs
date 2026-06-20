@@ -1,0 +1,589 @@
+//! The process runtime: spawn, capture, wait, signal, and shutdown.
+
+use std::process::Stdio;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use sealant_protocol::{
+    CaptureMethod, CaptureMode, Confidence, ControlError, Encoding, EventPayload, ExecAccepted,
+    ExecArgs, ExitReason, IoChunk, ProcessExited, ProcessId, ProcessStarted, ProcessState,
+    ProcessSummary, RequestId, Signal, StreamKind, StreamOffset,
+};
+use sealant_runtime_core::{Clock, IdGenerator, RuntimeConfig, RuntimeStatus};
+use sealant_telemetry::{Correlation, EventBus};
+use std::os::unix::process::ExitStatusExt;
+use tokio::io::{AsyncRead, AsyncReadExt};
+
+use crate::registry::{ProcessEntry, ProcessRegistry};
+use crate::signals;
+
+/// Composition of the dependencies needed to run processes.
+#[derive(Debug, Clone)]
+pub struct ProcessRuntime {
+    /// The managed-process registry.
+    pub registry: Arc<ProcessRegistry>,
+    /// The telemetry bus.
+    pub bus: Arc<EventBus>,
+    /// The id generator.
+    pub idgen: Arc<IdGenerator>,
+    /// Shared runtime status (live counters).
+    pub status: Arc<RuntimeStatus>,
+    /// The clock.
+    pub clock: Arc<Clock>,
+    /// Runtime configuration.
+    pub config: Arc<RuntimeConfig>,
+}
+
+fn validate_env(env: &[sealant_protocol::EnvVar]) -> Result<(), ControlError> {
+    for var in env {
+        if var.key.is_empty()
+            || var.key.contains('=')
+            || var.key.contains('\0')
+            || var.value.contains('\0')
+        {
+            return Err(ControlError::invalid_argument(format!(
+                "invalid environment variable name {:?}",
+                var.key
+            )));
+        }
+    }
+    Ok(())
+}
+
+impl ProcessRuntime {
+    /// Spawn a non-interactive process. Returns immediately with an [`ExecAccepted`]; the exit is
+    /// later surfaced as a `process.exited` event (plan §8.6).
+    ///
+    /// # Errors
+    /// Returns a [`ControlError`] if arguments are invalid or the process cannot be spawned.
+    pub fn exec(
+        &self,
+        args: ExecArgs,
+        request_id: Option<RequestId>,
+    ) -> Result<ExecAccepted, ControlError> {
+        if args.executable.trim().is_empty() {
+            return Err(ControlError::invalid_argument(
+                "executable must not be empty".to_owned(),
+            ));
+        }
+        validate_env(&args.env)?;
+
+        let cwd = args
+            .cwd
+            .clone()
+            .map_or_else(|| self.config.workspace_root.clone(), Into::into);
+
+        let mut command = tokio::process::Command::new(&args.executable);
+        command.args(&args.args);
+        command.env_clear();
+        for var in &self.config.child_env {
+            command.env(&var.key, &var.value);
+        }
+        for var in &args.env {
+            command.env(&var.key, &var.value);
+        }
+        command.current_dir(&cwd);
+        command.stdin(if args.stdin {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        });
+        command.stdout(Stdio::piped());
+        command.stderr(Stdio::piped());
+        // Own process group so signals reach the whole managed tree, not just the direct child.
+        command.process_group(0);
+        command.kill_on_drop(true);
+
+        let mut child = command
+            .spawn()
+            .map_err(|e| ControlError::process_start_failed(format!("{}: {e}", args.executable)))?;
+
+        let pid = child.id().map_or(-1, |p| p as i32);
+        // process_group(0) makes the child a group leader, so pgid == pid.
+        let pgid = pid;
+        let process_id = self.idgen.process_id();
+        let execution_id = args
+            .execution_id
+            .clone()
+            .or_else(|| self.config.default_execution_id.clone());
+
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+        let stdin = child.stdin.take();
+        let policy = args.capture.unwrap_or(self.config.capture);
+
+        let correlation = Correlation::new()
+            .execution(execution_id.clone())
+            .session(args.session_id.clone())
+            .process(process_id.clone())
+            .request(request_id);
+
+        let entry = Arc::new(ProcessEntry::new(
+            process_id.clone(),
+            pid,
+            pgid,
+            args.executable.clone(),
+            execution_id,
+            args.session_id.clone(),
+            stdin,
+        ));
+        entry.set_state(ProcessState::Running);
+        self.registry.insert(entry.clone());
+        self.status.inc_processes();
+
+        self.bus.publish(
+            &correlation,
+            CaptureMethod::Internal,
+            Confidence::Observed,
+            EventPayload::ProcessStarted(ProcessStarted {
+                pid,
+                pgid,
+                pidfd: false,
+                executable: args.executable.clone(),
+                args: args.args.clone(),
+                cwd: cwd.display().to_string(),
+                started_at: self.clock.wall_now(),
+            }),
+        );
+
+        let chunk_size = self.config.io_chunk_bytes;
+        let stdout_handle = stdout.map(|s| {
+            let bus = self.bus.clone();
+            let corr = correlation.clone();
+            tokio::spawn(capture_stream(
+                s,
+                StreamKind::Stdout,
+                policy.stdout,
+                chunk_size,
+                bus,
+                corr,
+            ))
+        });
+        let stderr_handle = stderr.map(|s| {
+            let bus = self.bus.clone();
+            let corr = correlation.clone();
+            tokio::spawn(capture_stream(
+                s,
+                StreamKind::Stderr,
+                policy.stderr,
+                chunk_size,
+                bus,
+                corr,
+            ))
+        });
+
+        let timeout = args.timeout_millis.map(Duration::from_millis);
+        let grace = Duration::from_millis(self.config.shutdown_grace_ms);
+        let waiter_bus = self.bus.clone();
+        let waiter_registry = self.registry.clone();
+        let waiter_status = self.status.clone();
+        let waiter_entry = entry;
+        let waiter_proc = process_id.clone();
+        tokio::spawn(async move {
+            let start = Instant::now();
+            let outcome = run_to_exit(child, pgid, timeout, grace).await;
+            // Drain captured output before publishing the exit, so all io.chunks precede it.
+            if let Some(handle) = stdout_handle {
+                let _ = handle.await;
+            }
+            if let Some(handle) = stderr_handle {
+                let _ = handle.await;
+            }
+            let duration_micros = start.elapsed().as_micros() as u64;
+            waiter_entry.set_state(outcome.state);
+            waiter_bus.publish(
+                &correlation,
+                CaptureMethod::Internal,
+                Confidence::Observed,
+                EventPayload::ProcessExited(ProcessExited {
+                    exit_code: outcome.exit_code,
+                    signal: outcome.signal,
+                    reason: outcome.reason,
+                    duration_micros,
+                }),
+            );
+            waiter_registry.remove(&waiter_proc);
+            waiter_status.dec_processes();
+        });
+
+        Ok(ExecAccepted {
+            process_id,
+            pid,
+            pgid,
+            pidfd: false,
+        })
+    }
+
+    /// Deliver a signal to a managed process's group.
+    ///
+    /// # Errors
+    /// Returns [`ControlError`] if the process is unknown or signalling fails.
+    pub fn signal(&self, process_id: &ProcessId, signal: Signal) -> Result<(), ControlError> {
+        let entry = self
+            .registry
+            .get(process_id)
+            .ok_or_else(|| ControlError::process_not_found(process_id.to_string()))?;
+        signals::signal_group(entry.pgid, signals::to_nix(signal)).map_err(|e| {
+            ControlError::new(
+                sealant_protocol::ControlErrorCode::PermissionDenied,
+                e.to_string(),
+            )
+        })
+    }
+
+    /// Forcefully kill a managed process's group with `SIGKILL`.
+    ///
+    /// # Errors
+    /// Returns [`ControlError`] if the process is unknown or signalling fails.
+    pub fn kill(&self, process_id: &ProcessId) -> Result<(), ControlError> {
+        self.signal(process_id, Signal::Kill)
+    }
+
+    /// Write bytes to a process's stdin.
+    ///
+    /// # Errors
+    /// Returns [`ControlError`] if the process is unknown or stdin is unavailable.
+    pub async fn write_stdin(
+        &self,
+        process_id: &ProcessId,
+        data: &[u8],
+    ) -> Result<(), ControlError> {
+        let entry = self
+            .registry
+            .get(process_id)
+            .ok_or_else(|| ControlError::process_not_found(process_id.to_string()))?;
+        entry.write_stdin(data).await
+    }
+
+    /// Close a process's stdin.
+    ///
+    /// # Errors
+    /// Returns [`ControlError`] if the process is unknown.
+    pub async fn close_stdin(&self, process_id: &ProcessId) -> Result<(), ControlError> {
+        let entry = self
+            .registry
+            .get(process_id)
+            .ok_or_else(|| ControlError::process_not_found(process_id.to_string()))?;
+        entry.close_stdin().await;
+        Ok(())
+    }
+
+    /// List managed processes, optionally filtered by execution.
+    #[must_use]
+    pub fn list(&self, execution: Option<&sealant_protocol::ExecutionId>) -> Vec<ProcessSummary> {
+        self.registry.list(execution)
+    }
+
+    /// Terminate all managed processes: graceful signal, then `SIGKILL` after the grace period.
+    pub async fn terminate_all(&self, graceful: Signal, grace: Duration) {
+        let running = self.registry.running();
+        if running.is_empty() {
+            return;
+        }
+        let nix_graceful = signals::to_nix(graceful);
+        for entry in &running {
+            entry.set_state(ProcessState::Terminating);
+            let _ = signals::signal_group(entry.pgid, nix_graceful);
+        }
+        wait_until_empty(&self.registry, grace).await;
+
+        for entry in self.registry.running() {
+            let _ = signals::signal_group(entry.pgid, nix::sys::signal::Signal::SIGKILL);
+        }
+        wait_until_empty(&self.registry, Duration::from_secs(2)).await;
+    }
+}
+
+async fn wait_until_empty(registry: &ProcessRegistry, within: Duration) {
+    let deadline = Instant::now() + within;
+    while !registry.is_empty() && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+struct ExitOutcome {
+    exit_code: Option<i32>,
+    signal: Option<i32>,
+    reason: ExitReason,
+    state: ProcessState,
+}
+
+async fn run_to_exit(
+    mut child: tokio::process::Child,
+    pgid: i32,
+    timeout: Option<Duration>,
+    grace: Duration,
+) -> ExitOutcome {
+    let mut timed_out = false;
+    let status = match timeout {
+        Some(limit) => {
+            tokio::select! {
+                result = child.wait() => result,
+                () = tokio::time::sleep(limit) => {
+                    timed_out = true;
+                    let _ = signals::signal_group(pgid, nix::sys::signal::Signal::SIGTERM);
+                    tokio::select! {
+                        result = child.wait() => result,
+                        () = tokio::time::sleep(grace) => {
+                            let _ = signals::signal_group(pgid, nix::sys::signal::Signal::SIGKILL);
+                            child.wait().await
+                        }
+                    }
+                }
+            }
+        }
+        None => child.wait().await,
+    };
+
+    match status {
+        Ok(exit) => {
+            let exit_code = exit.code();
+            let signal = exit.signal();
+            let reason = if timed_out {
+                ExitReason::Timeout
+            } else if exit_code.is_some() {
+                ExitReason::Exited
+            } else if signal.is_some() {
+                ExitReason::Signaled
+            } else {
+                ExitReason::Lost
+            };
+            let state = match reason {
+                ExitReason::Exited => ProcessState::Exited,
+                ExitReason::Signaled | ExitReason::Timeout => ProcessState::Signaled,
+                _ => ProcessState::Failed,
+            };
+            ExitOutcome {
+                exit_code,
+                signal,
+                reason,
+                state,
+            }
+        }
+        Err(_) => ExitOutcome {
+            exit_code: None,
+            signal: None,
+            reason: ExitReason::Lost,
+            state: ProcessState::Failed,
+        },
+    }
+}
+
+async fn capture_stream<R: AsyncRead + Unpin>(
+    mut reader: R,
+    stream: StreamKind,
+    mode: CaptureMode,
+    chunk_size: usize,
+    bus: Arc<EventBus>,
+    correlation: Correlation,
+) {
+    // Even when disabled we must drain the pipe so the child does not block on a full buffer.
+    if matches!(mode, CaptureMode::Disabled) {
+        let mut sink = [0u8; 8192];
+        loop {
+            match reader.read(&mut sink).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+        return;
+    }
+
+    let mut offset = StreamOffset::ZERO;
+    let mut buf = vec![0u8; chunk_size.max(1)];
+    loop {
+        let n = match reader.read(&mut buf).await {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(_) => break,
+        };
+        let content = if matches!(mode, CaptureMode::Full) {
+            Some(sealant_protocol::Base64Bytes::new(&buf[..n]))
+        } else {
+            None
+        };
+        bus.publish(
+            &correlation,
+            CaptureMethod::Pipe,
+            Confidence::Observed,
+            EventPayload::IoChunk(IoChunk {
+                stream,
+                encoding: Encoding::Base64,
+                byte_count: n as u64,
+                stream_offset: offset,
+                content,
+                artifact: None,
+                transform: None,
+            }),
+        );
+        offset = offset.advance(n as u64);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sealant_protocol::EventPayload;
+    use sealant_runtime_core::new_runtime_id;
+    use std::time::Duration;
+    use tokio::sync::broadcast::Receiver;
+
+    fn runtime() -> ProcessRuntime {
+        let rt = new_runtime_id();
+        let clock = Arc::new(Clock::new());
+        let idgen = Arc::new(IdGenerator::new(&rt));
+        let bus = Arc::new(EventBus::new(
+            rt.clone(),
+            clock.clone(),
+            idgen.clone(),
+            1024,
+        ));
+        let mut config = RuntimeConfig::new(rt);
+        config.workspace_root = std::env::temp_dir();
+        config.shutdown_grace_ms = 500;
+        ProcessRuntime {
+            registry: Arc::new(ProcessRegistry::new()),
+            bus,
+            idgen,
+            status: Arc::new(RuntimeStatus::new()),
+            clock,
+            config: Arc::new(config),
+        }
+    }
+
+    async fn collect_until_exit(
+        rx: &mut Receiver<sealant_protocol::EventEnvelope>,
+    ) -> Vec<EventPayload> {
+        let mut payloads = Vec::new();
+        loop {
+            let env = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("no timeout")
+                .expect("event");
+            let is_exit = matches!(env.payload, EventPayload::ProcessExited(_));
+            payloads.push(env.payload);
+            if is_exit {
+                break;
+            }
+        }
+        payloads
+    }
+
+    fn exec_args(executable: &str, args: &[&str]) -> ExecArgs {
+        ExecArgs {
+            execution_id: None,
+            session_id: None,
+            executable: executable.to_owned(),
+            args: args.iter().map(|s| (*s).to_owned()).collect(),
+            cwd: None,
+            env: vec![],
+            stdin: false,
+            timeout_millis: None,
+            background: false,
+            capture: None,
+            graceful_signal: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn exec_emits_started_output_and_exit() {
+        let rt = runtime();
+        let mut rx = rt.bus.subscribe();
+        let accepted = rt
+            .exec(exec_args("/bin/echo", &["hello"]), None)
+            .expect("spawn");
+        assert!(accepted.process_id.as_str().starts_with("proc_"));
+
+        let payloads = collect_until_exit(&mut rx).await;
+        assert!(matches!(
+            payloads.first(),
+            Some(EventPayload::ProcessStarted(_))
+        ));
+
+        let stdout: Vec<u8> = payloads
+            .iter()
+            .filter_map(|p| match p {
+                EventPayload::IoChunk(c) if c.stream == StreamKind::Stdout => {
+                    c.content.as_ref().map(|b| b.as_slice().to_vec())
+                }
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert_eq!(stdout, b"hello\n");
+
+        match payloads.last() {
+            Some(EventPayload::ProcessExited(e)) => {
+                assert_eq!(e.exit_code, Some(0));
+                assert_eq!(e.reason, ExitReason::Exited);
+            }
+            other => panic!("expected exit, got {other:?}"),
+        }
+        // Registry is cleaned up.
+        assert_eq!(rt.registry.len(), 0);
+        assert_eq!(rt.status.counts().0, 0);
+    }
+
+    #[tokio::test]
+    async fn capture_is_binary_safe() {
+        let rt = runtime();
+        let mut rx = rt.bus.subscribe();
+        // Emit bytes including NUL and a high byte via printf.
+        rt.exec(exec_args("/bin/sh", &["-c", r"printf 'a\000b\377c'"]), None)
+            .expect("spawn");
+        let payloads = collect_until_exit(&mut rx).await;
+        let stdout: Vec<u8> = payloads
+            .iter()
+            .filter_map(|p| match p {
+                EventPayload::IoChunk(c) if c.stream == StreamKind::Stdout => {
+                    c.content.as_ref().map(|b| b.as_slice().to_vec())
+                }
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert_eq!(stdout, vec![b'a', 0x00, b'b', 0xff, b'c']);
+    }
+
+    #[tokio::test]
+    async fn nonzero_exit_code_is_reported() {
+        let rt = runtime();
+        let mut rx = rt.bus.subscribe();
+        rt.exec(exec_args("/bin/sh", &["-c", "exit 42"]), None)
+            .expect("spawn");
+        let payloads = collect_until_exit(&mut rx).await;
+        match payloads.last() {
+            Some(EventPayload::ProcessExited(e)) => assert_eq!(e.exit_code, Some(42)),
+            other => panic!("expected exit, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn timeout_terminates_a_hung_process() {
+        let rt = runtime();
+        let mut rx = rt.bus.subscribe();
+        let mut args = exec_args("/bin/sh", &["-c", "sleep 30"]);
+        args.timeout_millis = Some(150);
+        rt.exec(args, None).expect("spawn");
+        let payloads = collect_until_exit(&mut rx).await;
+        match payloads.last() {
+            Some(EventPayload::ProcessExited(e)) => {
+                assert_eq!(e.reason, ExitReason::Timeout);
+                assert_eq!(e.signal, Some(nix::sys::signal::Signal::SIGTERM as i32));
+            }
+            other => panic!("expected timeout exit, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn command_not_found_is_reported() {
+        let rt = runtime();
+        let err = rt
+            .exec(exec_args("/nonexistent/binary-xyz", &[]), None)
+            .unwrap_err();
+        assert_eq!(
+            err.code(),
+            sealant_protocol::ControlErrorCode::ProcessStartFailed
+        );
+    }
+}
