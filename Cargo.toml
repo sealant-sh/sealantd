@@ -49,7 +49,7 @@ nix = { version = "0.29", features = ["process", "signal", "term", "fs", "user",
 rustix = { version = "0.38", features = ["process", "fs", "termios", "pipe", "stdio"] }
 libc = "0.2"
 # protobuf wire format (ADR-0012)
-prost = "0.13"
+prost = "0.14"
 prost-build = "0.13"
 protoc-bin-vendored = "3"
 # cli
