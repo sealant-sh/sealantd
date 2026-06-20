@@ -59,6 +59,9 @@ pub struct RuntimeConfig {
     pub spool_dir: Option<PathBuf>,
     /// Tracing log level filter (e.g. `info`).
     pub log_level: String,
+    /// Whether to observe the workspace filesystem (baseline snapshot + live watch + final diff).
+    #[serde(default)]
+    pub watch_filesystem: bool,
 }
 
 /// Default bounded limits for the smallest sandbox.
@@ -96,6 +99,7 @@ impl RuntimeConfig {
             io_chunk_bytes: 64 * 1024,
             spool_dir: None,
             log_level: "info".to_owned(),
+            watch_filesystem: false,
         }
     }
 

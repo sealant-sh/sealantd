@@ -7,6 +7,8 @@ use std::time::Duration;
 
 use sealant_control::ControlService;
 use sealant_eventlog::{FsyncPolicy, Spool, SpoolConfig};
+use sealant_fs::snapshot::SnapshotConfig;
+use sealant_fs::{FilesystemConfig, FilesystemRuntime};
 use sealant_process::{ProcessRegistry, ProcessRuntime};
 use sealant_protocol::{
     Capabilities, Command, CommandResult, Confidence, ControlError, ControlRequest,
@@ -88,6 +90,7 @@ pub struct Runtime {
     bus: Arc<EventBus>,
     processes: ProcessRuntime,
     sessions: SessionRuntime,
+    filesystem: Arc<FilesystemRuntime>,
     shutdown: Arc<ShutdownSignal>,
     features: Mutex<HashMap<Feature, bool>>,
     pidfd_supported: bool,
@@ -119,6 +122,14 @@ impl Runtime {
             clock: clock.clone(),
             config: config.clone(),
         };
+        let filesystem = Arc::new(FilesystemRuntime::new(
+            bus.clone(),
+            FilesystemConfig {
+                root: config.workspace_root.clone(),
+                snapshot: SnapshotConfig::default(),
+                execution_id: config.default_execution_id.clone(),
+            },
+        ));
         // Become a child subreaper so double-forked orphans reparent here (and the reaper can
         // collect them). Harmless and idempotent; a no-op off Linux.
         let subreaper = sealant_process::platform::set_child_subreaper();
@@ -131,6 +142,7 @@ impl Runtime {
             bus,
             processes,
             sessions,
+            filesystem,
             shutdown,
             features: Mutex::new(default_feature_states()),
             pidfd_supported,
@@ -184,6 +196,24 @@ impl Runtime {
         self.bus.start_delivery();
     }
 
+    /// Start filesystem observation if enabled (baseline snapshot + live watch).
+    pub fn start_filesystem(&self) {
+        if !self.config.watch_filesystem {
+            return;
+        }
+        if let Err(error) = self.filesystem.start() {
+            tracing::warn!(%error, "filesystem watch failed to start; degraded");
+            self.status.add_degradation("filesystem-watch-failed");
+        }
+    }
+
+    /// Finalize filesystem observation (final snapshot + diff), if enabled.
+    pub fn finalize_filesystem(&self) {
+        if self.config.watch_filesystem {
+            self.filesystem.finalize();
+        }
+    }
+
     /// Transition to healthy after startup validation. Emits `runtime.stateChanged`.
     pub fn mark_healthy(&self) {
         self.transition(RuntimeState::Healthy, None);
@@ -225,6 +255,8 @@ impl Runtime {
             self.sessions.terminate_all(grace),
             self.processes.terminate_all(signal, grace),
         );
+        // Capture the final filesystem state (final snapshot + baseline→final diff).
+        self.finalize_filesystem();
     }
 
     /// Finish shutdown: mark stopped.
@@ -289,7 +321,7 @@ impl Runtime {
             features: FeatureMatrix {
                 io_capture: true,
                 pty: true,
-                filesystem: false,
+                filesystem: self.config.watch_filesystem,
                 network: NetworkMode::Off,
                 privileged: false,
                 pidfd: self.pidfd_supported,

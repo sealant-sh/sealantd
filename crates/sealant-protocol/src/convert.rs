@@ -18,6 +18,10 @@ use crate::{
     RuntimeStateChanged, ServerMessage, SessionList, SessionOpened, SessionSummary,
     ShutdownAccepted, Signal, StreamKind, TelemetryDropped, TransformMeta,
 };
+use crate::{
+    FileChange, FileChangeKind, FileDiffAvailable, FileEntry, FileSnapshotCompleted, FileType,
+    FileWatchOverflow,
+};
 
 /// Errors decoding a wire message into a domain type.
 #[derive(Debug, thiserror::Error)]
@@ -436,6 +440,118 @@ impl TryFrom<wire::TelemetryDropped> for TelemetryDropped {
     }
 }
 
+enum_pair!(
+    file_change_kind,
+    FileChangeKind,
+    wire::FileChangeKind,
+    [Added, Modified, Deleted, Renamed, MetadataChanged]
+);
+enum_pair!(
+    file_type,
+    FileType,
+    wire::FileType,
+    [File, Dir, Symlink, Other]
+);
+
+impl From<FileEntry> for wire::FileEntry {
+    fn from(e: FileEntry) -> Self {
+        Self {
+            path: e.path,
+            file_type: enum_i32::<_, wire::FileType>(e.file_type),
+            size: e.size,
+            mtime_micros: e.mtime_micros,
+            mode: e.mode,
+            hash: e.hash,
+            symlink_target: e.symlink_target,
+        }
+    }
+}
+impl TryFrom<wire::FileEntry> for FileEntry {
+    type Error = WireError;
+    fn try_from(e: wire::FileEntry) -> Result<Self, WireError> {
+        Ok(Self {
+            path: e.path,
+            file_type: file_type(e.file_type)?,
+            size: e.size,
+            mtime_micros: e.mtime_micros,
+            mode: e.mode,
+            hash: e.hash,
+            symlink_target: e.symlink_target,
+        })
+    }
+}
+
+impl From<FileChange> for wire::FileChange {
+    fn from(c: FileChange) -> Self {
+        Self {
+            kind: enum_i32::<_, wire::FileChangeKind>(c.kind),
+            path: c.path,
+            rename_from: c.rename_from,
+            entry: c.entry.map(Into::into),
+            certain: c.certain,
+        }
+    }
+}
+impl TryFrom<wire::FileChange> for FileChange {
+    type Error = WireError;
+    fn try_from(c: wire::FileChange) -> Result<Self, WireError> {
+        Ok(Self {
+            kind: file_change_kind(c.kind)?,
+            path: c.path,
+            rename_from: c.rename_from,
+            entry: c.entry.map(TryInto::try_into).transpose()?,
+            certain: c.certain,
+        })
+    }
+}
+
+impl From<FileWatchOverflow> for wire::FileWatchOverflow {
+    fn from(o: FileWatchOverflow) -> Self {
+        Self { root: o.root }
+    }
+}
+impl From<wire::FileWatchOverflow> for FileWatchOverflow {
+    fn from(o: wire::FileWatchOverflow) -> Self {
+        Self { root: o.root }
+    }
+}
+impl From<FileSnapshotCompleted> for wire::FileSnapshotCompleted {
+    fn from(s: FileSnapshotCompleted) -> Self {
+        Self {
+            root: s.root,
+            file_count: s.file_count,
+        }
+    }
+}
+impl From<wire::FileSnapshotCompleted> for FileSnapshotCompleted {
+    fn from(s: wire::FileSnapshotCompleted) -> Self {
+        Self {
+            root: s.root,
+            file_count: s.file_count,
+        }
+    }
+}
+impl From<FileDiffAvailable> for wire::FileDiffAvailable {
+    fn from(d: FileDiffAvailable) -> Self {
+        Self {
+            added: d.added,
+            modified: d.modified,
+            deleted: d.deleted,
+            renamed: d.renamed,
+        }
+    }
+}
+impl From<wire::FileDiffAvailable> for FileDiffAvailable {
+    fn from(d: wire::FileDiffAvailable) -> Self {
+        Self {
+            added: d.added,
+            modified: d.modified,
+            deleted: d.deleted,
+            renamed: d.renamed,
+        }
+    }
+}
+
 impl From<EventPayload> for wire::event_envelope::Payload {
     fn from(p: EventPayload) -> Self {
         use wire::event_envelope::Payload as W;
@@ -453,6 +569,10 @@ impl From<EventPayload> for wire::event_envelope::Payload {
             EventPayload::ProcessExited(e) => W::ProcessExited(e.into()),
             EventPayload::IoChunk(c) => W::IoChunk(c.into()),
             EventPayload::TelemetryDropped(d) => W::TelemetryDropped(d.into()),
+            EventPayload::FileChange(c) => W::FileChange(c.into()),
+            EventPayload::FileWatchOverflow(o) => W::FileWatchOverflow(o.into()),
+            EventPayload::FileSnapshotCompleted(s) => W::FileSnapshotCompleted(s.into()),
+            EventPayload::FileDiffAvailable(d) => W::FileDiffAvailable(d.into()),
         }
     }
 }
@@ -472,6 +592,10 @@ impl TryFrom<wire::event_envelope::Payload> for EventPayload {
             W::ProcessExited(e) => EventPayload::ProcessExited(e.try_into()?),
             W::IoChunk(c) => EventPayload::IoChunk(c.try_into()?),
             W::TelemetryDropped(d) => EventPayload::TelemetryDropped(d.try_into()?),
+            W::FileChange(c) => EventPayload::FileChange(c.try_into()?),
+            W::FileWatchOverflow(o) => EventPayload::FileWatchOverflow(o.into()),
+            W::FileSnapshotCompleted(s) => EventPayload::FileSnapshotCompleted(s.into()),
+            W::FileDiffAvailable(d) => EventPayload::FileDiffAvailable(d.into()),
         })
     }
 }

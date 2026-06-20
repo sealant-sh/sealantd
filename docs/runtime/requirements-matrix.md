@@ -107,10 +107,29 @@ the single source of truth; the Rust daemon converts domain ⇄ protobuf at the 
 Follow-ups (non-blocking): Buf-generated typed SDKs (vs runtime `protobufjs`), Effect-Schema
 wrapping (ADR-0010), and `buf generate` clients for other languages.
 
-Still **Designed-only** (future phases): filesystem telemetry (FS-*), network telemetry (NET-*),
-security hardening (SEC-*: peer-cred validation, capability drop, fuzzers). Optional: client-ack
-true-at-least-once, retry/backoff to an external sink, full-screen-app soak, per-process pidfd
-signalling, resource sampling, pty.input redaction (Phase 7).
+**Phase 5 — Filesystem telemetry (complete; exit gate met).** New crate `sealant-fs`.
+- **Snapshot** (cross-platform): a path-bounded, symlink-safe walk (`walkdir`, no link following)
+  capturing per-entry metadata (type/size/mtime/mode/symlink-target) + optional content hashes,
+  skipping ignored trees (`node_modules`/`.git`/`target`/…) and editor temp files.
+- **Diff**: snapshot→snapshot into normalized `file.changed` events (added/modified/deleted/
+  metadataChanged) with heuristic **inferred** rename detection by content hash.
+- **Live watcher** (`notify`; inotify on Linux): maps backend events to `file.changed`, coalesces
+  editor temp noise, skips ignored trees, and on **overflow** emits `file.watchOverflow` + rescans.
+- **Hybrid lifecycle** (`FilesystemRuntime`): baseline snapshot (`file.snapshotCompleted`) → live
+  watch → final snapshot + diff on shutdown (`file.diffAvailable`). Wired into the daemon behind
+  `--watch-filesystem`; `capabilities.features.filesystem` reflects it.
+- New protocol events `file.changed` / `file.watchOverflow` / `file.snapshotCompleted` /
+  `file.diffAvailable` (domain + protobuf + conversions).
+- Tests: snapshot (ignore/symlink-loop/path-escape) + diff (add/modify/delete/inferred-rename)
+  cross-platform; the inotify live-watch + overflow-recovery test is Linux-only (docker).
+
+Exit gate (plan §22 Phase 5): create/modify/delete/rename ✅; editor temp files coalesced ✅;
+overflow emits an event + rescan ✅; symlink/path-boundary safe ✅.
+
+Still **Designed-only** (future phases): network telemetry (NET-*), security hardening
+(SEC-*: peer-cred validation, capability drop, fuzzers). Optional: client-ack true-at-least-once,
+retry/backoff to an external sink, full-screen-app soak, per-process pidfd signalling, resource
+sampling, pty.input redaction (Phase 7), filesystem diff artifacts for large patches.
 
 ---
 

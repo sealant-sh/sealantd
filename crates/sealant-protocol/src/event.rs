@@ -283,6 +283,109 @@ pub struct TelemetryDropped {
     pub priority: EventPriority,
 }
 
+/// Kind of filesystem change (plan §13).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum FileChangeKind {
+    /// A new entry appeared.
+    Added,
+    /// An entry's content changed.
+    Modified,
+    /// An entry was removed.
+    Deleted,
+    /// An entry was renamed/moved.
+    Renamed,
+    /// Only metadata (permissions/times) changed.
+    MetadataChanged,
+}
+
+/// Type of a filesystem entry.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum FileType {
+    /// Regular file.
+    File,
+    /// Directory.
+    Dir,
+    /// Symbolic link.
+    Symlink,
+    /// Anything else (device, socket, fifo).
+    Other,
+}
+
+/// Snapshot metadata for a filesystem entry (plan §13).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct FileEntry {
+    /// Path relative to the workspace root.
+    pub path: String,
+    /// Entry type.
+    pub file_type: FileType,
+    /// Size in bytes.
+    pub size: u64,
+    /// Modification time (microseconds since the Unix epoch).
+    pub mtime_micros: i64,
+    /// Unix mode bits.
+    pub mode: u32,
+    /// Optional content hash (e.g. `sha256:...`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hash: Option<String>,
+    /// Symlink target, when the entry is a symlink.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub symlink_target: Option<String>,
+}
+
+/// Payload for `file.changed`: a single observed filesystem mutation.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct FileChange {
+    /// The kind of change.
+    pub kind: FileChangeKind,
+    /// Affected path (the destination for a rename), relative to the workspace root.
+    pub path: String,
+    /// Source path for a rename.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rename_from: Option<String>,
+    /// Snapshot metadata, when available (added/modified/metadata).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry: Option<FileEntry>,
+    /// Whether the change attribution is certain (vs inferred, e.g. a heuristic rename).
+    #[serde(default)]
+    pub certain: bool,
+}
+
+/// Payload for `file.watchOverflow`: the watcher could not guarantee completeness; a rescan follows.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct FileWatchOverflow {
+    /// The watched root.
+    pub root: String,
+}
+
+/// Payload for `file.snapshotCompleted`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct FileSnapshotCompleted {
+    /// The snapshotted root.
+    pub root: String,
+    /// Number of entries captured.
+    pub file_count: u64,
+}
+
+/// Payload for `file.diffAvailable`: a summary of a baseline→final diff.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct FileDiffAvailable {
+    /// Entries added.
+    pub added: u64,
+    /// Entries modified.
+    pub modified: u64,
+    /// Entries deleted.
+    pub deleted: u64,
+    /// Entries renamed.
+    pub renamed: u64,
+}
+
 /// The typed, internally-tagged telemetry payload. The tag field is `eventType`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "eventType")]
@@ -305,6 +408,18 @@ pub enum EventPayload {
     /// Telemetry was dropped; never silent.
     #[serde(rename = "telemetry.dropped")]
     TelemetryDropped(TelemetryDropped),
+    /// A filesystem change was observed.
+    #[serde(rename = "file.changed")]
+    FileChange(FileChange),
+    /// The filesystem watcher overflowed; a rescan follows.
+    #[serde(rename = "file.watchOverflow")]
+    FileWatchOverflow(FileWatchOverflow),
+    /// A filesystem snapshot completed.
+    #[serde(rename = "file.snapshotCompleted")]
+    FileSnapshotCompleted(FileSnapshotCompleted),
+    /// A baseline→final diff summary is available.
+    #[serde(rename = "file.diffAvailable")]
+    FileDiffAvailable(FileDiffAvailable),
 }
 
 impl EventPayload {
@@ -318,6 +433,10 @@ impl EventPayload {
             Self::ProcessExited(_) => "process.exited",
             Self::IoChunk(_) => "io.chunk",
             Self::TelemetryDropped(_) => "telemetry.dropped",
+            Self::FileChange(_) => "file.changed",
+            Self::FileWatchOverflow(_) => "file.watchOverflow",
+            Self::FileSnapshotCompleted(_) => "file.snapshotCompleted",
+            Self::FileDiffAvailable(_) => "file.diffAvailable",
         }
     }
 
@@ -328,8 +447,12 @@ impl EventPayload {
             Self::RuntimeStateChanged(_)
             | Self::ProcessStarted(_)
             | Self::ProcessExited(_)
-            | Self::TelemetryDropped(_) => EventPriority::Critical,
-            Self::IoChunk(_) => EventPriority::Normal,
+            | Self::TelemetryDropped(_)
+            | Self::FileWatchOverflow(_)
+            | Self::FileDiffAvailable(_) => EventPriority::Critical,
+            Self::IoChunk(_) | Self::FileChange(_) | Self::FileSnapshotCompleted(_) => {
+                EventPriority::Normal
+            }
             Self::RuntimeHeartbeat(_) => EventPriority::Low,
         }
     }

@@ -29,6 +29,9 @@ struct Cli {
     /// Durable telemetry spool directory (enables crash-safe at-least-once delivery).
     #[arg(long)]
     spool_dir: Option<PathBuf>,
+    /// Observe the workspace filesystem (baseline snapshot + live watch + final diff).
+    #[arg(long)]
+    watch_filesystem: bool,
     /// Bound sandbox id.
     #[arg(long)]
     sandbox_id: Option<String>,
@@ -59,6 +62,9 @@ fn build_config(cli: &Cli) -> RuntimeConfig {
     }
     if let Some(spool_dir) = &cli.spool_dir {
         config.spool_dir = Some(spool_dir.clone());
+    }
+    if cli.watch_filesystem {
+        config.watch_filesystem = true;
     }
     if let Some(sandbox_id) = &cli.sandbox_id {
         config.sandbox_id = Some(sandbox_id.clone());
@@ -175,6 +181,8 @@ async fn serve(cli: Cli, runtime: Arc<Runtime>) -> ExitCode {
     sealant_process::platform::spawn_orphan_reaper(runtime.process_registry());
     // Start durable telemetry delivery: replay the spool, then deliver live events.
     runtime.start_telemetry();
+    // Begin filesystem observation if enabled (no-op otherwise).
+    runtime.start_filesystem();
 
     // Startup validation is complete; announce healthy before accepting work.
     runtime.mark_healthy();

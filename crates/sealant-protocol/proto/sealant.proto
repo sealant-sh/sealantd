@@ -229,6 +229,45 @@ message TelemetryDropped {
   EventPriority priority = 3;
 }
 
+enum FileChangeKind {
+  FILE_CHANGE_KIND_UNSPECIFIED = 0;
+  FILE_CHANGE_KIND_ADDED = 1;
+  FILE_CHANGE_KIND_MODIFIED = 2;
+  FILE_CHANGE_KIND_DELETED = 3;
+  FILE_CHANGE_KIND_RENAMED = 4;
+  FILE_CHANGE_KIND_METADATA_CHANGED = 5;
+}
+
+enum FileType {
+  FILE_TYPE_UNSPECIFIED = 0;
+  FILE_TYPE_FILE = 1;
+  FILE_TYPE_DIR = 2;
+  FILE_TYPE_SYMLINK = 3;
+  FILE_TYPE_OTHER = 4;
+}
+
+message FileEntry {
+  string path = 1;
+  FileType file_type = 2;
+  uint64 size = 3;
+  int64 mtime_micros = 4;
+  uint32 mode = 5;
+  optional string hash = 6;
+  optional string symlink_target = 7;
+}
+
+message FileChange {
+  FileChangeKind kind = 1;
+  string path = 2;
+  optional string rename_from = 3;
+  optional FileEntry entry = 4;
+  bool certain = 5;
+}
+
+message FileWatchOverflow { string root = 1; }
+message FileSnapshotCompleted { string root = 1; uint64 file_count = 2; }
+message FileDiffAvailable { uint64 added = 1; uint64 modified = 2; uint64 deleted = 3; uint64 renamed = 4; }
+
 message EventEnvelope {
   uint32 schema_version = 1;
   string event_id = 2;
@@ -249,6 +288,10 @@ message EventEnvelope {
     ProcessExited process_exited = 23;
     IoChunk io_chunk = 24;
     TelemetryDropped telemetry_dropped = 25;
+    FileChange file_change = 26;
+    FileWatchOverflow file_watch_overflow = 27;
+    FileSnapshotCompleted file_snapshot_completed = 28;
+    FileDiffAvailable file_diff_available = 29;
   }
 }
 
