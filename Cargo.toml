@@ -38,7 +38,7 @@ bytes = "1"
 base64 = "0.22"
 crc32fast = "1"
 hex = "0.4"
-sha2 = "0.10"
+sha2 = "0.11"
 getrandom = "0.2"
 tempfile = "3"
 # filesystem telemetry (plan §13)
