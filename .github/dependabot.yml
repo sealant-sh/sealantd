@@ -33,3 +33,5 @@ updates:
         update-types: ["version-update:semver-major"]
       - dependency-name: "sha2"
         update-types: ["version-update:semver-major"]
+      - dependency-name: "schemars"
+        update-types: ["version-update:semver-major"]
