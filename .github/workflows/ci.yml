@@ -24,7 +24,7 @@ jobs:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false # don't leave the git token in .git for later steps
       - uses: dtolnay/rust-toolchain@stable # Blacksmith runners don't preinstall Rust like github-hosted
@@ -40,11 +40,11 @@ jobs:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - run: corepack enable
-      - uses: actions/setup-node@v5
+      - uses: actions/setup-node@v6
         with:
           node-version: 24
       # --ignore-scripts: never run dependency lifecycle scripts (untrusted on fork PRs).

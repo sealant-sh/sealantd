@@ -16,22 +16,22 @@ jobs:
     # (The npm job stays on ubuntu-latest — github-hosted — to keep OIDC trusted publishing safe.)
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       # QEMU emulates arm64 on this amd64 runner; useblacksmith/setup-docker-builder adds sticky-disk
       # layer caching. Real arm64 speedup later = native arm64 Blacksmith runners + a per-arch matrix
       # (drops QEMU).
-      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-qemu-action@v4
       - uses: useblacksmith/setup-docker-builder@v1
 
-      - uses: docker/login-action@v3
+      - uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ghcr.io/${{ github.repository }}
           tags: |
@@ -59,12 +59,12 @@ jobs:
       contents: read
       id-token: write # OIDC: lets npm Trusted Publishing authenticate with no stored token
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       # Enable Corepack BEFORE setup-node: setup-node@v5 reads package.json#packageManager
       # (pnpm@11.1.0) and needs pnpm on PATH. Corepack ships with Node, so nothing runs on the
       # deprecated Node 20 action runtime.
       - run: corepack enable
-      - uses: actions/setup-node@v5
+      - uses: actions/setup-node@v6
         with:
           node-version: 24
           registry-url: "https://registry.npmjs.org"

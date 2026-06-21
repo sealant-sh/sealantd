@@ -10,6 +10,7 @@ import { spawn } from "node:child_process";
 import type { ChildProcess } from "node:child_process";
 import { Buffer } from "node:buffer";
 import { setTimeout as delay } from "node:timers/promises";
+import type { Duplex } from "node:stream";
 import type { MessageInitShape } from "@bufbuild/protobuf";
 
 import {
@@ -91,7 +92,7 @@ export interface ExecOptions {
 
 /** A connected, typed control client for one sealantd instance. */
 export class SealantClient {
-  #socket: net.Socket;
+  #stream: Duplex;
   #decoder: FrameDecoder = new FrameDecoder();
   #pending: Map<string, Pending> = new Map();
   #counter = 0;
@@ -99,11 +100,27 @@ export class SealantClient {
   #eventQueue: EventEnvelope[] = [];
   #eventWaiters: Array<(result: IteratorResult<EventEnvelope>) => void> = [];
 
-  constructor(socket: net.Socket) {
-    this.#socket = socket;
-    this.#socket.on("data", (chunk: Buffer) => this.#onData(chunk));
-    this.#socket.on("close", () => this.#onClose());
-    this.#socket.on("error", () => {});
+  constructor(stream: Duplex) {
+    this.#stream = stream;
+    this.#attach(stream);
+  }
+
+  /** Wire a transport stream's data/close/end/error events into the client. */
+  #attach(stream: Duplex): void {
+    stream.on("data", (chunk: Buffer) => this.#onData(chunk));
+    stream.on("close", () => this.#onClose());
+    // A `docker exec -i` stdio Duplex emits "end" (not always "close"); #onClose is idempotent.
+    stream.on("end", () => this.#onClose());
+    stream.on("error", () => {});
+  }
+
+  /**
+   * Build a client over an arbitrary Node Duplex — e.g. a `docker exec -i` stdio pipe bridged to the
+   * daemon's Unix socket. The framing/protocol is transport-agnostic, so this drives the same
+   * request/response/event machinery as {@link SealantClient.connect}.
+   */
+  static fromStream(stream: Duplex): SealantClient {
+    return new SealantClient(stream);
   }
 
   static async connect(
@@ -166,7 +183,7 @@ export class SealantClient {
     const body = encodeClient(message);
     return new Promise((resolve, reject) => {
       this.#pending.set(requestId, { resolve, reject });
-      this.#socket.write(encodeFrame(body), (error) => {
+      this.#stream.write(encodeFrame(body), (error) => {
         if (error) {
           this.#pending.delete(requestId);
           reject(error);
@@ -253,7 +270,7 @@ export class SealantClient {
   }
 
   close(): void {
-    this.#socket.end();
+    this.#stream.end();
   }
 
   #onData(chunk: Buffer): void {
@@ -261,7 +278,7 @@ export class SealantClient {
     try {
       messages = this.#decoder.push(chunk);
     } catch (error) {
-      this.#socket.destroy(error instanceof Error ? error : new Error(String(error)));
+      this.#stream.destroy(error instanceof Error ? error : new Error(String(error)));
       return;
     }
     for (const message of messages) {
