@@ -1,5 +1,15 @@
 # @sealant/runtime-client
 
+## 0.3.0
+
+### Minor Changes
+
+- 87c0094: sealantd: boot PID-1 supervisor subcommand
+
+### Patch Changes
+
+- @sealant/runtime-protocol@0.3.0
+
 ## 0.2.0
 
 ### Minor Changes

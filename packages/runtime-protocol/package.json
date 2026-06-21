@@ -1,6 +1,6 @@
 {
   "name": "@sealant/runtime-protocol",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Typed Protobuf wire codec + framing for the sealantd control protocol.",
   "license": "Apache-2.0",
   "repository": {
