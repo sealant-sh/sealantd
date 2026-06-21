@@ -526,27 +526,8 @@ async fn in_process_open_forward_loopback_echo() {
     runtime.mark_healthy();
     let (mut client, conn) = wire_runtime(runtime.clone());
 
-    // Forwarding is gated behind the networkCollection feature; enable it.
-    send_request(
-        &mut client,
-        ControlRequest::new(
-            RequestId::new("f0"),
-            Command::SetFeatureState {
-                feature: Feature::NetworkCollection,
-                enabled: true,
-            },
-        ),
-    )
-    .await;
-    // Drain the ack.
-    loop {
-        if let ServerMessage::Response(r) = recv_message(&mut client).await
-            && r.request_id == RequestId::new("f0")
-        {
-            assert!(r.is_ok());
-            break;
-        }
-    }
+    // Forwarding is a gateway transport primitive, NOT gated on networkCollection telemetry — no
+    // feature toggle here. (The default feature matrix leaves networkCollection OFF.)
 
     // Open the forward.
     send_request(
@@ -612,11 +593,26 @@ async fn in_process_open_forward_loopback_echo() {
     let _ = tokio::time::timeout(Duration::from_secs(5), conn).await;
 }
 
-/// §1.B policy gate: openForward must be denied when the networkCollection feature is off.
+/// §1.B transport/telemetry decoupling: openForward must be ALLOWED even with the networkCollection
+/// telemetry feature off (the default). Forwarding is the gateway's direct-tcpip substrate, not a
+/// network-capture concern — so a tunnel may be opened regardless of that kill switch.
 #[tokio::test]
-async fn in_process_open_forward_denied_when_feature_off() {
+async fn in_process_open_forward_allowed_when_feature_off() {
+    // A loopback listener so the forward has a real upstream to connect to.
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("bind upstream");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        // Accept once so the connect succeeds, then idle.
+        let _ = listener.accept().await;
+        std::future::pending::<()>().await;
+    });
+
     let mut config = RuntimeConfig::new(new_runtime_id());
     config.workspace_root = std::env::temp_dir();
+    // The default feature matrix leaves networkCollection OFF (see `default_feature_states`), so we
+    // make NO SetFeatureState call here: a successful openForward proves the decoupling.
     let runtime = Runtime::new(config, Arc::new(ShutdownSignal::new(1000)));
     runtime.mark_healthy();
     let (mut client, conn) = wire_runtime(runtime.clone());
@@ -627,13 +623,13 @@ async fn in_process_open_forward_denied_when_feature_off() {
             RequestId::new("d1"),
             Command::OpenForward(OpenForwardArgs {
                 host: "127.0.0.1".to_owned(),
-                port: 9,
+                port: addr.port(),
                 execution_id: None,
             }),
         ),
     )
     .await;
-    let denied = async {
+    let response = async {
         loop {
             if let ServerMessage::Response(r) = recv_message(&mut client).await
                 && r.request_id == RequestId::new("d1")
@@ -642,14 +638,14 @@ async fn in_process_open_forward_denied_when_feature_off() {
             }
         }
     };
-    let r = tokio::time::timeout(Duration::from_secs(5), denied)
+    let r = tokio::time::timeout(Duration::from_secs(5), response)
         .await
         .expect("response");
     match r.outcome {
-        ResponseOutcome::Error { error } => {
-            assert_eq!(error.code, sealant_protocol::ControlErrorCode::PolicyDenied);
-        }
-        other => panic!("expected PolicyDenied, got {other:?}"),
+        ResponseOutcome::Ok {
+            result: Some(CommandResult::ForwardOpened(_)),
+        } => {}
+        other => panic!("expected ForwardOpened with networkCollection off, got {other:?}"),
     }
 
     drop(client);

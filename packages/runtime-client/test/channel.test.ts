@@ -191,3 +191,145 @@ test("connection close fails open channels", async () => {
   assert.equal(cause.kind, "error");
   assert.equal(a.isClosed, true);
 });
+
+// --- half-close (SSH `ssh host cmd` semantics) -------------------------------------------------
+
+/** Decode the most recent ClientMessage::Stream frame the client wrote, if any. */
+function lastClientStream(conn: MockConn): StreamFrame | undefined {
+  for (let i = conn.written.length - 1; i >= 0; i--) {
+    const buf = conn.written[i];
+    const len = buf.readUInt32BE(0);
+    const msg = fromBinary(ClientMessageSchema, buf.subarray(4, 4 + len));
+    if (msg.message.case === "stream") return (msg.message as { value: StreamFrame }).value;
+  }
+  return undefined;
+}
+
+test("end() is a half-close: outbound End sent, inbound keeps flowing until remote StreamEnd", async () => {
+  const conn = new MockConn();
+  const client = SealantClient.fromStream(conn);
+  const a = client.openChannel("chan-A");
+
+  // Half-close outbound. This must NOT close the channel or stop inbound delivery.
+  a.end({ exitCode: undefined });
+  assert.equal(a.isOutboundClosed, true, "outbound half should be closed after end()");
+  assert.equal(a.isClosed, false, "channel must stay open after a half-close");
+
+  // The client wrote a StreamFrame::End for this channel (our EOF).
+  const sent = lastClientStream(conn);
+  assert.equal(sent?.channelId, "chan-A");
+  assert.equal(sent?.payload.case, "end");
+
+  // Outbound writes are now rejected, but inbound still delivers the daemon's remaining output.
+  assert.throws(() => a.write(new Uint8Array([0x01])), /outbound is closed/);
+
+  // Pull inbound through the raw iterator (not a for-await `break`, which would trigger return() and
+  // tear the channel down locally). The daemon's output arrives AFTER our stdin EOF.
+  const it = a[Symbol.asyncIterator]();
+  conn.inject(dataFrame("chan-A", [0x6f, 0x6b])); // "ok"
+  const first = await it.next();
+  assert.equal(first.done, false);
+  assert.deepEqual([...(first.value as Uint8Array)], [0x6f, 0x6b]);
+
+  // The remote StreamEnd is what finally closes the channel — and as `remote`, not `local`.
+  conn.inject(endFrame("chan-A", 0));
+  const next = await it.next();
+  assert.equal(next.done, true);
+  const cause = await a.closed;
+  assert.equal(cause.kind, "remote");
+  if (cause.kind === "remote") assert.equal(cause.end.exitCode, 0);
+  assert.equal(a.isClosed, true);
+
+  client.close();
+});
+
+test("end() then remote drain delivers all buffered inbound before completing", async () => {
+  const conn = new MockConn();
+  const client = SealantClient.fromStream(conn);
+  const a = client.openChannel("chan-A");
+
+  // Daemon output races in before we half-close; then more arrives; then End.
+  conn.inject(dataFrame("chan-A", [0x01]));
+  a.end();
+  conn.inject(dataFrame("chan-A", [0x02]));
+  conn.inject(endFrame("chan-A", 7));
+
+  const drained: Uint8Array[] = [];
+  for await (const chunk of a) drained.push(chunk);
+  assert.deepEqual(drained.map((c) => [...c]), [[0x01], [0x02]]);
+
+  const cause = await a.closed;
+  assert.equal(cause.kind, "remote");
+  if (cause.kind === "remote") assert.equal(cause.end.exitCode, 7);
+
+  client.close();
+});
+
+test("end() is idempotent and sends End only once", async () => {
+  const conn = new MockConn();
+  const client = SealantClient.fromStream(conn);
+  const a = client.openChannel("chan-A");
+
+  a.end();
+  a.end();
+  a.end();
+
+  const endFrames = conn.written.filter((buf) => {
+    const len = buf.readUInt32BE(0);
+    const msg = fromBinary(ClientMessageSchema, buf.subarray(4, 4 + len));
+    return (
+      msg.message.case === "stream" &&
+      (msg.message as { value: StreamFrame }).value.payload.case === "end"
+    );
+  });
+  assert.equal(endFrames.length, 1, "End must be sent exactly once");
+
+  client.close();
+});
+
+test("destroy() is a full local teardown: inbound completes, closed resolves local", async () => {
+  const conn = new MockConn();
+  const client = SealantClient.fromStream(conn);
+  const a = client.openChannel("chan-A");
+
+  // Queue some inbound that destroy() should discard (consumer is tearing down, not draining).
+  conn.inject(dataFrame("chan-A", [0xff]));
+  a.destroy();
+
+  assert.equal(a.isClosed, true);
+  assert.equal(a.isOutboundClosed, true);
+  // Outbound End was sent as part of the teardown.
+  assert.equal(lastClientStream(conn)?.payload.case, "end");
+
+  const cause = await a.closed;
+  assert.equal(cause.kind, "local");
+
+  // Late inbound after a full close is dropped without throwing.
+  conn.inject(dataFrame("chan-A", [0x00]));
+
+  client.close();
+});
+
+test("destroy() after end() does not send a second End and closes as local", async () => {
+  const conn = new MockConn();
+  const client = SealantClient.fromStream(conn);
+  const a = client.openChannel("chan-A");
+
+  a.end(); // half-close (sends End)
+  a.destroy(); // full teardown (must NOT send another End)
+
+  const endFrames = conn.written.filter((buf) => {
+    const len = buf.readUInt32BE(0);
+    const msg = fromBinary(ClientMessageSchema, buf.subarray(4, 4 + len));
+    return (
+      msg.message.case === "stream" &&
+      (msg.message as { value: StreamFrame }).value.payload.case === "end"
+    );
+  });
+  assert.equal(endFrames.length, 1, "destroy() after end() must not re-send End");
+
+  const cause = await a.closed;
+  assert.equal(cause.kind, "local");
+
+  client.close();
+});

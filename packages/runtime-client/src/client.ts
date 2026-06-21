@@ -284,8 +284,35 @@ export class SealantClient {
     return resultValue(result, "execAccepted") as ExecAccepted;
   }
 
-  async writeStdin(processId: string, data: Uint8Array): Promise<void> {
-    okResult(await this.request({ case: "writeStdin", value: { processId, data } }));
+  /**
+   * Write input bytes to a process's stdin or an interactive PTY session's input.
+   *
+   * The daemon's `WriteStdinArgs` carries an exclusive choice of `processId` (non-PTY stdin) OR
+   * `sessionId` (PTY input); it routes by whichever is set (see runtime dispatch). The gateway needs
+   * the `sessionId` path to deliver SSH PTY keystrokes to a live session.
+   *
+   * Backward compatible: a bare string `target` is treated as a `processId` (the original signature).
+   * Pass `{ sessionId }` to target a session, or `{ processId }` to be explicit.
+   */
+  async writeStdin(
+    target: string | { processId: string } | { sessionId: string },
+    data: Uint8Array,
+  ): Promise<void> {
+    const value =
+      typeof target === "string"
+        ? { processId: target, data }
+        : "sessionId" in target
+          ? { sessionId: target.sessionId, data }
+          : { processId: target.processId, data };
+    okResult(await this.request({ case: "writeStdin", value }));
+  }
+
+  /**
+   * Convenience for the gateway's interactive path: deliver `data` to a PTY session's input by
+   * `sessionId`. Equivalent to `writeStdin({ sessionId }, data)`.
+   */
+  async writeSessionInput(sessionId: string, data: Uint8Array): Promise<void> {
+    okResult(await this.request({ case: "writeStdin", value: { sessionId, data } }));
   }
 
   async signalProcess(processId: string, signal: number): Promise<void> {
@@ -318,7 +345,8 @@ export class SealantClient {
   /** Detach a previously attached session channel and tear down its local {@link Channel}. */
   async detachSession(channelId: string): Promise<void> {
     okResult(await this.request({ case: "detachSession", value: { channelId } }));
-    this.#channels.get(channelId)?.end();
+    // Explicit teardown command: fully close the local channel, don't leave inbound half-open.
+    this.#channels.get(channelId)?.destroy();
   }
 
   /** Open a direct-TCP forward to `host:port` as a multiplexed byte channel. */
@@ -337,7 +365,8 @@ export class SealantClient {
   /** Close a forward channel and tear down its local {@link Channel}. */
   async closeForward(channelId: string): Promise<void> {
     okResult(await this.request({ case: "closeForward", value: { channelId } }));
-    this.#channels.get(channelId)?.end();
+    // Explicit teardown command: fully close the local channel, don't leave inbound half-open.
+    this.#channels.get(channelId)?.destroy();
   }
 
   /** Open an SFTP subsystem channel as a multiplexed byte channel. */
@@ -360,7 +389,8 @@ export class SealantClient {
   /** Close an SFTP channel and tear down its local {@link Channel}. */
   async closeSftp(channelId: string): Promise<void> {
     okResult(await this.request({ case: "closeSftp", value: { channelId } }));
-    this.#channels.get(channelId)?.end();
+    // Explicit teardown command: fully close the local channel, don't leave inbound half-open.
+    this.#channels.get(channelId)?.destroy();
   }
 
   /**

@@ -12,10 +12,10 @@ use sealant_fs::{FilesystemConfig, FilesystemRuntime};
 use sealant_network::{ForwardRuntime, NetworkConfig, NetworkRuntime};
 use sealant_process::{ProcessRegistry, ProcessRuntime, SftpRuntime};
 use sealant_protocol::{
-    Capabilities, Command, CommandResult, Confidence, ControlError, ControlErrorCode,
-    ControlRequest, ControlResponse, EventEnvelope, EventPayload, ExecutionId, Feature,
-    FeatureMatrix, FeatureState, ForwardOpened, HealthReport, NetworkMode, ProcessAttached,
-    ProcessList, ProcessState, RuntimeHeartbeat, RuntimeMetrics, RuntimeState, RuntimeStateChanged,
+    Capabilities, Command, CommandResult, Confidence, ControlError, ControlRequest,
+    ControlResponse, EventEnvelope, EventPayload, ExecutionId, Feature, FeatureMatrix,
+    FeatureState, ForwardOpened, HealthReport, NetworkMode, ProcessAttached, ProcessList,
+    ProcessState, RuntimeHeartbeat, RuntimeMetrics, RuntimeState, RuntimeStateChanged,
     SCHEMA_VERSION, SftpOpened, ShutdownAccepted, Signal, StreamAttached,
 };
 use sealant_pty::{SessionRegistry, SessionRuntime};
@@ -611,16 +611,6 @@ impl Runtime {
         }
     }
 
-    /// Whether the given feature kill switch is currently enabled.
-    fn feature_enabled(&self, feature: Feature) -> bool {
-        self.features
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&feature)
-            .copied()
-            .unwrap_or(false)
-    }
-
     /// Dispatch the connection-scoped streaming commands (gateway consolidation §1.A/§1.B/§1.C).
     ///
     /// Each open binds a fresh [`ChannelId`] to a byte source and pumps it over `conn.out_tx` with
@@ -715,16 +705,14 @@ impl Runtime {
             }
 
             // §1.B — open a direct-tcpip forward to host:port.
+            //
+            // Forwarding is a gateway *transport* primitive (the SSH direct-tcpip substrate), not
+            // telemetry capture. It is deliberately NOT gated on `Feature::NetworkCollection` — that
+            // kill switch governs whether the daemon *observes/records* network traffic, a separate
+            // concern from whether a tunnel may be opened at all. Like session-attach and SFTP, the
+            // forward is a connection-scoped channel with its own eager teardown; it carries bytes,
+            // it does not capture them.
             Command::OpenForward(args) => {
-                if !self.feature_enabled(Feature::NetworkCollection) {
-                    return ControlResponse::error(
-                        rid,
-                        ControlError::new(
-                            ControlErrorCode::PolicyDenied,
-                            "tcp forwarding is disabled (networkCollection feature off)".to_owned(),
-                        ),
-                    );
-                }
                 let channel_id = self.idgen.channel_id();
                 match self
                     .forwards

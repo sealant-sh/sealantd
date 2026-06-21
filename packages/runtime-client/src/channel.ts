@@ -21,7 +21,9 @@ export interface ChannelTransport {
   release(channelId: string): void;
 }
 
-/** Why a channel closed: a daemon `StreamEnd`, a local `end()`/`destroy()`, or the connection dying. */
+/** Why a channel fully closed: a daemon `StreamEnd`, a local `destroy()` teardown, or the
+ * connection dying. Note that a half-close via `end()` does NOT resolve `closed` — only the *full*
+ * close does, and for a well-behaved peer that arrives as `remote` (the daemon's `StreamEnd`). */
 export type ChannelClose =
   | { kind: "remote"; end: StreamEnd }
   | { kind: "local" }
@@ -41,11 +43,17 @@ export class Channel implements AsyncIterable<Uint8Array> {
   #inbound: Uint8Array[] = [];
   #waiters: Array<(result: IteratorResult<Uint8Array>) => void> = [];
   #windowWaiters: Array<(credits: bigint) => void> = [];
+  /** Outbound half-closed: we have sent our `StreamEnd`; `write`/`windowUpdate` are now rejected.
+   * Inbound delivery is unaffected — this is the SSH-style half-close. */
+  #outboundClosed = false;
+  /** Fully closed: both halves are done. Inbound iterator completes and `closed` resolves. */
   #closed = false;
   #close?: ChannelClose;
   #resolveClosed!: (cause: ChannelClose) => void;
 
-  /** Resolves with the cause when the channel is fully closed (remote End, local end, or error). */
+  /** Resolves with the cause when the channel is *fully* closed (remote End, local `destroy()`, or
+   * error). A half-close via `end()` does NOT resolve this — inbound keeps flowing until the remote
+   * `StreamEnd`, at which point it resolves as `remote`. */
   readonly closed: Promise<ChannelClose>;
 
   constructor(channelId: string, transport: ChannelTransport) {
@@ -56,9 +64,15 @@ export class Channel implements AsyncIterable<Uint8Array> {
     });
   }
 
-  /** True once the channel has been closed from either side. */
+  /** True once the channel has been *fully* closed (both halves done). */
   get isClosed(): boolean {
     return this.#closed;
+  }
+
+  /** True once the outbound half has been closed via `end()` (or a full close). Inbound may still
+   * be flowing while this is true. */
+  get isOutboundClosed(): boolean {
+    return this.#outboundClosed;
   }
 
   /** The close cause, if the channel is closed; otherwise `undefined`. */
@@ -97,15 +111,18 @@ export class Channel implements AsyncIterable<Uint8Array> {
 
   // --- outbound (mux source; called by the consumer) ------------------------------------------
 
-  /** Write bytes to the daemon as a `StreamFrame::Data` on this channel. No-op once closed. */
+  /** Write bytes to the daemon as a `StreamFrame::Data` on this channel. Throws once the outbound
+   * half has been closed (via `end()`/`destroy()`) or the channel is fully closed. */
   write(data: Uint8Array): void {
-    if (this.#closed) throw new Error(`channel ${this.channelId} is closed`);
+    if (this.#outboundClosed) throw new Error(`channel ${this.channelId} outbound is closed`);
     this.#transport.sendData(this.channelId, data);
   }
 
-  /** Grant the daemon `credits` more bytes of send window (`StreamFrame::WindowUpdate`). */
+  /** Grant the daemon `credits` more bytes of send window (`StreamFrame::WindowUpdate`). Throws once
+   * the outbound half is closed. (Credits flow with outbound frames; once we have half-closed we no
+   * longer issue them.) */
   windowUpdate(credits: bigint): void {
-    if (this.#closed) throw new Error(`channel ${this.channelId} is closed`);
+    if (this.#outboundClosed) throw new Error(`channel ${this.channelId} outbound is closed`);
     this.#transport.sendWindowUpdate(this.channelId, credits);
   }
 
@@ -114,10 +131,33 @@ export class Channel implements AsyncIterable<Uint8Array> {
     return new Promise((resolve) => this.#windowWaiters.push(resolve));
   }
 
-  /** Half-close: send a `StreamFrame::End` to the daemon and close this channel locally. */
+  /**
+   * Half-close the outbound direction: send a `StreamFrame::End` to the daemon (our EOF) and reject
+   * further `write`/`windowUpdate`. Crucially this does NOT tear down inbound — the channel keeps
+   * delivering the daemon's output and stays open until the remote `StreamEnd` arrives (which then
+   * resolves `closed` as `remote`). This is the SSH semantics `ssh host cmd` relies on: stdin can
+   * hit EOF immediately while stdout/stderr and the exit status are still in flight.
+   *
+   * Idempotent; a no-op if the outbound half is already closed or the channel is fully closed.
+   */
   end(end?: StreamEnd): void {
-    if (this.#closed) return;
+    if (this.#outboundClosed || this.#closed) return;
+    this.#outboundClosed = true;
     this.#transport.sendEnd(this.channelId, end);
+  }
+
+  /**
+   * Full local teardown: half-close the outbound direction if it is still open, then close inbound
+   * too and resolve `closed` as `local`. Use this for a real abort/teardown where you do not intend
+   * to keep reading the daemon's remaining output. For normal completion prefer `end()` and let the
+   * remote `StreamEnd` close the channel.
+   */
+  destroy(end?: StreamEnd): void {
+    if (this.#closed) return;
+    if (!this.#outboundClosed) {
+      this.#outboundClosed = true;
+      this.#transport.sendEnd(this.channelId, end);
+    }
     this.#finish({ kind: "local" });
   }
 
@@ -131,8 +171,10 @@ export class Channel implements AsyncIterable<Uint8Array> {
         if (this.#closed) return Promise.resolve({ value: undefined, done: true });
         return new Promise((resolve) => this.#waiters.push(resolve));
       },
+      // The consumer stopped iterating (e.g. `break`): they will read no more inbound bytes, so this
+      // is a real teardown, not a half-close. Destroy fully.
       return: (): Promise<IteratorResult<Uint8Array>> => {
-        this.end();
+        this.destroy();
         return Promise.resolve({ value: undefined, done: true });
       },
     };
@@ -142,6 +184,8 @@ export class Channel implements AsyncIterable<Uint8Array> {
   #finish(cause: ChannelClose): void {
     if (this.#closed) return;
     this.#closed = true;
+    // A full close implies the outbound half is closed too (block any late writes).
+    this.#outboundClosed = true;
     this.#close = cause;
     for (const waiter of this.#waiters.splice(0)) {
       waiter({ value: undefined, done: true });
