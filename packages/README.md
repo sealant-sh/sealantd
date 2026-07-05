@@ -23,7 +23,7 @@ node --test packages/runtime-client/test/e2e.test.ts
 
 ## Monorepo integration (later)
 
-At integration into `get-sealant/sealant` these become real `workspace:*` packages. Two follow-ups
+At integration into `sealant-sh/sealant` these become real `workspace:*` packages. Two follow-ups
 (ADR-0010 / ADR-0012): generate typed clients with **Buf** (`buf generate`) instead of runtime
 protobuf.js loading, and re-express the surface with **Effect Schema** to match
 `@sealant/api-contracts`; `buf generate` also produces SDKs for other languages from the same

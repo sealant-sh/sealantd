@@ -1,13 +1,13 @@
 # Consuming sealantd from the monorepo
 
-sealantd ships **two artifacts** that the `get-sealant/sealant` monorepo consumes through different
+sealantd ships **two artifacts** that the `sealant-sh/sealant` monorepo consumes through different
 channels — the daemon **binary** runs inside each sandbox container; the **TypeScript SDK** runs in
 the orchestrator that drives sandboxes over the control socket.
 
 ## 1. The daemon binary → multi-arch image (GHCR)
 
 A `vX.Y.Z` tag triggers `.github/workflows/release.yml`, which builds and pushes a static,
-multi-arch image to `ghcr.io/get-sealant/sealantd`. The runtime layer is `scratch` + one static
+multi-arch image to `ghcr.io/sealant-sh/sealantd`. The runtime layer is `scratch` + one static
 binary.
 
 Bake it into the sandbox image with a single `COPY --from` — buildx selects the matching arch
@@ -15,7 +15,7 @@ automatically for each target platform:
 
 ```dockerfile
 # in the sandbox image the buildkit builder assembles
-COPY --from=ghcr.io/get-sealant/sealantd:X.Y.Z /usr/local/bin/sealantd /usr/local/bin/sealantd
+COPY --from=ghcr.io/sealant-sh/sealantd:X.Y.Z /usr/local/bin/sealantd /usr/local/bin/sealantd
 ```
 
 Pin by version (or by `@sha256:` digest for full reproducibility). Launch it in the sandbox with a

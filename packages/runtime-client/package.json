@@ -5,7 +5,7 @@
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "https://github.com/get-sealant/sealantd.git",
+    "url": "https://github.com/sealant-sh/sealantd.git",
     "directory": "packages/runtime-client"
   },
   "type": "module",

@@ -80,5 +80,5 @@ jobs:
       # Tokenless publish via npm Trusted Publishing: the OIDC id-token (permissions above)
       # authenticates the publish — no stored credential. --provenance attaches a public build
       # attestation (the source repo is public). Configure the matching trusted publisher on
-      # npmjs.com for BOTH packages: repo get-sealant/sealantd, workflow release.yml, env release.
+      # npmjs.com for BOTH packages: repo sealant-sh/sealantd, workflow release.yml, env release.
       - run: pnpm -r publish --access public --no-git-checks --provenance
