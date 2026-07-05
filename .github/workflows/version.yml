@@ -19,7 +19,7 @@ concurrency:
 
 jobs:
   version:
-    if: github.repository == 'get-sealant/sealantd'
+    if: github.repository == 'sealant-sh/sealantd'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:

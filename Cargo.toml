@@ -8,7 +8,7 @@ version = "0.0.0"
 edition = "2024"
 rust-version = "1.96"
 license = "Apache-2.0"
-repository = "https://github.com/get-sealant/sealant"
+repository = "https://github.com/sealant-sh/sealantd"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
