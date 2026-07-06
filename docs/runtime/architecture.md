@@ -1,6 +1,6 @@
 # sealantd Architecture
 
-`sealantd` is the authoritative runtime daemon that runs inside a Sealant Linux sandbox and records a factual evidence trail over a versioned, length-prefixed JSON Unix-socket protocol consumed by a TypeScript SDK. It emits facts; the SDK performs higher-level interpretation (plan §5). This document grounds the target architecture, crate boundaries, the telemetry data path, the sandbox insertion model, the correlation/identity model, and per-subsystem failure policy.
+`sealantd` is the authoritative runtime daemon that runs inside a Sealant Linux workspace and records a factual evidence trail over a versioned, length-prefixed JSON Unix-socket protocol consumed by a TypeScript SDK. It emits facts; the SDK performs higher-level interpretation (plan §5). This document grounds the target architecture, crate boundaries, the telemetry data path, the workspace insertion model, the correlation/identity model, and per-subsystem failure policy.
 
 Sources: `docs/runtime/integration-brief.md` (monorepo seams, real file paths) and `plan.html` (sections cited as "plan §N").
 
@@ -99,15 +99,15 @@ Queue-full behavior is policy-driven and observable: block producers, spill to d
 
 ---
 
-## 4. Sandbox insertion model (`integration-brief.md` §1, §6)
+## 4. Workspace insertion model (`integration-brief.md` §1, §6)
 
-Today command execution is fully delegated to an in-container `sshd` launched with `ForceCommand /usr/local/bin/sandbox-ssh-shell`; the ssh-gateway pipes channels to it (`apps/ssh-gateway/src/gateway-server.ts`). No per-process / PTY / I/O / fs / network capture exists anywhere. `sealantd` takes over PTY/process ownership at two precise seams in the BuildKit renderer.
+Today command execution is fully delegated to an in-container `sshd` launched with `ForceCommand /usr/local/bin/workspace-ssh-shell`; the ssh-gateway pipes channels to it (`apps/ssh-gateway/src/gateway-server.ts`). No per-process / PTY / I/O / fs / network capture exists anywhere. `sealantd` takes over PTY/process ownership at two precise seams in the BuildKit renderer.
 
-**Seam 1 — binary copy (`packages/sandboxes/src/buildkit/buildkit-builder.ts`, `renderContainerfile`).** Immediately after the existing `COPY entrypoint.sh /usr/local/bin/sandbox-entrypoint` at **line 1060**, add `COPY sealantd /usr/local/bin/sealantd` plus `RUN chmod 755`. The binary is staged into the build context alongside `entrypoint.sh` (written by `writeBuildContext`, ~lines 1079–1098).
+**Seam 1 — binary copy (`packages/workspaces/src/buildkit/buildkit-builder.ts`, `renderContainerfile`).** Immediately after the existing `COPY entrypoint.sh /usr/local/bin/workspace-entrypoint` at **line 1060**, add `COPY sealantd /usr/local/bin/sealantd` plus `RUN chmod 755`. The binary is staged into the build context alongside `entrypoint.sh` (written by `writeBuildContext`, ~lines 1079–1098).
 
-**Seam 2 — daemon launch (`renderSandboxEntrypoint`, same file).** Launch `sealantd` in the entrypoint **before the sshd block (line 838)** and **before the foreground harness command (line 842, `printf "$HARNESS_BANNER"`)**, so the daemon owns the PTY/process lifecycle and the gateway's upstream shell/exec lands on a `sealantd`-spawned process rather than a bare login shell.
+**Seam 2 — daemon launch (`renderWorkspaceEntrypoint`, same file).** Launch `sealantd` in the entrypoint **before the sshd block (line 838)** and **before the foreground harness command (line 842, `printf "$HARNESS_BANNER"`)**, so the daemon owns the PTY/process lifecycle and the gateway's upstream shell/exec lands on a `sealantd`-spawned process rather than a bare login shell.
 
-**Control entry point.** `sealantd` binds a Unix domain socket at `/run/sealantd.sock` with permissions `0600` before accepting any control request. The ssh-gateway (which still owns SSH auth, `integration-brief.md` §3) maps its session calls onto the protocol: `session.on("shell")`→`openSession`, `session.on("exec")`→`openSession`(exec), `pipeStreams`→`writeStdin`/stdout-stderr (binary-safe), `window-change`→`resizePty`, `signal`→signal translation, connection `close`→`closeSession`. The sandbox **fails closed** at session-open time if the socket is unreachable (plan §4.4; brief requirement 15).
+**Control entry point.** `sealantd` binds a Unix domain socket at `/run/sealantd.sock` with permissions `0600` before accepting any control request. The ssh-gateway (which still owns SSH auth, `integration-brief.md` §3) maps its session calls onto the protocol: `session.on("shell")`→`openSession`, `session.on("exec")`→`openSession`(exec), `pipeStreams`→`writeStdin`/stdout-stderr (binary-safe), `window-change`→`resizePty`, `signal`→signal translation, connection `close`→`closeSession`. The workspace **fails closed** at session-open time if the socket is unreachable (plan §4.4; brief requirement 15).
 
 **Single artifact.** Ship one statically-linked **musl linux/amd64** binary so it is safe across the three base images (Fedora glibc, Arch glibc, Nix non-FHS `nixos/nix`) without depending on distro-specific shared libraries (`integration-brief.md` §6). PTY allocation works unprivileged; syscall-level fs/network capture (eBPF/ptrace) is deferred because the blueprint→adapter path does not convey the required capabilities today.
 
@@ -119,17 +119,17 @@ Today command execution is fully delegated to an in-container `sshd` launched wi
 
 | Identifier | Meaning | Binding |
 |---|---|---|
-| `RuntimeId` | The daemon instance — one per sandbox+run. | Daemon identity stamped on every event envelope. |
-| `ExecutionId` | Carries the monorepo `runId` (== `attemptId`), the per-run correlation key. | `sandbox_runtime_instances.run_id` PK (1:1), `sandboxSshTargetSchema.attemptId` (`integration-brief.md` §2). |
-| `sandboxId` | Bound at **config level** (boot payload), not per-event minted. | `sandboxes` table PK; SSH carries it as `sbx-{id}` in the username (`integration-brief.md` §2). |
+| `RuntimeId` | The daemon instance — one per workspace+run. | Daemon identity stamped on every event envelope. |
+| `ExecutionId` | Carries the monorepo `runId` (== `attemptId`), the per-run correlation key. | `workspace_runtime_instances.run_id` PK (1:1), `workspaceSshTargetSchema.attemptId` (`integration-brief.md` §2). |
+| `workspaceId` | Bound at **config level** (boot payload), not per-event minted. | `workspaces` table PK; SSH carries it as `ws-{id}` in the username (`integration-brief.md` §2). |
 | `SessionId` | PTY/interactive session correlation. **Minted by sealantd** — no pre-existing format. | Maps to one ssh-gateway shell/exec session. |
 | `ProcessId` | Stable logical process id. **Minted by sealantd.** The OS PID is **never** the stable `ProcessId`; PID/PGID/pidfd are recorded separately. | Per managed command. |
 | `RequestId` | Control-request correlation and duplicate-request handling. | One per protocol request; one ack per request. |
-| `EventId` | Globally unique idempotency / delivery key. | Non-empty string, compatible with `sandboxEventSchema.eventId: NonEmptyTrimmedString` (the only precedent; **no prefix convention**). |
+| `EventId` | Globally unique idempotency / delivery key. | Non-empty string, compatible with `workspaceEventSchema.eventId: NonEmptyTrimmedString` (the only precedent; **no prefix convention**). |
 | `Sequence` | Monotonic order within the runtime's sequence domain — order observed/enqueued by Sealant, not kernel causality. | Assigned at the single deterministic sequencing point (§3). |
 | `StreamOffset` | Monotonic per-stream byte position for I/O events. | One offset domain per `(processId, streamKind)`. |
 
-Key rules: the only sequence-assignment point per runtime guarantees a total order without producer-side races (plan §5, §15); `StreamOffset` gives a separate, gap-free per-stream byte position even when sequence values interleave across streams (plan §8.4, §12). Every emitted event carries `runId`(=`ExecutionId`) and `sandboxId` so it serializes into the existing `{ eventId, sandboxId, attemptId?, type, occurredAt, message?, data }` envelope (`integration-brief.md` §4).
+Key rules: the only sequence-assignment point per runtime guarantees a total order without producer-side races (plan §5, §15); `StreamOffset` gives a separate, gap-free per-stream byte position even when sequence values interleave across streams (plan §8.4, §12). Every emitted event carries `runId`(=`ExecutionId`) and `workspaceId` so it serializes into the existing `{ eventId, workspaceId, attemptId?, type, occurredAt, message?, data }` envelope (`integration-brief.md` §4).
 
 ---
 
@@ -139,7 +139,7 @@ Every subsystem defines explicit degradation. No telemetry loss is silent: whene
 
 | Subsystem | Default | Rationale / on-failure behavior |
 |---|---|---|
-| Control socket bind (`sealant-control`) | **Fail-closed** | If `/run/sealantd.sock` (0600) cannot bind, or is unreachable at session-open, the sandbox refuses the session (brief req 15). The daemon is the run's evidence authority; no daemon = no run. |
+| Control socket bind (`sealant-control`) | **Fail-closed** | If `/run/sealantd.sock` (0600) cannot bind, or is unreachable at session-open, the workspace refuses the session (brief req 15). The daemon is the run's evidence authority; no daemon = no run. |
 | Config validation (`sealant-runtime-core`) | **Fail-closed** | Invalid config never reports healthy; the daemon refuses to start rather than capture under unknown policy (plan §9). |
 | Process exec / control (`sealant-process`) | **Fail-closed** | Process control is the daemon's core duty; an `exec` that cannot start returns a typed error (`process-start-failed`), it does not silently run uninstrumented. |
 | PTY sessions (`sealant-pty`) | **Fail-closed** | `pty-allocation-failed` is surfaced; an interactive session is not silently downgraded to an uninstrumented shell. |

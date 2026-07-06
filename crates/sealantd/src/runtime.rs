@@ -425,7 +425,7 @@ impl Runtime {
         Capabilities {
             schema_version: SCHEMA_VERSION,
             runtime_id: self.config.runtime_id.clone(),
-            sandbox_id: self.config.sandbox_id.clone(),
+            workspace_id: self.config.workspace_id.clone(),
             os: std::env::consts::OS.to_owned(),
             arch: std::env::consts::ARCH.to_owned(),
             daemon_version: DAEMON_VERSION.to_owned(),

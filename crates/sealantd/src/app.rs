@@ -13,9 +13,9 @@ use tokio::sync::watch;
 use crate::runtime::Runtime;
 use crate::shutdown::ShutdownSignal;
 
-/// Sealant sandbox runtime daemon.
+/// Sealant workspace runtime daemon.
 #[derive(Debug, Parser)]
-#[command(name = "sealantd", version, about = "Sealant sandbox runtime daemon")]
+#[command(name = "sealantd", version, about = "Sealant workspace runtime daemon")]
 struct Cli {
     /// Optional subcommand. With none, runs the control server (the bare SDK-spawn invocation).
     #[command(subcommand)]
@@ -28,7 +28,7 @@ struct Cli {
 /// `sealantd` subcommands.
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// PID-1 sandbox supervisor: prepare the workspace, clone, ssh, dotfiles, and lifecycle, then
+    /// PID-1 workspace supervisor: prepare the workspace, clone, ssh, dotfiles, and lifecycle, then
     /// run the control server in-process and supervise the harness. Configured entirely via the
     /// `SEALANT_*` environment contract.
     Boot(BootArgs),
@@ -64,9 +64,9 @@ struct ServeArgs {
     /// Route child egress through an explicit local proxy and observe HTTP/CONNECT metadata.
     #[arg(long)]
     network_proxy: bool,
-    /// Bound sandbox id.
+    /// Bound workspace id.
     #[arg(long)]
-    sandbox_id: Option<String>,
+    workspace_id: Option<String>,
     /// Default execution (run) id.
     #[arg(long)]
     execution_id: Option<String>,
@@ -101,8 +101,8 @@ fn build_config(cli: &ServeArgs) -> RuntimeConfig {
     if cli.network_proxy {
         config.network_mode = NetworkMode::Proxy;
     }
-    if let Some(sandbox_id) = &cli.sandbox_id {
-        config.sandbox_id = Some(sandbox_id.clone());
+    if let Some(workspace_id) = &cli.workspace_id {
+        config.workspace_id = Some(workspace_id.clone());
     }
     if let Some(execution_id) = &cli.execution_id {
         config.default_execution_id = Some(execution_id.clone().into());

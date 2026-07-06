@@ -483,9 +483,9 @@ pub struct Capabilities {
     pub schema_version: u32,
     /// Daemon instance id.
     pub runtime_id: RuntimeId,
-    /// Bound sandbox id, when known.
+    /// Bound workspace id, when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sandbox_id: Option<String>,
+    pub workspace_id: Option<String>,
     /// Operating system (e.g. `linux`).
     pub os: String,
     /// CPU architecture (e.g. `x86_64`).

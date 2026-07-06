@@ -6,7 +6,7 @@ Accepted, 2026-06-20.
 
 ## Context
 
-sealantd ships as a binary copied into the sandbox image and launched from the
+sealantd ships as a binary copied into the workspace image and launched from the
 entrypoint (brief §1, §6). The image is built three ways via `distroDefinitions`
 in `buildkit-builder.ts` (≈187/212/237): **Fedora 41** (glibc), **Arch** (glibc),
 and **`nixos/nix:latest`** (non-FHS, no `/usr/sbin`, nonstandard library layout).
@@ -70,7 +70,7 @@ Thus static musl is taken without violating the plan §20 caveat.
   **immediately after `buildkit-builder.ts:1060`** (the `COPY entrypoint.sh`
   line). Build remains `DOCKER_BUILDKIT=1 docker build` then `docker save`
   (lines 1124-1141).
-- In `renderSandboxEntrypoint`, launch sealantd **before the sshd block (~838)
+- In `renderWorkspaceEntrypoint`, launch sealantd **before the sshd block (~838)
   and before the foreground harness command at `:842`**, so the gateway's
   upstream shell/exec lands on a sealantd-spawned process and sealantd owns the
   PTY (brief §1). The entrypoint must create a writable runtime dir for the

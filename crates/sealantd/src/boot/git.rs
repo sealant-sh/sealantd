@@ -2,7 +2,7 @@
 //!
 //! Credentials are written under the SSH-runtime directory and applied *only* to the clone
 //! `Command`'s environment — never to the process env or the harness passthrough — then wiped
-//! (E6/E10). This is the typed port of the bash `cleanup_sandbox_clone_auth` discipline.
+//! (E6/E10). This is the typed port of the bash `cleanup_workspace_clone_auth` discipline.
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -53,7 +53,7 @@ pub(crate) fn materialize_clone_auth(
         CloneAuth::SshKey { key_b64 } => {
             let key = BASE64
                 .decode(key_b64.trim())
-                .map_err(|e| BootError::base64("SEALANT_SANDBOX_AUTH_KEY_BASE64", e))?;
+                .map_err(|e| BootError::base64("SEALANT_WORKSPACE_AUTH_KEY_BASE64", e))?;
             let key_path = runtime_dir.join("repo_ssh_key");
             write_secret_file(&key_path, &key, 0o600)?;
             out.files.push(key_path.clone());
@@ -100,7 +100,7 @@ fn write_secret_file(path: &Path, contents: &[u8], mode: u32) -> Result<(), Boot
     Ok(())
 }
 
-/// Clone the sandbox repository if it is not already present (E9).
+/// Clone the workspace repository if it is not already present (E9).
 ///
 /// Returns `Ok(false)` if the working directory already contains a checkout (no-op), `Ok(true)` if
 /// a clone was performed.
@@ -138,7 +138,7 @@ pub(crate) fn clone_repo_if_absent(
         .arg(working_directory);
     auth.apply(&mut command);
 
-    tracing::info!(url = %config.repo.url, reference = %config.repo.reference, "cloning sandbox repository");
+    tracing::info!(url = %config.repo.url, reference = %config.repo.reference, "cloning workspace repository");
     let status = command
         .status()
         .map_err(|e| BootError::Clone(format!("could not spawn git: {e}")))?;

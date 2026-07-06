@@ -18,12 +18,12 @@ decoding, and generate Rust fixtures consumed by TS and TS fixtures consumed by
 Rust.
 
 The monorepo already fixes the TS conventions to mirror (brief §5, from
-`packages/api-contracts/src/core-api/sandboxes.ts`): **Effect Schema**, not raw
+`packages/api-contracts/src/core-api/workspaces.ts`): **Effect Schema**, not raw
 types; `Schema.Literal(...)` for enums (never `Schema.String`);
 `Schema.optional(X)` for nullable (never `Schema.Union(X, Schema.Null)`);
 `Schema.NonEmptyTrimmedString` for IDs; `Schema.Struct` with camelCase fields;
 export both `const xSchema` and `type X = typeof xSchema.Type`. Errors follow
-the 8 `Sandbox*Error` classes (`sandboxes.ts:215-293`) using
+the 8 `Workspace*Error` classes (`workspaces.ts:215-293`) using
 `Schema.TaggedError` with HTTP status annotations. Packaging conventions (brief
 §5, from `api-contracts/package.json` + `pnpm-workspace.yaml`): `"version":
 "0.0.0"`, `"private": true`, `"type": "module"`, source `exports`
@@ -53,7 +53,7 @@ hand-defines a wire type.
 - IDs (`RuntimeId`, `ExecutionId`, `SessionId`, `ProcessId`, `RequestId`,
   `EventId`, `Sequence`, `StreamOffset` — plan §8.3) map to
   `Schema.NonEmptyTrimmedString`-based branded schemas, consistent with
-  `sandboxEventSchema.eventId` (`sandboxes.ts:195`).
+  `workspaceEventSchema.eventId` (`workspaces.ts:195`).
 - Closed enums (capture modes, runtime states, event types) →
   `Schema.Literal(...)` unions, never `Schema.String`.
 - Optional fields → `Schema.optional(X)`, never `Schema.Union(X, Schema.Null)`.
@@ -64,8 +64,8 @@ hand-defines a wire type.
   encode/decode utilities in `runtime-client`; UTF-8 is never assumed.
 
 **Error codes** are a single closed `Schema.Literal` code set, modeled as
-`Schema.TaggedError` classes mirroring the `Sandbox*Error` pattern
-(`sandboxes.ts:215-293`). The client deserializes any protocol error into a
+`Schema.TaggedError` classes mirroring the `Workspace*Error` pattern
+(`workspaces.ts:215-293`). The client deserializes any protocol error into a
 typed member of that closed union; an unknown error code is itself a decode
 error, not a silent pass-through (errors are closed, unlike events below).
 
@@ -124,7 +124,7 @@ Negative:
 - **Raw `Schema.String` enums / `Schema.Union(X, Null)`.** Rejected: contradicts
   the established `api-contracts` conventions (brief §5); loses exact error/enum
   unions required by plan §19.
-- **zod v4 (as used by `packages/sandboxes`/`validators`, brief §5).** Rejected:
+- **zod v4 (as used by `packages/workspaces`/`validators`, brief §5).** Rejected:
   the protocol is consumed by an Effect-based API surface; mirroring
   `api-contracts` (Effect Schema) keeps one idiom at the wire boundary.
 - **protobuf/gRPC instead of framed JSON.** Rejected here as a schema concern;

@@ -1,8 +1,8 @@
 # Consuming sealantd from the monorepo
 
 sealantd ships **two artifacts** that the `sealant-sh/sealant` monorepo consumes through different
-channels — the daemon **binary** runs inside each sandbox container; the **TypeScript SDK** runs in
-the orchestrator that drives sandboxes over the control socket.
+channels — the daemon **binary** runs inside each workspace container; the **TypeScript SDK** runs in
+the orchestrator that drives workspaces over the control socket.
 
 ## 1. The daemon binary → multi-arch image (GHCR)
 
@@ -10,15 +10,15 @@ A `vX.Y.Z` tag triggers `.github/workflows/release.yml`, which builds and pushes
 multi-arch image to `ghcr.io/sealant-sh/sealantd`. The runtime layer is `scratch` + one static
 binary.
 
-Bake it into the sandbox image with a single `COPY --from` — buildx selects the matching arch
+Bake it into the workspace image with a single `COPY --from` — buildx selects the matching arch
 automatically for each target platform:
 
 ```dockerfile
-# in the sandbox image the buildkit builder assembles
+# in the workspace image the buildkit builder assembles
 COPY --from=ghcr.io/sealant-sh/sealantd:X.Y.Z /usr/local/bin/sealantd /usr/local/bin/sealantd
 ```
 
-Pin by version (or by `@sha256:` digest for full reproducibility). Launch it in the sandbox with a
+Pin by version (or by `@sha256:` digest for full reproducibility). Launch it in the workspace with a
 socket on a shared path, e.g.:
 
 ```sh
@@ -31,7 +31,7 @@ Run it as the **same uid** as the controlling process so peer-credential validat
 ### Without a registry (alternative)
 
 `scripts/build-release.sh` emits `dist/sealantd-{amd64,arm64}`; attach them to a GitHub Release and
-`curl` the right arch in the sandbox Dockerfile. Simpler infra, but you own arch selection +
+`curl` the right arch in the workspace Dockerfile. Simpler infra, but you own arch selection +
 checksum verification.
 
 ## 2. The TypeScript SDK → npm

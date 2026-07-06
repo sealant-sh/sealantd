@@ -37,7 +37,7 @@ examples/demo.sh
 | `--spool-dir <dir>` | Enable the durable telemetry spool (crash-safe at-least-once delivery). |
 | `--watch-filesystem` | Baseline snapshot + live watch + final diff of the workspace. |
 | `--network-proxy` | Route child egress through the explicit proxy and observe HTTP/CONNECT. |
-| `--sandbox-id`, `--execution-id` | Correlation identifiers stamped onto telemetry. |
+| `--workspace-id`, `--execution-id` | Correlation identifiers stamped onto telemetry. |
 | `--shell <path>` | Default shell for interactive PTY sessions. |
 | `--check-config` | Validate config, print a sanitized summary, exit. |
 | `--print-capabilities` | Print the capability report (JSON) and exit. |

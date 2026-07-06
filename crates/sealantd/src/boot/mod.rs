@@ -1,4 +1,4 @@
-//! `sealantd boot`: the PID-1 sandbox supervisor.
+//! `sealantd boot`: the PID-1 workspace supervisor.
 //!
 //! `boot` is the container's PID 1. It reproduces every step the legacy bash entrypoint performed —
 //! workspace prep, glibc loader shim, git clone with scoped credentials, runtime dotfiles, lifecycle
@@ -35,7 +35,7 @@ pub use error::BootError;
 
 use config::{ForegroundConfig, LifecycleStep, OsFamily, Shell};
 
-/// The directory under the sandbox root holding boot-time clone credentials and dotfiles state.
+/// The directory under the workspace root holding boot-time clone credentials and dotfiles state.
 const SSH_RUNTIME_SUBDIR: &str = ".ssh-runtime";
 
 /// Entry point for the `boot` subcommand. Performs synchronous prep, then enters Tokio to run the
@@ -104,16 +104,16 @@ fn prepare(config: &BootConfig) -> Result<(), BootError> {
     Ok(())
 }
 
-/// The SSH-runtime / credential directory under the sandbox root.
+/// The SSH-runtime / credential directory under the workspace root.
 fn ssh_runtime_dir(config: &BootConfig) -> PathBuf {
-    config.workspace.sandbox_root.join(SSH_RUNTIME_SUBDIR)
+    config.workspace.workspace_root.join(SSH_RUNTIME_SUBDIR)
 }
 
-/// Step 3: create the standard directories and chdir into the sandbox root. The harness child's
+/// Step 3: create the standard directories and chdir into the workspace root. The harness child's
 /// identity/PATH are injected via `child_env` (see [`harness_child_env`]), not the process env.
 fn prepare_workspace(config: &BootConfig) -> Result<(), BootError> {
     let mut dirs: Vec<PathBuf> = vec![
-        config.workspace.sandbox_root.clone(),
+        config.workspace.workspace_root.clone(),
         config.workspace.working_directory.clone(),
         ssh_runtime_dir(config),
         PathBuf::from("/root"),
@@ -132,8 +132,8 @@ fn prepare_workspace(config: &BootConfig) -> Result<(), BootError> {
     // `/usr/local/bin` PATH prepend are injected explicitly via `child_env` in `harness_child_env`,
     // which is the only consumer that needs them. The clone helper commands inherit boot's own env
     // (PATH already includes the system dirs).
-    std::env::set_current_dir(&config.workspace.sandbox_root)
-        .map_err(|e| BootError::io_path("chdir", &config.workspace.sandbox_root, e))?;
+    std::env::set_current_dir(&config.workspace.workspace_root)
+        .map_err(|e| BootError::io_path("chdir", &config.workspace.workspace_root, e))?;
     Ok(())
 }
 
@@ -187,7 +187,7 @@ fn into_runtime_config(config: &BootConfig) -> RuntimeConfig {
     } else {
         NetworkMode::Off
     };
-    runtime_config.sandbox_id = config.control.sandbox_id.clone();
+    runtime_config.workspace_id = config.control.workspace_id.clone();
     runtime_config.default_execution_id = config.control.execution_id.clone().map(ExecutionId::new);
     runtime_config.default_shell = config.shells.login.display().to_string();
     runtime_config.log_level = "info".to_owned();

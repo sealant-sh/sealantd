@@ -78,7 +78,7 @@ pub struct ProcessRuntime {
     pub clock: Arc<Clock>,
     /// Runtime configuration.
     pub config: Arc<RuntimeConfig>,
-    /// Extra environment injected into every child last (e.g. egress-proxy routing); the sandbox
+    /// Extra environment injected into every child last (e.g. egress-proxy routing); the workspace
     /// controls these so a request cannot override them.
     pub extra_env: Arc<std::sync::Mutex<Vec<(String, String)>>>,
     /// Secret redactor applied to captured I/O.

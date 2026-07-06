@@ -28,5 +28,5 @@ RUN set -eux; \
 # Minimal runtime: a single static binary on scratch (no shell, no libc, no attack surface).
 FROM scratch AS runtime
 COPY --from=builder /sealantd /usr/local/bin/sealantd
-# Default socket lives in the sandbox's runtime dir; override via flags.
+# Default socket lives in the workspace's runtime dir; override via flags.
 ENTRYPOINT ["/usr/local/bin/sealantd"]

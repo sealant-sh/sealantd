@@ -25,7 +25,7 @@ pub fn set_child_subreaper() -> bool {
 }
 
 /// Best-effort `PR_SET_NO_NEW_PRIVS` (plan §18): after this, no child can gain privileges via a
-/// setuid/setgid binary or file capabilities. Irreversible and inherited; safe for a sandbox that
+/// setuid/setgid binary or file capabilities. Irreversible and inherited; safe for a workspace that
 /// never relies on privilege escalation. Returns whether it took effect (Linux only).
 #[cfg(target_os = "linux")]
 #[must_use]

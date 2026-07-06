@@ -5,7 +5,7 @@ use sealant_protocol::NetworkMode;
 /// Resolve a requested mode to the best mode actually available without elevated privilege.
 ///
 /// Privileged/metadata raw-socket backends need capabilities (`CAP_NET_ADMIN` / `CAP_BPF`) that the
-/// sandbox does not convey; absent them, we degrade to the userspace proxy rather than failing.
+/// workspace does not convey; absent them, we degrade to the userspace proxy rather than failing.
 #[must_use]
 pub fn detect_mode(requested: NetworkMode) -> NetworkMode {
     match requested {

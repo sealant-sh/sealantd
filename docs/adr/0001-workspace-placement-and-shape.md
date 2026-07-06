@@ -61,7 +61,7 @@ release event.
 - The Rust workspace is the unit of churn during the build-up phase and must not
   be entangled with the monorepo's pnpm/turbo graph or CI while crates are stubs.
 - The TS packages must be drop-in for the monorepo's Effect-based contracts
-  (`packages/api-contracts/src/core-api/sandboxes.ts` is the pattern of record).
+  (`packages/api-contracts/src/core-api/workspaces.ts` is the pattern of record).
 - A single repo keeps the Rust serde schema source and the generated TS types in
   one place, which ADR-0002 requires for schema generation to be a build-local
   step rather than a cross-repo pipeline.

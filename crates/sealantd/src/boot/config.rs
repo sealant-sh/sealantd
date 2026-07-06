@@ -1,6 +1,6 @@
 //! Typed configuration for `sealantd boot`, loaded once from the `SEALANT_*` environment contract.
 //!
-//! Every value the legacy bash entrypoint baked inline (sandbox root, working directory, repo
+//! Every value the legacy bash entrypoint baked inline (workspace root, working directory, repo
 //! url/ref, harness banner, shell paths, lifecycle steps, foreground command) now arrives through
 //! environment variables: build-static literals as image `ENV`, run-dynamic/secret values via
 //! `docker run -e`. [`BootConfig::from_env`] reads them, parses, and validates *before* any side
@@ -13,10 +13,10 @@ use serde::Deserialize;
 
 use crate::boot::error::BootError;
 
-/// Default sandbox root when `SEALANT_SANDBOX_ROOT` is unset.
-const DEFAULT_SANDBOX_ROOT: &str = "/sandbox";
+/// Default workspace root when `SEALANT_WORKSPACE_ROOT` is unset.
+const DEFAULT_WORKSPACE_ROOT: &str = "/workspace";
 /// Default working directory when `SEALANT_WORKING_DIRECTORY` is unset.
-const DEFAULT_WORKING_DIRECTORY: &str = "/sandbox/repo";
+const DEFAULT_WORKING_DIRECTORY: &str = "/workspace/repo";
 /// Default control socket path.
 const DEFAULT_CONTROL_SOCKET: &str = "/run/sealant/control.sock";
 /// Default HTTP git/dotfiles username.
@@ -27,13 +27,13 @@ const DEFAULT_DOTFILES_BOOTSTRAP_COMMAND: &str = "./install.sh";
 /// All `SEALANT_*` keys this loader consumes. Used to compute the harness passthrough environment
 /// (every other env var) and to redact secrets from it.
 const CONSUMED_KEYS: &[&str] = &[
-    "SEALANT_SANDBOX_ROOT",
+    "SEALANT_WORKSPACE_ROOT",
     "SEALANT_WORKING_DIRECTORY",
-    "SEALANT_SANDBOX_REPO_URL",
-    "SEALANT_SANDBOX_REPO_REF",
-    "SEALANT_SANDBOX_AUTH_KEY_BASE64",
-    "SEALANT_SANDBOX_HTTP_USERNAME",
-    "SEALANT_SANDBOX_HTTP_TOKEN",
+    "SEALANT_WORKSPACE_REPO_URL",
+    "SEALANT_WORKSPACE_REPO_REF",
+    "SEALANT_WORKSPACE_AUTH_KEY_BASE64",
+    "SEALANT_WORKSPACE_HTTP_USERNAME",
+    "SEALANT_WORKSPACE_HTTP_TOKEN",
     "SEALANT_DOTFILES_RUNTIME_APPLY",
     "SEALANT_DOTFILES_REPO_URL",
     "SEALANT_DOTFILES_REPO_REF",
@@ -59,7 +59,7 @@ const CONSUMED_KEYS: &[&str] = &[
     "SEALANT_NETWORK_PROXY",
     "SEALANT_SPOOL_DIR",
     "SEALANT_EXECUTION_ID",
-    "SEALANT_SANDBOX_ID",
+    "SEALANT_WORKSPACE_ID",
 ];
 
 /// Substring/suffix markers identifying secret env keys that must never reach the harness env.
@@ -131,13 +131,13 @@ impl EnvSource for MapEnv {
 /// Workspace layout (build-static).
 #[derive(Debug, Clone)]
 pub struct WorkspaceConfig {
-    /// Sandbox root, e.g. `/sandbox`.
-    pub sandbox_root: PathBuf,
+    /// Workspace root, e.g. `/workspace`.
+    pub workspace_root: PathBuf,
     /// Working directory the repo is cloned into and the harness runs in.
     pub working_directory: PathBuf,
 }
 
-/// The sandbox repository to clone.
+/// The workspace repository to clone.
 #[derive(Debug, Clone)]
 pub struct RepoConfig {
     /// Clone URL.
@@ -325,8 +325,8 @@ pub struct ControlConfig {
     pub spool_dir: Option<PathBuf>,
     /// Default execution id, when supplied.
     pub execution_id: Option<String>,
-    /// Bound sandbox id, when supplied.
-    pub sandbox_id: Option<String>,
+    /// Bound workspace id, when supplied.
+    pub workspace_id: Option<String>,
 }
 
 /// The fully-parsed, validated boot configuration.
@@ -378,10 +378,10 @@ impl BootConfig {
     /// Returns [`BootError::Config`] if a required value is missing/invalid.
     pub fn load(env: &dyn EnvSource) -> Result<Self, BootError> {
         let workspace = WorkspaceConfig {
-            sandbox_root: env
-                .get("SEALANT_SANDBOX_ROOT")
+            workspace_root: env
+                .get("SEALANT_WORKSPACE_ROOT")
                 .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| DEFAULT_SANDBOX_ROOT.to_owned())
+                .unwrap_or_else(|| DEFAULT_WORKSPACE_ROOT.to_owned())
                 .into(),
             working_directory: env
                 .get("SEALANT_WORKING_DIRECTORY")
@@ -391,13 +391,13 @@ impl BootConfig {
         };
 
         let url = env
-            .get("SEALANT_SANDBOX_REPO_URL")
+            .get("SEALANT_WORKSPACE_REPO_URL")
             .filter(|s| !s.is_empty())
-            .ok_or_else(|| BootError::config("SEALANT_SANDBOX_REPO_URL is required"))?;
+            .ok_or_else(|| BootError::config("SEALANT_WORKSPACE_REPO_URL is required"))?;
         let reference = env
-            .get("SEALANT_SANDBOX_REPO_REF")
+            .get("SEALANT_WORKSPACE_REPO_REF")
             .filter(|s| !s.is_empty())
-            .ok_or_else(|| BootError::config("SEALANT_SANDBOX_REPO_REF is required"))?;
+            .ok_or_else(|| BootError::config("SEALANT_WORKSPACE_REPO_REF is required"))?;
         let repo = RepoConfig { url, reference };
 
         let clone_auth = Self::load_clone_auth(env);
@@ -411,7 +411,7 @@ impl BootConfig {
         let banner = env
             .get("SEALANT_HARNESS_BANNER")
             .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "Starting sandbox".to_owned());
+            .unwrap_or_else(|| "Starting workspace".to_owned());
 
         let oci_runtime = match env.get("SEALANT_OCI_RUNTIME").as_deref() {
             Some("runsc") => OciRuntime::Runsc,
@@ -464,7 +464,7 @@ impl BootConfig {
                 .filter(|s| !s.is_empty())
                 .map(Into::into),
             execution_id: env.get("SEALANT_EXECUTION_ID").filter(|s| !s.is_empty()),
-            sandbox_id: env.get("SEALANT_SANDBOX_ID").filter(|s| !s.is_empty()),
+            workspace_id: env.get("SEALANT_WORKSPACE_ID").filter(|s| !s.is_empty()),
         };
 
         let passthrough_env = passthrough_env(env);
@@ -487,17 +487,17 @@ impl BootConfig {
 
     fn load_clone_auth(env: &dyn EnvSource) -> CloneAuth {
         if let Some(key) = env
-            .get("SEALANT_SANDBOX_AUTH_KEY_BASE64")
+            .get("SEALANT_WORKSPACE_AUTH_KEY_BASE64")
             .filter(|s| !s.is_empty())
         {
             return CloneAuth::SshKey { key_b64: key };
         }
         if let Some(token) = env
-            .get("SEALANT_SANDBOX_HTTP_TOKEN")
+            .get("SEALANT_WORKSPACE_HTTP_TOKEN")
             .filter(|s| !s.is_empty())
         {
             let username = env
-                .get("SEALANT_SANDBOX_HTTP_USERNAME")
+                .get("SEALANT_WORKSPACE_HTTP_USERNAME")
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| DEFAULT_HTTP_USERNAME.to_owned());
             return CloneAuth::HttpToken { username, token };
@@ -649,8 +649,8 @@ mod tests {
 
     fn base_pairs() -> Vec<(&'static str, &'static str)> {
         vec![
-            ("SEALANT_SANDBOX_REPO_URL", "git@github.com:o/r.git"),
-            ("SEALANT_SANDBOX_REPO_REF", "main"),
+            ("SEALANT_WORKSPACE_REPO_URL", "git@github.com:o/r.git"),
+            ("SEALANT_WORKSPACE_REPO_REF", "main"),
             ("SEALANT_OS_FAMILY", "fedora"),
             ("SEALANT_HARNESS_LAUNCH_COMMAND", "claude --dangerously"),
         ]
@@ -666,10 +666,10 @@ mod tests {
     #[test]
     fn minimal_config_uses_defaults() {
         let cfg = load_with(&[]).expect("valid");
-        assert_eq!(cfg.workspace.sandbox_root, PathBuf::from("/sandbox"));
+        assert_eq!(cfg.workspace.workspace_root, PathBuf::from("/workspace"));
         assert_eq!(
             cfg.workspace.working_directory,
-            PathBuf::from("/sandbox/repo")
+            PathBuf::from("/workspace/repo")
         );
         assert_eq!(cfg.repo.url, "git@github.com:o/r.git");
         assert_eq!(cfg.repo.reference, "main");
@@ -694,7 +694,7 @@ mod tests {
     #[test]
     fn missing_repo_url_is_fatal() {
         let env = MapEnv::from_pairs(&[
-            ("SEALANT_SANDBOX_REPO_REF", "main"),
+            ("SEALANT_WORKSPACE_REPO_REF", "main"),
             ("SEALANT_OS_FAMILY", "fedora"),
             ("SEALANT_HARNESS_LAUNCH_COMMAND", "x"),
         ]);
@@ -704,8 +704,8 @@ mod tests {
     #[test]
     fn missing_os_family_is_fatal() {
         let env = MapEnv::from_pairs(&[
-            ("SEALANT_SANDBOX_REPO_URL", "u"),
-            ("SEALANT_SANDBOX_REPO_REF", "main"),
+            ("SEALANT_WORKSPACE_REPO_URL", "u"),
+            ("SEALANT_WORKSPACE_REPO_REF", "main"),
             ("SEALANT_HARNESS_LAUNCH_COMMAND", "x"),
         ]);
         assert!(BootConfig::load(&env).is_err());
@@ -714,8 +714,8 @@ mod tests {
     #[test]
     fn ssh_key_auth_wins_over_http_token() {
         let cfg = load_with(&[
-            ("SEALANT_SANDBOX_AUTH_KEY_BASE64", "Zm9v"),
-            ("SEALANT_SANDBOX_HTTP_TOKEN", "ghs_xxx"),
+            ("SEALANT_WORKSPACE_AUTH_KEY_BASE64", "Zm9v"),
+            ("SEALANT_WORKSPACE_HTTP_TOKEN", "ghs_xxx"),
         ])
         .expect("valid");
         assert!(matches!(cfg.clone_auth, CloneAuth::SshKey { .. }));
@@ -723,7 +723,7 @@ mod tests {
 
     #[test]
     fn http_token_auth_defaults_username() {
-        let cfg = load_with(&[("SEALANT_SANDBOX_HTTP_TOKEN", "ghs_xxx")]).expect("valid");
+        let cfg = load_with(&[("SEALANT_WORKSPACE_HTTP_TOKEN", "ghs_xxx")]).expect("valid");
         match cfg.clone_auth {
             CloneAuth::HttpToken { username, token } => {
                 assert_eq!(username, "x-access-token");
@@ -822,7 +822,7 @@ mod tests {
     #[test]
     fn passthrough_drops_consumed_and_secret_keys() {
         let cfg = load_with(&[
-            ("SEALANT_SANDBOX_HTTP_TOKEN", "ghs_secret"),
+            ("SEALANT_WORKSPACE_HTTP_TOKEN", "ghs_secret"),
             ("MY_TOKEN", "should-drop"),
             ("ANTHROPIC_API_KEY", "should-drop"),
             ("PATH", "/usr/bin"),
@@ -838,8 +838,8 @@ mod tests {
         assert!(keys.contains(&"MY_PLAIN"));
         assert!(!keys.contains(&"MY_TOKEN"));
         assert!(!keys.contains(&"ANTHROPIC_API_KEY"));
-        assert!(!keys.contains(&"SEALANT_SANDBOX_HTTP_TOKEN"));
-        assert!(!keys.contains(&"SEALANT_SANDBOX_REPO_URL"));
+        assert!(!keys.contains(&"SEALANT_WORKSPACE_HTTP_TOKEN"));
+        assert!(!keys.contains(&"SEALANT_WORKSPACE_REPO_URL"));
     }
 
     #[test]
