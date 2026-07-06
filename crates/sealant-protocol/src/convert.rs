@@ -1011,7 +1011,7 @@ impl From<Capabilities> for wire::Capabilities {
         Self {
             schema_version: c.schema_version,
             runtime_id: c.runtime_id.into_inner(),
-            sandbox_id: c.sandbox_id,
+            workspace_id: c.workspace_id,
             os: c.os,
             arch: c.arch,
             daemon_version: c.daemon_version,
@@ -1026,7 +1026,7 @@ impl TryFrom<wire::Capabilities> for Capabilities {
         Ok(Self {
             schema_version: c.schema_version,
             runtime_id: RuntimeId::new(c.runtime_id),
-            sandbox_id: c.sandbox_id,
+            workspace_id: c.workspace_id,
             os: c.os,
             arch: c.arch,
             daemon_version: c.daemon_version,

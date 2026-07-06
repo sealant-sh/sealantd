@@ -1,6 +1,6 @@
 # sealantd
 
-The authoritative runtime daemon that runs inside Sealant Linux sandboxes. It records a
+The authoritative runtime daemon that runs inside Sealant Linux workspaces. It records a
 trustworthy factual record of an execution — process/PTY lifecycle, binary-safe I/O, filesystem
 and network evidence — and exposes it over a versioned, length-prefixed **Protobuf** control
 protocol (ADR-0012) on a Unix domain socket, consumed by a TypeScript SDK (and any language Buf can

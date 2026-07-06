@@ -1,5 +1,5 @@
 # Release pipeline: on a vX.Y.Z tag, build and push a multi-arch (amd64 + arm64) static sealantd
-# image to GHCR. The sandbox image consumes it via `COPY --from` (see docs/runtime/integration.md).
+# image to GHCR. The workspace image consumes it via `COPY --from` (see docs/runtime/integration.md).
 name: release
 
 on:

@@ -10,9 +10,9 @@ use sha2::{Digest, Sha256};
 
 use crate::error::ConfigError;
 
-/// Default Unix control-socket path inside a sandbox.
+/// Default Unix control-socket path inside a workspace.
 pub const DEFAULT_SOCKET_PATH: &str = "/run/sealantd.sock";
-/// Default workspace root inside a sandbox.
+/// Default workspace (repository/observation) root.
 pub const DEFAULT_WORKSPACE_ROOT: &str = "/workspace";
 
 /// All runtime configuration. Values are validated by [`RuntimeConfig::validate`] before the
@@ -21,11 +21,11 @@ pub const DEFAULT_WORKSPACE_ROOT: &str = "/workspace";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RuntimeConfig {
-    /// Daemon instance identity (one per sandbox+run).
+    /// Daemon instance identity (one per workspace+run).
     pub runtime_id: RuntimeId,
-    /// Bound sandbox id, when known.
+    /// Bound workspace id, when known.
     #[serde(default)]
-    pub sandbox_id: Option<String>,
+    pub workspace_id: Option<String>,
     /// Default execution id (the monorepo run/attempt id), when known.
     #[serde(default)]
     pub default_execution_id: Option<ExecutionId>,
@@ -71,7 +71,7 @@ pub struct RuntimeConfig {
     pub allowed_peer_uids: Vec<u32>,
 }
 
-/// Default bounded limits for the smallest sandbox.
+/// Default bounded limits for the smallest workspace.
 #[must_use]
 pub fn default_limits() -> Limits {
     Limits {
@@ -91,7 +91,7 @@ impl RuntimeConfig {
     pub fn new(runtime_id: RuntimeId) -> Self {
         Self {
             runtime_id,
-            sandbox_id: None,
+            workspace_id: None,
             default_execution_id: None,
             socket_path: PathBuf::from(DEFAULT_SOCKET_PATH),
             workspace_root: PathBuf::from(DEFAULT_WORKSPACE_ROOT),
@@ -173,7 +173,7 @@ impl RuntimeConfig {
         let env_keys: Vec<&str> = self.child_env.iter().map(|e| e.key.as_str()).collect();
         serde_json::json!({
             "runtimeId": self.runtime_id,
-            "sandboxId": self.sandbox_id,
+            "workspaceId": self.workspace_id,
             "defaultExecutionId": self.default_execution_id,
             "socketPath": self.socket_path,
             "workspaceRoot": self.workspace_root,

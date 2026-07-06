@@ -172,7 +172,7 @@ export class SealantClient {
     binPath: string;
     socketPath: string;
     workspace?: string;
-    sandboxId?: string;
+    workspaceId?: string;
     executionId?: string;
     spoolDir?: string;
     watchFilesystem?: boolean;
@@ -181,7 +181,7 @@ export class SealantClient {
   }): Promise<{ client: SealantClient; child: ChildProcess }> {
     const args = ["--socket", options.socketPath, "--log-level", options.logLevel ?? "off"];
     if (options.workspace) args.push("--workspace", options.workspace);
-    if (options.sandboxId) args.push("--sandbox-id", options.sandboxId);
+    if (options.workspaceId) args.push("--workspace-id", options.workspaceId);
     if (options.executionId) args.push("--execution-id", options.executionId);
     if (options.spoolDir) args.push("--spool-dir", options.spoolDir);
     if (options.watchFilesystem) args.push("--watch-filesystem");

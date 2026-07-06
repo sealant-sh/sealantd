@@ -51,7 +51,7 @@ test("starts daemon, execs, streams typed events, gets the result, and shuts dow
     binPath,
     socketPath,
     workspace: tmpdir(),
-    sandboxId: "sbx-e2e",
+    workspaceId: "ws-e2e",
     executionId: "run-e2e",
   });
   try {

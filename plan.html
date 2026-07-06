@@ -326,7 +326,7 @@
     <h1>Build <code>sealantd</code> in Rust</h1>
     <p class="subtitle">
       A comprehensive, production-oriented plan for the authoritative runtime daemon inside
-      Sealant sandboxes. This document is deliberately detailed: it defines responsibilities,
+      Sealant workspaces. This document is deliberately detailed: it defines responsibilities,
       architecture, protocol, process and PTY behavior, telemetry, durability, security,
       TypeScript integration, multi-agent workflows, and the validation loop required to prove
       the daemon works.
@@ -389,7 +389,7 @@
       </div>
       <p>
         <code>sealantd</code> is the authoritative runtime daemon that runs inside Sealant Linux
-        sandboxes and development containers. Build it in Rust and integrate it with the existing
+        workspaces and development containers. Build it in Rust and integrate it with the existing
         TypeScript codebase through a versioned, typed protocol.
       </p>
       <p>
@@ -409,7 +409,7 @@
     <section id="context">
       <h2>2. Product context and responsibility boundary</h2>
       <p>
-        Sealant provides customized development sandboxes for LLM-driven software work. A sandbox
+        Sealant provides customized development workspaces for LLM-driven software work. A workspace
         can contain a checked-out repository, shell configuration, dotfiles, language runtimes,
         package managers, LLM harnesses, coding agents, tests, linters, development servers, and
         user-defined tools.
@@ -430,7 +430,7 @@
           </thead>
           <tbody>
             <tr>
-              <td>Runtime behavior after sandbox startup</td>
+              <td>Runtime behavior after workspace startup</td>
               <td>Image building and BuildKit orchestration</td>
             </tr>
             <tr>
@@ -613,7 +613,7 @@
       <p>Before implementation, perform repository discovery and create traceable planning artifacts.</p>
       <ol>
         <li>Inspect the monorepo structure, package manager, CI, TypeScript conventions, Docker/BuildKit setup, protocol packages, and deployment assumptions.</li>
-        <li>Search for all existing references to sandboxes, execution IDs, sessions, SSH proxying, telemetry, networking, and wrapper/orchestrator behavior.</li>
+        <li>Search for all existing references to workspaces, execution IDs, sessions, SSH proxying, telemetry, networking, and wrapper/orchestrator behavior.</li>
         <li>Create the required documents:
           <ul>
             <li><code>docs/runtime/requirements-matrix.md</code></li>
@@ -942,7 +942,7 @@ internal-error</code></pre>
       <h3>SSH proxy integration boundary</h3>
       <ul>
         <li>The external proxy owns SSH authentication and edge transport.</li>
-        <li><code>sealantd</code> owns the in-sandbox PTY and shell/session lifecycle.</li>
+        <li><code>sealantd</code> owns the in-workspace PTY and shell/session lifecycle.</li>
         <li>The proxy calls <code>openSession</code>, <code>writeStdin</code>, <code>resizePty</code>, and <code>closeSession</code>.</li>
         <li>All proxied bytes must retain execution and session correlation.</li>
         <li>Do not build a second internet-facing SSH authentication server unless an existing repository requirement demands it.</li>
@@ -1257,7 +1257,7 @@ stopped</code></pre>
 
     <section id="security">
       <h2>18. Security and threat model</h2>
-      <p>Assume sandbox workloads can be buggy, hostile, evasive, or intentionally resource-exhausting.</p>
+      <p>Assume workspace workloads can be buggy, hostile, evasive, or intentionally resource-exhausting.</p>
 
       <h3>Security design goals</h3>
       <ul>

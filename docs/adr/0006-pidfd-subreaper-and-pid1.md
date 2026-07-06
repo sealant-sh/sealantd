@@ -6,7 +6,7 @@ Accepted, 2026-06-20
 
 ## Context
 
-sealantd is launched from the image entrypoint (`renderSandboxEntrypoint`, `buildkit-builder.ts` ~lines 819-840) and takes over the foreground PTY/process lifecycle that the upstream `sshd`/`sandbox-ssh-shell` owns today (brief §1, §3). Depending on how the entrypoint is structured, sealantd may run as the container's PID 1, or as a child under a thin init — both must be handled. Sandbox workloads can be buggy, hostile, evasive, or resource-exhausting (plan §18), and they routinely spawn deep process trees (shells, build tools, agents, dev servers) that detach and orphan descendants.
+sealantd is launched from the image entrypoint (`renderWorkspaceEntrypoint`, `buildkit-builder.ts` ~lines 819-840) and takes over the foreground PTY/process lifecycle that the upstream `sshd`/`workspace-ssh-shell` owns today (brief §1, §3). Depending on how the entrypoint is structured, sealantd may run as the container's PID 1, or as a child under a thin init — both must be handled. Workspace workloads can be buggy, hostile, evasive, or resource-exhausting (plan §18), and they routinely spawn deep process trees (shells, build tools, agents, dev servers) that detach and orphan descendants.
 
 The plan mandates, under process groups / pidfds / subreaping / PID 1 (plan §10.4):
 

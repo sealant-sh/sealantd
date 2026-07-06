@@ -25,7 +25,7 @@ module (length-delimited framing), serde / serde_json (bodies), and schemars
 **Effect Schema**, not raw types: `Schema.NonEmptyTrimmedString` for IDs,
 `Schema.Literal(...)` for enums, `Schema.optional(X)` for nullables,
 `Schema.Struct` with camelCase fields (integration brief §5, from
-`packages/api-contracts/src/core-api/sandboxes.ts`). The protocol must carry
+`packages/api-contracts/src/core-api/workspaces.ts`). The protocol must carry
 arbitrary process and terminal bytes that are explicitly not UTF-8 (integration
 brief §3 requires binary-safe stdin/stdout/stderr; plan §4.5 binary safety).
 
@@ -47,7 +47,7 @@ artifact from which the TypeScript types in `packages/runtime-protocol` are
 **generated and/or validated**. TS does not hand-author the wire shapes; it
 either codegen's from, or checks itself against, the emitted schema. The TS types
 follow the monorepo's Effect-Schema conventions (integration brief §5), and the
-error code set is a closed `Schema.Literal` union mirroring the `Sandbox*Error`
+error code set is a closed `Schema.Literal` union mirroring the `Workspace*Error`
 tagged-error pattern (plan §8.6; integration brief §5).
 
 **Binary payloads.** Arbitrary process / terminal bytes are never assumed to be

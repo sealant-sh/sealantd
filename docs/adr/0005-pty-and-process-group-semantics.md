@@ -6,7 +6,7 @@ Accepted, 2026-06-20
 
 ## Context
 
-In today's flow, command execution is fully delegated: the image entrypoint starts an in-container `sshd` launched with `ForceCommand /usr/local/bin/sandbox-ssh-shell`, and the ssh-gateway (`apps/ssh-gateway/src/gateway-server.ts`) opens an upstream SSH session and pipes channels (brief §1). The upstream `sshd` allocates the PTY and owns the shell/process lifecycle. sealantd replaces that foreground role: per the brief's insertion point (§1), the daemon is launched from `renderSandboxEntrypoint` (`buildkit-builder.ts` ~lines 819-840) before the sshd block, so the gateway's upstream shell/exec lands on a sealantd-spawned process rather than a bare login shell. The auth boundary does **not** move — `gateway-server.ts` `incomingConnection.on("authentication")` (line 151) keeps publickey-only auth, `sbx-{id}` username parsing, and the allowlist check (brief §3). What moves to sealantd is the in-sandbox PTY/process lifecycle: `pty/exec/shell/resize/signal` (brief §3).
+In today's flow, command execution is fully delegated: the image entrypoint starts an in-container `sshd` launched with `ForceCommand /usr/local/bin/workspace-ssh-shell`, and the ssh-gateway (`apps/ssh-gateway/src/gateway-server.ts`) opens an upstream SSH session and pipes channels (brief §1). The upstream `sshd` allocates the PTY and owns the shell/process lifecycle. sealantd replaces that foreground role: per the brief's insertion point (§1), the daemon is launched from `renderWorkspaceEntrypoint` (`buildkit-builder.ts` ~lines 819-840) before the sshd block, so the gateway's upstream shell/exec lands on a sealantd-spawned process rather than a bare login shell. The auth boundary does **not** move — `gateway-server.ts` `incomingConnection.on("authentication")` (line 151) keeps publickey-only auth, `ws-{id}` username parsing, and the allowlist check (brief §3). What moves to sealantd is the in-workspace PTY/process lifecycle: `pty/exec/shell/resize/signal` (brief §3).
 
 The gateway call sites sealantd's session API must service are concrete (brief §3):
 
@@ -28,7 +28,7 @@ The plan requires deliberate process groups (plan §10.4), PTY master/slave allo
 
 4. **SSH signal-name translation.** The signal handler servicing `gateway-server.ts:231` translates SSH signal names (e.g. `INT`, `TERM`, `KILL`, `HUP`, `QUIT`, `USR1`, `USR2`) to the corresponding OS signal numbers and delivers them to the session's process group. Unknown/unsupported names are rejected with a typed control error rather than silently dropped.
 
-5. **Ownership boundary.** The ssh-gateway owns authentication and edge transport; sealantd owns the in-sandbox PTY/process lifecycle (brief §3, plan §11). sealantd does not authenticate end users — it trusts the gateway's already-authenticated upstream connection (or, in the replacement model, the control-socket caller).
+5. **Ownership boundary.** The ssh-gateway owns authentication and edge transport; sealantd owns the in-workspace PTY/process lifecycle (brief §3, plan §11). sealantd does not authenticate end users — it trusts the gateway's already-authenticated upstream connection (or, in the replacement model, the control-socket caller).
 
 6. **Capture, not emulation.** sealantd captures PTY output and forwarded input as raw bytes (base64 with original byte count over the JSON wire — plan §4.5, §12) and forwards them; it does not parse escape sequences or maintain a screen model. It is not a terminal emulator (plan §11).
 
@@ -39,7 +39,7 @@ The plan requires deliberate process groups (plan §10.4), PTY master/slave allo
 - A single Ctrl-C / `SIGINT` reaches the whole foreground job (pipelines, subshells), matching operator expectations and avoiding orphaned children (plan §10.4).
 - Interactive shells, pagers, REPLs, and full-screen TUIs work because they get a real controlling terminal with a correct foreground pgrp (plan §11).
 - Binary-safe byte forwarding satisfies the gateway's `pipeStreams` contract (brief §3) and the plan's binary-safety rule (plan §4.5): no UTF-8 assumption, no line buffering, preserved chunk boundaries.
-- Exec sessions surface real exit codes for `incomingChannel.exit(code)` (`gateway-server.ts:318-322`), which the delegated `sandbox-ssh-shell` path cannot guarantee today.
+- Exec sessions surface real exit codes for `incomingChannel.exit(code)` (`gateway-server.ts:318-322`), which the delegated `workspace-ssh-shell` path cannot guarantee today.
 - PTY works unprivileged, so the single musl linux/amd64 artifact runs under plain `docker run` across Fedora/Arch/Nix base images (brief §6).
 
 ### Negative

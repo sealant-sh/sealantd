@@ -77,7 +77,7 @@ macro_rules! string_id {
 }
 
 string_id!(
-    /// Daemon instance identity. One runtime per sandbox + run.
+    /// Daemon instance identity. One runtime per workspace + run.
     RuntimeId,
     "rt"
 );

@@ -6,7 +6,7 @@ Accepted, 2026-06-20.
 
 ## Context
 
-sealantd runs inside Sealant Linux sandboxes launched by plain `docker run`
+sealantd runs inside Sealant Linux workspaces launched by plain `docker run`
 through `DockerRuntimeAdapter` (brief §1). The container is unprivileged: PTY
 allocation via `openpty`/`TIOCSWINSZ` (the `nix`/`rustix` term features in
 `Cargo.toml`) works without elevation, but any syscall- or kernel-level network

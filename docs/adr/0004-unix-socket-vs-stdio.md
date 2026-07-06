@@ -6,7 +6,7 @@ Accepted, 2026-06-20
 
 ## Context
 
-sealantd is the control and telemetry entry point inside a Sealant sandbox. The
+sealantd is the control and telemetry entry point inside a Sealant workspace. The
 plan fixes the transport split (plan §8.1): "Primary transport: Unix domain
 socket"; "Optional transport: stdio adapter for wrappers and deterministic
 integration tests"; "When using stdio, protocol output goes only to stdout and
@@ -16,17 +16,17 @@ blindly unlinking arbitrary files." The Unix-socket-vs-stdio split is a mandator
 ADR subject (plan §6).
 
 The integration brief grounds where this transport plugs in. sealantd replaces or
-wraps the in-container `sshd` / `sandbox-ssh-shell` foreground role established in
-`renderSandboxEntrypoint` (`buildkit-builder.ts` ~lines 819-840) and should "bind
+wraps the in-container `sshd` / `workspace-ssh-shell` foreground role established in
+`renderWorkspaceEntrypoint` (`buildkit-builder.ts` ~lines 819-840) and should "bind
 a Unix socket (e.g. `/run/sealantd.sock`, perms `0600`) as the SDK/control entry
 point" (integration brief §1). Authentication is **owned entirely by the ssh
 gateway**, not sealantd: `gateway-server.ts` enforces publickey-only auth, derives
-`sandboxId` from the `sbx-{id}` username, and connects upstream with a single
+`workspaceId` from the `ws-{id}` username, and connects upstream with a single
 gateway-held key (integration brief §3). sealantd therefore does not authenticate
 end users — it trusts the already-authenticated control-socket caller. The
 gateway session verbs (`openSession`/`shell`, `exec`, `writeStdin`, `resizePty`,
 `signal`, `closeSession`) are what the socket API services (integration brief §3;
-plan §8.5 required commands; plan §19 SDK shape). The sandbox must **fail closed**
+plan §8.5 required commands; plan §19 SDK shape). The workspace must **fail closed**
 — refuse the session — if the socket is unreachable at session-open time
 (integration brief §7, requirement 15). Diagnostics use structured `tracing` and
 must never share a channel with product telemetry (plan §18 logging-vs-telemetry).
@@ -104,7 +104,7 @@ diagnostics (plan §18 logging-vs-telemetry).
   to a single parent's pipes, which does not fit the "bind before accepting
   requests, fail closed if unreachable" model (brief §7).
 - **TCP / loopback socket.** Rejected: it widens the attack surface inside the
-  sandbox network namespace and cannot use filesystem permissions or
+  workspace network namespace and cannot use filesystem permissions or
   `SO_PEERCRED`; the Unix socket's `0600` + peer-cred gate is strictly tighter
   (plan §8.1, §18).
 - **Drop the stdio adapter entirely.** Rejected: it is the deterministic harness
