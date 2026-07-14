@@ -130,15 +130,19 @@ pub(crate) fn clone_repo_if_absent(
     }
 
     let mut command = Command::new("git");
-    command
-        .arg("clone")
-        .arg("--branch")
-        .arg(&config.repo.reference)
-        .arg(&config.repo.url)
-        .arg(working_directory);
+    command.arg("clone");
+    // No reference means the remote's default branch — a plain clone resolves it.
+    if let Some(reference) = &config.repo.reference {
+        command.arg("--branch").arg(reference);
+    }
+    command.arg(&config.repo.url).arg(working_directory);
     auth.apply(&mut command);
 
-    tracing::info!(url = %config.repo.url, reference = %config.repo.reference, "cloning workspace repository");
+    tracing::info!(
+        url = %config.repo.url,
+        reference = config.repo.reference.as_deref().unwrap_or("(remote default)"),
+        "cloning workspace repository"
+    );
     let status = command
         .status()
         .map_err(|e| BootError::Clone(format!("could not spawn git: {e}")))?;

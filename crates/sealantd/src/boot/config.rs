@@ -142,8 +142,8 @@ pub struct WorkspaceConfig {
 pub struct RepoConfig {
     /// Clone URL.
     pub url: String,
-    /// Branch/ref to check out.
-    pub reference: String,
+    /// Branch/ref to check out; `None` clones the remote's default branch.
+    pub reference: Option<String>,
 }
 
 /// Git clone authentication (mutually exclusive).
@@ -396,8 +396,7 @@ impl BootConfig {
             .ok_or_else(|| BootError::config("SEALANT_WORKSPACE_REPO_URL is required"))?;
         let reference = env
             .get("SEALANT_WORKSPACE_REPO_REF")
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| BootError::config("SEALANT_WORKSPACE_REPO_REF is required"))?;
+            .filter(|s| !s.is_empty());
         let repo = RepoConfig { url, reference };
 
         let clone_auth = Self::load_clone_auth(env);
@@ -672,7 +671,7 @@ mod tests {
             PathBuf::from("/workspace/repo")
         );
         assert_eq!(cfg.repo.url, "git@github.com:o/r.git");
-        assert_eq!(cfg.repo.reference, "main");
+        assert_eq!(cfg.repo.reference.as_deref(), Some("main"));
         assert!(matches!(cfg.clone_auth, CloneAuth::None));
         assert!(cfg.dotfiles.is_none());
         assert_eq!(cfg.os_family, OsFamily::Fedora);
@@ -689,6 +688,29 @@ mod tests {
             }
             other => panic!("expected harness foreground, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn missing_repo_ref_means_remote_default_branch() {
+        let env = MapEnv::from_pairs(&[
+            ("SEALANT_WORKSPACE_REPO_URL", "git@github.com:o/r.git"),
+            ("SEALANT_OS_FAMILY", "fedora"),
+            ("SEALANT_HARNESS_LAUNCH_COMMAND", "x"),
+        ]);
+        let cfg = BootConfig::load(&env).expect("valid");
+        assert_eq!(cfg.repo.reference, None);
+    }
+
+    #[test]
+    fn empty_repo_ref_means_remote_default_branch() {
+        let env = MapEnv::from_pairs(&[
+            ("SEALANT_WORKSPACE_REPO_URL", "git@github.com:o/r.git"),
+            ("SEALANT_WORKSPACE_REPO_REF", ""),
+            ("SEALANT_OS_FAMILY", "fedora"),
+            ("SEALANT_HARNESS_LAUNCH_COMMAND", "x"),
+        ]);
+        let cfg = BootConfig::load(&env).expect("valid");
+        assert_eq!(cfg.repo.reference, None);
     }
 
     #[test]
