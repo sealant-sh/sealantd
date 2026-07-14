@@ -193,11 +193,16 @@ impl ProcessRuntime {
         command.process_group(0);
         command.kill_on_drop(true);
 
+        // Spawn under the reap gate: the pid must be owned before the orphan reaper can peek at
+        // it, or a fast-exiting child gets misread as an adopted orphan and its status stolen.
+        let mut owned = self.registry.owned_pids();
         let mut child = command
             .spawn()
             .map_err(|e| ControlError::process_start_failed(format!("{}: {e}", args.executable)))?;
 
         let pid = child.id().map_or(-1, |p| p as i32);
+        owned.insert(pid);
+        drop(owned);
         // process_group(0) makes the child a group leader, so pgid == pid.
         let pgid = pid;
         let process_id = self.idgen.process_id();
@@ -326,6 +331,7 @@ impl ProcessRuntime {
                 }),
             );
             waiter_registry.remove(&waiter_proc);
+            waiter_registry.release_pid(pid);
             waiter_status.dec_processes();
         });
 
