@@ -177,6 +177,7 @@ impl Runtime {
             tracing::debug!("PR_SET_NO_NEW_PRIVS engaged");
         }
         let pidfd_supported = sealant_process::platform::pidfd_supported();
+        let sftp = Arc::new(SftpRuntime::new(processes.registry.clone()));
         Arc::new(Self {
             config,
             clock,
@@ -188,7 +189,7 @@ impl Runtime {
             filesystem,
             network,
             forwards: Arc::new(ForwardRuntime::new()),
-            sftp: Arc::new(SftpRuntime::new()),
+            sftp,
             extra_env,
             shutdown,
             features: Mutex::new(default_feature_states()),

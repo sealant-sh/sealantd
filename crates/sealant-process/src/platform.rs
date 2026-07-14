@@ -4,7 +4,8 @@
 //! With `PR_SET_CHILD_SUBREAPER` (or when running as PID 1) a process that double-forks an orphan
 //! has that orphan reparented to the daemon. The [`spawn_orphan_reaper`] task reaps such orphans so
 //! they do not linger as zombies — without stealing children that Tokio owns and reaps itself
-//! (those are identified via the [`ProcessRegistry`] and left alone).
+//! (those are registered in the [`ProcessRegistry`] owned-pid set and left alone; each sweep
+//! holds the spawn↔reap gate so a registration in flight is never missed).
 
 use std::sync::Arc;
 
@@ -96,6 +97,9 @@ pub fn spawn_orphan_reaper(_registry: Arc<ProcessRegistry>) {}
 #[cfg(target_os = "linux")]
 fn reap_orphans(registry: &ProcessRegistry) {
     use nix::sys::wait::{Id, WaitPidFlag, waitid, waitpid};
+    // Hold the spawn↔reap gate for the whole sweep: a spawn path registers its pid under the
+    // same lock, so we can never observe an exited child whose ownership is still being recorded.
+    let owned = registry.owned_pids();
     // Peek at each waitable child WITHOUT reaping it (WNOWAIT); `Err` (ECHILD/transient) ends the loop.
     while let Ok(status) = waitid(
         Id::All,
@@ -104,7 +108,7 @@ fn reap_orphans(registry: &ProcessRegistry) {
         let Some(pid) = status.pid() else {
             break; // StillAlive: a child exists but none has exited.
         };
-        if registry.contains_pid(pid.as_raw()) {
+        if owned.contains(&pid.as_raw()) {
             // Tokio owns and will reap this one. Stop so we don't spin on it; the periodic sweep
             // retries any orphans queued behind it.
             break;
