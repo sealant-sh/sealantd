@@ -67,6 +67,7 @@ const CONSUMED_KEYS: &[&str] = &[
     "SEALANT_SESSION_JOURNAL_DIR",
     "SEALANT_EXECUTION_ID",
     "SEALANT_WORKSPACE_ID",
+    "SEALANT_HARNESS_ENV_KEYS",
 ];
 
 /// Substring/suffix markers identifying secret env keys that must never reach the harness env.
@@ -78,6 +79,12 @@ const SECRET_MARKERS: &[&str] = &[
     "CREDENTIAL",
     "APIKEY",
 ];
+
+/// Env keys the control plane injects *for the harness* — connected-account credentials delivered
+/// as container env (the platform's `planCredentialInjections` contract). They match the secret
+/// markers, but they exist precisely so the harness can consume them, so the passthrough keeps
+/// them. Injectors can extend this set at launch via `SEALANT_HARNESS_ENV_KEYS`.
+const HARNESS_CREDENTIAL_KEYS: &[&str] = &["CLAUDE_CODE_OAUTH_TOKEN", "GITHUB_TOKEN", "GH_TOKEN"];
 
 /// Whether an env key looks like a secret and should be excluded from the harness passthrough.
 fn is_secret_key(key: &str) -> bool {
@@ -766,13 +773,31 @@ fn parse_lifecycle(env: &dyn EnvSource, key: &str) -> Result<Vec<LifecycleStep>,
 }
 
 /// Compute the harness passthrough environment: every env var that is not a consumed `SEALANT_*`
-/// key and does not look like a secret.
+/// key and does not look like a secret. Exempt from the secret scrub: the platform's harness
+/// credential injections (`HARNESS_CREDENTIAL_KEYS`) plus any keys the injector declared via
+/// `SEALANT_HARNESS_ENV_KEYS` (comma-separated) — those are addressed *to* the harness, not to the
+/// daemon. Consumed `SEALANT_*` keys can never be exempted; that check runs first.
 fn passthrough_env(env: &dyn EnvSource) -> Vec<(String, String)> {
     let consumed: BTreeSet<&str> = CONSUMED_KEYS.iter().copied().collect();
+    let mut exempt: BTreeSet<String> = HARNESS_CREDENTIAL_KEYS
+        .iter()
+        .map(|k| (*k).to_owned())
+        .collect();
+    if let Some(declared) = env.get("SEALANT_HARNESS_ENV_KEYS") {
+        exempt.extend(
+            declared
+                .split(',')
+                .map(str::trim)
+                .filter(|k| !k.is_empty())
+                .map(str::to_owned),
+        );
+    }
     let mut out: Vec<(String, String)> = env
         .entries()
         .into_iter()
-        .filter(|(k, _)| !consumed.contains(k.as_str()) && !is_secret_key(k))
+        .filter(|(k, _)| {
+            !consumed.contains(k.as_str()) && (exempt.contains(k) || !is_secret_key(k))
+        })
         .collect();
     out.sort_by(|a, b| a.0.cmp(&b.0));
     out
@@ -1117,6 +1142,52 @@ mod tests {
         assert!(!keys.contains(&"ANTHROPIC_API_KEY"));
         assert!(!keys.contains(&"SEALANT_WORKSPACE_HTTP_TOKEN"));
         assert!(!keys.contains(&"SEALANT_WORKSPACE_REPO_URL"));
+    }
+
+    #[test]
+    fn passthrough_keeps_harness_credential_injections() {
+        let cfg = load_with(&[
+            ("CLAUDE_CODE_OAUTH_TOKEN", "keep"),
+            ("GITHUB_TOKEN", "keep"),
+            ("GH_TOKEN", "keep"),
+            ("UNLISTED_TOKEN", "should-drop"),
+        ])
+        .expect("valid");
+        let keys: Vec<&str> = cfg
+            .passthrough_env
+            .iter()
+            .map(|(k, _)| k.as_str())
+            .collect();
+        assert!(keys.contains(&"CLAUDE_CODE_OAUTH_TOKEN"));
+        assert!(keys.contains(&"GITHUB_TOKEN"));
+        assert!(keys.contains(&"GH_TOKEN"));
+        assert!(!keys.contains(&"UNLISTED_TOKEN"));
+    }
+
+    #[test]
+    fn passthrough_honors_declared_harness_env_keys() {
+        let cfg = load_with(&[
+            (
+                "SEALANT_HARNESS_ENV_KEYS",
+                "MY_PROVIDER_TOKEN, EXTRA_SECRET, SEALANT_WORKSPACE_HTTP_TOKEN",
+            ),
+            ("MY_PROVIDER_TOKEN", "keep"),
+            ("EXTRA_SECRET", "keep"),
+            ("UNLISTED_TOKEN", "should-drop"),
+            // A declaration can never resurrect a consumed SEALANT_* key.
+            ("SEALANT_WORKSPACE_HTTP_TOKEN", "ghs_secret"),
+        ])
+        .expect("valid");
+        let keys: Vec<&str> = cfg
+            .passthrough_env
+            .iter()
+            .map(|(k, _)| k.as_str())
+            .collect();
+        assert!(keys.contains(&"MY_PROVIDER_TOKEN"));
+        assert!(keys.contains(&"EXTRA_SECRET"));
+        assert!(!keys.contains(&"UNLISTED_TOKEN"));
+        assert!(!keys.contains(&"SEALANT_HARNESS_ENV_KEYS"));
+        assert!(!keys.contains(&"SEALANT_WORKSPACE_HTTP_TOKEN"));
     }
 
     #[test]
