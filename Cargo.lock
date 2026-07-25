@@ -827,11 +827,13 @@ dependencies = [
 name = "sealant-pty"
 version = "0.0.0"
 dependencies = [
+ "crc32fast",
  "libc",
  "nix",
  "sealant-protocol",
  "sealant-runtime-core",
  "sealant-telemetry",
+ "tempfile",
  "tokio",
  "tracing",
 ]

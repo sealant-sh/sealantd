@@ -11,8 +11,9 @@ use std::process::Command;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 
-use crate::boot::config::{BootConfig, CloneAuth};
+use crate::boot::config::{CloneAuth, RepoConfig};
 use crate::boot::error::BootError;
+use crate::boot::mount;
 
 /// Credentials scoped to the clone command: env vars to apply and files to wipe afterwards.
 #[derive(Debug, Default)]
@@ -108,10 +109,10 @@ fn write_secret_file(path: &Path, contents: &[u8], mode: u32) -> Result<(), Boot
 /// # Errors
 /// Returns [`BootError::Clone`] on a non-zero `git` exit.
 pub(crate) fn clone_repo_if_absent(
-    config: &BootConfig,
+    repo: &RepoConfig,
+    working_directory: &std::path::Path,
     auth: &CloneAuthEnv,
 ) -> Result<bool, BootError> {
-    let working_directory = &config.workspace.working_directory;
     if working_directory.join(".git").exists() {
         tracing::info!(
             workdir = %working_directory.display(),
@@ -123,8 +124,18 @@ pub(crate) fn clone_repo_if_absent(
     if let Some(parent) = working_directory.parent() {
         std::fs::create_dir_all(parent).map_err(|e| BootError::io_path("mkdir -p", parent, e))?;
     }
-    // A partial/dirty directory without .git blocks a fresh clone; remove it (E9 `rm -rf`).
+    // A partial/dirty directory without .git blocks a fresh clone; remove it (E9 `rm -rf`) —
+    // unless it is a mountpoint. Mounted directories are caller-owned no matter how the boot is
+    // configured; deleting one from a mislabeled clone-mode boot would destroy host data.
     if working_directory.exists() {
+        if mount::is_mount_point(working_directory) {
+            return Err(BootError::config(format!(
+                "refusing to clear {}: it is a mountpoint without a .git, which looks like a \
+                 caller-owned mounted source booted in clone mode (set \
+                 SEALANT_WORKSPACE_SOURCE=mount)",
+                working_directory.display()
+            )));
+        }
         std::fs::remove_dir_all(working_directory)
             .map_err(|e| BootError::io_path("rm -rf", working_directory, e))?;
     }
@@ -132,15 +143,15 @@ pub(crate) fn clone_repo_if_absent(
     let mut command = Command::new("git");
     command.arg("clone");
     // No reference means the remote's default branch — a plain clone resolves it.
-    if let Some(reference) = &config.repo.reference {
+    if let Some(reference) = &repo.reference {
         command.arg("--branch").arg(reference);
     }
-    command.arg(&config.repo.url).arg(working_directory);
+    command.arg(&repo.url).arg(working_directory);
     auth.apply(&mut command);
 
     tracing::info!(
-        url = %config.repo.url,
-        reference = config.repo.reference.as_deref().unwrap_or("(remote default)"),
+        url = %repo.url,
+        reference = repo.reference.as_deref().unwrap_or("(remote default)"),
         "cloning workspace repository"
     );
     let status = command

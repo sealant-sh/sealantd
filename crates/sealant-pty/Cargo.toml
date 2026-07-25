@@ -17,3 +17,7 @@ tokio = { workspace = true }
 nix = { workspace = true }
 libc = { workspace = true }
 tracing = { workspace = true }
+crc32fast = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

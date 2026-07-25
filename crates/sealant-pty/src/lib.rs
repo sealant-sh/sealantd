@@ -6,7 +6,9 @@
 //! It is the in-workspace half of the ssh-gateway session boundary (brief §3); the gateway owns auth.
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
+pub mod journal;
 pub mod pty;
 pub mod session;
 
+pub use journal::{JournalChunk, SessionJournal};
 pub use session::{SessionRegistry, SessionRuntime};

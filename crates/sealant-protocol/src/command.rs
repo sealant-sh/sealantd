@@ -242,6 +242,24 @@ pub struct AttachSessionArgs {
     /// Consumption mode.
     #[serde(default)]
     pub mode: AttachMode,
+    /// When set, replay the durable output journal from this sequence (clamped to the first
+    /// retained record) before live frames; data-frame `seq` values are journal sequences.
+    /// `None` = live tail only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_sequence: Option<u64>,
+}
+
+/// Arguments to `readSessionOutput`: a one-shot batch read of a session's durable output journal.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ReadSessionOutputArgs {
+    /// Session whose journal to read.
+    pub session_id: SessionId,
+    /// First sequence to return (clamped to the first retained record).
+    pub from_sequence: u64,
+    /// Cap on returned payload bytes (defaulted/clamped by the daemon).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bytes: Option<u64>,
 }
 
 /// Arguments to `openForward` (direct-tcpip): open a TCP connection from inside the container.
@@ -390,6 +408,17 @@ pub enum Command {
         /// Channel to close.
         channel_id: ChannelId,
     },
+    /// Send a signal to a session's process group (SIGINT/SIGTERM/...).
+    #[serde(rename = "signalSession")]
+    SignalSession {
+        /// Target session.
+        session_id: SessionId,
+        /// Signal to deliver to the group.
+        signal: Signal,
+    },
+    /// Read a batch of a session's durable output journal from a sequence.
+    #[serde(rename = "readSessionOutput")]
+    ReadSessionOutput(ReadSessionOutputArgs),
 }
 
 impl Command {
@@ -421,6 +450,8 @@ impl Command {
             Self::CloseForward { .. } => "closeForward",
             Self::OpenSftp(_) => "openSftp",
             Self::CloseSftp { .. } => "closeSftp",
+            Self::SignalSession { .. } => "signalSession",
+            Self::ReadSessionOutput(_) => "readSessionOutput",
         }
     }
 }
@@ -601,6 +632,17 @@ pub struct ProcessList {
     pub processes: Vec<ProcessSummary>,
 }
 
+/// Lifecycle state of an interactive session.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum SessionState {
+    /// The session leader is running.
+    #[default]
+    Running,
+    /// The session leader has exited; the entry is retained for journal replay until closed.
+    Exited,
+}
+
 /// Summary of one session for `listSessions`.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -618,6 +660,24 @@ pub struct SessionSummary {
     /// Associated execution, when any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_id: Option<ExecutionId>,
+    /// Lifecycle state.
+    #[serde(default)]
+    pub state: SessionState,
+    /// Exit code, when exited normally.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    /// Terminating signal, when signaled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signal: Option<i32>,
+    /// Wall-clock start time (unix micros).
+    #[serde(default)]
+    pub started_at_micros: i64,
+    /// First output sequence still retained in the journal.
+    #[serde(default)]
+    pub first_journal_sequence: u64,
+    /// Next output sequence the journal will assign (i.e. current end cursor).
+    #[serde(default)]
+    pub next_journal_sequence: u64,
 }
 
 /// Result of `listSessions`.
@@ -626,6 +686,38 @@ pub struct SessionSummary {
 pub struct SessionList {
     /// Active sessions.
     pub sessions: Vec<SessionSummary>,
+}
+
+/// One journal record returned by `readSessionOutput`.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionOutputChunk {
+    /// Journal sequence of this chunk.
+    pub sequence: u64,
+    /// Redacted output bytes.
+    pub data: crate::Base64Bytes,
+}
+
+/// Result of `readSessionOutput`: a batch of journal records plus cursors and lifecycle state.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionOutput {
+    /// The session read.
+    pub session_id: SessionId,
+    /// Records in `[fromSequence, nextSequence)` order.
+    pub chunks: Vec<SessionOutputChunk>,
+    /// Pass as the next `fromSequence` to continue reading.
+    pub next_sequence: u64,
+    /// First sequence still retained (requests below this were clamped up).
+    pub first_available_sequence: u64,
+    /// Lifecycle state at read time.
+    pub state: SessionState,
+    /// Exit code, when exited.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    /// Terminating signal, when signaled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signal: Option<i32>,
 }
 
 /// Result of `getRuntimeMetrics`.
@@ -726,6 +818,8 @@ pub enum CommandResult {
     ForwardOpened(ForwardOpened),
     /// An SFTP bridge was opened on a channel.
     SftpOpened(SftpOpened),
+    /// A batch of session journal output.
+    SessionOutput(SessionOutput),
     /// Generic acknowledgement with no data.
     Accepted,
 }

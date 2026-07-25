@@ -19,6 +19,9 @@ const DEFAULT_WORKSPACE_ROOT: &str = "/workspace";
 const DEFAULT_WORKING_DIRECTORY: &str = "/workspace/repo";
 /// Default control socket path.
 const DEFAULT_CONTROL_SOCKET: &str = "/run/sealant/control.sock";
+/// Default directory for per-session durable PTY output journals (real disk, not tmpfs, so
+/// scrollback does not compete with RAM).
+const DEFAULT_SESSION_JOURNAL_DIR: &str = "/var/lib/sealantd/session-journals";
 /// Default HTTP git/dotfiles username.
 const DEFAULT_HTTP_USERNAME: &str = "x-access-token";
 /// Default dotfiles bootstrap command.
@@ -29,6 +32,9 @@ const DEFAULT_DOTFILES_BOOTSTRAP_COMMAND: &str = "./install.sh";
 const CONSUMED_KEYS: &[&str] = &[
     "SEALANT_WORKSPACE_ROOT",
     "SEALANT_WORKING_DIRECTORY",
+    "SEALANT_WORKSPACE_SOURCE",
+    "SEALANT_WORKSPACE_MOUNT_HOST_PATH",
+    "SEALANT_MOUNT_ALLOWED_STORE_ROOTS",
     "SEALANT_WORKSPACE_REPO_URL",
     "SEALANT_WORKSPACE_REPO_REF",
     "SEALANT_WORKSPACE_AUTH_KEY_BASE64",
@@ -58,6 +64,7 @@ const CONSUMED_KEYS: &[&str] = &[
     "SEALANT_WATCH_FILESYSTEM",
     "SEALANT_NETWORK_PROXY",
     "SEALANT_SPOOL_DIR",
+    "SEALANT_SESSION_JOURNAL_DIR",
     "SEALANT_EXECUTION_ID",
     "SEALANT_WORKSPACE_ID",
 ];
@@ -144,6 +151,25 @@ pub struct RepoConfig {
     pub url: String,
     /// Branch/ref to check out; `None` clones the remote's default branch.
     pub reference: Option<String>,
+}
+
+/// A caller-owned mounted workspace source: the working directory is a host path the orchestrator
+/// bind-mounted into the container. The daemon never clones into it and never touches its
+/// contents under any lifecycle event.
+#[derive(Debug, Clone)]
+pub struct MountConfig {
+    /// The host path backing the mount (validated against the operator allowlist; recorded for
+    /// provenance — the daemon itself only ever sees the container-side working directory).
+    pub host_path: PathBuf,
+}
+
+/// How the workspace working directory is provisioned.
+#[derive(Debug, Clone)]
+pub enum WorkspaceSource {
+    /// Clone a remote repository into the working directory at boot (the default).
+    Clone(RepoConfig),
+    /// The working directory is a caller-owned bind mount; the mount IS the repo.
+    Mount(MountConfig),
 }
 
 /// Git clone authentication (mutually exclusive).
@@ -323,6 +349,8 @@ pub struct ControlConfig {
     pub network_proxy: bool,
     /// Optional durable telemetry spool directory.
     pub spool_dir: Option<PathBuf>,
+    /// Directory for per-session durable PTY output journals.
+    pub session_journal_dir: PathBuf,
     /// Default execution id, when supplied.
     pub execution_id: Option<String>,
     /// Bound workspace id, when supplied.
@@ -334,9 +362,9 @@ pub struct ControlConfig {
 pub struct BootConfig {
     /// Workspace layout.
     pub workspace: WorkspaceConfig,
-    /// Repository to clone.
-    pub repo: RepoConfig,
-    /// Clone authentication.
+    /// How the working directory is provisioned (clone or caller-owned mount).
+    pub source: WorkspaceSource,
+    /// Clone authentication (unused for mounted sources).
     pub clone_auth: CloneAuth,
     /// Runtime-applied dotfiles, when configured.
     pub dotfiles: Option<DotfilesConfig>,
@@ -390,14 +418,21 @@ impl BootConfig {
                 .into(),
         };
 
-        let url = env
-            .get("SEALANT_WORKSPACE_REPO_URL")
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| BootError::config("SEALANT_WORKSPACE_REPO_URL is required"))?;
-        let reference = env
-            .get("SEALANT_WORKSPACE_REPO_REF")
-            .filter(|s| !s.is_empty());
-        let repo = RepoConfig { url, reference };
+        let source = Self::load_source(env)?;
+        // Boot writes runtime state (.ssh-runtime) under the workspace root. For a mounted
+        // source, the root must therefore live outside the mount, or boot would write into
+        // caller-owned contents.
+        if matches!(source, WorkspaceSource::Mount(_))
+            && workspace
+                .workspace_root
+                .starts_with(&workspace.working_directory)
+        {
+            return Err(BootError::config(format!(
+                "SEALANT_WORKSPACE_ROOT {} must not be inside the mounted working directory {}",
+                workspace.workspace_root.display(),
+                workspace.working_directory.display()
+            )));
+        }
 
         let clone_auth = Self::load_clone_auth(env);
         let dotfiles = Self::load_dotfiles(env)?;
@@ -452,9 +487,10 @@ impl BootConfig {
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| DEFAULT_CONTROL_SOCKET.to_owned())
                 .into(),
+            // Default ON: file evidence is the product; an operator opts *out* with 0/false.
             watch_filesystem: env
                 .get("SEALANT_WATCH_FILESYSTEM")
-                .is_some_and(|v| is_truthy(&v)),
+                .is_none_or(|v| is_truthy(&v)),
             network_proxy: env
                 .get("SEALANT_NETWORK_PROXY")
                 .is_some_and(|v| is_truthy(&v)),
@@ -462,6 +498,11 @@ impl BootConfig {
                 .get("SEALANT_SPOOL_DIR")
                 .filter(|s| !s.is_empty())
                 .map(Into::into),
+            session_journal_dir: env
+                .get("SEALANT_SESSION_JOURNAL_DIR")
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| DEFAULT_SESSION_JOURNAL_DIR.to_owned())
+                .into(),
             execution_id: env.get("SEALANT_EXECUTION_ID").filter(|s| !s.is_empty()),
             workspace_id: env.get("SEALANT_WORKSPACE_ID").filter(|s| !s.is_empty()),
         };
@@ -470,7 +511,7 @@ impl BootConfig {
 
         Ok(Self {
             workspace,
-            repo,
+            source,
             clone_auth,
             dotfiles,
             lifecycle,
@@ -482,6 +523,108 @@ impl BootConfig {
             control,
             passthrough_env,
         })
+    }
+
+    /// Resolve the workspace source: `SEALANT_WORKSPACE_SOURCE` selects `clone` (default) or
+    /// `mount`. Mount mode requires a caller-owned host path inside the operator-configured
+    /// allowlist of store roots, and rejects clone-only configuration; clone mode rejects mount
+    /// configuration. Both directions fail fast rather than guessing.
+    fn load_source(env: &dyn EnvSource) -> Result<WorkspaceSource, BootError> {
+        let mode = env
+            .get("SEALANT_WORKSPACE_SOURCE")
+            .map(|s| s.trim().to_ascii_lowercase())
+            .filter(|s| !s.is_empty());
+        let url = env
+            .get("SEALANT_WORKSPACE_REPO_URL")
+            .filter(|s| !s.is_empty());
+        let mount_host_path = env
+            .get("SEALANT_WORKSPACE_MOUNT_HOST_PATH")
+            .filter(|s| !s.is_empty());
+
+        match mode.as_deref() {
+            None | Some("clone") => {
+                if mount_host_path.is_some() {
+                    return Err(BootError::config(
+                        "SEALANT_WORKSPACE_MOUNT_HOST_PATH is set but SEALANT_WORKSPACE_SOURCE \
+                         is not \"mount\"",
+                    ));
+                }
+                let url =
+                    url.ok_or_else(|| BootError::config("SEALANT_WORKSPACE_REPO_URL is required"))?;
+                let reference = env
+                    .get("SEALANT_WORKSPACE_REPO_REF")
+                    .filter(|s| !s.is_empty());
+                Ok(WorkspaceSource::Clone(RepoConfig { url, reference }))
+            }
+            Some("mount") => {
+                if url.is_some() {
+                    return Err(BootError::config(
+                        "SEALANT_WORKSPACE_REPO_URL must not be set when \
+                         SEALANT_WORKSPACE_SOURCE=mount: a mounted workspace never clones",
+                    ));
+                }
+                let host_path = PathBuf::from(mount_host_path.ok_or_else(|| {
+                    BootError::config(
+                        "SEALANT_WORKSPACE_MOUNT_HOST_PATH is required when \
+                         SEALANT_WORKSPACE_SOURCE=mount",
+                    )
+                })?);
+                if !crate::boot::mount::is_clean_absolute(&host_path) {
+                    return Err(BootError::config(format!(
+                        "SEALANT_WORKSPACE_MOUNT_HOST_PATH {} must be an absolute path without \
+                         `.` or `..` components",
+                        host_path.display()
+                    )));
+                }
+                let roots = Self::load_allowed_store_roots(env)?;
+                if !roots
+                    .iter()
+                    .any(|root| crate::boot::mount::is_proper_descendant(root, &host_path))
+                {
+                    return Err(BootError::config(format!(
+                        "mount host path {} is outside the operator-configured store roots \
+                         (SEALANT_MOUNT_ALLOWED_STORE_ROOTS); refusing to provision",
+                        host_path.display()
+                    )));
+                }
+                Ok(WorkspaceSource::Mount(MountConfig { host_path }))
+            }
+            Some(other) => Err(BootError::config(format!(
+                "SEALANT_WORKSPACE_SOURCE has unknown value {other:?} (expected clone|mount)"
+            ))),
+        }
+    }
+
+    /// Parse the operator allowlist of mountable store roots (colon-separated absolute paths).
+    fn load_allowed_store_roots(env: &dyn EnvSource) -> Result<Vec<PathBuf>, BootError> {
+        let raw = env
+            .get("SEALANT_MOUNT_ALLOWED_STORE_ROOTS")
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| {
+                BootError::config(
+                    "SEALANT_MOUNT_ALLOWED_STORE_ROOTS is required when \
+                     SEALANT_WORKSPACE_SOURCE=mount (operator-configured, colon-separated \
+                     absolute store roots)",
+                )
+            })?;
+        let mut roots = Vec::new();
+        for part in raw.split(':').filter(|p| !p.trim().is_empty()) {
+            let root = PathBuf::from(part.trim());
+            if !crate::boot::mount::is_clean_absolute(&root) {
+                return Err(BootError::config(format!(
+                    "SEALANT_MOUNT_ALLOWED_STORE_ROOTS entry {} must be an absolute path \
+                     without `.` or `..` components",
+                    root.display()
+                )));
+            }
+            roots.push(root);
+        }
+        if roots.is_empty() {
+            return Err(BootError::config(
+                "SEALANT_MOUNT_ALLOWED_STORE_ROOTS contains no usable roots",
+            ));
+        }
+        Ok(roots)
     }
 
     fn load_clone_auth(env: &dyn EnvSource) -> CloneAuth {
@@ -662,6 +805,13 @@ mod tests {
         BootConfig::load(&env)
     }
 
+    fn clone_repo(cfg: &BootConfig) -> &RepoConfig {
+        match &cfg.source {
+            WorkspaceSource::Clone(repo) => repo,
+            WorkspaceSource::Mount(m) => panic!("expected clone source, got mount {m:?}"),
+        }
+    }
+
     #[test]
     fn minimal_config_uses_defaults() {
         let cfg = load_with(&[]).expect("valid");
@@ -670,8 +820,8 @@ mod tests {
             cfg.workspace.working_directory,
             PathBuf::from("/workspace/repo")
         );
-        assert_eq!(cfg.repo.url, "git@github.com:o/r.git");
-        assert_eq!(cfg.repo.reference.as_deref(), Some("main"));
+        assert_eq!(clone_repo(&cfg).url, "git@github.com:o/r.git");
+        assert_eq!(clone_repo(&cfg).reference.as_deref(), Some("main"));
         assert!(matches!(cfg.clone_auth, CloneAuth::None));
         assert!(cfg.dotfiles.is_none());
         assert_eq!(cfg.os_family, OsFamily::Fedora);
@@ -681,7 +831,7 @@ mod tests {
             cfg.control.socket,
             PathBuf::from("/run/sealant/control.sock")
         );
-        assert!(!cfg.control.watch_filesystem);
+        assert!(cfg.control.watch_filesystem, "file watching defaults on");
         match cfg.foreground {
             ForegroundConfig::Harness { launch_command } => {
                 assert_eq!(launch_command, "claude --dangerously");
@@ -698,7 +848,7 @@ mod tests {
             ("SEALANT_HARNESS_LAUNCH_COMMAND", "x"),
         ]);
         let cfg = BootConfig::load(&env).expect("valid");
-        assert_eq!(cfg.repo.reference, None);
+        assert_eq!(clone_repo(&cfg).reference, None);
     }
 
     #[test]
@@ -710,7 +860,112 @@ mod tests {
             ("SEALANT_HARNESS_LAUNCH_COMMAND", "x"),
         ]);
         let cfg = BootConfig::load(&env).expect("valid");
-        assert_eq!(cfg.repo.reference, None);
+        assert_eq!(clone_repo(&cfg).reference, None);
+    }
+
+    fn mount_pairs() -> Vec<(&'static str, &'static str)> {
+        vec![
+            ("SEALANT_WORKSPACE_SOURCE", "mount"),
+            ("SEALANT_WORKSPACE_MOUNT_HOST_PATH", "/srv/mend/store/wt-1"),
+            ("SEALANT_MOUNT_ALLOWED_STORE_ROOTS", "/srv/mend/store"),
+            ("SEALANT_OS_FAMILY", "fedora"),
+            ("SEALANT_HARNESS_LAUNCH_COMMAND", "sleep infinity"),
+        ]
+    }
+
+    #[test]
+    fn mount_source_parses_without_repo_url() {
+        let cfg = BootConfig::load(&MapEnv::from_pairs(&mount_pairs())).expect("valid");
+        match &cfg.source {
+            WorkspaceSource::Mount(m) => {
+                assert_eq!(m.host_path, PathBuf::from("/srv/mend/store/wt-1"));
+            }
+            other => panic!("expected mount source, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mount_source_rejects_repo_url() {
+        let mut pairs = mount_pairs();
+        pairs.push(("SEALANT_WORKSPACE_REPO_URL", "git@github.com:o/r.git"));
+        let err = BootConfig::load(&MapEnv::from_pairs(&pairs)).expect_err("conflicting");
+        assert!(format!("{err}").contains("never clones"));
+    }
+
+    #[test]
+    fn mount_source_requires_host_path() {
+        let pairs: Vec<_> = mount_pairs()
+            .into_iter()
+            .filter(|(k, _)| *k != "SEALANT_WORKSPACE_MOUNT_HOST_PATH")
+            .collect();
+        assert!(BootConfig::load(&MapEnv::from_pairs(&pairs)).is_err());
+    }
+
+    #[test]
+    fn mount_source_requires_allowlist() {
+        let pairs: Vec<_> = mount_pairs()
+            .into_iter()
+            .filter(|(k, _)| *k != "SEALANT_MOUNT_ALLOWED_STORE_ROOTS")
+            .collect();
+        let err = BootConfig::load(&MapEnv::from_pairs(&pairs)).expect_err("no allowlist");
+        assert!(format!("{err}").contains("SEALANT_MOUNT_ALLOWED_STORE_ROOTS"));
+    }
+
+    #[test]
+    fn mount_host_path_outside_allowlist_is_rejected() {
+        let mut pairs = mount_pairs();
+        pairs.retain(|(k, _)| *k != "SEALANT_WORKSPACE_MOUNT_HOST_PATH");
+        pairs.push(("SEALANT_WORKSPACE_MOUNT_HOST_PATH", "/home/user/checkout"));
+        let err = BootConfig::load(&MapEnv::from_pairs(&pairs)).expect_err("outside allowlist");
+        assert!(format!("{err}").contains("outside the operator-configured store roots"));
+    }
+
+    #[test]
+    fn mount_host_path_equal_to_root_is_rejected() {
+        let mut pairs = mount_pairs();
+        pairs.retain(|(k, _)| *k != "SEALANT_WORKSPACE_MOUNT_HOST_PATH");
+        pairs.push(("SEALANT_WORKSPACE_MOUNT_HOST_PATH", "/srv/mend/store"));
+        assert!(BootConfig::load(&MapEnv::from_pairs(&pairs)).is_err());
+    }
+
+    #[test]
+    fn mount_host_path_with_dotdot_is_rejected() {
+        let mut pairs = mount_pairs();
+        pairs.retain(|(k, _)| *k != "SEALANT_WORKSPACE_MOUNT_HOST_PATH");
+        pairs.push((
+            "SEALANT_WORKSPACE_MOUNT_HOST_PATH",
+            "/srv/mend/store/../secrets",
+        ));
+        assert!(BootConfig::load(&MapEnv::from_pairs(&pairs)).is_err());
+    }
+
+    #[test]
+    fn mount_allowlist_supports_multiple_roots() {
+        let mut pairs = mount_pairs();
+        pairs.retain(|(k, _)| *k != "SEALANT_MOUNT_ALLOWED_STORE_ROOTS");
+        pairs.push((
+            "SEALANT_MOUNT_ALLOWED_STORE_ROOTS",
+            "/var/lib/other:/srv/mend/store",
+        ));
+        assert!(BootConfig::load(&MapEnv::from_pairs(&pairs)).is_ok());
+    }
+
+    #[test]
+    fn mount_host_path_in_clone_mode_is_rejected() {
+        let err = load_with(&[("SEALANT_WORKSPACE_MOUNT_HOST_PATH", "/srv/mend/store/wt-1")])
+            .expect_err("mount path without mount mode");
+        assert!(format!("{err}").contains("SEALANT_WORKSPACE_SOURCE"));
+    }
+
+    #[test]
+    fn unknown_workspace_source_is_fatal() {
+        assert!(load_with(&[("SEALANT_WORKSPACE_SOURCE", "attach")]).is_err());
+    }
+
+    #[test]
+    fn explicit_clone_source_is_accepted() {
+        let cfg = load_with(&[("SEALANT_WORKSPACE_SOURCE", "clone")]).expect("valid");
+        assert!(matches!(cfg.source, WorkspaceSource::Clone(_)));
     }
 
     #[test]

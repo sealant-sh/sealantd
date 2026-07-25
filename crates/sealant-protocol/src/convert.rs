@@ -148,6 +148,12 @@ enum_pair!(
     [Interactive, Observe]
 );
 enum_pair!(
+    session_state,
+    crate::SessionState,
+    wire::SessionState,
+    [Running, Exited]
+);
+enum_pair!(
     capture_mode,
     CaptureMode,
     wire::CaptureMode,
@@ -798,6 +804,7 @@ impl From<AttachSessionArgs> for wire::AttachSessionArgs {
         Self {
             session_id: a.session_id.into_inner(),
             mode: enum_i32::<_, wire::AttachMode>(a.mode),
+            from_sequence: a.from_sequence,
         }
     }
 }
@@ -807,7 +814,27 @@ impl TryFrom<wire::AttachSessionArgs> for AttachSessionArgs {
         Ok(Self {
             session_id: SessionId::new(a.session_id),
             mode: attach_mode(a.mode)?,
+            from_sequence: a.from_sequence,
         })
+    }
+}
+
+impl From<crate::ReadSessionOutputArgs> for wire::ReadSessionOutputArgs {
+    fn from(a: crate::ReadSessionOutputArgs) -> Self {
+        Self {
+            session_id: a.session_id.into_inner(),
+            from_sequence: a.from_sequence,
+            max_bytes: a.max_bytes,
+        }
+    }
+}
+impl From<wire::ReadSessionOutputArgs> for crate::ReadSessionOutputArgs {
+    fn from(a: wire::ReadSessionOutputArgs) -> Self {
+        Self {
+            session_id: SessionId::new(a.session_id),
+            from_sequence: a.from_sequence,
+            max_bytes: a.max_bytes,
+        }
     }
 }
 
@@ -935,6 +962,14 @@ impl From<Command> for wire::command::Command {
             Command::CloseSftp { channel_id } => W::CloseSftp(wire::CloseSftpArgs {
                 channel_id: channel_id.into_inner(),
             }),
+            Command::SignalSession {
+                session_id,
+                signal: sig,
+            } => W::SignalSession(wire::SignalSessionArgs {
+                session_id: session_id.into_inner(),
+                signal: enum_i32::<_, wire::Signal>(sig),
+            }),
+            Command::ReadSessionOutput(a) => W::ReadSessionOutput(a.into()),
         }
     }
 }
@@ -1000,6 +1035,11 @@ impl TryFrom<wire::command::Command> for Command {
             W::CloseSftp(a) => Command::CloseSftp {
                 channel_id: ChannelId::new(a.channel_id),
             },
+            W::SignalSession(a) => Command::SignalSession {
+                session_id: SessionId::new(a.session_id),
+                signal: signal(a.signal)?,
+            },
+            W::ReadSessionOutput(a) => Command::ReadSessionOutput(a.into()),
         })
     }
 }
@@ -1135,19 +1175,74 @@ impl From<SessionSummary> for wire::SessionSummary {
             cols: u32::from(s.cols),
             rows: u32::from(s.rows),
             execution_id: opt_id(s.execution_id),
+            state: enum_i32::<_, wire::SessionState>(s.state),
+            exit_code: s.exit_code,
+            signal: s.signal,
+            started_at_micros: s.started_at_micros,
+            first_journal_sequence: s.first_journal_sequence,
+            next_journal_sequence: s.next_journal_sequence,
         }
     }
 }
-impl From<wire::SessionSummary> for SessionSummary {
-    fn from(s: wire::SessionSummary) -> Self {
-        Self {
+impl TryFrom<wire::SessionSummary> for SessionSummary {
+    type Error = WireError;
+    fn try_from(s: wire::SessionSummary) -> Result<Self, WireError> {
+        Ok(Self {
             session_id: SessionId::new(s.session_id),
             process_id: ProcessId::new(s.process_id),
             pid: s.pid,
             cols: s.cols as u16,
             rows: s.rows as u16,
             execution_id: s.execution_id.map(ExecutionId::new),
+            state: session_state(s.state)?,
+            exit_code: s.exit_code,
+            signal: s.signal,
+            started_at_micros: s.started_at_micros,
+            first_journal_sequence: s.first_journal_sequence,
+            next_journal_sequence: s.next_journal_sequence,
+        })
+    }
+}
+
+impl From<crate::SessionOutput> for wire::SessionOutput {
+    fn from(o: crate::SessionOutput) -> Self {
+        Self {
+            session_id: o.session_id.into_inner(),
+            chunks: o
+                .chunks
+                .into_iter()
+                .map(|c| wire::SessionOutputChunk {
+                    sequence: c.sequence,
+                    data: c.data.into_inner(),
+                })
+                .collect(),
+            next_sequence: o.next_sequence,
+            first_available_sequence: o.first_available_sequence,
+            state: enum_i32::<_, wire::SessionState>(o.state),
+            exit_code: o.exit_code,
+            signal: o.signal,
         }
+    }
+}
+impl TryFrom<wire::SessionOutput> for crate::SessionOutput {
+    type Error = WireError;
+    fn try_from(o: wire::SessionOutput) -> Result<Self, WireError> {
+        Ok(Self {
+            session_id: SessionId::new(o.session_id),
+            chunks: o
+                .chunks
+                .into_iter()
+                .map(|c| crate::SessionOutputChunk {
+                    sequence: c.sequence,
+                    data: Base64Bytes::new(c.data),
+                })
+                .collect(),
+            next_sequence: o.next_sequence,
+            first_available_sequence: o.first_available_sequence,
+            state: session_state(o.state)?,
+            exit_code: o.exit_code,
+            signal: o.signal,
+        })
     }
 }
 
@@ -1202,6 +1297,7 @@ impl From<CommandResult> for wire::command_result::Result {
             CommandResult::SftpOpened(s) => W::SftpOpened(wire::SftpOpened {
                 channel_id: s.channel_id.into_inner(),
             }),
+            CommandResult::SessionOutput(o) => W::SessionOutput(o.into()),
             CommandResult::Accepted => W::Accepted(wire::Empty {}),
         }
     }
@@ -1232,7 +1328,11 @@ impl TryFrom<wire::command_result::Result> for CommandResult {
                     .collect::<Result<_, _>>()?,
             }),
             W::SessionList(l) => CommandResult::SessionList(SessionList {
-                sessions: l.sessions.into_iter().map(Into::into).collect(),
+                sessions: l
+                    .sessions
+                    .into_iter()
+                    .map(TryInto::try_into)
+                    .collect::<Result<_, _>>()?,
             }),
             W::Metrics(m) => CommandResult::Metrics(RuntimeMetrics {
                 uptime_millis: m.uptime_millis,
@@ -1262,6 +1362,7 @@ impl TryFrom<wire::command_result::Result> for CommandResult {
             W::SftpOpened(s) => CommandResult::SftpOpened(SftpOpened {
                 channel_id: ChannelId::new(s.channel_id),
             }),
+            W::SessionOutput(o) => CommandResult::SessionOutput(o.try_into()?),
             W::Accepted(_) => CommandResult::Accepted,
         })
     }
@@ -1638,6 +1739,7 @@ mod tests {
         let msg = ClientMessage::Request(ControlRequest::new(
             RequestId::new("req_a"),
             Command::AttachSession(AttachSessionArgs {
+                from_sequence: None,
                 session_id: SessionId::new("ses_1"),
                 mode: AttachMode::Interactive,
             }),

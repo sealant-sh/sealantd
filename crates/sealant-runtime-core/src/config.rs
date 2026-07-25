@@ -57,6 +57,14 @@ pub struct RuntimeConfig {
     /// Durable spool directory (telemetry pipeline; populated in a later phase).
     #[serde(default)]
     pub spool_dir: Option<PathBuf>,
+    /// Directory for per-session durable PTY output journals. `None` falls back to a
+    /// runtime-scoped directory under the system temp dir.
+    #[serde(default)]
+    pub session_journal_dir: Option<PathBuf>,
+    /// Per-segment size cap for session journals (two segments retained per session, so on-disk
+    /// scrollback per session is bounded at twice this).
+    #[serde(default = "default_session_journal_segment_bytes")]
+    pub session_journal_segment_bytes: u64,
     /// Tracing log level filter (e.g. `info`).
     pub log_level: String,
     /// Whether to observe the workspace filesystem (baseline snapshot + live watch + final diff).
@@ -69,6 +77,11 @@ pub struct RuntimeConfig {
     /// root). Empty by default.
     #[serde(default)]
     pub allowed_peer_uids: Vec<u32>,
+}
+
+/// Default per-segment size cap for session output journals (16 MiB; two segments retained).
+fn default_session_journal_segment_bytes() -> u64 {
+    16 * 1024 * 1024
 }
 
 /// Default bounded limits for the smallest workspace.
@@ -105,6 +118,8 @@ impl RuntimeConfig {
             shutdown_grace_ms: 10_000,
             io_chunk_bytes: 64 * 1024,
             spool_dir: None,
+            session_journal_dir: None,
+            session_journal_segment_bytes: default_session_journal_segment_bytes(),
             log_level: "info".to_owned(),
             watch_filesystem: false,
             network_mode: NetworkMode::Off,

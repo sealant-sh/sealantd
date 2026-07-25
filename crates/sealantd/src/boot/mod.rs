@@ -15,6 +15,7 @@ pub mod config;
 mod dotfiles;
 mod error;
 mod git;
+mod mount;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -33,7 +34,7 @@ use crate::shutdown::ShutdownSignal;
 pub use config::BootConfig;
 pub use error::BootError;
 
-use config::{ForegroundConfig, LifecycleStep, OsFamily, Shell};
+use config::{ForegroundConfig, LifecycleStep, OsFamily, Shell, WorkspaceSource};
 
 /// The directory under the workspace root holding boot-time clone credentials and dotfiles state.
 const SSH_RUNTIME_SUBDIR: &str = ".ssh-runtime";
@@ -93,13 +94,23 @@ fn prepare(config: &BootConfig) -> Result<(), BootError> {
         glibc_loader_shim();
     }
 
-    let runtime_dir = ssh_runtime_dir(config);
-
-    // Steps 5–7: clone with scoped credentials, then wipe them.
-    let clone_auth = git::materialize_clone_auth(&config.clone_auth, &runtime_dir)?;
-    let clone_result = git::clone_repo_if_absent(config, &clone_auth);
-    clone_auth.wipe();
-    clone_result?;
+    // Steps 5–7: provision the working directory per source mode.
+    match &config.source {
+        // Clone with scoped credentials, then wipe them.
+        WorkspaceSource::Clone(repo) => {
+            let runtime_dir = ssh_runtime_dir(config);
+            let clone_auth = git::materialize_clone_auth(&config.clone_auth, &runtime_dir)?;
+            let clone_result =
+                git::clone_repo_if_absent(repo, &config.workspace.working_directory, &clone_auth);
+            clone_auth.wipe();
+            clone_result?;
+        }
+        // Caller-owned mount: no clone, no credentials; verify the mount actually exists and is
+        // writable so writes land on the host path rather than the container layer.
+        WorkspaceSource::Mount(mount_config) => {
+            mount::verify_mounted_source(&config.workspace.working_directory, mount_config)?;
+        }
+    }
 
     Ok(())
 }
@@ -119,6 +130,7 @@ fn prepare_workspace(config: &BootConfig) -> Result<(), BootError> {
         PathBuf::from("/root"),
         PathBuf::from("/tmp"),
         PathBuf::from("/run/sealant"),
+        config.control.session_journal_dir.clone(),
     ];
     if let Some(parent) = config.control.socket.parent() {
         dirs.push(parent.to_path_buf());
@@ -181,6 +193,7 @@ fn into_runtime_config(config: &BootConfig) -> RuntimeConfig {
     runtime_config.socket_path = config.control.socket.clone();
     runtime_config.workspace_root = config.workspace.working_directory.clone();
     runtime_config.spool_dir = config.control.spool_dir.clone();
+    runtime_config.session_journal_dir = Some(config.control.session_journal_dir.clone());
     runtime_config.watch_filesystem = config.control.watch_filesystem;
     runtime_config.network_mode = if config.control.network_proxy {
         NetworkMode::Proxy

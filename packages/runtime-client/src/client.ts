@@ -36,7 +36,11 @@ import {
   type ProcessList,
   type RuntimeMetrics,
   type ServerMessage,
+  type SessionList,
+  type SessionOpened,
+  type SessionOutput,
   type SftpOpened,
+  type Signal,
   type StreamAttached,
   type StreamFrame,
 } from "@sealant/runtime-protocol";
@@ -93,6 +97,37 @@ function resultValue(result: CommandResult, kase: CommandResult["result"]["case"
   return (result.result as { value: unknown }).value;
 }
 
+/** Options for {@link SealantClient.openSession} (a subset of the wire `OpenSessionArgs`). */
+export interface OpenSessionOptions {
+  /** Shell/command to run; defaults to the daemon's configured default shell. */
+  shell?: string;
+  /** Arguments to the shell/command. */
+  args?: string[];
+  /** Working directory (defaults to the workspace root). */
+  cwd?: string;
+  /** Environment overlay entries. */
+  env?: Array<{ key: string; value: string }>;
+  /** Initial terminal columns. */
+  cols: number;
+  /** Initial terminal rows. */
+  rows: number;
+  /** `TERM` to advertise (defaults daemon-side). */
+  term?: string;
+  /** Execution to associate the session with. */
+  executionId?: string;
+}
+
+/** Options for {@link SealantClient.attachSession}. */
+export interface AttachSessionOptions {
+  /** Consumption mode (interactive by default). */
+  mode?: AttachMode;
+  /**
+   * Replay the durable output journal from this sequence (0 = full retained scrollback) before
+   * live frames; data-frame `seq` values are journal sequences. Omit for a live tail only.
+   */
+  fromSequence?: number | bigint;
+}
+
 /** Options for {@link SealantClient.exec} (a subset of the wire `ExecArgs`). */
 export interface ExecOptions {
   executable: string;
@@ -116,6 +151,14 @@ export class SealantClient {
   #eventWaiters: Array<(result: IteratorResult<EventEnvelope>) => void> = [];
   /** Demux table: channel_id → open `Channel`. Inbound `ServerMessage::Stream` frames route here. */
   #channels: Map<string, Channel> = new Map();
+  /**
+   * Frames that arrived for a channel the caller has not registered yet. The daemon may write
+   * channel frames BEFORE the response that carries the channel id reaches the caller (journal
+   * replay on `attachSession({fromSequence})` does this by design; a fast exec-attach can too), so
+   * they are buffered here and flushed by {@link SealantClient.openChannel}. Bounded per channel;
+   * cleared on connection close.
+   */
+  #pendingFrames: Map<string, StreamFrame[]> = new Map();
   #transport: ChannelTransport;
 
   constructor(stream: Duplex) {
@@ -240,6 +283,12 @@ export class SealantClient {
     if (existing) return existing;
     const channel = new Channel(channelId, this.#transport);
     this.#channels.set(channelId, channel);
+    // Flush any frames that raced ahead of the response carrying this channel id.
+    const pending = this.#pendingFrames.get(channelId);
+    if (pending) {
+      this.#pendingFrames.delete(channelId);
+      for (const frame of pending) this.#deliverFrame(channel, frame);
+    }
     return channel;
   }
 
@@ -330,13 +379,104 @@ export class SealantClient {
   // returns an open {@link Channel} already wired into the demux table — an async-iterable of that
   // channel's inbound bytes plus `write`/`windowUpdate`/`end` for outbound bytes.
 
-  /** Attach to an existing PTY session as a multiplexed channel (interactive by default). */
+  // ===================== interactive sessions =====================
+
+  /** Open an interactive PTY session (arbitrary command or the default shell). */
+  async openSession(options: OpenSessionOptions): Promise<SessionOpened> {
+    return resultValue(
+      okResult(
+        await this.request({
+          case: "openSession",
+          value: {
+            shell: options.shell,
+            args: options.args ?? [],
+            cwd: options.cwd,
+            env: options.env ?? [],
+            cols: options.cols,
+            rows: options.rows,
+            term: options.term,
+            executionId: options.executionId,
+          },
+        }),
+      ),
+      "sessionOpened",
+    ) as SessionOpened;
+  }
+
+  /**
+   * Close a session: hang up a running session's terminal (SIGHUP), or drop an exited session's
+   * retained tombstone (and its journal).
+   */
+  async closeSession(sessionId: string): Promise<void> {
+    okResult(await this.request({ case: "closeSession", value: { sessionId } }));
+  }
+
+  /** Resize a running session's PTY. */
+  async resizePty(sessionId: string, cols: number, rows: number): Promise<void> {
+    okResult(await this.request({ case: "resizePty", value: { sessionId, cols, rows } }));
+  }
+
+  /** List sessions: running first, then retained exited tombstones (state + exit code). */
+  async listSessions(): Promise<SessionList> {
+    return resultValue(
+      okResult(await this.request({ case: "listSessions", value: {} })),
+      "sessionList",
+    ) as SessionList;
+  }
+
+  /** Deliver a signal (e.g. SIGINT/SIGTERM) to a running session's process group. */
+  async signalSession(sessionId: string, signal: Signal): Promise<void> {
+    okResult(await this.request({ case: "signalSession", value: { sessionId, signal } }));
+  }
+
+  /**
+   * One-shot batch read of a session's durable output journal from `fromSequence` (clamped to the
+   * first retained record). Works for running and exited sessions; the result carries the cursors
+   * (`nextSequence`, `firstAvailableSequence`) and lifecycle state.
+   */
+  async readSessionOutput(
+    sessionId: string,
+    fromSequence: number | bigint,
+    maxBytes?: number | bigint,
+  ): Promise<SessionOutput> {
+    return resultValue(
+      okResult(
+        await this.request({
+          case: "readSessionOutput",
+          value: {
+            sessionId,
+            fromSequence: BigInt(fromSequence),
+            maxBytes: maxBytes === undefined ? undefined : BigInt(maxBytes),
+          },
+        }),
+      ),
+      "sessionOutput",
+    ) as SessionOutput;
+  }
+
+  /**
+   * Attach to an existing PTY session as a multiplexed channel (interactive by default). Pass
+   * `{ fromSequence }` to replay the durable journal (scrollback) before live output — data-frame
+   * `seq` values are then journal sequences, resumable across disconnects.
+   */
   async attachSession(
     sessionId: string,
-    mode: AttachMode = AttachMode.INTERACTIVE,
+    modeOrOptions: AttachMode | AttachSessionOptions = AttachMode.INTERACTIVE,
   ): Promise<{ result: StreamAttached; channel: Channel }> {
+    const options: AttachSessionOptions =
+      typeof modeOrOptions === "object" ? modeOrOptions : { mode: modeOrOptions };
     const result = resultValue(
-      okResult(await this.request({ case: "attachSession", value: { sessionId, mode } })),
+      okResult(
+        await this.request({
+          case: "attachSession",
+          value: {
+            sessionId,
+            mode: options.mode ?? AttachMode.INTERACTIVE,
+            fromSequence:
+              options.fromSequence === undefined ? undefined : BigInt(options.fromSequence),
+          },
+        }),
+      ),
       "streamAttached",
     ) as StreamAttached;
     return { result, channel: this.openChannel(result.channelId) };
@@ -475,13 +615,26 @@ export class SealantClient {
     }
   }
 
+  /** Frames buffered per not-yet-registered channel (a full session journal replay fits). */
+  static readonly #MAX_PENDING_FRAMES = 65536;
+
   /** Demultiplex one inbound `ServerMessage::Stream` frame into its `Channel` by `channelId`. */
   #routeStream(frame: StreamFrame): void {
     const channel = this.#channels.get(frame.channelId);
     if (!channel) {
-      // Frame for an unknown/already-closed channel: nothing to deliver to. Drop it.
+      // The channel id is not registered (yet): buffer bounded, flushed by openChannel. Frames
+      // beyond the bound (or for channels that are never opened) are dropped on close.
+      const pending = this.#pendingFrames.get(frame.channelId) ?? [];
+      if (pending.length < SealantClient.#MAX_PENDING_FRAMES) {
+        pending.push(frame);
+        this.#pendingFrames.set(frame.channelId, pending);
+      }
       return;
     }
+    this.#deliverFrame(channel, frame);
+  }
+
+  #deliverFrame(channel: Channel, frame: StreamFrame): void {
     switch (frame.payload.case) {
       case "data":
         channel.pushData(frame.payload.value);
@@ -520,6 +673,7 @@ export class SealantClient {
       channel.fail(new Error("connection closed"));
     }
     this.#channels.clear();
+    this.#pendingFrames.clear();
   }
 }
 

@@ -432,6 +432,7 @@ async fn in_process_attach_streams_pty_output_over_channel() {
         ControlRequest::new(
             RequestId::new("a1"),
             Command::AttachSession(AttachSessionArgs {
+                from_sequence: None,
                 session_id: session_id.clone(),
                 mode: AttachMode::Interactive,
             }),
@@ -683,6 +684,7 @@ async fn in_process_connection_drop_tears_down_attachment() {
         ControlRequest::new(
             RequestId::new("t3"),
             Command::AttachSession(AttachSessionArgs {
+                from_sequence: None,
                 session_id: session_id.clone(),
                 mode: AttachMode::Interactive,
             }),
@@ -1011,6 +1013,129 @@ async fn in_process_exec_attach_streams_burst_losslessly_with_exit_code() {
         tele_numbers, 20000,
         "IoChunk telemetry must still carry the full output in parallel"
     );
+
+    drop(client);
+    let _ = tokio::time::timeout(Duration::from_secs(5), conn).await;
+}
+
+/// Boot-composition regression test for file evidence: with `watch_filesystem` enabled the
+/// composed runtime must emit `file.snapshotCompleted` at start, `file.changed` (stamped with the
+/// active execution id) for writes made by an exec'd process — including inside directories
+/// created after the watch started — and the final `file.changed` + `file.diffAvailable` at
+/// shutdown. Ignored trees (`.git`) must stay silent. Every prior file-watch defect survived the
+/// suite because nothing exercised this composition.
+#[tokio::test]
+async fn in_process_watch_filesystem_emits_file_events_for_exec_writes() {
+    let dir = tempfile::tempdir().expect("tmp");
+    std::fs::create_dir_all(dir.path().join(".git/objects")).expect("mkdir .git");
+    std::fs::write(dir.path().join("existing.txt"), b"baseline").expect("seed");
+
+    let mut config = RuntimeConfig::new(new_runtime_id());
+    config.workspace_root = dir.path().to_path_buf();
+    config.watch_filesystem = true;
+    let runtime = Runtime::new(config, Arc::new(ShutdownSignal::new(1000)));
+    let mut events = runtime.event_subscriber();
+    runtime.start_filesystem();
+    runtime.mark_healthy();
+
+    let (_sd_tx, sd_rx) = watch::channel(false);
+    let (mut client, server) = tokio::io::duplex(1 << 20);
+    let (server_read, server_write) = tokio::io::split(server);
+    let conn = tokio::spawn(handle_connection(
+        runtime.clone(),
+        server_read,
+        server_write,
+        sd_rx,
+    ));
+
+    // Exec a run that edits files: a new file at the root, a file inside a brand-new nested
+    // directory, and a write into the ignored .git tree.
+    let mut args = exec_args(
+        "/bin/sh",
+        &[
+            "-c",
+            "echo edit > run-edit.txt; mkdir -p sub/nested && echo deep > sub/nested/deep.txt; \
+             echo obj > .git/objects/deadbeef",
+        ],
+    );
+    args.execution_id = Some(sealant_protocol::ExecutionId::new("exec-e2e"));
+    args.cwd = Some(dir.path().display().to_string());
+    send_request(
+        &mut client,
+        ControlRequest::new(RequestId::new("r1"), Command::Exec(args)),
+    )
+    .await;
+
+    // Collect from the bus subscription until we have seen the process exit AND both expected
+    // file.changed events (the watcher observes writes asynchronously).
+    let mut snapshot_completed = false;
+    let mut exited = false;
+    let mut changed_paths: Vec<(String, Option<String>)> = Vec::new();
+    let collect = async {
+        loop {
+            let env = match events.recv().await {
+                Ok(env) => env,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            };
+            match &env.payload {
+                EventPayload::FileSnapshotCompleted(_) => snapshot_completed = true,
+                EventPayload::FileChange(c) => changed_paths.push((
+                    c.path.clone(),
+                    env.execution_id.as_ref().map(|id| id.as_str().to_owned()),
+                )),
+                EventPayload::ProcessExited(_) => exited = true,
+                _ => {}
+            }
+            if exited
+                && changed_paths.iter().any(|(p, _)| p == "run-edit.txt")
+                && changed_paths
+                    .iter()
+                    .any(|(p, _)| p == "sub/nested/deep.txt")
+            {
+                break;
+            }
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(10), collect)
+        .await
+        .expect("file events for exec writes did not arrive");
+
+    assert!(snapshot_completed, "baseline snapshot event missing");
+    assert!(
+        changed_paths.iter().all(|(p, _)| !p.starts_with(".git")),
+        "ignored .git tree must not emit events, got {changed_paths:?}"
+    );
+    assert!(
+        changed_paths
+            .iter()
+            .filter(|(p, _)| p == "run-edit.txt" || p == "sub/nested/deep.txt")
+            .all(|(_, exec)| exec.as_deref() == Some("exec-e2e")),
+        "file events must carry the exec's execution id, got {changed_paths:?}"
+    );
+
+    // Shutdown finalizes filesystem observation: the authoritative diff must be published.
+    let mut saw_diff = false;
+    let shutdown_and_drain = async {
+        runtime.begin_shutdown().await;
+        loop {
+            match events.recv().await {
+                Ok(env) => {
+                    if matches!(env.payload, EventPayload::FileDiffAvailable(_)) {
+                        saw_diff = true;
+                        break;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(10), shutdown_and_drain)
+        .await
+        .expect("final diff did not arrive");
+    assert!(saw_diff, "file.diffAvailable missing at shutdown");
+    runtime.finish_shutdown();
 
     drop(client);
     let _ = tokio::time::timeout(Duration::from_secs(5), conn).await;

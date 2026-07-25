@@ -380,7 +380,21 @@ enum AttachMode {
   ATTACH_MODE_INTERACTIVE = 1;
   ATTACH_MODE_OBSERVE = 2;
 }
-message AttachSessionArgs { string session_id = 1; AttachMode mode = 2; }
+message AttachSessionArgs {
+  string session_id = 1;
+  AttachMode mode = 2;
+  // When set, replay the session's durable output journal starting at this sequence (clamped to
+  // the first retained record) before live frames; data-frame `seq` values are journal sequences.
+  // Absent = live tail only (no replay).
+  optional uint64 from_sequence = 3;
+}
+message SignalSessionArgs { string session_id = 1; Signal signal = 2; }
+message ReadSessionOutputArgs {
+  string session_id = 1;
+  uint64 from_sequence = 2;
+  // Cap on returned payload bytes (defaulted/clamped by the daemon).
+  optional uint64 max_bytes = 3;
+}
 message DetachSessionArgs { string channel_id = 1; }
 message OpenForwardArgs { string host = 1; uint32 port = 2; optional string execution_id = 3; }
 message CloseForwardArgs { string channel_id = 1; }
@@ -413,6 +427,8 @@ message Command {
     CloseForwardArgs close_forward = 22;
     OpenSftpArgs open_sftp = 23;
     CloseSftpArgs close_sftp = 24;
+    SignalSessionArgs signal_session = 25;
+    ReadSessionOutputArgs read_session_output = 26;
   }
 }
 
@@ -465,6 +481,12 @@ message ProcessSummary {
 }
 message ProcessList { repeated ProcessSummary processes = 1; }
 
+enum SessionState {
+  SESSION_STATE_UNSPECIFIED = 0;
+  SESSION_STATE_RUNNING = 1;
+  SESSION_STATE_EXITED = 2;
+}
+
 message SessionSummary {
   string session_id = 1;
   string process_id = 2;
@@ -472,8 +494,28 @@ message SessionSummary {
   uint32 cols = 4;
   uint32 rows = 5;
   optional string execution_id = 6;
+  SessionState state = 7;
+  optional int32 exit_code = 8;
+  optional int32 signal = 9;
+  int64 started_at_micros = 10;
+  // Journal cursor bounds: the first still-retained output sequence and the next to be assigned.
+  uint64 first_journal_sequence = 11;
+  uint64 next_journal_sequence = 12;
 }
 message SessionList { repeated SessionSummary sessions = 1; }
+
+message SessionOutputChunk { uint64 sequence = 1; bytes data = 2; }
+message SessionOutput {
+  string session_id = 1;
+  repeated SessionOutputChunk chunks = 2;
+  // Cursor to pass as the next from_sequence (chunks were [from, next)).
+  uint64 next_sequence = 3;
+  // First sequence still retained in the journal (requests below this are clamped up to it).
+  uint64 first_available_sequence = 4;
+  SessionState state = 5;
+  optional int32 exit_code = 6;
+  optional int32 signal = 7;
+}
 
 message RuntimeMetrics {
   uint64 uptime_millis = 1;
@@ -507,6 +549,7 @@ message CommandResult {
     ForwardOpened forward_opened = 11;
     SftpOpened sftp_opened = 12;
     ProcessAttached process_attached = 13;
+    SessionOutput session_output = 14;
   }
 }
 

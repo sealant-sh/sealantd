@@ -334,6 +334,24 @@ impl EventBus {
         event_id
     }
 
+    /// Best-effort flush of the durable pipeline: waits (bounded) for the delivery task to drain
+    /// the submit queue, then flushes the spool to disk. No-op for a direct bus. Call before
+    /// tearing down connections at shutdown so just-published events (e.g. the final filesystem
+    /// diff) reach subscribers and the spool instead of dying in the queue.
+    pub async fn flush(&self, max_wait: Duration) {
+        let Delivery::Durable(durable) = &self.delivery else {
+            return;
+        };
+        let deadline = tokio::time::Instant::now() + max_wait;
+        while self.queue_depth() > 0 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // The delivery task may still be mid-broadcast on the last recv'd event; give it a beat.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let mut spool = durable.spool.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = spool.flush();
+    }
+
     /// Subscribe to the event stream. Each subscriber gets an independent receiver.
     #[must_use]
     pub fn subscribe(&self) -> broadcast::Receiver<EventEnvelope> {
