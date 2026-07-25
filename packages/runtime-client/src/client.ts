@@ -36,7 +36,11 @@ import {
   type ProcessList,
   type RuntimeMetrics,
   type ServerMessage,
+  type SessionList,
+  type SessionOpened,
+  type SessionOutput,
   type SftpOpened,
+  type Signal,
   type StreamAttached,
   type StreamFrame,
 } from "@sealant/runtime-protocol";
@@ -91,6 +95,37 @@ function resultValue(result: CommandResult, kase: CommandResult["result"]["case"
     throw new Error(`expected result ${kase}, got ${String(result.result.case)}`);
   }
   return (result.result as { value: unknown }).value;
+}
+
+/** Options for {@link SealantClient.openSession} (a subset of the wire `OpenSessionArgs`). */
+export interface OpenSessionOptions {
+  /** Shell/command to run; defaults to the daemon's configured default shell. */
+  shell?: string;
+  /** Arguments to the shell/command. */
+  args?: string[];
+  /** Working directory (defaults to the workspace root). */
+  cwd?: string;
+  /** Environment overlay entries. */
+  env?: Array<{ key: string; value: string }>;
+  /** Initial terminal columns. */
+  cols: number;
+  /** Initial terminal rows. */
+  rows: number;
+  /** `TERM` to advertise (defaults daemon-side). */
+  term?: string;
+  /** Execution to associate the session with. */
+  executionId?: string;
+}
+
+/** Options for {@link SealantClient.attachSession}. */
+export interface AttachSessionOptions {
+  /** Consumption mode (interactive by default). */
+  mode?: AttachMode;
+  /**
+   * Replay the durable output journal from this sequence (0 = full retained scrollback) before
+   * live frames; data-frame `seq` values are journal sequences. Omit for a live tail only.
+   */
+  fromSequence?: number | bigint;
 }
 
 /** Options for {@link SealantClient.exec} (a subset of the wire `ExecArgs`). */
@@ -330,13 +365,104 @@ export class SealantClient {
   // returns an open {@link Channel} already wired into the demux table — an async-iterable of that
   // channel's inbound bytes plus `write`/`windowUpdate`/`end` for outbound bytes.
 
-  /** Attach to an existing PTY session as a multiplexed channel (interactive by default). */
+  // ===================== interactive sessions =====================
+
+  /** Open an interactive PTY session (arbitrary command or the default shell). */
+  async openSession(options: OpenSessionOptions): Promise<SessionOpened> {
+    return resultValue(
+      okResult(
+        await this.request({
+          case: "openSession",
+          value: {
+            shell: options.shell,
+            args: options.args ?? [],
+            cwd: options.cwd,
+            env: options.env ?? [],
+            cols: options.cols,
+            rows: options.rows,
+            term: options.term,
+            executionId: options.executionId,
+          },
+        }),
+      ),
+      "sessionOpened",
+    ) as SessionOpened;
+  }
+
+  /**
+   * Close a session: hang up a running session's terminal (SIGHUP), or drop an exited session's
+   * retained tombstone (and its journal).
+   */
+  async closeSession(sessionId: string): Promise<void> {
+    okResult(await this.request({ case: "closeSession", value: { sessionId } }));
+  }
+
+  /** Resize a running session's PTY. */
+  async resizePty(sessionId: string, cols: number, rows: number): Promise<void> {
+    okResult(await this.request({ case: "resizePty", value: { sessionId, cols, rows } }));
+  }
+
+  /** List sessions: running first, then retained exited tombstones (state + exit code). */
+  async listSessions(): Promise<SessionList> {
+    return resultValue(
+      okResult(await this.request({ case: "listSessions", value: {} })),
+      "sessionList",
+    ) as SessionList;
+  }
+
+  /** Deliver a signal (e.g. SIGINT/SIGTERM) to a running session's process group. */
+  async signalSession(sessionId: string, signal: Signal): Promise<void> {
+    okResult(await this.request({ case: "signalSession", value: { sessionId, signal } }));
+  }
+
+  /**
+   * One-shot batch read of a session's durable output journal from `fromSequence` (clamped to the
+   * first retained record). Works for running and exited sessions; the result carries the cursors
+   * (`nextSequence`, `firstAvailableSequence`) and lifecycle state.
+   */
+  async readSessionOutput(
+    sessionId: string,
+    fromSequence: number | bigint,
+    maxBytes?: number | bigint,
+  ): Promise<SessionOutput> {
+    return resultValue(
+      okResult(
+        await this.request({
+          case: "readSessionOutput",
+          value: {
+            sessionId,
+            fromSequence: BigInt(fromSequence),
+            maxBytes: maxBytes === undefined ? undefined : BigInt(maxBytes),
+          },
+        }),
+      ),
+      "sessionOutput",
+    ) as SessionOutput;
+  }
+
+  /**
+   * Attach to an existing PTY session as a multiplexed channel (interactive by default). Pass
+   * `{ fromSequence }` to replay the durable journal (scrollback) before live output — data-frame
+   * `seq` values are then journal sequences, resumable across disconnects.
+   */
   async attachSession(
     sessionId: string,
-    mode: AttachMode = AttachMode.INTERACTIVE,
+    modeOrOptions: AttachMode | AttachSessionOptions = AttachMode.INTERACTIVE,
   ): Promise<{ result: StreamAttached; channel: Channel }> {
+    const options: AttachSessionOptions =
+      typeof modeOrOptions === "object" ? modeOrOptions : { mode: modeOrOptions };
     const result = resultValue(
-      okResult(await this.request({ case: "attachSession", value: { sessionId, mode } })),
+      okResult(
+        await this.request({
+          case: "attachSession",
+          value: {
+            sessionId,
+            mode: options.mode ?? AttachMode.INTERACTIVE,
+            fromSequence:
+              options.fromSequence === undefined ? undefined : BigInt(options.fromSequence),
+          },
+        }),
+      ),
       "streamAttached",
     ) as StreamAttached;
     return { result, channel: this.openChannel(result.channelId) };

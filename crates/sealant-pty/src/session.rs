@@ -14,14 +14,16 @@ use nix::unistd::Pid;
 use sealant_protocol::{
     Base64Bytes, CaptureMethod, ChannelId, Confidence, ControlError, Encoding, EventPayload,
     ExecutionId, ExitReason, IoChunk, OpenSessionArgs, ProcessExited, ProcessId, ProcessStarted,
-    ServerMessage, SessionId, SessionList, SessionOpened, SessionSummary, StreamEnd, StreamFrame,
-    StreamKind, StreamOffset,
+    ServerMessage, SessionId, SessionList, SessionOpened, SessionOutput, SessionOutputChunk,
+    SessionState, SessionSummary, Signal, StreamEnd, StreamFrame, StreamKind, StreamOffset,
+    TransformMeta,
 };
-use sealant_runtime_core::{Clock, IdGenerator, RuntimeConfig, RuntimeStatus};
+use sealant_runtime_core::{Clock, IdGenerator, Redactor, RuntimeConfig, RuntimeStatus};
 use sealant_telemetry::{Correlation, EventBus};
 use tokio::io::unix::AsyncFd;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
+use crate::journal::SessionJournal;
 use crate::pty::{self, PtyChild};
 
 /// Default terminal type advertised to the child when the caller does not specify one.
@@ -41,8 +43,13 @@ pub struct ChannelSink {
     pub channel_id: ChannelId,
     /// The connection's backpressured outbound queue.
     pub out_tx: mpsc::Sender<ServerMessage>,
-    /// Per-channel monotonic data-frame counter (gap detection only).
-    seq: Arc<std::sync::atomic::AtomicU64>,
+    /// Gate for live fan-out: held false while an attach is replaying journal history, so live
+    /// frames never interleave with replayed ones.
+    ready: watch::Receiver<bool>,
+    /// Keeps the gate's sender alive for the sink's lifetime (a dropped sender reads as open).
+    _ready_tx: Arc<watch::Sender<bool>>,
+    /// First journal sequence this sink should receive live (earlier ones were replayed).
+    start_seq: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// A live interactive session: a shell running under a PTY.
@@ -60,14 +67,35 @@ pub struct SessionEntry {
     pub execution_id: Option<ExecutionId>,
     /// The reliable output attachment, when a gateway has attached.
     pub attached: Mutex<Option<ChannelSink>>,
+    /// The durable, redacted output journal (the reattach/scrollback read surface).
+    pub journal: Arc<Mutex<SessionJournal>>,
+    /// Wall-clock start time (unix micros).
+    pub started_at_micros: i64,
+    /// `Some((exit_code, signal))` once the leader has exited.
+    exit: Mutex<Option<(Option<i32>, Option<i32>)>>,
     cols: AtomicU16,
     rows: AtomicU16,
 }
 
 impl SessionEntry {
+    /// Lifecycle state plus exit codes, when exited.
+    #[must_use]
+    pub fn exit_status(&self) -> Option<(Option<i32>, Option<i32>)> {
+        *self.exit.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn mark_exited(&self, exit_code: Option<i32>, signal: Option<i32>) {
+        *self.exit.lock().unwrap_or_else(|e| e.into_inner()) = Some((exit_code, signal));
+    }
+
     /// A summary of this session.
     #[must_use]
     pub fn summary(&self) -> SessionSummary {
+        let exit = self.exit_status();
+        let (first_seq, next_seq) = {
+            let journal = self.journal.lock().unwrap_or_else(|e| e.into_inner());
+            (journal.first_seq(), journal.next_seq())
+        };
         SessionSummary {
             session_id: self.session_id.clone(),
             process_id: self.process_id.clone(),
@@ -75,14 +103,32 @@ impl SessionEntry {
             cols: self.cols.load(Ordering::Relaxed),
             rows: self.rows.load(Ordering::Relaxed),
             execution_id: self.execution_id.clone(),
+            state: if exit.is_some() {
+                SessionState::Exited
+            } else {
+                SessionState::Running
+            },
+            exit_code: exit.and_then(|(code, _)| code),
+            signal: exit.and_then(|(_, sig)| sig),
+            started_at_micros: self.started_at_micros,
+            first_journal_sequence: first_seq,
+            next_journal_sequence: next_seq,
         }
     }
 }
 
+/// Cap on retained exited-session tombstones; the oldest is evicted (journal files deleted).
+const MAX_FINISHED_SESSIONS: usize = 128;
+
 /// Thread-safe registry of interactive sessions.
+///
+/// Running sessions live in `running`; when a leader exits its entry moves to `finished` as a
+/// tombstone (state, exit code, journal) so clients can still observe the exit and replay the
+/// scrollback. Tombstones are dropped on an explicit `closeSession` or by FIFO eviction.
 #[derive(Debug, Default)]
 pub struct SessionRegistry {
     inner: Mutex<HashMap<SessionId, Arc<SessionEntry>>>,
+    finished: Mutex<Vec<Arc<SessionEntry>>>,
 }
 
 impl SessionRegistry {
@@ -96,45 +142,90 @@ impl SessionRegistry {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    fn lock_finished(&self) -> std::sync::MutexGuard<'_, Vec<Arc<SessionEntry>>> {
+        self.finished.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     fn insert(&self, entry: Arc<SessionEntry>) {
         self.lock().insert(entry.session_id.clone(), entry);
     }
 
-    /// Look up a session.
+    /// Look up a session — running first, then exited tombstones.
     #[must_use]
     pub fn get(&self, id: &SessionId) -> Option<Arc<SessionEntry>> {
+        if let Some(entry) = self.lock().get(id).cloned() {
+            return Some(entry);
+        }
+        self.lock_finished()
+            .iter()
+            .find(|e| &e.session_id == id)
+            .cloned()
+    }
+
+    /// Look up a *running* session only.
+    #[must_use]
+    pub fn get_running(&self, id: &SessionId) -> Option<Arc<SessionEntry>> {
         self.lock().get(id).cloned()
     }
 
-    fn remove(&self, id: &SessionId) -> Option<Arc<SessionEntry>> {
-        self.lock().remove(id)
+    /// Move a running session to the finished tombstones (evicting the oldest beyond the cap).
+    fn finish(&self, id: &SessionId) -> Option<Arc<SessionEntry>> {
+        let entry = self.lock().remove(id)?;
+        let mut finished = self.lock_finished();
+        finished.push(entry.clone());
+        if finished.len() > MAX_FINISHED_SESSIONS {
+            let evicted = finished.remove(0);
+            evicted
+                .journal
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove_files();
+        }
+        Some(entry)
     }
 
-    /// Number of live sessions.
+    /// Drop an exited session's tombstone (and its journal files). Returns whether one existed.
+    fn remove_finished(&self, id: &SessionId) -> bool {
+        let mut finished = self.lock_finished();
+        let Some(pos) = finished.iter().position(|e| &e.session_id == id) else {
+            return false;
+        };
+        let removed = finished.remove(pos);
+        removed
+            .journal
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove_files();
+        true
+    }
+
+    /// Number of running sessions.
     #[must_use]
     pub fn len(&self) -> usize {
         self.lock().len()
     }
 
-    /// Whether there are no sessions.
+    /// Whether there are no running sessions.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.lock().is_empty()
     }
 
-    /// Summaries of all sessions.
+    /// Summaries of all sessions: running first, then retained exited tombstones.
     #[must_use]
     pub fn list(&self) -> Vec<SessionSummary> {
-        self.lock().values().map(|e| e.summary()).collect()
+        let mut out: Vec<SessionSummary> = self.lock().values().map(|e| e.summary()).collect();
+        out.extend(self.lock_finished().iter().map(|e| e.summary()));
+        out
     }
 
-    /// Snapshot of all live session entries.
+    /// Snapshot of all running session entries.
     #[must_use]
     pub fn entries(&self) -> Vec<Arc<SessionEntry>> {
         self.lock().values().cloned().collect()
     }
 
-    /// All session leader pids.
+    /// All running session leader pids.
     #[must_use]
     pub fn pids(&self) -> Vec<i32> {
         self.lock().values().map(|e| e.pid).collect()
@@ -158,11 +249,28 @@ pub struct SessionRuntime {
     pub config: Arc<RuntimeConfig>,
     /// Extra environment injected into every session child last (e.g. egress-proxy routing).
     pub extra_env: Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    /// Secret redaction applied to output before it reaches the journal, telemetry, or a sink.
+    pub redactor: Arc<Redactor>,
 }
 
 fn signal_session(pid: i32, signal: NixSignal) {
     // The session leader is its own process-group leader (setsid), so signal the whole group.
     let _ = nix::sys::signal::killpg(Pid::from_raw(pid), signal);
+}
+
+/// Map a protocol signal onto the host signal for group delivery.
+fn to_nix_signal(signal: Signal) -> NixSignal {
+    match signal {
+        Signal::Hup => NixSignal::SIGHUP,
+        Signal::Int => NixSignal::SIGINT,
+        Signal::Quit => NixSignal::SIGQUIT,
+        Signal::Term => NixSignal::SIGTERM,
+        Signal::Kill => NixSignal::SIGKILL,
+        Signal::Usr1 => NixSignal::SIGUSR1,
+        Signal::Usr2 => NixSignal::SIGUSR2,
+        Signal::Stop => NixSignal::SIGSTOP,
+        Signal::Cont => NixSignal::SIGCONT,
+    }
 }
 
 impl SessionRuntime {
@@ -224,6 +332,24 @@ impl SessionRuntime {
             .or_else(|| self.config.default_execution_id.clone());
         let master = Arc::new(master);
 
+        // The durable output journal is a product guarantee (reattach + scrollback); a session
+        // that cannot journal must not open.
+        let journal_dir = self.config.session_journal_dir.clone().unwrap_or_else(|| {
+            std::env::temp_dir().join(format!("sealantd-journals-{}", self.config.runtime_id))
+        });
+        let journal = SessionJournal::create(
+            &journal_dir,
+            session_id.as_str(),
+            self.config.session_journal_segment_bytes,
+        )
+        .map_err(|e| {
+            signal_session(pid, NixSignal::SIGKILL);
+            ControlError::internal(format!(
+                "session journal create failed under {}: {e}",
+                journal_dir.display()
+            ))
+        })?;
+
         let entry = Arc::new(SessionEntry {
             session_id: session_id.clone(),
             process_id: process_id.clone(),
@@ -231,6 +357,9 @@ impl SessionRuntime {
             master: master.clone(),
             execution_id: execution_id.clone(),
             attached: Mutex::new(None),
+            journal: Arc::new(Mutex::new(journal)),
+            started_at_micros: self.clock.wall_now().get(),
+            exit: Mutex::new(None),
             cols: AtomicU16::new(args.cols),
             rows: AtomicU16::new(args.rows),
         });
@@ -264,6 +393,8 @@ impl SessionRuntime {
         let capture_corr = correlation.clone();
         let capture_master = master.clone();
         let capture_entry = entry.clone();
+        let capture_redactor = self.redactor.clone();
+        let capture_status = self.status.clone();
         let chunk_size = self.config.io_chunk_bytes;
         let capture = tokio::spawn(async move {
             capture_output(
@@ -272,6 +403,8 @@ impl SessionRuntime {
                 capture_corr,
                 chunk_size,
                 capture_entry,
+                capture_redactor,
+                capture_status,
             )
             .await;
         });
@@ -301,7 +434,13 @@ impl SessionRuntime {
             // `capture.await` above already drained the PTY to EOF, fanning every chunk to both the
             // telemetry bus AND the attach sink (single reader). So by here the attach stream has
             // received all output; send a final End{exit_code, signal} and clear the attachment.
-            let entry = waiter_registry.remove(&waiter_session);
+            // The entry itself becomes an exited tombstone (state + exit code + journal) so
+            // clients can still observe the exit and replay the scrollback after the fact.
+            let entry = waiter_registry.get_running(&waiter_session);
+            if let Some(entry) = &entry {
+                entry.mark_exited(exit_code, signal);
+            }
+            waiter_registry.finish(&waiter_session);
             if let Some(entry) = entry {
                 let sink = entry
                     .attached
@@ -342,13 +481,17 @@ impl SessionRuntime {
     ) -> Result<(), ControlError> {
         let entry = self
             .registry
-            .get(session_id)
+            .get_running(session_id)
             .ok_or_else(|| ControlError::session_not_found(session_id.to_string()))?;
         pty::write_all(&entry.master, data)
             .await
             .map_err(|e| ControlError::invalid_argument(format!("pty input write failed: {e}")))?;
 
-        // Record the forwarded input as evidence (redaction is a later-phase concern).
+        // Record the forwarded input as evidence, redacted before it becomes readable.
+        let (recorded, masked) = self.redactor.redact(data);
+        if masked > 0 {
+            self.status.add_redacted(masked);
+        }
         let correlation = Correlation::new()
             .execution(entry.execution_id.clone())
             .session(Some(session_id.clone()))
@@ -360,11 +503,16 @@ impl SessionRuntime {
             EventPayload::IoChunk(IoChunk {
                 stream: StreamKind::PtyInput,
                 encoding: Encoding::Base64,
-                byte_count: data.len() as u64,
+                byte_count: recorded.len() as u64,
                 stream_offset: StreamOffset::ZERO,
-                content: Some(Base64Bytes::new(data)),
+                content: Some(Base64Bytes::new(recorded.as_slice())),
                 artifact: None,
-                transform: None,
+                transform: (masked > 0).then_some(TransformMeta {
+                    redacted: true,
+                    truncated: false,
+                    coalesced: false,
+                    original_byte_count: Some(data.len() as u64),
+                }),
             }),
         );
         Ok(())
@@ -381,23 +529,78 @@ impl SessionRuntime {
     ///
     /// Re-attaching replaces the prior attachment (the old gateway simply stops receiving frames).
     ///
+    /// With `from_sequence`, the durable journal is replayed first — data frames carry journal
+    /// sequences, so `[from, live)` is delivered exactly once and in order before live output.
+    /// Attaching to an *exited* session replays the retained scrollback and then sends the final
+    /// `End{exit_code, signal}` frame.
+    ///
     /// # Errors
     /// Returns a [`ControlError`] if the session is unknown.
-    pub fn attach(
+    pub async fn attach(
         &self,
         session_id: &SessionId,
         channel_id: ChannelId,
         out_tx: mpsc::Sender<ServerMessage>,
+        from_sequence: Option<u64>,
     ) -> Result<(), ControlError> {
         let entry = self
             .registry
             .get(session_id)
             .ok_or_else(|| ControlError::session_not_found(session_id.to_string()))?;
+
+        if let Some((exit_code, signal)) = entry.exit_status() {
+            // Exited tombstone: replay-only, no live sink to install.
+            if let Some(from) = from_sequence {
+                replay_journal(&entry, &channel_id, &out_tx, from).await;
+            }
+            let frame = StreamFrame::end(
+                channel_id,
+                u64::MAX,
+                StreamEnd {
+                    exit_code,
+                    signal,
+                    error: None,
+                },
+            );
+            let _ = out_tx.send(ServerMessage::Stream(frame)).await;
+            return Ok(());
+        }
+
+        let Some(from) = from_sequence else {
+            // Live tail only: the sink is ready immediately and receives every chunk from now on.
+            let (ready_tx, ready_rx) = watch::channel(true);
+            *entry.attached.lock().unwrap_or_else(|e| e.into_inner()) = Some(ChannelSink {
+                channel_id,
+                out_tx,
+                ready: ready_rx,
+                _ready_tx: Arc::new(ready_tx),
+                start_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            });
+            return Ok(());
+        };
+
+        // Replay + live: install the sink gated closed so the capture loop journals but does not
+        // fan out; snapshot the journal end (nothing at/after it has been sent — the gate was
+        // closed before the snapshot); replay [from, end); then open the gate. The capture loop
+        // skips live chunks below `start_seq` (they were part of the replayed range).
+        let (ready_tx, ready_rx) = watch::channel(false);
+        let ready_tx = Arc::new(ready_tx);
+        let start_seq = Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
         *entry.attached.lock().unwrap_or_else(|e| e.into_inner()) = Some(ChannelSink {
-            channel_id,
-            out_tx,
-            seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            channel_id: channel_id.clone(),
+            out_tx: out_tx.clone(),
+            ready: ready_rx,
+            _ready_tx: ready_tx.clone(),
+            start_seq: start_seq.clone(),
         });
+        let upper = entry
+            .journal
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .next_seq();
+        start_seq.store(upper, Ordering::SeqCst);
+        replay_journal_until(&entry, &channel_id, &out_tx, from, upper).await;
+        let _ = ready_tx.send(true);
         Ok(())
     }
 
@@ -449,17 +652,87 @@ impl SessionRuntime {
         Ok(())
     }
 
-    /// Close a session by hanging up its terminal (SIGHUP). The wait task publishes the exit.
+    /// Close a session. Running: hang up its terminal (SIGHUP; the wait task publishes the exit
+    /// and leaves an exited tombstone). Exited: drop the tombstone and its journal files.
     ///
     /// # Errors
     /// Returns a [`ControlError`] if the session is unknown.
     pub fn close(&self, session_id: &SessionId) -> Result<(), ControlError> {
+        if let Some(entry) = self.registry.get_running(session_id) {
+            signal_session(entry.pid, NixSignal::SIGHUP);
+            return Ok(());
+        }
+        if self.registry.remove_finished(session_id) {
+            return Ok(());
+        }
+        Err(ControlError::session_not_found(session_id.to_string()))
+    }
+
+    /// Deliver a signal to a running session's process group.
+    ///
+    /// # Errors
+    /// Returns a [`ControlError`] if the session is unknown or already exited.
+    pub fn signal(&self, session_id: &SessionId, signal: Signal) -> Result<(), ControlError> {
+        let entry = self
+            .registry
+            .get_running(session_id)
+            .ok_or_else(|| ControlError::session_not_found(session_id.to_string()))?;
+        signal_session(entry.pid, to_nix_signal(signal));
+        Ok(())
+    }
+
+    /// Read a batch of a session's durable output journal from `from_sequence` (clamped to the
+    /// first retained record), bounded by `max_bytes` of payload.
+    ///
+    /// # Errors
+    /// Returns a [`ControlError`] if the session is unknown (running and exited both read fine).
+    pub fn read_output(
+        &self,
+        session_id: &SessionId,
+        from_sequence: u64,
+        max_bytes: Option<u64>,
+    ) -> Result<SessionOutput, ControlError> {
+        /// Per-response payload cap: stay comfortably under the control frame limit.
+        const DEFAULT_MAX_BYTES: u64 = 1024 * 1024;
         let entry = self
             .registry
             .get(session_id)
             .ok_or_else(|| ControlError::session_not_found(session_id.to_string()))?;
-        signal_session(entry.pid, NixSignal::SIGHUP);
-        Ok(())
+        let budget = max_bytes
+            .unwrap_or(DEFAULT_MAX_BYTES)
+            .clamp(1, DEFAULT_MAX_BYTES);
+        let exit = entry.exit_status();
+        let (chunks, first_available, journal_end) = {
+            let journal = entry.journal.lock().unwrap_or_else(|e| e.into_inner());
+            (
+                journal.read_from(from_sequence, budget),
+                journal.first_seq(),
+                journal.next_seq(),
+            )
+        };
+        let next_sequence = chunks.last().map_or_else(
+            || from_sequence.clamp(first_available, journal_end),
+            |c| c.sequence + 1,
+        );
+        Ok(SessionOutput {
+            session_id: session_id.clone(),
+            chunks: chunks
+                .into_iter()
+                .map(|c| SessionOutputChunk {
+                    sequence: c.sequence,
+                    data: Base64Bytes::new(c.data),
+                })
+                .collect(),
+            next_sequence,
+            first_available_sequence: first_available,
+            state: if exit.is_some() {
+                SessionState::Exited
+            } else {
+                SessionState::Running
+            },
+            exit_code: exit.and_then(|(code, _)| code),
+            signal: exit.and_then(|(_, sig)| sig),
+        })
     }
 
     /// List active sessions.
@@ -529,6 +802,8 @@ async fn capture_output(
     correlation: Correlation,
     chunk_size: usize,
     entry: Arc<SessionEntry>,
+    redactor: Arc<Redactor>,
+    status: Arc<RuntimeStatus>,
 ) {
     let mut offset = StreamOffset::ZERO;
     let mut buf = vec![0u8; chunk_size.max(1)];
@@ -536,7 +811,31 @@ async fn capture_output(
         match pty::read(&master, &mut buf).await {
             Ok(0) => break,
             Ok(n) => {
-                // (a) lossy telemetry tap (always on).
+                // (a) redact once; every downstream consumer (journal, telemetry, sink) sees the
+                // same redacted bytes — the journal is the product read surface and must never
+                // hold raw secrets.
+                let (recorded, masked) = redactor.redact(&buf[..n]);
+                if masked > 0 {
+                    status.add_redacted(masked);
+                }
+
+                // (b) durable journal append — the sequence minted here is the wire sequence for
+                // both live frames and replays.
+                let seq = {
+                    let mut journal = entry.journal.lock().unwrap_or_else(|e| e.into_inner());
+                    journal.append(&recorded)
+                };
+                let seq = match seq {
+                    Ok(seq) => seq,
+                    Err(error) => {
+                        tracing::error!(%error, session = %entry.session_id,
+                            "session journal append failed; output recording degraded");
+                        status.add_degradation("session-journal-append-failed");
+                        u64::MAX
+                    }
+                };
+
+                // (c) lossy telemetry tap (always on).
                 bus.publish(
                     &correlation,
                     CaptureMethod::Pty,
@@ -544,32 +843,43 @@ async fn capture_output(
                     EventPayload::IoChunk(IoChunk {
                         stream: StreamKind::PtyOutput,
                         encoding: Encoding::Base64,
-                        byte_count: n as u64,
+                        byte_count: recorded.len() as u64,
                         stream_offset: offset,
-                        content: Some(Base64Bytes::new(&buf[..n])),
+                        content: Some(Base64Bytes::new(recorded.as_slice())),
                         artifact: None,
-                        transform: None,
+                        transform: (masked > 0).then_some(TransformMeta {
+                            redacted: true,
+                            truncated: false,
+                            coalesced: false,
+                            original_byte_count: Some(n as u64),
+                        }),
                     }),
                 );
                 offset = offset.advance(n as u64);
 
-                // (b) reliable attach fan-out (backpressured). Snapshot the sink under the lock,
-                // then send outside it. If the gateway queue is closed (connection gone), clear the
-                // stale attachment so we stop trying.
+                // (d) reliable attach fan-out (backpressured). Snapshot the sink under the lock,
+                // then send outside it. A replaying attach holds the gate closed; chunks below
+                // its start_seq are covered by the replay and skipped here. If the gateway queue
+                // is closed (connection gone), clear the stale attachment so we stop trying.
                 let sink = entry
                     .attached
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .clone();
                 if let Some(sink) = sink {
-                    let seq = sink.seq.fetch_add(1, Ordering::Relaxed);
-                    let frame = StreamFrame::data(sink.channel_id.clone(), seq, &buf[..n]);
-                    if sink
-                        .out_tx
-                        .send(ServerMessage::Stream(frame))
-                        .await
-                        .is_err()
-                    {
+                    let mut ready = sink.ready.clone();
+                    // An error means the attach task died before opening the gate; treat the
+                    // attachment as stale and drop it.
+                    let gate_open = ready.wait_for(|open| *open).await.is_ok();
+                    let wanted = gate_open && seq >= sink.start_seq.load(Ordering::SeqCst);
+                    let delivered = if wanted {
+                        let frame =
+                            StreamFrame::data(sink.channel_id.clone(), seq, recorded.as_slice());
+                        sink.out_tx.send(ServerMessage::Stream(frame)).await.is_ok()
+                    } else {
+                        gate_open
+                    };
+                    if !delivered {
                         let mut guard = entry.attached.lock().unwrap_or_else(|e| e.into_inner());
                         if guard
                             .as_ref()
@@ -582,6 +892,61 @@ async fn capture_output(
             }
             Err(e) if pty::is_eof_error(&e) => break,
             Err(_) => break,
+        }
+    }
+}
+
+/// Replay a session's journal from `from` to its current end over `out_tx` (used for attaches to
+/// exited sessions, where no live producer exists).
+async fn replay_journal(
+    entry: &Arc<SessionEntry>,
+    channel_id: &ChannelId,
+    out_tx: &mpsc::Sender<ServerMessage>,
+    from: u64,
+) {
+    let upper = entry
+        .journal
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .next_seq();
+    replay_journal_until(entry, channel_id, out_tx, from, upper).await;
+}
+
+/// Replay journal records `[from, upper)` over `out_tx` in bounded batches. The journal lock is
+/// held only while reading a batch, never across a send.
+async fn replay_journal_until(
+    entry: &Arc<SessionEntry>,
+    channel_id: &ChannelId,
+    out_tx: &mpsc::Sender<ServerMessage>,
+    from: u64,
+    upper: u64,
+) {
+    /// Per-batch payload budget for journal reads during replay.
+    const REPLAY_BATCH_BYTES: u64 = 256 * 1024;
+    let mut cursor = from;
+    while cursor < upper {
+        let chunks = {
+            let journal = entry.journal.lock().unwrap_or_else(|e| e.into_inner());
+            journal.read_from(cursor, REPLAY_BATCH_BYTES)
+        };
+        if chunks.is_empty() {
+            break;
+        }
+        let mut progressed = false;
+        for chunk in chunks {
+            if chunk.sequence >= upper {
+                return;
+            }
+            cursor = chunk.sequence + 1;
+            progressed = true;
+            let frame =
+                StreamFrame::data(channel_id.clone(), chunk.sequence, chunk.data.as_slice());
+            if out_tx.send(ServerMessage::Stream(frame)).await.is_err() {
+                return;
+            }
+        }
+        if !progressed {
+            break;
         }
     }
 }
@@ -615,6 +980,7 @@ mod tests {
             clock,
             config: Arc::new(config),
             extra_env: Arc::new(std::sync::Mutex::new(Vec::new())),
+            redactor: Arc::new(Redactor::default()),
         }
     }
 
@@ -773,7 +1139,8 @@ mod tests {
                 24,
             ))
             .expect("open");
-        rt.attach(&opened.session_id, channel.clone(), out_tx)
+        rt.attach(&opened.session_id, channel.clone(), out_tx, None)
+            .await
             .expect("attach");
 
         let (bytes, _exit) = attach_output_until_end(&mut out_rx, &channel).await;
@@ -797,7 +1164,8 @@ mod tests {
         let opened = rt
             .open(session_args(&["-c", script], 80, 24))
             .expect("open");
-        rt.attach(&opened.session_id, channel.clone(), out_tx)
+        rt.attach(&opened.session_id, channel.clone(), out_tx, None)
+            .await
             .expect("attach");
 
         // Drain slowly: yield (and occasionally sleep) to keep the queue saturated.
@@ -853,7 +1221,8 @@ mod tests {
         let opened = rt
             .open(session_args(&["-c", "exit 7"], 80, 24))
             .expect("open");
-        rt.attach(&opened.session_id, channel.clone(), out_tx)
+        rt.attach(&opened.session_id, channel.clone(), out_tx, None)
+            .await
             .expect("attach");
         let (_bytes, exit) = attach_output_until_end(&mut out_rx, &channel).await;
         assert_eq!(exit, Some(7), "End must carry the leader's exit code");
@@ -869,7 +1238,8 @@ mod tests {
         let opened = rt
             .open(session_args(&["-c", "printf 'PARALLEL\\n'"], 80, 24))
             .expect("open");
-        rt.attach(&opened.session_id, channel.clone(), out_tx)
+        rt.attach(&opened.session_id, channel.clone(), out_tx, None)
+            .await
             .expect("attach");
 
         let (attach_bytes, _exit) = attach_output_until_end(&mut out_rx, &channel).await;
@@ -891,7 +1261,8 @@ mod tests {
         let opened = rt
             .open(session_args(&["-c", "sleep 30"], 80, 24))
             .expect("open");
-        rt.attach(&opened.session_id, channel.clone(), out_tx)
+        rt.attach(&opened.session_id, channel.clone(), out_tx, None)
+            .await
             .expect("attach");
         rt.detach(&channel);
         // After detach, the session entry must have no attachment.
@@ -944,5 +1315,186 @@ mod tests {
         }
         assert!(released, "session resources should be released after close");
         assert_eq!(rt.status.counts().1, 0);
+    }
+
+    /// Poll `read_output` until its reassembled text contains `needle` (or time out).
+    async fn journal_contains(rt: &SessionRuntime, id: &SessionId, needle: &str) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            let out = rt.read_output(id, 0, None).expect("read_output");
+            let text: String = out
+                .chunks
+                .iter()
+                .map(|c| String::from_utf8_lossy(c.data.as_slice()).to_string())
+                .collect();
+            if text.contains(needle) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        false
+    }
+
+    /// The product path: attach, disconnect, write more, reattach with `from_sequence: 0`, and
+    /// receive the FULL scrollback (both markers) with contiguous journal sequences, then live
+    /// output continues on the same channel.
+    #[tokio::test]
+    async fn reattach_replays_full_scrollback_from_sequence_zero() {
+        let rt = runtime();
+        let opened = rt.open(session_args(&[], 80, 24)).expect("open");
+
+        // First client: live attach, produce a marker, then die (drop the receiver).
+        let (tx1, rx1) = mpsc::channel::<ServerMessage>(64);
+        rt.attach(&opened.session_id, ChannelId::new("c1"), tx1, None)
+            .await
+            .expect("attach 1");
+        rt.write_input(&opened.session_id, b"echo FIRST_MARKER\n")
+            .await
+            .expect("write 1");
+        assert!(
+            journal_contains(&rt, &opened.session_id, "FIRST_MARKER").await,
+            "first marker must reach the journal"
+        );
+        drop(rx1);
+
+        // Output produced while nobody is attached must still land in the journal.
+        rt.write_input(&opened.session_id, b"echo SECOND_MARKER\n")
+            .await
+            .expect("write 2");
+        assert!(
+            journal_contains(&rt, &opened.session_id, "SECOND_MARKER").await,
+            "detached-window output must be journaled, not dropped"
+        );
+
+        // Reattach with full replay; then produce live output on the same channel.
+        let (tx2, mut rx2) = mpsc::channel::<ServerMessage>(64);
+        rt.attach(&opened.session_id, ChannelId::new("c2"), tx2, Some(0))
+            .await
+            .expect("reattach");
+        rt.write_input(&opened.session_id, b"echo THIRD_MARKER\n")
+            .await
+            .expect("write 3");
+
+        let mut text = String::new();
+        let mut last_seq: Option<u64> = None;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !text.contains("THIRD_MARKER") && Instant::now() < deadline {
+            let Ok(Some(msg)) = tokio::time::timeout(Duration::from_secs(5), rx2.recv()).await
+            else {
+                break;
+            };
+            if let ServerMessage::Stream(frame) = msg
+                && let sealant_protocol::StreamPayload::Data { data } = frame.payload
+            {
+                if let Some(prev) = last_seq {
+                    assert_eq!(frame.seq, prev + 1, "replay+live must be contiguous");
+                } else {
+                    assert_eq!(frame.seq, 0, "replay must start at sequence 0");
+                }
+                last_seq = Some(frame.seq);
+                text.push_str(&String::from_utf8_lossy(data.as_slice()));
+            }
+        }
+        let first = text.find("FIRST_MARKER");
+        let second = text.find("SECOND_MARKER");
+        let third = text.find("THIRD_MARKER");
+        assert!(
+            first.is_some() && second.is_some() && third.is_some(),
+            "all three markers must arrive on the reattached channel; got {text:?}"
+        );
+        assert!(first < second && second < third, "markers must be in order");
+
+        rt.close(&opened.session_id).expect("close");
+    }
+
+    /// signalSession delivers to the group; the exited session stays observable as a tombstone
+    /// (state, signal, scrollback) until an explicit close drops it.
+    #[tokio::test]
+    async fn signal_terminates_and_tombstone_reports_exit_and_scrollback() {
+        let rt = runtime();
+        let mut rx = rt.bus.subscribe();
+        let opened = rt
+            .open(session_args(&["-c", "echo READY; sleep 30"], 80, 24))
+            .expect("open");
+        assert!(
+            wait_for_output(&mut rx, "READY", Duration::from_secs(4)).await,
+            "session should print READY"
+        );
+        rt.signal(&opened.session_id, Signal::Term).expect("signal");
+
+        // The waiter marks the exit; running set drains, tombstone appears.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !rt.registry.is_empty() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            rt.registry.is_empty(),
+            "running set should drain after SIGTERM"
+        );
+
+        let out = rt
+            .read_output(&opened.session_id, 0, None)
+            .expect("tombstone must be readable");
+        assert_eq!(out.state, SessionState::Exited);
+        assert_eq!(out.signal, Some(libc::SIGTERM), "signal 15 expected");
+        let text: String = out
+            .chunks
+            .iter()
+            .map(|c| String::from_utf8_lossy(c.data.as_slice()).to_string())
+            .collect();
+        assert!(
+            text.contains("READY"),
+            "scrollback must survive exit: {text:?}"
+        );
+
+        let summaries = rt.list().sessions;
+        let summary = summaries
+            .iter()
+            .find(|s| s.session_id == opened.session_id)
+            .expect("tombstone listed");
+        assert_eq!(summary.state, SessionState::Exited);
+
+        // Close drops the tombstone.
+        rt.close(&opened.session_id).expect("close tombstone");
+        assert!(rt.registry.get(&opened.session_id).is_none());
+        assert!(rt.read_output(&opened.session_id, 0, None).is_err());
+    }
+
+    /// Secrets are redacted before the journal (the readable surface), telemetry, and live sinks.
+    #[tokio::test]
+    async fn output_is_redacted_before_it_is_readable() {
+        let mut rt = runtime();
+        rt.redactor = Arc::new(Redactor::new(vec!["super-secret-value-123".to_owned()]));
+        let mut rx = rt.bus.subscribe();
+        let opened = rt
+            .open(session_args(
+                &["-c", "printf 'token=super-secret-value-123 end\n'"],
+                80,
+                24,
+            ))
+            .expect("open");
+        let out_bytes = output_until_exit(&mut rx).await;
+        let telemetry_text = String::from_utf8_lossy(&out_bytes);
+        assert!(
+            !telemetry_text.contains("super-secret-value-123"),
+            "telemetry must be redacted"
+        );
+
+        let out = rt
+            .read_output(&opened.session_id, 0, None)
+            .expect("read journal");
+        let journal_text: String = out
+            .chunks
+            .iter()
+            .map(|c| String::from_utf8_lossy(c.data.as_slice()).to_string())
+            .collect();
+        assert!(
+            !journal_text.contains("super-secret-value-123"),
+            "journal must never hold raw secrets: {journal_text:?}"
+        );
+        assert!(
+            journal_text.contains("***REDACTED***"),
+            "journal should carry the mask: {journal_text:?}"
+        );
     }
 }

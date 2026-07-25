@@ -19,6 +19,9 @@ const DEFAULT_WORKSPACE_ROOT: &str = "/workspace";
 const DEFAULT_WORKING_DIRECTORY: &str = "/workspace/repo";
 /// Default control socket path.
 const DEFAULT_CONTROL_SOCKET: &str = "/run/sealant/control.sock";
+/// Default directory for per-session durable PTY output journals (real disk, not tmpfs, so
+/// scrollback does not compete with RAM).
+const DEFAULT_SESSION_JOURNAL_DIR: &str = "/var/lib/sealantd/session-journals";
 /// Default HTTP git/dotfiles username.
 const DEFAULT_HTTP_USERNAME: &str = "x-access-token";
 /// Default dotfiles bootstrap command.
@@ -61,6 +64,7 @@ const CONSUMED_KEYS: &[&str] = &[
     "SEALANT_WATCH_FILESYSTEM",
     "SEALANT_NETWORK_PROXY",
     "SEALANT_SPOOL_DIR",
+    "SEALANT_SESSION_JOURNAL_DIR",
     "SEALANT_EXECUTION_ID",
     "SEALANT_WORKSPACE_ID",
 ];
@@ -345,6 +349,8 @@ pub struct ControlConfig {
     pub network_proxy: bool,
     /// Optional durable telemetry spool directory.
     pub spool_dir: Option<PathBuf>,
+    /// Directory for per-session durable PTY output journals.
+    pub session_journal_dir: PathBuf,
     /// Default execution id, when supplied.
     pub execution_id: Option<String>,
     /// Bound workspace id, when supplied.
@@ -492,6 +498,11 @@ impl BootConfig {
                 .get("SEALANT_SPOOL_DIR")
                 .filter(|s| !s.is_empty())
                 .map(Into::into),
+            session_journal_dir: env
+                .get("SEALANT_SESSION_JOURNAL_DIR")
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| DEFAULT_SESSION_JOURNAL_DIR.to_owned())
+                .into(),
             execution_id: env.get("SEALANT_EXECUTION_ID").filter(|s| !s.is_empty()),
             workspace_id: env.get("SEALANT_WORKSPACE_ID").filter(|s| !s.is_empty()),
         };

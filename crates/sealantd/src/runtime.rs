@@ -148,7 +148,7 @@ impl Runtime {
             clock: clock.clone(),
             config: config.clone(),
             extra_env: extra_env.clone(),
-            redactor,
+            redactor: redactor.clone(),
         };
         let sessions = SessionRuntime {
             registry: Arc::new(SessionRegistry::new()),
@@ -158,6 +158,7 @@ impl Runtime {
             clock: clock.clone(),
             config: config.clone(),
             extra_env: extra_env.clone(),
+            redactor: redactor.clone(),
         };
         let fs_execution: sealant_fs::SharedExecution =
             Arc::new(Mutex::new(config.default_execution_id.clone()));
@@ -611,6 +612,24 @@ impl Runtime {
                 Ok(()) => ControlResponse::accepted(rid),
                 Err(error) => ControlResponse::error(rid, error),
             },
+            Command::SignalSession { session_id, signal } => {
+                match self.sessions.signal(&session_id, signal) {
+                    Ok(()) => ControlResponse::accepted(rid),
+                    Err(error) => ControlResponse::error(rid, error),
+                }
+            }
+            Command::ReadSessionOutput(args) => {
+                match self.sessions.read_output(
+                    &args.session_id,
+                    args.from_sequence,
+                    args.max_bytes,
+                ) {
+                    Ok(output) => {
+                        ControlResponse::ok_with(rid, CommandResult::SessionOutput(output))
+                    }
+                    Err(error) => ControlResponse::error(rid, error),
+                }
+            }
             Command::SetFeatureState { feature, enabled } => {
                 self.set_feature(feature, enabled);
                 ControlResponse::accepted(rid)
@@ -714,14 +733,20 @@ impl Runtime {
                 }
             }
 
-            // §1.A — attach a session's PTY output to a fresh reliable channel.
+            // §1.A — attach a session's PTY output to a fresh reliable channel, optionally
+            // replaying the durable journal from a sequence first (reattach + scrollback).
             Command::AttachSession(args) => {
                 let channel_id = self.idgen.channel_id();
-                match self.sessions.attach(
-                    &args.session_id,
-                    channel_id.clone(),
-                    conn.out_tx.clone(),
-                ) {
+                match self
+                    .sessions
+                    .attach(
+                        &args.session_id,
+                        channel_id.clone(),
+                        conn.out_tx.clone(),
+                        args.from_sequence,
+                    )
+                    .await
+                {
                     Ok(()) => {
                         // No inbound sink for attach: client keystrokes use writeStdin (the PTY is
                         // the input path). Register an eager closer so a connection drop detaches the

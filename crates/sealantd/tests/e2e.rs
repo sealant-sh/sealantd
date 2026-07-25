@@ -432,6 +432,7 @@ async fn in_process_attach_streams_pty_output_over_channel() {
         ControlRequest::new(
             RequestId::new("a1"),
             Command::AttachSession(AttachSessionArgs {
+                from_sequence: None,
                 session_id: session_id.clone(),
                 mode: AttachMode::Interactive,
             }),
@@ -683,6 +684,7 @@ async fn in_process_connection_drop_tears_down_attachment() {
         ControlRequest::new(
             RequestId::new("t3"),
             Command::AttachSession(AttachSessionArgs {
+                from_sequence: None,
                 session_id: session_id.clone(),
                 mode: AttachMode::Interactive,
             }),

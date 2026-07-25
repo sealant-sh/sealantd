@@ -130,6 +130,7 @@ fn prepare_workspace(config: &BootConfig) -> Result<(), BootError> {
         PathBuf::from("/root"),
         PathBuf::from("/tmp"),
         PathBuf::from("/run/sealant"),
+        config.control.session_journal_dir.clone(),
     ];
     if let Some(parent) = config.control.socket.parent() {
         dirs.push(parent.to_path_buf());
@@ -192,6 +193,7 @@ fn into_runtime_config(config: &BootConfig) -> RuntimeConfig {
     runtime_config.socket_path = config.control.socket.clone();
     runtime_config.workspace_root = config.workspace.working_directory.clone();
     runtime_config.spool_dir = config.control.spool_dir.clone();
+    runtime_config.session_journal_dir = Some(config.control.session_journal_dir.clone());
     runtime_config.watch_filesystem = config.control.watch_filesystem;
     runtime_config.network_mode = if config.control.network_proxy {
         NetworkMode::Proxy
