@@ -481,9 +481,10 @@ impl BootConfig {
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| DEFAULT_CONTROL_SOCKET.to_owned())
                 .into(),
+            // Default ON: file evidence is the product; an operator opts *out* with 0/false.
             watch_filesystem: env
                 .get("SEALANT_WATCH_FILESYSTEM")
-                .is_some_and(|v| is_truthy(&v)),
+                .is_none_or(|v| is_truthy(&v)),
             network_proxy: env
                 .get("SEALANT_NETWORK_PROXY")
                 .is_some_and(|v| is_truthy(&v)),
@@ -819,7 +820,7 @@ mod tests {
             cfg.control.socket,
             PathBuf::from("/run/sealant/control.sock")
         );
-        assert!(!cfg.control.watch_filesystem);
+        assert!(cfg.control.watch_filesystem, "file watching defaults on");
         match cfg.foreground {
             ForegroundConfig::Harness { launch_command } => {
                 assert_eq!(launch_command, "claude --dangerously");

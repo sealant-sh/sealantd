@@ -49,10 +49,12 @@ fn secret_env_values(config: &RuntimeConfig) -> Vec<String> {
         .collect()
 }
 
-fn default_feature_states() -> HashMap<Feature, bool> {
+/// Initial feature states, derived from configuration rather than hardcoded: a disabled
+/// filesystem watcher must be visible as disabled in health, not reported as live.
+fn default_feature_states(config: &RuntimeConfig) -> HashMap<Feature, bool> {
     HashMap::from([
-        (Feature::FilesystemDiffing, true),
-        (Feature::LiveFilesystemWatching, true),
+        (Feature::FilesystemDiffing, config.watch_filesystem),
+        (Feature::LiveFilesystemWatching, config.watch_filesystem),
         (Feature::NetworkCollection, false),
         (Feature::PayloadCapture, false),
         (Feature::VerboseIoCapture, true),
@@ -113,6 +115,9 @@ pub struct Runtime {
     processes: ProcessRuntime,
     sessions: SessionRuntime,
     filesystem: Arc<FilesystemRuntime>,
+    /// The live execution association stamped onto filesystem events; updated as executions and
+    /// runs start/stop so a run's edits correlate to that run.
+    fs_execution: sealant_fs::SharedExecution,
     network: Arc<NetworkRuntime>,
     forwards: Arc<ForwardRuntime>,
     sftp: Arc<SftpRuntime>,
@@ -154,12 +159,14 @@ impl Runtime {
             config: config.clone(),
             extra_env: extra_env.clone(),
         };
+        let fs_execution: sealant_fs::SharedExecution =
+            Arc::new(Mutex::new(config.default_execution_id.clone()));
         let filesystem = Arc::new(FilesystemRuntime::new(
             bus.clone(),
             FilesystemConfig {
                 root: config.workspace_root.clone(),
                 snapshot: SnapshotConfig::default(),
-                execution_id: config.default_execution_id.clone(),
+                execution: fs_execution.clone(),
             },
         ));
         let network = Arc::new(NetworkRuntime::new(
@@ -178,6 +185,7 @@ impl Runtime {
         }
         let pidfd_supported = sealant_process::platform::pidfd_supported();
         let sftp = Arc::new(SftpRuntime::new(processes.registry.clone()));
+        let features = Mutex::new(default_feature_states(&config));
         Arc::new(Self {
             config,
             clock,
@@ -187,12 +195,13 @@ impl Runtime {
             processes,
             sessions,
             filesystem,
+            fs_execution,
             network,
             forwards: Arc::new(ForwardRuntime::new()),
             sftp,
             extra_env,
             shutdown,
-            features: Mutex::new(default_feature_states()),
+            features,
             pidfd_supported,
             subreaper,
         })
@@ -295,14 +304,19 @@ impl Runtime {
         self.bus.start_delivery();
     }
 
-    /// Start filesystem observation if enabled (baseline snapshot + live watch).
+    /// Start filesystem observation if enabled (baseline snapshot + live watch). A start failure
+    /// is loud: it downgrades the advertised feature states and health so a record consumer can
+    /// see that file evidence is missing, instead of silently producing zero file events.
     pub fn start_filesystem(&self) {
         if !self.config.watch_filesystem {
             return;
         }
         if let Err(error) = self.filesystem.start() {
-            tracing::warn!(%error, "filesystem watch failed to start; degraded");
+            tracing::error!(%error, root = %self.config.workspace_root.display(),
+                "filesystem watch failed to start; file evidence will be missing");
             self.status.add_degradation("filesystem-watch-failed");
+            self.set_feature(Feature::FilesystemDiffing, false);
+            self.set_feature(Feature::LiveFilesystemWatching, false);
         }
     }
 
@@ -369,6 +383,9 @@ impl Runtime {
         self.finalize_filesystem();
         // Stop the egress proxy.
         self.network.shutdown();
+        // Drain the durable delivery queue before callers tear down connections, so the final
+        // filesystem diff and exit events reach subscribers and the spool.
+        self.bus.flush(Duration::from_secs(2)).await;
     }
 
     /// Finish shutdown: mark stopped.
@@ -502,20 +519,24 @@ impl Runtime {
             }
             Command::ExecutionStart(args) => {
                 self.status.inc_executions();
-                let _ = args;
+                self.note_execution(args.execution_id.as_ref());
                 ControlResponse::accepted(rid)
             }
             Command::ExecutionStop { execution_id } => {
                 self.stop_execution(&execution_id);
+                self.clear_execution(&execution_id);
                 self.status.dec_executions();
                 ControlResponse::accepted(rid)
             }
-            Command::Exec(args) => match self.processes.exec(args, Some(rid.clone())) {
-                Ok(accepted) => {
-                    ControlResponse::ok_with(rid, CommandResult::ExecAccepted(accepted))
+            Command::Exec(args) => {
+                self.note_execution(args.execution_id.as_ref());
+                match self.processes.exec(args, Some(rid.clone())) {
+                    Ok(accepted) => {
+                        ControlResponse::ok_with(rid, CommandResult::ExecAccepted(accepted))
+                    }
+                    Err(error) => ControlResponse::error(rid, error),
                 }
-                Err(error) => ControlResponse::error(rid, error),
-            },
+            }
             Command::SignalProcess { process_id, signal } => {
                 match self.processes.signal(&process_id, signal) {
                     Ok(()) => ControlResponse::accepted(rid),
@@ -569,10 +590,15 @@ impl Runtime {
             Command::ListSessions => {
                 ControlResponse::ok_with(rid, CommandResult::SessionList(self.sessions.list()))
             }
-            Command::OpenSession(args) => match self.sessions.open(args) {
-                Ok(opened) => ControlResponse::ok_with(rid, CommandResult::SessionOpened(opened)),
-                Err(error) => ControlResponse::error(rid, error),
-            },
+            Command::OpenSession(args) => {
+                self.note_execution(args.execution_id.as_ref());
+                match self.sessions.open(args) {
+                    Ok(opened) => {
+                        ControlResponse::ok_with(rid, CommandResult::SessionOpened(opened))
+                    }
+                    Err(error) => ControlResponse::error(rid, error),
+                }
+            }
             Command::CloseSession { session_id } => match self.sessions.close(&session_id) {
                 Ok(()) => ControlResponse::accepted(rid),
                 Err(error) => ControlResponse::error(rid, error),
@@ -601,6 +627,22 @@ impl Runtime {
                     "streaming command requires a connection-scoped writer".to_owned(),
                 ),
             ),
+        }
+    }
+
+    /// Note that work is running under `execution_id`: filesystem events observed from now on are
+    /// stamped with it (last-started wins; workspaces run one harness/run at a time in practice).
+    fn note_execution(&self, execution_id: Option<&ExecutionId>) {
+        if let Some(id) = execution_id {
+            *self.fs_execution.lock().unwrap_or_else(|e| e.into_inner()) = Some(id.clone());
+        }
+    }
+
+    /// The execution stopped; fall back to the configured default association.
+    fn clear_execution(&self, execution_id: &ExecutionId) {
+        let mut guard = self.fs_execution.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.as_ref() == Some(execution_id) {
+            (*guard).clone_from(&self.config.default_execution_id);
         }
     }
 
@@ -637,6 +679,7 @@ impl Runtime {
             // §1.A exec-attach — run a non-PTY process and bind its stdout/stderr to a fresh
             // reliable channel (VSCode's non-PTY bootstrap reads its output losslessly here).
             Command::Exec(args) => {
+                self.note_execution(args.execution_id.as_ref());
                 let channel_id = self.idgen.channel_id();
                 match self.processes.exec_attached(
                     args,

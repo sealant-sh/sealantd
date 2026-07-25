@@ -13,5 +13,5 @@ pub mod runtime;
 pub mod snapshot;
 pub mod watcher;
 
-pub use runtime::{FilesystemConfig, FilesystemRuntime};
+pub use runtime::{FilesystemConfig, FilesystemRuntime, SharedExecution};
 pub use snapshot::{Snapshot, snapshot};

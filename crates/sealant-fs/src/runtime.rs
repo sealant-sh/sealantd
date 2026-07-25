@@ -11,7 +11,12 @@ use sealant_telemetry::{Correlation, EventBus};
 
 use crate::diff::diff;
 use crate::snapshot::{Snapshot, SnapshotConfig, snapshot};
-use crate::watcher::{WatchContext, build_watcher};
+use crate::watcher::{WatchContext, WatcherHandle, build_watcher};
+
+/// A shared, updatable execution association. File events are stamped with whatever execution is
+/// active when they fire (the composition root updates this as executions/runs start and stop),
+/// so a run's edits correlate to that run rather than to a boot-frozen default.
+pub type SharedExecution = Arc<Mutex<Option<ExecutionId>>>;
 
 /// Filesystem telemetry configuration.
 #[derive(Debug, Clone)]
@@ -20,8 +25,8 @@ pub struct FilesystemConfig {
     pub root: PathBuf,
     /// Snapshot/ignore configuration.
     pub snapshot: SnapshotConfig,
-    /// Execution to correlate events with.
-    pub execution_id: Option<ExecutionId>,
+    /// Execution to correlate events with (live handle, updated by the composition root).
+    pub execution: SharedExecution,
 }
 
 /// Owns the baseline snapshot and the live watcher; produces a final diff on `finalize`.
@@ -29,7 +34,7 @@ pub struct FilesystemRuntime {
     bus: Arc<EventBus>,
     config: FilesystemConfig,
     baseline: Mutex<Option<Snapshot>>,
-    watcher: Mutex<Option<notify::RecommendedWatcher>>,
+    watcher: Mutex<Option<WatcherHandle>>,
 }
 
 impl std::fmt::Debug for FilesystemRuntime {
@@ -53,7 +58,13 @@ impl FilesystemRuntime {
     }
 
     fn correlation(&self) -> Correlation {
-        Correlation::new().execution(self.config.execution_id.clone())
+        let execution = self
+            .config
+            .execution
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        Correlation::new().execution(execution)
     }
 
     /// Take the baseline snapshot and start the live watcher.
@@ -76,7 +87,7 @@ impl FilesystemRuntime {
                 root: self.config.root.clone(),
                 snapshot_config: self.config.snapshot.clone(),
                 bus: self.bus.clone(),
-                correlation: self.correlation(),
+                execution: self.config.execution.clone(),
             },
             baseline.clone(),
         )?;
@@ -175,7 +186,7 @@ mod tests {
             FilesystemConfig {
                 root: root.clone(),
                 snapshot: SnapshotConfig::default(),
-                execution_id: None,
+                execution: Arc::new(Mutex::new(None)),
             },
         );
         fs.start().expect("start watcher");
@@ -203,5 +214,59 @@ mod tests {
         // finalize emits a diff summary.
         let after = drain_for(&mut rx, Duration::from_secs(2)).await;
         assert!(after.iter().any(|e| e.event_type() == "file.diffAvailable"));
+    }
+
+    /// Directories created after the watcher starts must be adopted (per-directory watches are
+    /// registered dynamically), and edits inside them must be observed. Also asserts that ignored
+    /// trees produce no events even when created live.
+    #[tokio::test]
+    async fn live_watch_adopts_new_directories_and_skips_ignored() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let root = dir.path().to_path_buf();
+        // A pre-existing ignored tree must not consume watches or emit events.
+        std::fs::create_dir_all(root.join(".git/objects")).expect("mkdir .git");
+        let bus = bus();
+        let mut rx = bus.subscribe();
+        let execution = Arc::new(Mutex::new(Some(ExecutionId::new("exec-t".to_owned()))));
+        let fs = FilesystemRuntime::new(
+            bus.clone(),
+            FilesystemConfig {
+                root: root.clone(),
+                snapshot: SnapshotConfig::default(),
+                execution: execution.clone(),
+            },
+        );
+        fs.start().expect("start watcher");
+
+        std::fs::create_dir_all(root.join("src/nested")).expect("mkdir");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        std::fs::write(root.join("src/nested/deep.txt"), b"payload").expect("write");
+        std::fs::write(root.join(".git/objects/aa"), b"git internal").expect("write git");
+
+        let events = drain_for(&mut rx, Duration::from_secs(2)).await;
+        let changed: Vec<_> = events
+            .iter()
+            .filter_map(|e| match &e.payload {
+                EventPayload::FileChange(c) => Some((e, c)),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            changed.iter().any(|(_, c)| c.path == "src/nested/deep.txt"),
+            "expected a file.changed for the file inside the new nested directory, got {:?}",
+            changed.iter().map(|(_, c)| &c.path).collect::<Vec<_>>()
+        );
+        assert!(
+            changed.iter().all(|(_, c)| !c.path.starts_with(".git")),
+            "ignored trees must not produce events"
+        );
+        // Events carry the live execution association.
+        assert!(
+            changed.iter().all(|(e, _)| e
+                .execution_id
+                .as_ref()
+                .is_some_and(|id| id.as_str() == "exec-t")),
+            "file events must carry the active execution id"
+        );
     }
 }
