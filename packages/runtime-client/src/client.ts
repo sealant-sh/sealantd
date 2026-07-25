@@ -151,6 +151,14 @@ export class SealantClient {
   #eventWaiters: Array<(result: IteratorResult<EventEnvelope>) => void> = [];
   /** Demux table: channel_id → open `Channel`. Inbound `ServerMessage::Stream` frames route here. */
   #channels: Map<string, Channel> = new Map();
+  /**
+   * Frames that arrived for a channel the caller has not registered yet. The daemon may write
+   * channel frames BEFORE the response that carries the channel id reaches the caller (journal
+   * replay on `attachSession({fromSequence})` does this by design; a fast exec-attach can too), so
+   * they are buffered here and flushed by {@link SealantClient.openChannel}. Bounded per channel;
+   * cleared on connection close.
+   */
+  #pendingFrames: Map<string, StreamFrame[]> = new Map();
   #transport: ChannelTransport;
 
   constructor(stream: Duplex) {
@@ -275,6 +283,12 @@ export class SealantClient {
     if (existing) return existing;
     const channel = new Channel(channelId, this.#transport);
     this.#channels.set(channelId, channel);
+    // Flush any frames that raced ahead of the response carrying this channel id.
+    const pending = this.#pendingFrames.get(channelId);
+    if (pending) {
+      this.#pendingFrames.delete(channelId);
+      for (const frame of pending) this.#deliverFrame(channel, frame);
+    }
     return channel;
   }
 
@@ -601,13 +615,26 @@ export class SealantClient {
     }
   }
 
+  /** Frames buffered per not-yet-registered channel (a full session journal replay fits). */
+  static readonly #MAX_PENDING_FRAMES = 65536;
+
   /** Demultiplex one inbound `ServerMessage::Stream` frame into its `Channel` by `channelId`. */
   #routeStream(frame: StreamFrame): void {
     const channel = this.#channels.get(frame.channelId);
     if (!channel) {
-      // Frame for an unknown/already-closed channel: nothing to deliver to. Drop it.
+      // The channel id is not registered (yet): buffer bounded, flushed by openChannel. Frames
+      // beyond the bound (or for channels that are never opened) are dropped on close.
+      const pending = this.#pendingFrames.get(frame.channelId) ?? [];
+      if (pending.length < SealantClient.#MAX_PENDING_FRAMES) {
+        pending.push(frame);
+        this.#pendingFrames.set(frame.channelId, pending);
+      }
       return;
     }
+    this.#deliverFrame(channel, frame);
+  }
+
+  #deliverFrame(channel: Channel, frame: StreamFrame): void {
     switch (frame.payload.case) {
       case "data":
         channel.pushData(frame.payload.value);
@@ -646,6 +673,7 @@ export class SealantClient {
       channel.fail(new Error("connection closed"));
     }
     this.#channels.clear();
+    this.#pendingFrames.clear();
   }
 }
 
