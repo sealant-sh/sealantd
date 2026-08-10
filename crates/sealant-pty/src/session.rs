@@ -4,9 +4,9 @@ use std::collections::HashMap;
 use std::io;
 use std::os::fd::OwnedFd;
 use std::os::unix::process::ExitStatusExt;
-use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use nix::sys::signal::Signal as NixSignal;
@@ -21,7 +21,7 @@ use sealant_protocol::{
 use sealant_runtime_core::{Clock, IdGenerator, Redactor, RuntimeConfig, RuntimeStatus};
 use sealant_telemetry::{Correlation, EventBus};
 use tokio::io::unix::AsyncFd;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::journal::SessionJournal;
 use crate::pty::{self, PtyChild};
@@ -61,8 +61,8 @@ pub struct SessionEntry {
     pub process_id: ProcessId,
     /// OS pid of the session leader (also its session id / process-group id).
     pub pid: i32,
-    /// The PTY master, shared between capture, input, and resize.
-    pub master: Arc<AsyncFd<OwnedFd>>,
+    /// The PTY master, owned by capture and borrowed by input and resize while the leader lives.
+    pub master: Weak<AsyncFd<OwnedFd>>,
     /// Associated execution, when any.
     pub execution_id: Option<ExecutionId>,
     /// The reliable output attachment, when a gateway has attached.
@@ -354,7 +354,7 @@ impl SessionRuntime {
             session_id: session_id.clone(),
             process_id: process_id.clone(),
             pid,
-            master: master.clone(),
+            master: Arc::downgrade(&master),
             execution_id: execution_id.clone(),
             attached: Mutex::new(None),
             journal: Arc::new(Mutex::new(journal)),
@@ -386,9 +386,10 @@ impl SessionRuntime {
             }),
         );
 
-        // Capture pty.output until the slave closes. This is the SINGLE PTY reader: it publishes
-        // every chunk as `IoChunk` telemetry and, when a gateway is attached, also forwards the same
-        // chunk to the attach sink (sharing one `read()` so the attach stream is lossless).
+        // Capture pty.output until the slave closes or the session leader exits. This is the SINGLE
+        // PTY reader: it publishes every chunk as `IoChunk` telemetry and, when a gateway is
+        // attached, also forwards the same chunk to the attach sink (sharing one `read()` so the
+        // attach stream is lossless).
         let capture_bus = self.bus.clone();
         let capture_corr = correlation.clone();
         let capture_master = master.clone();
@@ -396,15 +397,19 @@ impl SessionRuntime {
         let capture_redactor = self.redactor.clone();
         let capture_status = self.status.clone();
         let chunk_size = self.config.io_chunk_bytes;
+        let (leader_exited_tx, leader_exited_rx) = oneshot::channel();
         let capture = tokio::spawn(async move {
             capture_output(
                 capture_master,
-                capture_bus,
-                capture_corr,
                 chunk_size,
-                capture_entry,
-                capture_redactor,
-                capture_status,
+                CaptureContext {
+                    bus: capture_bus,
+                    correlation: capture_corr,
+                    entry: capture_entry,
+                    redactor: capture_redactor,
+                    status: capture_status,
+                    leader_exited_rx,
+                },
             )
             .await;
         });
@@ -418,6 +423,7 @@ impl SessionRuntime {
         tokio::spawn(async move {
             let start = Instant::now();
             let status_result = child.wait().await;
+            let _ = leader_exited_tx.send(());
             let _ = capture.await;
             let (exit_code, signal, reason) = classify(&status_result);
             waiter_bus.publish(
@@ -431,9 +437,10 @@ impl SessionRuntime {
                     duration_micros: start.elapsed().as_micros() as u64,
                 }),
             );
-            // `capture.await` above already drained the PTY to EOF, fanning every chunk to both the
-            // telemetry bus AND the attach sink (single reader). So by here the attach stream has
-            // received all output; send a final End{exit_code, signal} and clear the attachment.
+            // `capture.await` above drained all bytes available when the leader exited, fanning
+            // every chunk to both the telemetry bus AND the attach sink (single reader). Do not
+            // wait for helper processes that inherited the slave: the session belongs to its
+            // leader. Send a final End{exit_code, signal} and clear the attachment.
             // The entry itself becomes an exited tombstone (state + exit code + journal) so
             // clients can still observe the exit and replay the scrollback after the fact.
             let entry = waiter_registry.get_running(&waiter_session);
@@ -483,7 +490,11 @@ impl SessionRuntime {
             .registry
             .get_running(session_id)
             .ok_or_else(|| ControlError::session_not_found(session_id.to_string()))?;
-        pty::write_all(&entry.master, data)
+        let master = entry
+            .master
+            .upgrade()
+            .ok_or_else(|| ControlError::session_not_found(session_id.to_string()))?;
+        pty::write_all(&master, data)
             .await
             .map_err(|e| ControlError::invalid_argument(format!("pty input write failed: {e}")))?;
 
@@ -645,7 +656,11 @@ impl SessionRuntime {
             .registry
             .get(session_id)
             .ok_or_else(|| ControlError::session_not_found(session_id.to_string()))?;
-        pty::resize(&entry.master, cols, rows)
+        let master = entry
+            .master
+            .upgrade()
+            .ok_or_else(|| ControlError::session_not_found(session_id.to_string()))?;
+        pty::resize(&master, cols, rows)
             .map_err(|e| ControlError::invalid_argument(format!("pty resize failed: {e}")))?;
         entry.cols.store(cols, Ordering::Relaxed);
         entry.rows.store(rows, Ordering::Relaxed);
@@ -786,31 +801,64 @@ fn classify(
     }
 }
 
-/// The single PTY reader for a session. Reads `pty.output` until the slave closes and, for each
-/// chunk, (a) publishes a lossy `IoChunk` telemetry event (recording/redaction path) and (b), when a
-/// gateway is attached, forwards the same bytes to the attach sink as a [`StreamFrame::Data`] via an
-/// **awaited** `out_tx.send`.
+/// The single PTY reader for a session. Reads `pty.output` until the slave closes or the session
+/// leader exits and, for each chunk, (a) publishes a lossy `IoChunk` telemetry event
+/// (recording/redaction path) and (b), when a gateway is attached, forwards the same bytes to the
+/// attach sink as a [`StreamFrame::Data`] via an **awaited** `out_tx.send`.
 ///
 /// Because there is exactly one reader, the attach sink sees every byte (no second reader racing for
 /// the fd). Awaiting the attach send applies backpressure to this loop: the next `pty::read` waits
 /// until the gateway accepts the chunk, so a slow gateway throttles the PTY drain and the kernel PTY
 /// buffer backpressures the shell — the inversion of the lossy `Lagged`-drop path. Telemetry
 /// publish stays non-blocking (it may drop on lag, as before); only the attach send blocks.
-async fn capture_output(
-    master: Arc<AsyncFd<OwnedFd>>,
+struct CaptureContext {
     bus: Arc<EventBus>,
     correlation: Correlation,
-    chunk_size: usize,
     entry: Arc<SessionEntry>,
     redactor: Arc<Redactor>,
     status: Arc<RuntimeStatus>,
-) {
+    leader_exited_rx: oneshot::Receiver<()>,
+}
+
+async fn capture_output(master: Arc<AsyncFd<OwnedFd>>, chunk_size: usize, context: CaptureContext) {
+    let CaptureContext {
+        bus,
+        correlation,
+        entry,
+        redactor,
+        status,
+        mut leader_exited_rx,
+    } = context;
     let mut offset = StreamOffset::ZERO;
     let mut buf = vec![0u8; chunk_size.max(1)];
+    let mut post_exit_bytes_remaining = None;
     loop {
-        match pty::read(&master, &mut buf).await {
+        let read_result = match post_exit_bytes_remaining {
+            Some(0) => break,
+            Some(remaining) => {
+                let read_size = remaining.min(buf.len());
+                pty::try_read(&master, &mut buf[..read_size])
+            }
+            None => tokio::select! {
+                biased;
+                _ = &mut leader_exited_rx => {
+                    let available = pty::readable_bytes(&master).unwrap_or_else(|error| {
+                        tracing::warn!(%error, session = %entry.session_id,
+                            "failed to snapshot buffered PTY output at leader exit");
+                        0
+                    });
+                    post_exit_bytes_remaining = Some(available);
+                    continue;
+                }
+                result = pty::read(&master, &mut buf) => result,
+            },
+        };
+        match read_result {
             Ok(0) => break,
             Ok(n) => {
+                if let Some(remaining) = &mut post_exit_bytes_remaining {
+                    *remaining = remaining.saturating_sub(n);
+                }
                 // (a) redact once; every downstream consumer (journal, telemetry, sink) sees the
                 // same redacted bytes — the journal is the product read surface and must never
                 // hold raw secrets.
@@ -889,6 +937,11 @@ async fn capture_output(
                         }
                     }
                 }
+            }
+            Err(e)
+                if post_exit_bytes_remaining.is_some() && e.kind() == io::ErrorKind::WouldBlock =>
+            {
+                break;
             }
             Err(e) if pty::is_eof_error(&e) => break,
             Err(_) => break,
@@ -1148,6 +1201,77 @@ mod tests {
         assert!(text.contains("LINE1"), "got: {text:?}");
         assert!(text.contains("LINE2"), "got: {text:?}");
         assert!(text.contains("DONE"), "got: {text:?}");
+    }
+
+    #[tokio::test]
+    async fn attach_ends_when_leader_exits_with_inherited_slave_open() {
+        let rt = runtime();
+        let channel = ChannelId::new("chan_inherited_slave");
+        let (out_tx, mut out_rx) = mpsc::channel::<ServerMessage>(8);
+
+        // The background process ignores the controlling-terminal hangup and keeps its inherited
+        // stdout open after the shell (the session leader) exits. The attachment still belongs to
+        // the leader and must not wait for that helper process to finish.
+        let opened = rt
+            .open(session_args(
+                &[
+                    "-c",
+                    "trap '' HUP; sleep 5 & printf 'LEADER_DONE\\n'; exit 0",
+                ],
+                80,
+                24,
+            ))
+            .expect("open");
+        rt.attach(&opened.session_id, channel.clone(), out_tx, None)
+            .await
+            .expect("attach");
+
+        let (bytes, exit_code) = tokio::time::timeout(
+            Duration::from_secs(1),
+            attach_output_until_end(&mut out_rx, &channel),
+        )
+        .await
+        .expect("attach should end promptly when the session leader exits");
+
+        assert!(
+            String::from_utf8_lossy(&bytes).contains("LEADER_DONE"),
+            "leader output should be drained before the attachment ends"
+        );
+        assert_eq!(exit_code, Some(0));
+    }
+
+    #[tokio::test]
+    async fn attach_end_is_not_extended_by_a_writing_helper() {
+        let rt = runtime();
+        let channel = ChannelId::new("chan_writing_helper");
+        let (out_tx, mut out_rx) = mpsc::channel::<ServerMessage>(8);
+
+        let opened = rt
+            .open(session_args(
+                &["-c", "trap '' HUP; yes HELPER & sleep 0.1; exit 0"],
+                80,
+                24,
+            ))
+            .expect("open");
+        rt.attach(&opened.session_id, channel.clone(), out_tx, None)
+            .await
+            .expect("attach");
+
+        let exit_code = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let message = out_rx.recv().await.expect("frame");
+                if let ServerMessage::Stream(frame) = message {
+                    assert_eq!(frame.channel_id, channel);
+                    if let sealant_protocol::StreamPayload::End(end) = frame.payload {
+                        return end.exit_code;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("helper output must not extend the attachment after leader exit");
+
+        assert_eq!(exit_code, Some(0));
     }
 
     #[tokio::test]

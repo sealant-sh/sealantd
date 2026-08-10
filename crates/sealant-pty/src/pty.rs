@@ -96,7 +96,7 @@ pub fn spawn(
     let child = command.spawn()?;
     let pid = child.id().map_or(-1, |p| p as i32);
     // Parent's slave handles were moved into the command and are dropped after spawn, so the master
-    // observes EOF/EIO once the child closes its end.
+    // observes EOF/EIO once the child and every descendant that inherited the slave close it.
     let master = AsyncFd::new(master)?;
     Ok(PtyChild { master, child, pid })
 }
@@ -108,20 +108,43 @@ pub fn spawn(
 pub async fn read(master: &AsyncFd<OwnedFd>, buf: &mut [u8]) -> io::Result<usize> {
     loop {
         let mut guard = master.readable().await?;
-        let result = guard.try_io(|inner| {
-            let fd = inner.get_ref().as_raw_fd();
-            // SAFETY: `fd` is a valid PTY master; `buf` is valid for `buf.len()` bytes.
-            let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
-            if n < 0 {
-                Err(io::Error::last_os_error())
-            } else {
-                Ok(n as usize)
-            }
-        });
+        let result = guard.try_io(|inner| try_read(inner, buf));
         match result {
             Ok(io_result) => return io_result,
             Err(_would_block) => continue,
         }
+    }
+}
+
+/// Read bytes currently available from the PTY master without waiting for readiness.
+///
+/// # Errors
+/// Returns [`io::ErrorKind::WouldBlock`] when no bytes are currently buffered, or another I/O
+/// error from `read(2)`.
+pub fn try_read(master: &AsyncFd<OwnedFd>, buf: &mut [u8]) -> io::Result<usize> {
+    let fd = master.get_ref().as_raw_fd();
+    // SAFETY: `fd` is a valid non-blocking PTY master; `buf` is valid for `buf.len()` bytes.
+    let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+    if n < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(n as usize)
+    }
+}
+
+/// Return the number of bytes currently buffered for reading from the PTY master.
+///
+/// # Errors
+/// Returns an I/O error when `FIONREAD` cannot inspect the master descriptor.
+pub fn readable_bytes(master: &AsyncFd<OwnedFd>) -> io::Result<usize> {
+    let fd = master.get_ref().as_raw_fd();
+    let mut available: libc::c_int = 0;
+    // SAFETY: `fd` is a valid PTY master and `available` is writable for the ioctl result.
+    let result = unsafe { libc::ioctl(fd, libc::FIONREAD, &mut available) };
+    if result < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(usize::try_from(available).unwrap_or_default())
     }
 }
 
