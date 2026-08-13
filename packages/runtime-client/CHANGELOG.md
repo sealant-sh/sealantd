@@ -1,5 +1,25 @@
 # @sealant/runtime-client
 
+## 0.7.0
+
+### Minor Changes
+
+- 12c9a3f: UDP forwards: `openForward` accepts `protocol: "udp"` and opens a connected
+  UDP socket instead of a TCP stream. The channel is already message-framed, so
+  one frame is exactly one datagram in both directions — boundaries hold end to
+  end. Omitted or `"tcp"` keeps the existing byte-stream behavior; the wire
+  field is absent for TCP, so old daemons and clients interoperate unchanged.
+
+### Patch Changes
+
+- 12c9a3f: End interactive terminal attachments when their session leader exits, even if a helper process
+  inherited the PTY slave and keeps it open. Sealantd now drains output already written by the leader,
+  emits the final stream end immediately, and releases the PTY master instead of making clients wait
+  for unrelated helper cleanup.
+- Updated dependencies [12c9a3f]
+- Updated dependencies [12c9a3f]
+  - @sealant/runtime-protocol@0.7.0
+
 ## 0.6.2
 
 ### Patch Changes
