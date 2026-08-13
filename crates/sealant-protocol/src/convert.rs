@@ -13,12 +13,12 @@ use crate::{
     CaptureMode, CapturePolicy, ClientMessage, Command, CommandResult, Confidence, ControlError,
     ControlErrorCode, ControlRequest, ControlResponse, Encoding, EnvVar, EventEnvelope,
     EventPayload, ExecAccepted, ExecArgs, ExecutionStartArgs, ExitReason, Feature, FeatureMatrix,
-    FeatureState, ForwardOpened, HealthReport, IoChunk, Limits, NetworkMode, OpenForwardArgs,
-    OpenSessionArgs, OpenSftpArgs, ProcessAttached, ProcessExited, ProcessList, ProcessStarted,
-    ProcessState, ProcessSummary, ResponseOutcome, RuntimeHeartbeat, RuntimeMetrics, RuntimeState,
-    RuntimeStateChanged, ServerMessage, SessionList, SessionOpened, SessionSummary, SftpOpened,
-    ShutdownAccepted, Signal, StreamAttached, StreamEnd, StreamFrame, StreamKind, StreamPayload,
-    TelemetryDropped, TransformMeta,
+    FeatureState, ForwardOpened, ForwardProtocol, HealthReport, IoChunk, Limits, NetworkMode,
+    OpenForwardArgs, OpenSessionArgs, OpenSftpArgs, ProcessAttached, ProcessExited, ProcessList,
+    ProcessStarted, ProcessState, ProcessSummary, ResponseOutcome, RuntimeHeartbeat,
+    RuntimeMetrics, RuntimeState, RuntimeStateChanged, ServerMessage, SessionList, SessionOpened,
+    SessionSummary, SftpOpened, ShutdownAccepted, Signal, StreamAttached, StreamEnd, StreamFrame,
+    StreamKind, StreamPayload, TelemetryDropped, TransformMeta,
 };
 use crate::{
     FileChange, FileChangeKind, FileDiffAvailable, FileEntry, FileSnapshotCompleted, FileType,
@@ -844,6 +844,11 @@ impl From<OpenForwardArgs> for wire::OpenForwardArgs {
             host: a.host,
             port: u32::from(a.port),
             execution_id: opt_id(a.execution_id),
+            // Tcp is the wire default (field absent) — old peers never see it.
+            protocol: match a.protocol {
+                ForwardProtocol::Tcp => None,
+                ForwardProtocol::Udp => Some("udp".to_owned()),
+            },
         }
     }
 }
@@ -853,6 +858,12 @@ impl From<wire::OpenForwardArgs> for OpenForwardArgs {
             host: a.host,
             port: a.port as u16,
             execution_id: a.execution_id.map(ExecutionId::new),
+            // Anything but the exact "udp" opt-in stays TCP — unknown strings
+            // from newer peers degrade to the safe default instead of erroring.
+            protocol: match a.protocol.as_deref() {
+                Some("udp") => ForwardProtocol::Udp,
+                _ => ForwardProtocol::Tcp,
+            },
         }
     }
 }
@@ -1756,6 +1767,7 @@ mod tests {
                 host: "127.0.0.1".to_owned(),
                 port: 8000,
                 execution_id: Some(ExecutionId::new("run-1")),
+                protocol: ForwardProtocol::Udp,
             }),
         ));
         let bytes = encode_client(&msg);

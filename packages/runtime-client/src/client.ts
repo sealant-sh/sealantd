@@ -489,14 +489,25 @@ export class SealantClient {
     this.#channels.get(channelId)?.destroy();
   }
 
-  /** Open a direct-TCP forward to `host:port` as a multiplexed byte channel. */
+  /**
+   * Open a direct forward to `host:port` as a multiplexed channel. TCP (the
+   * default) is a byte stream; `protocol: "udp"` opens a connected UDP socket
+   * where one channel frame is exactly one datagram, both directions.
+   */
   async openForward(
     host: string,
     port: number,
     executionId?: string,
+    protocol?: "tcp" | "udp",
   ): Promise<{ result: ForwardOpened; channel: Channel }> {
     const result = resultValue(
-      okResult(await this.request({ case: "openForward", value: { host, port, executionId } })),
+      okResult(
+        await this.request({
+          case: "openForward",
+          // Omit tcp on the wire — the field's absence is the old default.
+          value: { host, port, executionId, protocol: protocol === "udp" ? "udp" : undefined },
+        }),
+      ),
       "forwardOpened",
     ) as ForwardOpened;
     return { result, channel: this.openChannel(result.channelId) };

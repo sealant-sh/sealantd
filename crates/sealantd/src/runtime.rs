@@ -790,6 +790,7 @@ impl Runtime {
                         &args.host,
                         args.port,
                         args.execution_id,
+                        args.protocol,
                         conn.out_tx.clone(),
                     )
                     .await

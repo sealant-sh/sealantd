@@ -263,6 +263,19 @@ pub struct ReadSessionOutputArgs {
 }
 
 /// Arguments to `openForward` (direct-tcpip): open a TCP connection from inside the container.
+/// Transport for a forward: a TCP byte stream (the default), or UDP datagrams
+/// where every `StreamPayload::Data` frame is EXACTLY one datagram — the frame
+/// boundary is the datagram boundary, end to end.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum ForwardProtocol {
+    /// Connected TCP stream; frames chunk arbitrarily.
+    #[default]
+    Tcp,
+    /// Connected UDP socket; one Data frame = one datagram, both directions.
+    Udp,
+}
+
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct OpenForwardArgs {
@@ -273,6 +286,9 @@ pub struct OpenForwardArgs {
     /// Execution to correlate the forward with, when any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_id: Option<ExecutionId>,
+    /// Forward transport; omitted means TCP (the wire default predates UDP).
+    #[serde(default)]
+    pub protocol: ForwardProtocol,
 }
 
 /// Arguments to `openSftp`: spawn an in-container `sftp-server` bound to a reliable channel.
