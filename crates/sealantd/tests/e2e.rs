@@ -11,8 +11,9 @@ use std::time::Duration;
 use sealant_control::{handle_connection, read_frame, write_frame};
 use sealant_protocol::{
     AttachMode, AttachSessionArgs, ChannelId, ClientMessage, Command, CommandResult,
-    ControlRequest, EventPayload, ExecArgs, Feature, OpenForwardArgs, OpenSessionArgs, RequestId,
-    ResponseOutcome, ServerMessage, StreamFrame, StreamKind, StreamPayload,
+    ControlRequest, EventPayload, ExecArgs, Feature, ForwardProtocol, OpenForwardArgs,
+    OpenSessionArgs, RequestId, ResponseOutcome, ServerMessage, StreamFrame, StreamKind,
+    StreamPayload,
 };
 use sealant_runtime_core::{RuntimeConfig, new_runtime_id};
 use sealantd::Runtime;
@@ -539,6 +540,7 @@ async fn in_process_open_forward_loopback_echo() {
                 host: "127.0.0.1".to_owned(),
                 port: addr.port(),
                 execution_id: None,
+                protocol: ForwardProtocol::default(),
             }),
         ),
     )
@@ -626,6 +628,7 @@ async fn in_process_open_forward_allowed_when_feature_off() {
                 host: "127.0.0.1".to_owned(),
                 port: addr.port(),
                 execution_id: None,
+                protocol: ForwardProtocol::default(),
             }),
         ),
     )
@@ -820,6 +823,7 @@ async fn in_process_idle_forward_torn_down_on_connection_drop() {
                 host: "127.0.0.1".to_owned(),
                 port: addr.port(),
                 execution_id: None,
+                protocol: ForwardProtocol::default(),
             }),
         ),
     )

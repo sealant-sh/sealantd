@@ -396,7 +396,7 @@ message ReadSessionOutputArgs {
   optional uint64 max_bytes = 3;
 }
 message DetachSessionArgs { string channel_id = 1; }
-message OpenForwardArgs { string host = 1; uint32 port = 2; optional string execution_id = 3; }
+message OpenForwardArgs { string host = 1; uint32 port = 2; optional string execution_id = 3; optional string protocol = 4; }
 message CloseForwardArgs { string channel_id = 1; }
 message OpenSftpArgs { optional string execution_id = 1; optional string cwd = 2; }
 message CloseSftpArgs { string channel_id = 1; }

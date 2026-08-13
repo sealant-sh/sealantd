@@ -1,5 +1,8 @@
-//! Direct-tcpip forwarding: open a TCP connection from inside the container to `host:port` and pump
-//! bytes both ways over a reliable [`ChannelId`] conduit (gateway consolidation §1.B).
+//! Direct forwarding: open a TCP connection (or a connected UDP socket) from inside the container
+//! to `host:port` and pump both ways over a reliable [`ChannelId`] conduit (gateway §1.B).
+//!
+//! UDP keeps datagram boundaries by construction: one [`StreamPayload::Data`] frame is EXACTLY one
+//! datagram, in both directions. The conduit is already message-framed, so nothing re-chunks it.
 //!
 //! This is a *raw byte conduit*: payload never touches the telemetry `EventBus`. Outbound (socket →
 //! gateway) bytes become [`StreamFrame::Data`] on the connection's backpressured `out_tx`; inbound
@@ -9,17 +12,22 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
+use std::sync::Arc;
+
 use sealant_protocol::{
-    ChannelId, ControlError, ControlErrorCode, ExecutionId, ServerMessage, StreamEnd, StreamFrame,
-    StreamPayload,
+    ChannelId, ControlError, ControlErrorCode, ExecutionId, ForwardProtocol, ServerMessage,
+    StreamEnd, StreamFrame, StreamPayload,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 use tokio::net::tcp::OwnedReadHalf;
+use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::mpsc;
 
 /// Read-buffer size for the socket→gateway pump (raw conduit; not a recorded stream).
 const READ_BUF: usize = 64 * 1024;
+
+/// One datagram is at most 65_507 payload bytes; a 64 KiB + header buffer never truncates.
+const UDP_BUF: usize = 65_536;
 
 /// A live forward: the two pump tasks driving one TCP connection.
 #[derive(Debug)]
@@ -64,8 +72,12 @@ impl ForwardRuntime {
         host: &str,
         port: u16,
         _execution_id: Option<ExecutionId>,
+        protocol: ForwardProtocol,
         out_tx: mpsc::Sender<ServerMessage>,
     ) -> Result<mpsc::Sender<StreamPayload>, ControlError> {
+        if protocol == ForwardProtocol::Udp {
+            return self.open_udp(channel_id, host, port, out_tx).await;
+        }
         // The exact connect used by the egress proxy (proxy.rs); resolves inside the container.
         let stream = TcpStream::connect((host, port)).await.map_err(|e| {
             ControlError::new(
@@ -104,6 +116,90 @@ impl ForwardRuntime {
                 }
             }
             let _ = write_half.shutdown().await;
+        });
+
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).insert(
+            channel_id,
+            ForwardEntry {
+                socket_to_gateway,
+                gateway_to_socket,
+            },
+        );
+        Ok(inbound_tx)
+    }
+
+    /// Open a connected-UDP forward to `host:port` bound to `channel_id`.
+    ///
+    /// `connect` pins the peer: sends need no address and receives only accept
+    /// that peer's datagrams — the conduit stays point-to-point like the TCP
+    /// path. UDP has no EOF, so the flow lives until an inbound `End` or an
+    /// explicit close; transient ICMP-driven errors (nothing listening yet)
+    /// never kill the pumps.
+    ///
+    /// # Errors
+    /// Returns a [`ControlError`] with [`ControlErrorCode::InternalError`] when
+    /// binding or resolving/connecting the socket fails.
+    async fn open_udp(
+        &self,
+        channel_id: ChannelId,
+        host: &str,
+        port: u16,
+        out_tx: mpsc::Sender<ServerMessage>,
+    ) -> Result<mpsc::Sender<StreamPayload>, ControlError> {
+        let socket = UdpSocket::bind(("0.0.0.0", 0)).await.map_err(|e| {
+            ControlError::new(
+                ControlErrorCode::InternalError,
+                format!("udp forward bind failed: {e}"),
+            )
+        })?;
+        socket.connect((host, port)).await.map_err(|e| {
+            ControlError::new(
+                ControlErrorCode::InternalError,
+                format!("udp forward connect to {host}:{port} failed: {e}"),
+            )
+        })?;
+        let socket = Arc::new(socket);
+
+        // Inbound (gateway → socket): bounded so a fast gateway backpressures.
+        let (inbound_tx, mut inbound_rx) = mpsc::channel::<StreamPayload>(64);
+
+        // socket → gateway: every received datagram becomes exactly one Data frame.
+        let s2g_channel = channel_id.clone();
+        let s2g_out = out_tx.clone();
+        let s2g_socket = Arc::clone(&socket);
+        let socket_to_gateway = tokio::spawn(async move {
+            let mut buf = vec![0u8; UDP_BUF];
+            let mut seq: u64 = 0;
+            loop {
+                match s2g_socket.recv(&mut buf).await {
+                    Ok(n) => {
+                        let frame = StreamFrame::data(s2g_channel.clone(), seq, &buf[..n]);
+                        seq = seq.wrapping_add(1);
+                        if s2g_out.send(ServerMessage::Stream(frame)).await.is_err() {
+                            return; // connection gone
+                        }
+                    }
+                    // ECONNREFUSED after an ICMP just means nothing listens yet;
+                    // Linux delivers it once per probe, so this cannot hot-loop.
+                    Err(_) => continue,
+                }
+            }
+        });
+
+        // gateway → socket: one Data frame = one send(); End retires the flow.
+        let gateway_to_socket = tokio::spawn(async move {
+            while let Some(payload) = inbound_rx.recv().await {
+                match payload {
+                    StreamPayload::Data { data } => {
+                        // A datagram is delivered whole or not at all — a send
+                        // error (e.g. ICMP-driven refusal) drops that one
+                        // datagram, exactly UDP's own contract.
+                        let _ = socket.send(data.as_slice()).await;
+                    }
+                    StreamPayload::WindowUpdate { .. } => {}
+                    StreamPayload::End(_) => break,
+                }
+            }
         });
 
         self.inner.lock().unwrap_or_else(|e| e.into_inner()).insert(
@@ -211,7 +307,14 @@ mod tests {
         let rt = ForwardRuntime::new();
         let channel = ChannelId::new("chan_fwd");
         let inbound = rt
-            .open(channel.clone(), "127.0.0.1", addr.port(), None, out_tx)
+            .open(
+                channel.clone(),
+                "127.0.0.1",
+                addr.port(),
+                None,
+                ForwardProtocol::Tcp,
+                out_tx,
+            )
             .await
             .expect("open forward");
         assert_eq!(rt.len(), 1);
@@ -286,7 +389,14 @@ mod tests {
         let rt = ForwardRuntime::new();
         let channel = ChannelId::new("chan_idle");
         let _inbound = rt
-            .open(channel.clone(), "127.0.0.1", addr.port(), None, out_tx)
+            .open(
+                channel.clone(),
+                "127.0.0.1",
+                addr.port(),
+                None,
+                ForwardProtocol::Tcp,
+                out_tx,
+            )
             .await
             .expect("open forward");
         assert_eq!(rt.len(), 1);
@@ -302,13 +412,79 @@ mod tests {
             .expect("eof signal");
     }
 
+    /// UDP loopback echo: datagram boundaries must survive both directions —
+    /// two sends arrive as two frames, never coalesced into one.
+    #[tokio::test]
+    async fn udp_forward_round_trips_datagrams() {
+        let server = tokio::net::UdpSocket::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind udp echo");
+        let addr = server.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let mut b = [0u8; 2048];
+            loop {
+                let Ok((n, peer)) = server.recv_from(&mut b).await else {
+                    break;
+                };
+                if server.send_to(&b[..n], peer).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let (out_tx, mut out_rx) = mpsc::channel::<ServerMessage>(256);
+        let rt = ForwardRuntime::new();
+        let channel = ChannelId::new("chan_udp");
+        let inbound = rt
+            .open(
+                channel.clone(),
+                "127.0.0.1",
+                addr.port(),
+                None,
+                ForwardProtocol::Udp,
+                out_tx,
+            )
+            .await
+            .expect("open udp forward");
+        assert_eq!(rt.len(), 1);
+
+        // Two distinct datagrams must come back as two distinct Data frames.
+        for payload in [b"ping".as_slice(), b"pong!".as_slice()] {
+            inbound
+                .send(StreamPayload::data(Base64Bytes::new(payload.to_vec())))
+                .await
+                .expect("inbound send");
+            match out_rx.recv().await.expect("echo frame") {
+                ServerMessage::Stream(StreamFrame {
+                    payload: StreamPayload::Data { data },
+                    channel_id,
+                    ..
+                }) => {
+                    assert_eq!(channel_id, channel);
+                    assert_eq!(data.as_slice(), payload, "boundary must hold");
+                }
+                other => panic!("expected data frame, got {other:?}"),
+            }
+        }
+
+        rt.close(&channel);
+        assert!(rt.is_empty());
+    }
+
     #[tokio::test]
     async fn forward_connect_failure_is_an_error() {
         let (out_tx, _out_rx) = mpsc::channel::<ServerMessage>(8);
         let rt = ForwardRuntime::new();
         // Port 1 on loopback should refuse.
         let result = rt
-            .open(ChannelId::new("chan_x"), "127.0.0.1", 1, None, out_tx)
+            .open(
+                ChannelId::new("chan_x"),
+                "127.0.0.1",
+                1,
+                None,
+                ForwardProtocol::Tcp,
+                out_tx,
+            )
             .await;
         assert!(result.is_err(), "connect to 127.0.0.1:1 should fail");
         assert!(rt.is_empty());
