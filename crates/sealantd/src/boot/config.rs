@@ -336,6 +336,9 @@ pub enum OsFamily {
     Nix,
     /// Ubuntu.
     Ubuntu,
+    /// A caller-supplied base image (any Linux base with a shell). Tool paths fall back to
+    /// `/bin/sh` because nothing else is guaranteed by the custom-base contract.
+    Custom,
 }
 
 /// Resolved shell/tool paths (build-static).
@@ -470,9 +473,10 @@ impl BootConfig {
             Some("arch") => OsFamily::Arch,
             Some("nix") => OsFamily::Nix,
             Some("ubuntu") => OsFamily::Ubuntu,
+            Some("custom") => OsFamily::Custom,
             Some(other) => {
                 return Err(BootError::config(format!(
-                    "SEALANT_OS_FAMILY has unknown value {other:?} (expected fedora|arch|nix|ubuntu)"
+                    "SEALANT_OS_FAMILY has unknown value {other:?} (expected fedora|arch|nix|ubuntu|custom)"
                 )));
             }
             None => return Err(BootError::config("SEALANT_OS_FAMILY is required")),
@@ -810,6 +814,8 @@ fn default_login_shell(family: OsFamily) -> &'static str {
     match family {
         OsFamily::Fedora | OsFamily::Arch | OsFamily::Ubuntu => "/usr/bin/zsh",
         OsFamily::Nix => "/bin/bash",
+        // The custom-base contract guarantees a POSIX shell and nothing more.
+        OsFamily::Custom => "/bin/sh",
     }
 }
 
@@ -848,10 +854,20 @@ mod tests {
     }
 
     #[test]
+    fn custom_os_family_parses_with_posix_shell_defaults() {
+        let cfg = load_with(&[("SEALANT_OS_FAMILY", "custom")]).expect("valid");
+        assert_eq!(cfg.os_family, OsFamily::Custom);
+        assert_eq!(cfg.shells.login, PathBuf::from("/bin/sh"));
+    }
+
+    #[test]
     fn unknown_os_family_lists_every_supported_value() {
         let err = load_with(&[("SEALANT_OS_FAMILY", "gentoo")]).expect_err("invalid");
         let message = err.to_string();
-        assert!(message.contains("fedora|arch|nix|ubuntu"), "{message}");
+        assert!(
+            message.contains("fedora|arch|nix|ubuntu|custom"),
+            "{message}"
+        );
     }
 
     #[test]
