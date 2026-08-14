@@ -25,7 +25,7 @@ const DEFAULT_SESSION_JOURNAL_DIR: &str = "/var/lib/sealantd/session-journals";
 /// Default HTTP git/dotfiles username.
 const DEFAULT_HTTP_USERNAME: &str = "x-access-token";
 /// Default dotfiles bootstrap command.
-const DEFAULT_DOTFILES_BOOTSTRAP_COMMAND: &str = "./install.sh";
+pub(crate) const DEFAULT_DOTFILES_BOOTSTRAP_COMMAND: &str = "./install.sh";
 
 /// All `SEALANT_*` keys this loader consumes. Used to compute the harness passthrough environment
 /// (every other env var) and to redact secrets from it.
@@ -50,6 +50,7 @@ const CONSUMED_KEYS: &[&str] = &[
     "SEALANT_DOTFILES_BOOTSTRAP_COMMAND",
     "SEALANT_DOTFILES_HTTP_USERNAME",
     "SEALANT_DOTFILES_HTTP_TOKEN",
+    "SEALANT_DOTFILES_ARCHIVE_DIR",
     "SEALANT_LIFECYCLE_SETUP_JSON",
     "SEALANT_LIFECYCLE_STARTUP_JSON",
     "SEALANT_FOREGROUND_COMMAND",
@@ -199,7 +200,8 @@ pub enum CloneAuth {
 }
 
 /// Dotfiles manager selection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum DotfilesManager {
     /// Auto-detect (chezmoi / stow / copy).
     Auto,
@@ -212,7 +214,8 @@ pub enum DotfilesManager {
 }
 
 /// Where dotfiles are applied.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum DotfilesTarget {
     /// `$HOME`.
     Home,
@@ -380,6 +383,9 @@ pub struct BootConfig {
     pub clone_auth: CloneAuth,
     /// Runtime-applied dotfiles, when configured.
     pub dotfiles: Option<DotfilesConfig>,
+    /// Directory holding caller-provided dotfiles archives (manifest.json + *.tar.gz), when
+    /// configured. Applied after the repo-based dotfiles, before the control socket binds.
+    pub dotfiles_archives: Option<PathBuf>,
     /// Lifecycle steps.
     pub lifecycle: LifecycleConfig,
     /// Foreground (harness) launch.
@@ -448,6 +454,10 @@ impl BootConfig {
 
         let clone_auth = Self::load_clone_auth(env);
         let dotfiles = Self::load_dotfiles(env)?;
+        let dotfiles_archives = env
+            .get("SEALANT_DOTFILES_ARCHIVE_DIR")
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from);
         let lifecycle = LifecycleConfig {
             setup: parse_lifecycle(env, "SEALANT_LIFECYCLE_SETUP_JSON")?,
             startup: parse_lifecycle(env, "SEALANT_LIFECYCLE_STARTUP_JSON")?,
@@ -528,6 +538,7 @@ impl BootConfig {
             source,
             clone_auth,
             dotfiles,
+            dotfiles_archives,
             lifecycle,
             foreground,
             banner,
