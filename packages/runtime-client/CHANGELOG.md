@@ -1,5 +1,24 @@
 # @sealant/runtime-client
 
+## 0.8.0
+
+### Minor Changes
+
+- d195113: Custom-base support: `sealantd boot` accepts `SEALANT_OS_FAMILY=custom` (tool paths fall back to
+  `/bin/sh` — the custom-base contract guarantees a POSIX shell and nothing more), and the sealantd
+  image now ships a fully static `socat` at `/usr/local/bin/socat` beside the daemon, so workspace
+  image builders can `COPY --from` the control-relay dependency into any base instead of depending
+  on the base's package manager.
+- d195113: `sealantd boot` accepts `SEALANT_OS_FAMILY=ubuntu` (Ubuntu workspace images boot with
+  fedora/arch-style tool-path defaults; the glibc loader shim stays Nix-only). The unknown-value
+  error now lists `fedora|arch|nix|ubuntu`.
+
+### Patch Changes
+
+- Updated dependencies [d195113]
+- Updated dependencies [d195113]
+  - @sealant/runtime-protocol@0.8.0
+
 ## 0.7.0
 
 ### Minor Changes
