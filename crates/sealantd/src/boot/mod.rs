@@ -288,6 +288,14 @@ async fn boot_serve(runtime: Arc<Runtime>, config: BootConfig) -> ExitCode {
         eprintln!("sealantd boot: {error}");
         return shutdown_before_control(&runtime, ExitCode::FAILURE).await;
     }
+    // Caller-provided archives apply after the repo so local selections override its files.
+    if let Some(dir) = &config.dotfiles_archives
+        && let Err(error) = dotfiles::apply_archives(dir)
+    {
+        tracing::error!(%error, "dotfiles archive apply failed");
+        eprintln!("sealantd boot: {error}");
+        return shutdown_before_control(&runtime, ExitCode::FAILURE).await;
+    }
 
     // Step 13: control server in-process on the same runtime/bus/registry.
     let control_runtime = runtime.clone();

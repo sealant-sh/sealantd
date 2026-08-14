@@ -1,16 +1,24 @@
 //! Runtime dotfiles application (E11): clone the dotfiles repo (optionally with an HTTP askpass
 //! shim), auto-detect the manager (chezmoi / stow / copy), apply, and optionally run a bootstrap
-//! command. Runs synchronously before the harness starts so a failure aborts boot.
+//! command. Also applies caller-provided dotfiles archives (manifest.json + *.tar.gz staged by
+//! the launching adapter) through the same manager dispatch. Runs synchronously before the
+//! control socket binds so a failure aborts boot and nothing observes a half-applied home.
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::boot::config::{DotfilesConfig, DotfilesManager, DotfilesTarget};
+use serde::Deserialize;
+
+use crate::boot::config::{
+    DEFAULT_DOTFILES_BOOTSTRAP_COMMAND, DotfilesConfig, DotfilesManager, DotfilesTarget,
+};
 use crate::boot::error::BootError;
 
 /// Where the dotfiles repo is checked out.
 const CHECKOUT_DIR: &str = "/root/.local/share/chezmoi";
+/// Where caller-provided dotfiles archives are extracted before application.
+const ARCHIVE_STAGING_DIR: &str = "/root/.local/share/sealant-dotfiles";
 /// Home target.
 const HOME_DIR: &str = "/root";
 
@@ -35,18 +43,116 @@ pub(crate) fn apply(config: &DotfilesConfig, runtime_dir: &Path) -> Result<(), B
     }
     clone_result?;
 
-    let manager = detect_manager(config.manager, &checkout);
+    apply_tree(
+        &checkout,
+        config.manager,
+        config.target,
+        config.bootstrap,
+        &config.bootstrap_command,
+    )
+}
+
+/// Apply one checked-out/extracted dotfiles tree: detect the manager, apply, run the bootstrap.
+fn apply_tree(
+    checkout: &Path,
+    manager: DotfilesManager,
+    target: DotfilesTarget,
+    bootstrap: bool,
+    bootstrap_command: &str,
+) -> Result<(), BootError> {
+    let manager = detect_manager(manager, checkout);
     tracing::info!(?manager, "applying dotfiles");
     match manager {
-        ResolvedManager::Chezmoi => apply_chezmoi(&checkout)?,
-        ResolvedManager::Stow => apply_stow(&checkout, config.target)?,
-        ResolvedManager::Copy => apply_copy(&checkout, config.target)?,
+        ResolvedManager::Chezmoi => apply_chezmoi(checkout)?,
+        ResolvedManager::Stow => apply_stow(checkout, target)?,
+        ResolvedManager::Copy => apply_copy(checkout, target)?,
     }
 
-    if config.bootstrap {
-        run_bootstrap(&checkout, &config.bootstrap_command)?;
+    if bootstrap {
+        run_bootstrap(checkout, bootstrap_command)?;
     }
     Ok(())
+}
+
+/// The manifest describing caller-provided dotfiles archives (`manifest.json` beside them).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ArchiveManifest {
+    archives: Vec<ArchiveEntry>,
+}
+
+/// One caller-provided archive: a gzipped tar applied like a checkout, in manifest order.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ArchiveEntry {
+    /// Archive file name inside the archive dir — a plain basename, no path segments.
+    file: String,
+    #[serde(default)]
+    manager: Option<DotfilesManager>,
+    #[serde(default)]
+    target: Option<DotfilesTarget>,
+    /// Run the bootstrap command after applying (skipped when absent), mirroring the repo path.
+    #[serde(default = "default_true")]
+    bootstrap: bool,
+    #[serde(default)]
+    bootstrap_command: Option<String>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Apply caller-provided dotfiles archives from `dir`, in manifest order.
+///
+/// # Errors
+/// Returns [`BootError::Dotfiles`] (or a wrapped I/O/command error) on failure; any failure
+/// aborts boot like the repo-based path.
+pub(crate) fn apply_archives(dir: &Path) -> Result<(), BootError> {
+    let manifest_path = dir.join("manifest.json");
+    let raw = std::fs::read_to_string(&manifest_path)
+        .map_err(|e| BootError::io_path("read", &manifest_path, e))?;
+    let manifest: ArchiveManifest = serde_json::from_str(&raw)
+        .map_err(|e| BootError::Dotfiles(format!("invalid dotfiles archive manifest: {e}")))?;
+
+    for (index, entry) in manifest.archives.iter().enumerate() {
+        if entry.file.contains('/') || entry.file.contains("..") {
+            return Err(BootError::Dotfiles(format!(
+                "dotfiles archive file name {:?} must be a plain basename",
+                entry.file
+            )));
+        }
+        let archive = dir.join(&entry.file);
+        let staging = PathBuf::from(ARCHIVE_STAGING_DIR).join(index.to_string());
+        if staging.exists() {
+            std::fs::remove_dir_all(&staging)
+                .map_err(|e| BootError::io_path("rm -rf", &staging, e))?;
+        }
+        std::fs::create_dir_all(&staging)
+            .map_err(|e| BootError::io_path("mkdir -p", &staging, e))?;
+        extract_archive(&archive, &staging)?;
+        apply_tree(
+            &staging,
+            entry.manager.unwrap_or(DotfilesManager::Auto),
+            entry.target.unwrap_or(DotfilesTarget::Home),
+            entry.bootstrap,
+            entry
+                .bootstrap_command
+                .as_deref()
+                .unwrap_or(DEFAULT_DOTFILES_BOOTSTRAP_COMMAND),
+        )?;
+    }
+    Ok(())
+}
+
+fn extract_archive(archive: &Path, staging: &Path) -> Result<(), BootError> {
+    run_checked(
+        Command::new("tar")
+            .arg("-xzf")
+            .arg(archive)
+            .arg("-C")
+            .arg(staging),
+        "tar -xzf",
+    )
 }
 
 /// Write the dotfiles HTTP askpass shim if a token is configured.
@@ -322,5 +428,61 @@ mod tests {
     #[test]
     fn single_quote_escapes() {
         assert_eq!(single_quote("a'b"), "'a'\\''b'");
+    }
+
+    #[test]
+    fn archive_manifest_parses_with_defaults() {
+        let manifest: ArchiveManifest = serde_json::from_str(
+            r#"{"archives":[
+                {"file":"0.tar.gz"},
+                {"file":"1.tar.gz","manager":"copy","target":"config","bootstrap":false,"bootstrapCommand":"./setup.sh"}
+            ]}"#,
+        )
+        .expect("valid manifest");
+        assert_eq!(manifest.archives.len(), 2);
+        let first = &manifest.archives[0];
+        assert_eq!(first.manager, None);
+        assert_eq!(first.target, None);
+        assert!(first.bootstrap);
+        assert_eq!(first.bootstrap_command, None);
+        let second = &manifest.archives[1];
+        assert_eq!(second.manager, Some(DotfilesManager::Copy));
+        assert_eq!(second.target, Some(DotfilesTarget::Config));
+        assert!(!second.bootstrap);
+        assert_eq!(second.bootstrap_command.as_deref(), Some("./setup.sh"));
+    }
+
+    #[test]
+    fn archive_file_name_with_path_segments_is_rejected() {
+        let dir = tempfile::tempdir().expect("tmp");
+        std::fs::write(
+            dir.path().join("manifest.json"),
+            r#"{"archives":[{"file":"../evil.tar.gz"}]}"#,
+        )
+        .expect("write");
+        let err = apply_archives(dir.path()).expect_err("traversal must be rejected");
+        assert!(format!("{err}").contains("plain basename"));
+    }
+
+    #[test]
+    fn extract_archive_unpacks_into_staging() {
+        let source = tempfile::tempdir().expect("src");
+        std::fs::write(source.path().join(".zshrc"), b"export MARKER=1\n").expect("write");
+        let packed = tempfile::tempdir().expect("packed");
+        let archive = packed.path().join("dots.tar.gz");
+        let status = Command::new("tar")
+            .arg("-czf")
+            .arg(&archive)
+            .arg("-C")
+            .arg(source.path())
+            .arg(".")
+            .status()
+            .expect("tar available");
+        assert!(status.success());
+
+        let staging = tempfile::tempdir().expect("staging");
+        extract_archive(&archive, staging.path()).expect("extract");
+        let content = std::fs::read_to_string(staging.path().join(".zshrc")).expect("read");
+        assert_eq!(content, "export MARKER=1\n");
     }
 }
