@@ -334,6 +334,8 @@ pub enum OsFamily {
     Arch,
     /// Nix.
     Nix,
+    /// Ubuntu.
+    Ubuntu,
 }
 
 /// Resolved shell/tool paths (build-static).
@@ -467,9 +469,10 @@ impl BootConfig {
             Some("fedora") => OsFamily::Fedora,
             Some("arch") => OsFamily::Arch,
             Some("nix") => OsFamily::Nix,
+            Some("ubuntu") => OsFamily::Ubuntu,
             Some(other) => {
                 return Err(BootError::config(format!(
-                    "SEALANT_OS_FAMILY has unknown value {other:?} (expected fedora|arch|nix)"
+                    "SEALANT_OS_FAMILY has unknown value {other:?} (expected fedora|arch|nix|ubuntu)"
                 )));
             }
             None => return Err(BootError::config("SEALANT_OS_FAMILY is required")),
@@ -805,7 +808,7 @@ fn passthrough_env(env: &dyn EnvSource) -> Vec<(String, String)> {
 
 fn default_login_shell(family: OsFamily) -> &'static str {
     match family {
-        OsFamily::Fedora | OsFamily::Arch => "/usr/bin/zsh",
+        OsFamily::Fedora | OsFamily::Arch | OsFamily::Ubuntu => "/usr/bin/zsh",
         OsFamily::Nix => "/bin/bash",
     }
 }
@@ -835,6 +838,20 @@ mod tests {
             WorkspaceSource::Clone(repo) => repo,
             WorkspaceSource::Mount(m) => panic!("expected clone source, got mount {m:?}"),
         }
+    }
+
+    #[test]
+    fn ubuntu_os_family_parses_with_fedora_style_defaults() {
+        let cfg = load_with(&[("SEALANT_OS_FAMILY", "ubuntu")]).expect("valid");
+        assert_eq!(cfg.os_family, OsFamily::Ubuntu);
+        assert_eq!(cfg.shells.login, PathBuf::from("/usr/bin/zsh"));
+    }
+
+    #[test]
+    fn unknown_os_family_lists_every_supported_value() {
+        let err = load_with(&[("SEALANT_OS_FAMILY", "gentoo")]).expect_err("invalid");
+        let message = err.to_string();
+        assert!(message.contains("fedora|arch|nix|ubuntu"), "{message}");
     }
 
     #[test]
