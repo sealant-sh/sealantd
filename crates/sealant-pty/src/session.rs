@@ -253,6 +253,9 @@ pub struct SessionRuntime {
     pub redactor: Arc<Redactor>,
 }
 
+/// After `close()` sends the hangup, how long the leader may linger before its group is killed.
+const CLOSE_KILL_GRACE: Duration = Duration::from_secs(2);
+
 fn signal_session(pid: i32, signal: NixSignal) {
     // The session leader is its own process-group leader (setsid), so signal the whole group.
     let _ = nix::sys::signal::killpg(Pid::from_raw(pid), signal);
@@ -675,6 +678,23 @@ impl SessionRuntime {
     pub fn close(&self, session_id: &SessionId) -> Result<(), ControlError> {
         if let Some(entry) = self.registry.get_running(session_id) {
             signal_session(entry.pid, NixSignal::SIGHUP);
+            // SIGHUP alone is not a reliable teardown: an interactive shell parked at its prompt
+            // can absorb it without exiting (dash, for one, defers pending-signal processing
+            // until the current input read completes — a read that will never complete once the
+            // client is gone). A close means "this session ends", so escalate to SIGKILL after a
+            // grace window if the leader is still running — same ladder as `terminate_all`.
+            let registry = self.registry.clone();
+            let session_id = session_id.clone();
+            let pid = entry.pid;
+            tokio::spawn(async move {
+                tokio::time::sleep(CLOSE_KILL_GRACE).await;
+                if registry
+                    .get_running(&session_id)
+                    .is_some_and(|entry| entry.pid == pid)
+                {
+                    signal_session(pid, NixSignal::SIGKILL);
+                }
+            });
             return Ok(());
         }
         if self.registry.remove_finished(session_id) {
@@ -820,6 +840,26 @@ struct CaptureContext {
     leader_exited_rx: oneshot::Receiver<()>,
 }
 
+/// How long the post-exit drain waits before re-checking a quiet PTY. Bytes the leader wrote
+/// right before exiting can still be in flight through the kernel's tty flip-buffer work when we
+/// look (a plain `FIONREAD`/`read` sees nothing yet), so one quiet check is not proof the stream
+/// is drained — two checks this far apart are.
+const POST_EXIT_QUIET_RECHECK: Duration = Duration::from_millis(2);
+
+/// Cap on bytes drained after the leader exits. The leader's own undelivered output is bounded by
+/// kernel PTY buffering (well under this), so the cap only ever cuts a HELPER that keeps writing
+/// after the leader died — bounding how far such a helper can extend the attachment (the session
+/// belongs to its leader) without putting any time limit on delivering the leader's bytes to a
+/// slow consumer.
+const POST_EXIT_DRAIN_BUDGET: usize = 256 * 1024;
+
+/// Post-exit drain state: how much more we are willing to read, and whether the last poll found
+/// the PTY quiet (two consecutive quiet polls end the drain).
+struct PostExitDrain {
+    budget: usize,
+    saw_quiet: bool,
+}
+
 async fn capture_output(master: Arc<AsyncFd<OwnedFd>>, chunk_size: usize, context: CaptureContext) {
     let CaptureContext {
         bus,
@@ -831,23 +871,36 @@ async fn capture_output(master: Arc<AsyncFd<OwnedFd>>, chunk_size: usize, contex
     } = context;
     let mut offset = StreamOffset::ZERO;
     let mut buf = vec![0u8; chunk_size.max(1)];
-    let mut post_exit_bytes_remaining = None;
+    let mut post_exit: Option<PostExitDrain> = None;
     loop {
-        let read_result = match post_exit_bytes_remaining {
-            Some(0) => break,
-            Some(remaining) => {
-                let read_size = remaining.min(buf.len());
-                pty::try_read(&master, &mut buf[..read_size])
+        let read_result = match &mut post_exit {
+            Some(drain) => {
+                if drain.budget == 0 {
+                    break;
+                }
+                let read_size = drain.budget.min(buf.len());
+                match pty::try_read(&master, &mut buf[..read_size]) {
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        if drain.saw_quiet {
+                            break;
+                        }
+                        drain.saw_quiet = true;
+                        tokio::time::sleep(POST_EXIT_QUIET_RECHECK).await;
+                        continue;
+                    }
+                    other => {
+                        drain.saw_quiet = false;
+                        other
+                    }
+                }
             }
             None => tokio::select! {
                 biased;
                 _ = &mut leader_exited_rx => {
-                    let available = pty::readable_bytes(&master).unwrap_or_else(|error| {
-                        tracing::warn!(%error, session = %entry.session_id,
-                            "failed to snapshot buffered PTY output at leader exit");
-                        0
+                    post_exit = Some(PostExitDrain {
+                        budget: POST_EXIT_DRAIN_BUDGET,
+                        saw_quiet: false,
                     });
-                    post_exit_bytes_remaining = Some(available);
                     continue;
                 }
                 result = pty::read(&master, &mut buf) => result,
@@ -856,8 +909,8 @@ async fn capture_output(master: Arc<AsyncFd<OwnedFd>>, chunk_size: usize, contex
         match read_result {
             Ok(0) => break,
             Ok(n) => {
-                if let Some(remaining) = &mut post_exit_bytes_remaining {
-                    *remaining = remaining.saturating_sub(n);
+                if let Some(drain) = &mut post_exit {
+                    drain.budget = drain.budget.saturating_sub(n);
                 }
                 // (a) redact once; every downstream consumer (journal, telemetry, sink) sees the
                 // same redacted bytes — the journal is the product read surface and must never
@@ -938,11 +991,8 @@ async fn capture_output(master: Arc<AsyncFd<OwnedFd>>, chunk_size: usize, contex
                     }
                 }
             }
-            Err(e)
-                if post_exit_bytes_remaining.is_some() && e.kind() == io::ErrorKind::WouldBlock =>
-            {
-                break;
-            }
+            // Post-exit WouldBlock never reaches here — the drain arm handles it with a quiet
+            // re-check above.
             Err(e) if pty::is_eof_error(&e) => break,
             Err(_) => break,
         }
@@ -1430,7 +1480,9 @@ mod tests {
 
         rt.close(&opened.session_id).expect("close");
         let mut released = false;
-        for _ in 0..200 {
+        // Budget covers the close() SIGKILL escalation (2s grace) plus loaded-machine margin —
+        // an interactive shell at its prompt can absorb the HUP, so release may take the ladder.
+        for _ in 0..500 {
             if rt.registry.is_empty() {
                 released = true;
                 break;
