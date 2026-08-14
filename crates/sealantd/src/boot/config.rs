@@ -225,8 +225,8 @@ pub enum DotfilesTarget {
 pub struct DotfilesConfig {
     /// Clone URL.
     pub url: String,
-    /// Branch/ref.
-    pub reference: String,
+    /// Branch/ref. Absent clones the remote's default branch — never assume `main`.
+    pub reference: Option<String>,
     /// GitHub installation repository id, when the dotfiles repo is installation-backed.
     pub github_installation_repository_id: Option<String>,
     /// Manager selection.
@@ -676,10 +676,7 @@ impl BootConfig {
             })?;
         let reference = env
             .get("SEALANT_DOTFILES_REPO_REF")
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| {
-                BootError::config("SEALANT_DOTFILES_REPO_REF is required for runtime dotfiles")
-            })?;
+            .filter(|s| !s.is_empty());
         let github_installation_repository_id = env
             .get("SEALANT_DOTFILES_GITHUB_INSTALLATION_REPOSITORY_ID")
             .filter(|s| !s.is_empty());
@@ -1080,10 +1077,22 @@ mod tests {
         ])
         .expect("valid");
         let d = cfg.dotfiles.expect("dotfiles present");
+        assert_eq!(d.reference.as_deref(), Some("main"));
         assert_eq!(d.manager, DotfilesManager::Chezmoi);
         assert_eq!(d.target, DotfilesTarget::Config);
         assert!(!d.bootstrap);
         assert_eq!(d.http_username, "x-access-token");
+    }
+
+    #[test]
+    fn dotfiles_without_ref_takes_remote_default_branch() {
+        let cfg = load_with(&[
+            ("SEALANT_DOTFILES_RUNTIME_APPLY", "1"),
+            ("SEALANT_DOTFILES_REPO_URL", "https://github.com/o/dots.git"),
+        ])
+        .expect("valid");
+        let d = cfg.dotfiles.expect("dotfiles present");
+        assert_eq!(d.reference, None);
     }
 
     #[test]

@@ -79,14 +79,12 @@ fn clone_dotfiles(
     askpass: Option<&Path>,
 ) -> Result<(), BootError> {
     let mut command = Command::new("git");
-    command
-        .arg("clone")
-        .arg("--depth")
-        .arg("1")
-        .arg("--branch")
-        .arg(&config.reference)
-        .arg(&config.url)
-        .arg(checkout);
+    command.arg("clone").arg("--depth").arg("1");
+    // No ref means the remote's default branch — `--branch` would also reject commit SHAs.
+    if let Some(reference) = &config.reference {
+        command.arg("--branch").arg(reference);
+    }
+    command.arg(&config.url).arg(checkout);
     if let Some(path) = askpass {
         command.env("GIT_ASKPASS", path);
         command.env("GIT_TERMINAL_PROMPT", "0");

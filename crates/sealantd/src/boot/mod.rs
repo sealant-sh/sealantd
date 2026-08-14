@@ -277,22 +277,25 @@ async fn boot_serve(runtime: Arc<Runtime>, config: BootConfig) -> ExitCode {
     }
     runtime.mark_healthy();
 
-    // Step 12: control server in-process on the same runtime/bus/registry.
+    // Step 12: runtime dotfiles, synchronously, BEFORE the control socket binds. The launching
+    // adapter and the gateway treat the socket as the readiness signal, and everything they inject
+    // after readiness (credential files into $HOME) must never race a dotfiles apply that writes
+    // the same tree.
+    if let Some(dotfiles) = &config.dotfiles
+        && let Err(error) = dotfiles::apply(dotfiles, &ssh_runtime_dir(&config))
+    {
+        tracing::error!(%error, "dotfiles apply failed");
+        eprintln!("sealantd boot: {error}");
+        return shutdown_before_control(&runtime, ExitCode::FAILURE).await;
+    }
+
+    // Step 13: control server in-process on the same runtime/bus/registry.
     let control_runtime = runtime.clone();
     let socket = control_runtime.socket_path();
     let allowed = control_runtime.allowed_peer_uids();
     let mut control_handle = tokio::spawn(async move {
         sealant_control::serve_unix(control_runtime, &socket, allowed, serve_rx).await
     });
-
-    // Step 13: runtime dotfiles, synchronously, before the harness.
-    if let Some(dotfiles) = &config.dotfiles
-        && let Err(error) = dotfiles::apply(dotfiles, &ssh_runtime_dir(&config))
-    {
-        tracing::error!(%error, "dotfiles apply failed");
-        eprintln!("sealantd boot: {error}");
-        return shutdown_with(&runtime, &serve_tx, control_handle, ExitCode::FAILURE).await;
-    }
 
     // Print the harness banner (E8) now that prep is done.
     tracing::info!(banner = %config.banner, "{}", config.banner);
@@ -516,6 +519,21 @@ async fn shutdown_with(
     {
         tracing::warn!(%error, "control server task join error");
     }
+    runtime.finish_shutdown();
+    tracing::info!("sealantd boot stopped");
+    code
+}
+
+/// Shutdown path for failures that happen before the control server is spawned (there is no
+/// socket to close and no task to join).
+async fn shutdown_before_control(runtime: &Arc<Runtime>, code: ExitCode) -> ExitCode {
+    if !matches!(
+        runtime.state(),
+        RuntimeState::ShuttingDown | RuntimeState::Stopped
+    ) {
+        runtime.shutdown().request_graceful(None);
+    }
+    runtime.begin_shutdown().await;
     runtime.finish_shutdown();
     tracing::info!("sealantd boot stopped");
     code
