@@ -38,6 +38,11 @@ pub struct RuntimeConfig {
     /// Explicit child base environment (never `std::env::vars()`).
     #[serde(default)]
     pub child_env: Vec<EnvVar>,
+    /// Literal values the I/O redactor must mask in addition to the values of secret-looking
+    /// `child_env` keys — the launcher-provided secret environment, whose names are arbitrary. Never
+    /// serialized: this list must not reach a config dump, fingerprint, or telemetry payload.
+    #[serde(default, skip_serializing)]
+    pub redact_literals: Vec<String>,
     /// Child user id to drop to, when configured.
     #[serde(default)]
     pub child_uid: Option<u32>,
@@ -110,6 +115,7 @@ impl RuntimeConfig {
             workspace_root: PathBuf::from(DEFAULT_WORKSPACE_ROOT),
             default_shell: "/bin/bash".to_owned(),
             child_env: Vec::new(),
+            redact_literals: Vec::new(),
             child_uid: None,
             child_gid: None,
             limits: default_limits(),
@@ -171,20 +177,35 @@ impl RuntimeConfig {
         Ok(())
     }
 
-    /// A deterministic SHA-256 hex fingerprint of the full configuration.
+    /// A deterministic SHA-256 hex fingerprint of the configuration's *sanitized* form: env keys
+    /// contribute, env values do not. The fingerprint is logged, and a hash over secret-bearing
+    /// values would hand a log reader an offline-guessing oracle for low-entropy secrets.
     #[must_use]
     pub fn config_hash(&self) -> String {
-        let json = serde_json::to_vec(self).unwrap_or_default();
+        let json = serde_json::to_vec(&self.sanitized_fields()).unwrap_or_default();
         let mut hasher = Sha256::new();
         hasher.update(&json);
         hex::encode(hasher.finalize())
     }
 
-    /// A sanitized, secret-free summary suitable for logs and telemetry.
+    /// A sanitized, secret-free summary suitable for logs and telemetry: the sanitized fields
+    /// plus their fingerprint.
     ///
     /// Environment values are never emitted; only the *keys* are listed.
     #[must_use]
     pub fn sanitized_summary(&self) -> serde_json::Value {
+        let mut summary = self.sanitized_fields();
+        if let Some(object) = summary.as_object_mut() {
+            object.insert(
+                "configHash".to_owned(),
+                serde_json::Value::String(self.config_hash()),
+            );
+        }
+        summary
+    }
+
+    /// The secret-free field set both the summary and the fingerprint are built from.
+    fn sanitized_fields(&self) -> serde_json::Value {
         let env_keys: Vec<&str> = self.child_env.iter().map(|e| e.key.as_str()).collect();
         serde_json::json!({
             "runtimeId": self.runtime_id,
@@ -202,7 +223,6 @@ impl RuntimeConfig {
             "shutdownGraceMs": self.shutdown_grace_ms,
             "ioChunkBytes": self.io_chunk_bytes,
             "logLevel": self.log_level,
-            "configHash": self.config_hash(),
         })
     }
 }
@@ -251,5 +271,24 @@ mod tests {
         let text = summary.to_string();
         assert!(text.contains("SECRET_TOKEN"));
         assert!(!text.contains("super-secret"));
+    }
+
+    #[test]
+    fn config_hash_ignores_env_values_and_redact_literals() {
+        let mut a = cfg();
+        a.child_env = vec![EnvVar {
+            key: "DATABASE_URL".to_owned(),
+            value: "postgres://one".to_owned(),
+        }];
+        a.redact_literals = vec!["postgres://one".to_owned()];
+        let mut b = a.clone();
+        b.child_env[0].value = "postgres://two".to_owned();
+        b.redact_literals = vec!["postgres://two".to_owned()];
+        // Same keys, different values: the logged fingerprint must not distinguish them.
+        assert_eq!(a.config_hash(), b.config_hash());
+        // And a serialized config never carries the redact list at all.
+        let json = serde_json::to_string(&a).expect("serializable");
+        assert!(!json.contains("redactLiterals"));
+        assert!(!json.contains("redact_literals"));
     }
 }

@@ -28,7 +28,8 @@ use crate::shutdown::ShutdownSignal;
 /// Daemon build version.
 pub const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Collect the values of secret-looking env vars so captured I/O can redact them (plan §18).
+/// Collect the values captured I/O must redact (plan §18): the values of secret-looking env vars
+/// plus every launcher-provided secret literal, whatever its name.
 fn secret_env_values(config: &RuntimeConfig) -> Vec<String> {
     const MARKERS: &[&str] = &[
         "TOKEN",
@@ -46,6 +47,7 @@ fn secret_env_values(config: &RuntimeConfig) -> Vec<String> {
             MARKERS.iter().any(|m| key.contains(m)) || key.ends_with("_KEY") || key == "KEY"
         })
         .map(|var| var.value.clone())
+        .chain(config.redact_literals.iter().cloned())
         .collect()
 }
 

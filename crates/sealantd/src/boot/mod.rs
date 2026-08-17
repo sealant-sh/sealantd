@@ -39,6 +39,9 @@ use config::{ForegroundConfig, LifecycleStep, OsFamily, Shell, WorkspaceSource};
 /// The directory under the workspace root holding boot-time clone credentials and dotfiles state.
 const SSH_RUNTIME_SUBDIR: &str = ".ssh-runtime";
 
+/// Child-environment keys `boot` computes itself; no launcher-provided entry may set them.
+const BOOT_OWNED_KEYS: &[&str] = &["HOME", "USER", "LOGNAME", "PATH"];
+
 /// Entry point for the `boot` subcommand. Performs synchronous prep, then enters Tokio to run the
 /// control server and supervise the harness. Returns the process exit code.
 #[must_use]
@@ -54,14 +57,28 @@ pub fn run_boot(log_level: &str) -> ExitCode {
         }
     };
 
-    match prepare(&config) {
-        Ok(()) => run_supervised(config),
-        Err(error) => {
-            tracing::error!(%error, "boot preparation failed");
-            eprintln!("sealantd boot: {error}");
-            ExitCode::FAILURE
-        }
+    if let Err(error) = prepare(&config) {
+        tracing::error!(%error, "boot preparation failed");
+        eprintln!("sealantd boot: {error}");
+        return ExitCode::FAILURE;
     }
+
+    // The launcher-provided secret environment is read exactly once, here, and handed straight to
+    // the runtime config: it never rides `BootConfig` (which is `Debug`) and never touches this
+    // process's own environment.
+    let secret_env = match &config.secret_env_file {
+        None => Vec::new(),
+        Some(path) => match config::load_secret_env(path) {
+            Ok(entries) => entries,
+            Err(error) => {
+                tracing::error!(%error, "secret environment file is invalid");
+                eprintln!("sealantd boot: {error}");
+                return ExitCode::FAILURE;
+            }
+        },
+    };
+
+    run_supervised(config, secret_env)
 }
 
 fn init_tracing(log_level: &str) {
@@ -188,7 +205,7 @@ fn find_nix_loader() -> Option<PathBuf> {
 }
 
 /// Build the `RuntimeConfig` from the boot config (the `into_runtime_config` of the spec).
-fn into_runtime_config(config: &BootConfig) -> RuntimeConfig {
+fn into_runtime_config(config: &BootConfig, secret_env: &[(String, String)]) -> RuntimeConfig {
     let mut runtime_config = RuntimeConfig::new(new_runtime_id());
     runtime_config.socket_path = config.control.socket.clone();
     runtime_config.workspace_root = config.workspace.working_directory.clone();
@@ -204,16 +221,30 @@ fn into_runtime_config(config: &BootConfig) -> RuntimeConfig {
     runtime_config.default_execution_id = config.control.execution_id.clone().map(ExecutionId::new);
     runtime_config.default_shell = config.shells.login.display().to_string();
     runtime_config.log_level = "info".to_owned();
-    // The harness child's base environment: the passthrough env plus the prep-set identity vars.
-    runtime_config.child_env = harness_child_env(config);
+    // The harness child's base environment: the passthrough env, the launcher's secret env, and
+    // the prep-set identity vars. Every secret value seeds the I/O redactor whatever its name.
+    runtime_config.child_env = harness_child_env(config, secret_env);
+    runtime_config.redact_literals = secret_env.iter().map(|(_, value)| value.clone()).collect();
     runtime_config
 }
 
-/// Compute the harness child's base environment: the non-secret passthrough plus the identity vars
-/// `boot` set on itself in prep (HOME/USER/LOGNAME/PATH). Secrets were already excluded.
-fn harness_child_env(config: &BootConfig) -> Vec<EnvVar> {
+/// Compute the harness child's base environment, in precedence order (later wins): the non-secret
+/// passthrough, then the launcher-provided secret environment (explicitly addressed to the
+/// workspace, so it bypasses the secret-name scrub and overrides same-named passthrough entries),
+/// then the identity vars `boot` set on itself in prep (HOME/USER/LOGNAME/PATH), which nothing may
+/// override.
+fn harness_child_env(config: &BootConfig, secret_env: &[(String, String)]) -> Vec<EnvVar> {
     let mut map: std::collections::BTreeMap<String, String> =
         config.passthrough_env.iter().cloned().collect();
+    for (key, value) in secret_env {
+        // The identity/PATH keys are computed below from the passthrough alone; a launcher entry
+        // under one of those names is dropped (the platform's own validation rejects them first).
+        if BOOT_OWNED_KEYS.contains(&key.as_str()) {
+            tracing::warn!(key, "secret env entry ignored: the key is owned by boot");
+            continue;
+        }
+        map.insert(key.clone(), value.clone());
+    }
     map.insert("HOME".to_owned(), "/root".to_owned());
     map.insert("USER".to_owned(), "root".to_owned());
     map.insert("LOGNAME".to_owned(), "root".to_owned());
@@ -237,8 +268,10 @@ fn harness_child_env(config: &BootConfig) -> Vec<EnvVar> {
 }
 
 /// Steps 9–18: build the runtime, enter Tokio, run the control server and supervise the harness.
-fn run_supervised(config: BootConfig) -> ExitCode {
-    let runtime_config = into_runtime_config(&config);
+fn run_supervised(config: BootConfig, secret_env: Vec<(String, String)>) -> ExitCode {
+    let runtime_config = into_runtime_config(&config, &secret_env);
+    // Nothing downstream needs the values in this form; the runtime config owns them now.
+    drop(secret_env);
     if let Err(error) = runtime_config.validate() {
         tracing::error!(%error, "derived runtime configuration is invalid");
         eprintln!("sealantd boot: invalid runtime configuration: {error}");
@@ -545,4 +578,84 @@ async fn shutdown_before_control(runtime: &Arc<Runtime>, code: ExitCode) -> Exit
     runtime.finish_shutdown();
     tracing::info!("sealantd boot stopped");
     code
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use config::MapEnv;
+
+    fn boot_config(pairs: &[(&str, &str)]) -> BootConfig {
+        let mut all = vec![
+            ("SEALANT_WORKSPACE_REPO_URL", "git@github.com:o/r.git"),
+            ("SEALANT_OS_FAMILY", "fedora"),
+            ("SEALANT_HARNESS_LAUNCH_COMMAND", "x"),
+        ];
+        all.extend_from_slice(pairs);
+        BootConfig::load(&MapEnv::from_pairs(&all)).expect("valid boot config")
+    }
+
+    fn lookup<'a>(env: &'a [EnvVar], key: &str) -> Option<&'a str> {
+        env.iter().find(|v| v.key == key).map(|v| v.value.as_str())
+    }
+
+    #[test]
+    fn secret_env_overrides_passthrough_but_never_identity_vars() {
+        let config = boot_config(&[
+            ("PORT", "3000"),
+            ("APP_MODE", "review"),
+            ("PATH", "/usr/bin"),
+        ]);
+        let secret_env = vec![
+            ("PORT".to_owned(), "4000".to_owned()),
+            ("DATABASE_URL".to_owned(), "postgres://u:p@h/db".to_owned()),
+            // A launcher cannot smuggle identity/PATH through the secret file: prep's values win.
+            ("HOME".to_owned(), "/elsewhere".to_owned()),
+            ("PATH".to_owned(), "/evil".to_owned()),
+        ];
+        let env = harness_child_env(&config, &secret_env);
+        assert_eq!(lookup(&env, "PORT"), Some("4000"));
+        assert_eq!(lookup(&env, "APP_MODE"), Some("review"));
+        assert_eq!(lookup(&env, "DATABASE_URL"), Some("postgres://u:p@h/db"));
+        assert_eq!(lookup(&env, "HOME"), Some("/root"));
+        assert_eq!(lookup(&env, "USER"), Some("root"));
+        assert!(lookup(&env, "PATH").is_some_and(|p| p.starts_with("/usr/local/bin:")));
+        assert!(lookup(&env, "PATH").is_some_and(|p| !p.contains("/evil")));
+    }
+
+    #[test]
+    fn secret_env_bypasses_the_secret_name_scrub_and_seeds_the_redactor() {
+        // The daemon's own env scrub drops secret-looking names from the PASSTHROUGH…
+        let config = boot_config(&[("MY_TOKEN", "from-container-env")]);
+        assert!(!config.passthrough_env.iter().any(|(k, _)| k == "MY_TOKEN"));
+        // …but the launcher-provided secret env is addressed to the workspace and lands verbatim,
+        // with every value (whatever its name) registered for I/O redaction.
+        let secret_env = vec![
+            ("MY_TOKEN".to_owned(), "from-secret-file-value".to_owned()),
+            (
+                "DATABASE_URL".to_owned(),
+                "postgres://plain-name".to_owned(),
+            ),
+        ];
+        let runtime_config = into_runtime_config(&config, &secret_env);
+        assert_eq!(
+            lookup(&runtime_config.child_env, "MY_TOKEN"),
+            Some("from-secret-file-value")
+        );
+        assert_eq!(
+            runtime_config.redact_literals,
+            vec![
+                "from-secret-file-value".to_owned(),
+                "postgres://plain-name".to_owned()
+            ]
+        );
+    }
+
+    #[test]
+    fn empty_secret_env_changes_nothing() {
+        let config = boot_config(&[("APP_MODE", "review")]);
+        let with = harness_child_env(&config, &[]);
+        assert_eq!(lookup(&with, "APP_MODE"), Some("review"));
+        assert!(into_runtime_config(&config, &[]).redact_literals.is_empty());
+    }
 }
