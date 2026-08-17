@@ -7,7 +7,7 @@
 //! effect, so a misconfigured container fails fast rather than booting half-broken.
 
 use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
@@ -51,6 +51,7 @@ const CONSUMED_KEYS: &[&str] = &[
     "SEALANT_DOTFILES_HTTP_USERNAME",
     "SEALANT_DOTFILES_HTTP_TOKEN",
     "SEALANT_DOTFILES_ARCHIVE_DIR",
+    "SEALANT_SECRET_ENV_FILE",
     "SEALANT_LIFECYCLE_SETUP_JSON",
     "SEALANT_LIFECYCLE_STARTUP_JSON",
     "SEALANT_FOREGROUND_COMMAND",
@@ -386,6 +387,12 @@ pub struct BootConfig {
     /// Directory holding caller-provided dotfiles archives (manifest.json + *.tar.gz), when
     /// configured. Applied after the repo-based dotfiles, before the control socket binds.
     pub dotfiles_archives: Option<PathBuf>,
+    /// File holding the launcher-provided secret environment (a JSON object, name → value), when
+    /// configured. Read once at boot by [`load_secret_env`]; the values are injected into the
+    /// harness child environment explicitly (bypassing the secret-name scrub, since these are
+    /// addressed *to* the workspace) and every value seeds the I/O redactor. Only the PATH lives
+    /// on this struct — values never ride a `Debug`-printable config.
+    pub secret_env_file: Option<PathBuf>,
     /// Lifecycle steps.
     pub lifecycle: LifecycleConfig,
     /// Foreground (harness) launch.
@@ -456,6 +463,10 @@ impl BootConfig {
         let dotfiles = Self::load_dotfiles(env)?;
         let dotfiles_archives = env
             .get("SEALANT_DOTFILES_ARCHIVE_DIR")
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from);
+        let secret_env_file = env
+            .get("SEALANT_SECRET_ENV_FILE")
             .filter(|s| !s.is_empty())
             .map(PathBuf::from);
         let lifecycle = LifecycleConfig {
@@ -539,6 +550,7 @@ impl BootConfig {
             clone_auth,
             dotfiles,
             dotfiles_archives,
+            secret_env_file,
             lifecycle,
             foreground,
             banner,
@@ -816,6 +828,72 @@ fn passthrough_env(env: &dyn EnvSource) -> Vec<(String, String)> {
         .collect();
     out.sort_by(|a, b| a.0.cmp(&b.0));
     out
+}
+
+/// Maximum number of secret environment entries the daemon accepts from the launcher.
+const MAX_SECRET_ENV_ENTRIES: usize = 256;
+
+/// Whether `name` is a well-formed, non-platform environment variable name: `[A-Za-z_][A-Za-z0-9_]*`,
+/// at most 128 bytes, and not in the daemon's own `SEALANT_` namespace.
+fn is_acceptable_secret_env_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first == '_' || first.is_ascii_alphabetic()) {
+        return false;
+    }
+    name.len() <= 128
+        && chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
+        && !name.to_ascii_uppercase().starts_with("SEALANT_")
+}
+
+/// Read the launcher-provided secret environment: a JSON object mapping variable names to string
+/// values, sorted by name. Every entry is validated — a malformed file, an unusable name, or a NUL
+/// in a value fails boot loudly rather than starting a workspace with a silently missing secret.
+/// The file is consumed once; the launcher is expected to remove it after the workspace reports
+/// ready, so from then on the values live only in daemon memory and child environments.
+///
+/// # Errors
+/// Returns [`BootError::Config`] when the file cannot be read or does not satisfy the contract.
+pub fn load_secret_env(path: &Path) -> Result<Vec<(String, String)>, BootError> {
+    let raw = std::fs::read(path).map_err(|e| BootError::io_path("read secret env", path, e))?;
+    let parsed: serde_json::Value = serde_json::from_slice(&raw).map_err(|e| {
+        BootError::config(format!("SEALANT_SECRET_ENV_FILE is not valid JSON: {e}"))
+    })?;
+    let Some(object) = parsed.as_object() else {
+        return Err(BootError::config(
+            "SEALANT_SECRET_ENV_FILE must contain a JSON object of name → value",
+        ));
+    };
+    if object.len() > MAX_SECRET_ENV_ENTRIES {
+        return Err(BootError::config(format!(
+            "SEALANT_SECRET_ENV_FILE has {} entries; the maximum is {MAX_SECRET_ENV_ENTRIES}",
+            object.len()
+        )));
+    }
+    let mut out = Vec::with_capacity(object.len());
+    for (name, value) in object {
+        // Diagnostics name the KEY only — never the value.
+        if !is_acceptable_secret_env_name(name) {
+            return Err(BootError::config(format!(
+                "SEALANT_SECRET_ENV_FILE entry {name:?} is not an acceptable environment variable name"
+            )));
+        }
+        let Some(value) = value.as_str() else {
+            return Err(BootError::config(format!(
+                "SEALANT_SECRET_ENV_FILE entry {name} must be a string"
+            )));
+        };
+        if value.contains('\0') {
+            return Err(BootError::config(format!(
+                "SEALANT_SECRET_ENV_FILE entry {name} contains NUL"
+            )));
+        }
+        out.push((name.clone(), value.to_owned()));
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(out)
 }
 
 fn default_login_shell(family: OsFamily) -> &'static str {
@@ -1254,5 +1332,99 @@ mod tests {
     fn runsc_oci_runtime_is_detected() {
         let cfg = load_with(&[("SEALANT_OCI_RUNTIME", "runsc")]).expect("valid");
         assert_eq!(cfg.oci_runtime, OciRuntime::Runsc);
+    }
+
+    // ── SEALANT_SECRET_ENV_FILE ────────────────────────────────────────────
+
+    fn secret_file(contents: &str) -> tempfile::NamedTempFile {
+        let file = tempfile::NamedTempFile::new().expect("tempfile");
+        std::fs::write(file.path(), contents).expect("write");
+        file
+    }
+
+    #[test]
+    fn secret_env_file_path_is_consumed_and_never_passed_through() {
+        let cfg = load_with(&[("SEALANT_SECRET_ENV_FILE", "/run/sealant/secrets/env.json")])
+            .expect("valid");
+        assert_eq!(
+            cfg.secret_env_file,
+            Some(PathBuf::from("/run/sealant/secrets/env.json"))
+        );
+        assert!(
+            !cfg.passthrough_env
+                .iter()
+                .any(|(k, _)| k == "SEALANT_SECRET_ENV_FILE")
+        );
+        let none = load_with(&[("SEALANT_SECRET_ENV_FILE", "")]).expect("valid");
+        assert!(none.secret_env_file.is_none());
+    }
+
+    #[test]
+    fn load_secret_env_reads_a_json_object_sorted_by_name() {
+        let file = secret_file(
+            r#"{"STRIPE_API_KEY":"sk_live_abcdefghijklmnop","DATABASE_URL":"postgres://u:p@h/db","EMPTY":"","MULTI":"a\nb"}"#,
+        );
+        let entries = load_secret_env(file.path()).expect("valid");
+        assert_eq!(
+            entries,
+            vec![
+                ("DATABASE_URL".to_owned(), "postgres://u:p@h/db".to_owned()),
+                ("EMPTY".to_owned(), String::new()),
+                ("MULTI".to_owned(), "a\nb".to_owned()),
+                (
+                    "STRIPE_API_KEY".to_owned(),
+                    "sk_live_abcdefghijklmnop".to_owned()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn load_secret_env_rejects_malformed_input_without_echoing_values() {
+        let missing = load_secret_env(Path::new("/nonexistent/secret-env.json"));
+        assert!(missing.is_err());
+
+        let not_json = secret_file("KEY=value\n");
+        assert!(load_secret_env(not_json.path()).is_err());
+
+        let not_object = secret_file(r#"["A","B"]"#);
+        let err = load_secret_env(not_object.path()).expect_err("array is not an object");
+        assert!(err.to_string().contains("JSON object"), "{err}");
+
+        let non_string = secret_file(r#"{"PORT": 3000}"#);
+        let err = load_secret_env(non_string.path()).expect_err("number value");
+        assert!(err.to_string().contains("PORT"), "{err}");
+
+        for bad_name in [
+            "1LEADING",
+            "WITH-DASH",
+            "WITH SPACE",
+            "",
+            "SEALANT_ANYTHING",
+            "sealant_x",
+        ] {
+            let file = secret_file(&format!(r#"{{"{bad_name}":"attacker-visible-value"}}"#));
+            let err = load_secret_env(file.path()).expect_err(bad_name);
+            let message = err.to_string();
+            assert!(!message.contains("attacker-visible-value"), "{message}");
+        }
+
+        let nul = secret_file("{\"HAS_NUL\":\"a\\u0000b\"}");
+        let err = load_secret_env(nul.path()).expect_err("NUL value");
+        assert!(err.to_string().contains("HAS_NUL"), "{err}");
+    }
+
+    #[test]
+    fn load_secret_env_caps_entry_count() {
+        let mut object = String::from("{");
+        for i in 0..=MAX_SECRET_ENV_ENTRIES {
+            if i > 0 {
+                object.push(',');
+            }
+            object.push_str(&format!(r#""VAR_{i}":"v""#));
+        }
+        object.push('}');
+        let file = secret_file(&object);
+        assert!(load_secret_env(file.path()).is_err());
     }
 }
