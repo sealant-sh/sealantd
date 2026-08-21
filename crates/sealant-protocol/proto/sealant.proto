@@ -179,6 +179,8 @@ message FeatureMatrix {
   bool privileged = 5;
   bool pidfd = 6;
   bool subreaper = 7;
+  // Pipe-mode sessions (`OpenSessionArgs.mode = SESSION_MODE_PIPE`) available.
+  bool pipe_sessions = 8;
 }
 
 message FeatureState {
@@ -353,6 +355,18 @@ message WriteStdinArgs {
   bytes data = 3;
 }
 
+// How a session's leader is wired to the daemon.
+enum SessionMode {
+  SESSION_MODE_UNSPECIFIED = 0;
+  // A pseudoterminal: the leader is a session leader with a controlling tty (interactive shells,
+  // TUIs). Output is the PTY byte stream; input is keystrokes; resize applies.
+  SESSION_MODE_PTY = 1;
+  // Plain pipes: stdin/stdout/stderr are pipes, no tty (protocol processes such as JSON-RPC
+  // servers). stdout is the journaled/attachable output, stderr is recorded as telemetry only,
+  // stdin is the input path; resize is rejected.
+  SESSION_MODE_PIPE = 2;
+}
+
 message OpenSessionArgs {
   optional string execution_id = 1;
   optional string shell = 2;
@@ -362,6 +376,8 @@ message OpenSessionArgs {
   uint32 cols = 6;
   uint32 rows = 7;
   optional string term = 8;
+  // Defaults to PTY when unspecified (wire compatibility with pre-pipe clients).
+  SessionMode mode = 9;
 }
 
 message RuntimeGracefulShutdownArgs { optional uint64 grace_millis = 1; }
@@ -501,6 +517,8 @@ message SessionSummary {
   // Journal cursor bounds: the first still-retained output sequence and the next to be assigned.
   uint64 first_journal_sequence = 11;
   uint64 next_journal_sequence = 12;
+  // PTY unless the session was opened in pipe mode (unspecified reads as PTY).
+  SessionMode mode = 13;
 }
 message SessionList { repeated SessionSummary sessions = 1; }
 

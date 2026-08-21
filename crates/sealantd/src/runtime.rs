@@ -458,6 +458,7 @@ impl Runtime {
                 privileged: false,
                 pidfd: self.pidfd_supported,
                 subreaper: self.subreaper,
+                pipe_sessions: true,
             },
             limits: self.config.limits,
         }

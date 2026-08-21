@@ -154,6 +154,12 @@ enum_pair!(
     [Running, Exited]
 );
 enum_pair!(
+    session_mode,
+    crate::SessionMode,
+    wire::SessionMode,
+    [Pty, Pipe]
+);
+enum_pair!(
     capture_mode,
     CaptureMode,
     wire::CaptureMode,
@@ -190,6 +196,15 @@ enum_pair!(
         InternalError
     ]
 );
+
+/// `SESSION_MODE_UNSPECIFIED` (0) reads as PTY: pre-pipe clients never set the field, and their
+/// sessions were always pseudoterminals.
+fn session_mode_or_default(value: i32) -> Result<crate::SessionMode, WireError> {
+    if value == wire::SessionMode::Unspecified as i32 {
+        return Ok(crate::SessionMode::Pty);
+    }
+    session_mode(value)
+}
 
 fn enum_i32<D, W>(value: D) -> i32
 where
@@ -321,6 +336,7 @@ impl From<FeatureMatrix> for wire::FeatureMatrix {
             privileged: f.privileged,
             pidfd: f.pidfd,
             subreaper: f.subreaper,
+            pipe_sessions: f.pipe_sessions,
         }
     }
 }
@@ -335,6 +351,7 @@ impl TryFrom<wire::FeatureMatrix> for FeatureMatrix {
             privileged: f.privileged,
             pidfd: f.pidfd,
             subreaper: f.subreaper,
+            pipe_sessions: f.pipe_sessions,
         })
     }
 }
@@ -780,6 +797,7 @@ impl From<OpenSessionArgs> for wire::OpenSessionArgs {
             cols: u32::from(a.cols),
             rows: u32::from(a.rows),
             term: a.term,
+            mode: enum_i32::<_, wire::SessionMode>(a.mode),
         }
     }
 }
@@ -795,6 +813,7 @@ impl TryFrom<wire::OpenSessionArgs> for OpenSessionArgs {
             cols: a.cols as u16,
             rows: a.rows as u16,
             term: a.term,
+            mode: session_mode_or_default(a.mode)?,
         })
     }
 }
@@ -1192,6 +1211,7 @@ impl From<SessionSummary> for wire::SessionSummary {
             started_at_micros: s.started_at_micros,
             first_journal_sequence: s.first_journal_sequence,
             next_journal_sequence: s.next_journal_sequence,
+            mode: enum_i32::<_, wire::SessionMode>(s.mode),
         }
     }
 }
@@ -1211,6 +1231,7 @@ impl TryFrom<wire::SessionSummary> for SessionSummary {
             started_at_micros: s.started_at_micros,
             first_journal_sequence: s.first_journal_sequence,
             next_journal_sequence: s.next_journal_sequence,
+            mode: session_mode_or_default(s.mode)?,
         })
     }
 }
@@ -1664,6 +1685,65 @@ mod tests {
         let bytes = encode_client(&msg);
         let back = decode_client(&bytes).expect("decode");
         assert_eq!(back, msg);
+    }
+
+    #[test]
+    fn open_session_pipe_mode_round_trips_and_unspecified_reads_as_pty() {
+        let msg = ClientMessage::Request(ControlRequest::new(
+            RequestId::new("req_2"),
+            Command::OpenSession(OpenSessionArgs {
+                execution_id: Some(ExecutionId::new("run-8")),
+                shell: Some("codex".to_owned()),
+                args: vec!["app-server".to_owned()],
+                cwd: None,
+                env: vec![],
+                cols: 0,
+                rows: 0,
+                term: None,
+                mode: crate::SessionMode::Pipe,
+            }),
+        ));
+        let bytes = encode_client(&msg);
+        let back = decode_client(&bytes).expect("decode");
+        assert_eq!(back, msg);
+
+        // A pre-pipe client never sets the field: the wire default (0 = unspecified) is PTY.
+        let wire_args = wire::OpenSessionArgs {
+            execution_id: None,
+            shell: None,
+            args: vec![],
+            cwd: None,
+            env: vec![],
+            cols: 80,
+            rows: 24,
+            term: None,
+            mode: 0,
+        };
+        let args = OpenSessionArgs::try_from(wire_args).expect("decode");
+        assert_eq!(args.mode, crate::SessionMode::Pty);
+    }
+
+    #[test]
+    fn session_summary_mode_round_trips() {
+        let summary = SessionSummary {
+            session_id: SessionId::new("sess_1"),
+            process_id: ProcessId::new("proc_1"),
+            pid: 42,
+            cols: 0,
+            rows: 0,
+            execution_id: None,
+            state: crate::SessionState::Running,
+            exit_code: None,
+            signal: None,
+            started_at_micros: 7,
+            first_journal_sequence: 0,
+            next_journal_sequence: 3,
+            mode: crate::SessionMode::Pipe,
+        };
+        let wire_summary = wire::SessionSummary::from(summary.clone());
+        assert_eq!(wire_summary.mode, wire::SessionMode::Pipe as i32);
+        let back = SessionSummary::try_from(wire_summary).expect("decode");
+        assert_eq!(back, summary);
     }
 
     #[test]

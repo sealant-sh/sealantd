@@ -279,6 +279,7 @@ async fn in_process_session_open_write_resize_close() {
                 cols: 80,
                 rows: 24,
                 term: None,
+                mode: sealant_protocol::SessionMode::Pty,
             }),
         ),
     )
@@ -392,6 +393,7 @@ async fn open_session(
                 cols: 80,
                 rows: 24,
                 term: None,
+                mode: sealant_protocol::SessionMode::Pty,
             }),
         ),
     )

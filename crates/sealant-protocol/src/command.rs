@@ -220,6 +220,27 @@ pub struct OpenSessionArgs {
     /// `TERM` value to advertise to the child.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub term: Option<String>,
+    /// How the leader is wired: a pseudoterminal (default) or plain pipes.
+    #[serde(default)]
+    pub mode: SessionMode,
+}
+
+/// How a session's leader is wired to the daemon.
+///
+/// `Pty` is the interactive shape: a controlling terminal, keystroke input, PTY output, resize.
+/// `Pipe` is the protocol shape for processes that speak a byte protocol over stdio (JSON-RPC /
+/// NDJSON servers): no tty, stdout is the journaled and attachable output, stderr is recorded as
+/// telemetry only (diagnostics, never mixed into the protocol stream), stdin is the input path, and
+/// resize is rejected. Everything else — the durable journal, reattach from a sequence, tombstones,
+/// signals, close — is identical between the two.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum SessionMode {
+    /// A pseudoterminal session (interactive shells, TUIs).
+    #[default]
+    Pty,
+    /// A plain-pipe session (protocol processes).
+    Pipe,
 }
 
 /// How a gateway wants to consume a session's reliable output stream.
@@ -520,6 +541,9 @@ pub struct FeatureMatrix {
     pub pidfd: bool,
     /// `PR_SET_CHILD_SUBREAPER` in effect.
     pub subreaper: bool,
+    /// Pipe-mode sessions ([`SessionMode::Pipe`]) available.
+    #[serde(default)]
+    pub pipe_sessions: bool,
 }
 
 /// Result of `runtime.getCapabilities`.
@@ -694,6 +718,9 @@ pub struct SessionSummary {
     /// Next output sequence the journal will assign (i.e. current end cursor).
     #[serde(default)]
     pub next_journal_sequence: u64,
+    /// How the leader is wired (PTY unless opened in pipe mode).
+    #[serde(default)]
+    pub mode: SessionMode,
 }
 
 /// Result of `listSessions`.
