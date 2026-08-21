@@ -24,6 +24,7 @@ import {
   StreamFrameSchema,
   ControlErrorCode,
   AttachMode,
+  SessionMode,
   type CommandResult,
   type Capabilities,
   type ControlError,
@@ -115,6 +116,14 @@ export interface OpenSessionOptions {
   term?: string;
   /** Execution to associate the session with. */
   executionId?: string;
+  /**
+   * How the leader is wired. `PTY` (default) allocates a pseudoterminal — interactive shells and
+   * TUIs. `PIPE` gives the leader plain stdio pipes and no tty — the shape for processes that
+   * speak a byte protocol over stdin/stdout (JSON-RPC / NDJSON servers): stdout is the journaled,
+   * attachable output, stderr is recorded as telemetry only, `writeSessionInput` feeds stdin, and
+   * `resizePty` is rejected. `cols`/`rows` are ignored in pipe mode.
+   */
+  mode?: SessionMode;
 }
 
 /** Options for {@link SealantClient.attachSession}. */
@@ -396,6 +405,7 @@ export class SealantClient {
             rows: options.rows,
             term: options.term,
             executionId: options.executionId,
+            mode: options.mode ?? SessionMode.PTY,
           },
         }),
       ),

@@ -7,8 +7,9 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod journal;
+pub mod pipe;
 pub mod pty;
 pub mod session;
 
 pub use journal::{JournalChunk, SessionJournal};
-pub use session::{SessionRegistry, SessionRuntime};
+pub use session::{LeaderIo, SessionRegistry, SessionRuntime};

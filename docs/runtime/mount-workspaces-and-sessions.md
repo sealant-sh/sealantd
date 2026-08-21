@@ -64,6 +64,14 @@ replayable output journal and full lifecycle reporting.
   `startedAtMicros`, and the journal cursor bounds. Exited sessions persist as tombstones (up to
   128, FIFO-evicted) so a re-fetched handle can observe the exit and replay the scrollback;
   `closeSession` on a tombstone drops it and its journal files.
+- **Pipe mode**: `openSession{mode: SESSION_MODE_PIPE}` starts the leader with plain stdio pipes
+  and no controlling terminal — the shape for processes that speak a byte protocol over stdio
+  (JSON-RPC / NDJSON servers such as `codex app-server`), where tty line discipline would corrupt
+  the stream. stdout is the journaled, attachable output (same `attachSession` / `fromSequence` /
+  tombstone semantics as PTY); stderr is recorded as `stderr` `IoChunk` telemetry only and never
+  enters the journal or the channel; `writeStdin{sessionId}` feeds stdin and is recorded as
+  `stdin`; `resizePty` is rejected. `SessionSummary.mode` reports the shape; the feature matrix
+  advertises `pipeSessions`. An unspecified `mode` reads as PTY, so pre-pipe clients are unaffected.
 - **Client**: `@sealant/runtime-client` gained typed `openSession` / `closeSession` / `resizePty` /
   `listSessions` / `signalSession` / `readSessionOutput` and `attachSession(id, { fromSequence })`.
   The client also buffers channel frames that arrive ahead of the response carrying their channel

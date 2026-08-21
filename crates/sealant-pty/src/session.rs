@@ -14,16 +14,19 @@ use nix::unistd::Pid;
 use sealant_protocol::{
     Base64Bytes, CaptureMethod, ChannelId, Confidence, ControlError, Encoding, EventPayload,
     ExecutionId, ExitReason, IoChunk, OpenSessionArgs, ProcessExited, ProcessId, ProcessStarted,
-    ServerMessage, SessionId, SessionList, SessionOpened, SessionOutput, SessionOutputChunk,
-    SessionState, SessionSummary, Signal, StreamEnd, StreamFrame, StreamKind, StreamOffset,
-    TransformMeta,
+    ServerMessage, SessionId, SessionList, SessionMode, SessionOpened, SessionOutput,
+    SessionOutputChunk, SessionState, SessionSummary, Signal, StreamEnd, StreamFrame, StreamKind,
+    StreamOffset, TransformMeta,
 };
 use sealant_runtime_core::{Clock, IdGenerator, Redactor, RuntimeConfig, RuntimeStatus};
 use sealant_telemetry::{Correlation, EventBus};
 use tokio::io::unix::AsyncFd;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::process::{ChildStderr, ChildStdin, ChildStdout};
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::journal::SessionJournal;
+use crate::pipe::{self, PipeChild};
 use crate::pty::{self, PtyChild};
 
 /// Default terminal type advertised to the child when the caller does not specify one.
@@ -52,7 +55,22 @@ pub struct ChannelSink {
     start_seq: Arc<std::sync::atomic::AtomicU64>,
 }
 
-/// A live interactive session: a shell running under a PTY.
+/// The leader's input side, by session mode. Output is owned by the capture task in both modes.
+#[derive(Debug)]
+pub enum LeaderIo {
+    /// PTY: the master, owned by capture and borrowed by input and resize while the leader lives.
+    Pty {
+        /// The PTY master.
+        master: Weak<AsyncFd<OwnedFd>>,
+    },
+    /// Pipe: the child's stdin, held until the leader exits (or the pipe breaks).
+    Pipe {
+        /// The stdin pipe; `None` once it has been closed.
+        stdin: tokio::sync::Mutex<Option<ChildStdin>>,
+    },
+}
+
+/// A live session: a leader running under a PTY or over plain pipes.
 #[derive(Debug)]
 pub struct SessionEntry {
     /// Session id.
@@ -61,8 +79,10 @@ pub struct SessionEntry {
     pub process_id: ProcessId,
     /// OS pid of the session leader (also its session id / process-group id).
     pub pid: i32,
-    /// The PTY master, owned by capture and borrowed by input and resize while the leader lives.
-    pub master: Weak<AsyncFd<OwnedFd>>,
+    /// How the leader is wired.
+    pub mode: SessionMode,
+    /// The leader's input path (and, for PTY, the resize handle).
+    pub io: LeaderIo,
     /// Associated execution, when any.
     pub execution_id: Option<ExecutionId>,
     /// The reliable output attachment, when a gateway has attached.
@@ -113,6 +133,7 @@ impl SessionEntry {
             started_at_micros: self.started_at_micros,
             first_journal_sequence: first_seq,
             next_journal_sequence: next_seq,
+            mode: self.mode,
         }
     }
 }
@@ -317,15 +338,53 @@ impl SessionRuntime {
                 .cloned(),
         );
 
-        let PtyChild { master, child, pid } = pty::spawn(
-            &shell, &args.args, &cwd, &env, args.cols, args.rows, &term,
-        )
-        .map_err(|e| {
-            ControlError::new(
-                sealant_protocol::ControlErrorCode::PtyAllocationFailed,
-                format!("{shell}: {e}"),
-            )
-        })?;
+        // Spawn the leader in the requested shape. Both shapes yield a child to wait on, an input
+        // handle for `write_input`, and an output source for the single capture reader.
+        let (child, pid, io, outputs, method) = match args.mode {
+            SessionMode::Pty => {
+                let PtyChild { master, child, pid } =
+                    pty::spawn(&shell, &args.args, &cwd, &env, args.cols, args.rows, &term)
+                        .map_err(|e| {
+                            ControlError::new(
+                                sealant_protocol::ControlErrorCode::PtyAllocationFailed,
+                                format!("{shell}: {e}"),
+                            )
+                        })?;
+                let master = Arc::new(master);
+                (
+                    child,
+                    pid,
+                    LeaderIo::Pty {
+                        master: Arc::downgrade(&master),
+                    },
+                    LeaderOutputs::Pty { master },
+                    CaptureMethod::Pty,
+                )
+            }
+            SessionMode::Pipe => {
+                let PipeChild {
+                    stdin,
+                    stdout,
+                    stderr,
+                    child,
+                    pid,
+                } = pipe::spawn(&shell, &args.args, &cwd, &env).map_err(|e| {
+                    ControlError::new(
+                        sealant_protocol::ControlErrorCode::ProcessStartFailed,
+                        format!("{shell}: {e}"),
+                    )
+                })?;
+                (
+                    child,
+                    pid,
+                    LeaderIo::Pipe {
+                        stdin: tokio::sync::Mutex::new(Some(stdin)),
+                    },
+                    LeaderOutputs::Pipe { stdout, stderr },
+                    CaptureMethod::Pipe,
+                )
+            }
+        };
 
         let session_id = self.idgen.session_id();
         let process_id = self.idgen.process_id();
@@ -333,7 +392,6 @@ impl SessionRuntime {
             .execution_id
             .clone()
             .or_else(|| self.config.default_execution_id.clone());
-        let master = Arc::new(master);
 
         // The durable output journal is a product guarantee (reattach + scrollback); a session
         // that cannot journal must not open.
@@ -357,7 +415,8 @@ impl SessionRuntime {
             session_id: session_id.clone(),
             process_id: process_id.clone(),
             pid,
-            master: Arc::downgrade(&master),
+            mode: args.mode,
+            io,
             execution_id: execution_id.clone(),
             attached: Mutex::new(None),
             journal: Arc::new(Mutex::new(journal)),
@@ -376,7 +435,7 @@ impl SessionRuntime {
 
         self.bus.publish(
             &correlation,
-            CaptureMethod::Pty,
+            method,
             Confidence::Observed,
             EventPayload::ProcessStarted(ProcessStarted {
                 pid,
@@ -389,33 +448,50 @@ impl SessionRuntime {
             }),
         );
 
-        // Capture pty.output until the slave closes or the session leader exits. This is the SINGLE
-        // PTY reader: it publishes every chunk as `IoChunk` telemetry and, when a gateway is
-        // attached, also forwards the same chunk to the attach sink (sharing one `read()` so the
-        // attach stream is lossless).
-        let capture_bus = self.bus.clone();
-        let capture_corr = correlation.clone();
-        let capture_master = master.clone();
-        let capture_entry = entry.clone();
-        let capture_redactor = self.redactor.clone();
-        let capture_status = self.status.clone();
+        // Capture the leader's output until it closes or the leader exits. This is the SINGLE
+        // output reader per session: it publishes every chunk as `IoChunk` telemetry and, when a
+        // gateway is attached, also forwards the same chunk to the attach sink (sharing one read so
+        // the attach stream is lossless). PTY: the master. Pipe: stdout — stderr gets its own
+        // telemetry-only reader so diagnostics never interleave with the protocol stream.
+        let fanout = Fanout {
+            bus: self.bus.clone(),
+            correlation: correlation.clone(),
+            entry: entry.clone(),
+            redactor: self.redactor.clone(),
+            status: self.status.clone(),
+        };
         let chunk_size = self.config.io_chunk_bytes;
         let (leader_exited_tx, leader_exited_rx) = oneshot::channel();
-        let capture = tokio::spawn(async move {
-            capture_output(
-                capture_master,
-                chunk_size,
-                CaptureContext {
-                    bus: capture_bus,
-                    correlation: capture_corr,
-                    entry: capture_entry,
-                    redactor: capture_redactor,
-                    status: capture_status,
-                    leader_exited_rx,
-                },
-            )
-            .await;
-        });
+        let capture = match outputs {
+            LeaderOutputs::Pty { master } => tokio::spawn(async move {
+                capture_output(
+                    master,
+                    chunk_size,
+                    CaptureContext {
+                        fanout,
+                        leader_exited_rx,
+                    },
+                )
+                .await;
+            }),
+            LeaderOutputs::Pipe { stdout, stderr } => {
+                let stderr_fanout = fanout.clone();
+                tokio::spawn(async move {
+                    capture_stderr(stderr, chunk_size, stderr_fanout).await;
+                });
+                tokio::spawn(async move {
+                    capture_pipe_output(
+                        stdout,
+                        chunk_size,
+                        CaptureContext {
+                            fanout,
+                            leader_exited_rx,
+                        },
+                    )
+                    .await;
+                })
+            }
+        };
 
         // Wait for the leader to exit, then publish the final result.
         let waiter_bus = self.bus.clone();
@@ -431,7 +507,7 @@ impl SessionRuntime {
             let (exit_code, signal, reason) = classify(&status_result);
             waiter_bus.publish(
                 &correlation,
-                CaptureMethod::Pty,
+                method,
                 Confidence::Observed,
                 EventPayload::ProcessExited(ProcessExited {
                     exit_code,
@@ -480,7 +556,7 @@ impl SessionRuntime {
         })
     }
 
-    /// Write bytes to a session's PTY input.
+    /// Write bytes to a session's input: the PTY master, or the leader's stdin pipe.
     ///
     /// # Errors
     /// Returns a [`ControlError`] if the session is unknown or the write fails.
@@ -493,13 +569,41 @@ impl SessionRuntime {
             .registry
             .get_running(session_id)
             .ok_or_else(|| ControlError::session_not_found(session_id.to_string()))?;
-        let master = entry
-            .master
-            .upgrade()
-            .ok_or_else(|| ControlError::session_not_found(session_id.to_string()))?;
-        pty::write_all(&master, data)
-            .await
-            .map_err(|e| ControlError::invalid_argument(format!("pty input write failed: {e}")))?;
+        let (method, stream) = match &entry.io {
+            LeaderIo::Pty { master } => {
+                let master = master
+                    .upgrade()
+                    .ok_or_else(|| ControlError::session_not_found(session_id.to_string()))?;
+                pty::write_all(&master, data).await.map_err(|e| {
+                    ControlError::invalid_argument(format!("pty input write failed: {e}"))
+                })?;
+                (CaptureMethod::Pty, StreamKind::PtyInput)
+            }
+            LeaderIo::Pipe { stdin } => {
+                let mut guard = stdin.lock().await;
+                let Some(pipe) = guard.as_mut() else {
+                    return Err(ControlError::invalid_argument(
+                        "session stdin is closed".to_owned(),
+                    ));
+                };
+                let written = async {
+                    pipe.write_all(data).await?;
+                    pipe.flush().await
+                }
+                .await;
+                if let Err(e) = written {
+                    // A broken pipe means the leader stopped reading; drop our end so the next
+                    // write fails fast instead of blocking on a dead reader.
+                    if e.kind() == io::ErrorKind::BrokenPipe {
+                        *guard = None;
+                    }
+                    return Err(ControlError::invalid_argument(format!(
+                        "stdin write failed: {e}"
+                    )));
+                }
+                (CaptureMethod::Pipe, StreamKind::Stdin)
+            }
+        };
 
         // Record the forwarded input as evidence, redacted before it becomes readable.
         let (recorded, masked) = self.redactor.redact(data);
@@ -512,10 +616,10 @@ impl SessionRuntime {
             .process(entry.process_id.clone());
         self.bus.publish(
             &correlation,
-            CaptureMethod::Pty,
+            method,
             Confidence::Observed,
             EventPayload::IoChunk(IoChunk {
-                stream: StreamKind::PtyInput,
+                stream,
                 encoding: Encoding::Base64,
                 byte_count: recorded.len() as u64,
                 stream_offset: StreamOffset::ZERO,
@@ -659,8 +763,12 @@ impl SessionRuntime {
             .registry
             .get(session_id)
             .ok_or_else(|| ControlError::session_not_found(session_id.to_string()))?;
-        let master = entry
-            .master
+        let LeaderIo::Pty { master } = &entry.io else {
+            return Err(ControlError::invalid_argument(
+                "pipe-mode session has no terminal to resize".to_owned(),
+            ));
+        };
+        let master = master
             .upgrade()
             .ok_or_else(|| ControlError::session_not_found(session_id.to_string()))?;
         pty::resize(&master, cols, rows)
@@ -831,13 +939,123 @@ fn classify(
 /// until the gateway accepts the chunk, so a slow gateway throttles the PTY drain and the kernel PTY
 /// buffer backpressures the shell — the inversion of the lossy `Lagged`-drop path. Telemetry
 /// publish stays non-blocking (it may drop on lag, as before); only the attach send blocks.
-struct CaptureContext {
+/// The leader's output source, handed to the capture reader at open.
+enum LeaderOutputs {
+    Pty {
+        master: Arc<AsyncFd<OwnedFd>>,
+    },
+    Pipe {
+        stdout: ChildStdout,
+        stderr: ChildStderr,
+    },
+}
+
+/// Everything a captured chunk fans out to: redaction, the durable journal, the telemetry tap,
+/// and the reliable attach sink. Shared by the PTY and pipe readers so both modes have exactly the
+/// same delivery guarantees.
+#[derive(Clone)]
+struct Fanout {
     bus: Arc<EventBus>,
     correlation: Correlation,
     entry: Arc<SessionEntry>,
     redactor: Arc<Redactor>,
     status: Arc<RuntimeStatus>,
+}
+
+struct CaptureContext {
+    fanout: Fanout,
     leader_exited_rx: oneshot::Receiver<()>,
+}
+
+impl Fanout {
+    /// Deliver one raw output chunk: redact once, journal (minting the wire sequence), publish the
+    /// lossy telemetry tap, and forward to the attach sink with backpressure.
+    async fn deliver(
+        &self,
+        raw: &[u8],
+        offset: &mut StreamOffset,
+        stream: StreamKind,
+        method: CaptureMethod,
+    ) {
+        let entry = &self.entry;
+        // (a) redact once; every downstream consumer (journal, telemetry, sink) sees the same
+        // redacted bytes — the journal is the product read surface and must never hold raw
+        // secrets.
+        let (recorded, masked) = self.redactor.redact(raw);
+        if masked > 0 {
+            self.status.add_redacted(masked);
+        }
+
+        // (b) durable journal append — the sequence minted here is the wire sequence for both
+        // live frames and replays.
+        let seq = {
+            let mut journal = entry.journal.lock().unwrap_or_else(|e| e.into_inner());
+            journal.append(&recorded)
+        };
+        let seq = match seq {
+            Ok(seq) => seq,
+            Err(error) => {
+                tracing::error!(%error, session = %entry.session_id,
+                    "session journal append failed; output recording degraded");
+                self.status.add_degradation("session-journal-append-failed");
+                u64::MAX
+            }
+        };
+
+        // (c) lossy telemetry tap (always on).
+        self.bus.publish(
+            &self.correlation,
+            method,
+            Confidence::Observed,
+            EventPayload::IoChunk(IoChunk {
+                stream,
+                encoding: Encoding::Base64,
+                byte_count: recorded.len() as u64,
+                stream_offset: *offset,
+                content: Some(Base64Bytes::new(recorded.as_slice())),
+                artifact: None,
+                transform: (masked > 0).then_some(TransformMeta {
+                    redacted: true,
+                    truncated: false,
+                    coalesced: false,
+                    original_byte_count: Some(raw.len() as u64),
+                }),
+            }),
+        );
+        *offset = offset.advance(raw.len() as u64);
+
+        // (d) reliable attach fan-out (backpressured). Snapshot the sink under the lock, then send
+        // outside it. A replaying attach holds the gate closed; chunks below its start_seq are
+        // covered by the replay and skipped here. If the gateway queue is closed (connection
+        // gone), clear the stale attachment so we stop trying.
+        let sink = entry
+            .attached
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(sink) = sink {
+            let mut ready = sink.ready.clone();
+            // An error means the attach task died before opening the gate; treat the attachment
+            // as stale and drop it.
+            let gate_open = ready.wait_for(|open| *open).await.is_ok();
+            let wanted = gate_open && seq >= sink.start_seq.load(Ordering::SeqCst);
+            let delivered = if wanted {
+                let frame = StreamFrame::data(sink.channel_id.clone(), seq, recorded.as_slice());
+                sink.out_tx.send(ServerMessage::Stream(frame)).await.is_ok()
+            } else {
+                gate_open
+            };
+            if !delivered {
+                let mut guard = entry.attached.lock().unwrap_or_else(|e| e.into_inner());
+                if guard
+                    .as_ref()
+                    .is_some_and(|s| s.channel_id == sink.channel_id)
+                {
+                    *guard = None;
+                }
+            }
+        }
+    }
 }
 
 /// How long the post-exit drain waits before re-checking a quiet PTY. Bytes the leader wrote
@@ -862,11 +1080,7 @@ struct PostExitDrain {
 
 async fn capture_output(master: Arc<AsyncFd<OwnedFd>>, chunk_size: usize, context: CaptureContext) {
     let CaptureContext {
-        bus,
-        correlation,
-        entry,
-        redactor,
-        status,
+        fanout,
         mut leader_exited_rx,
     } = context;
     let mut offset = StreamOffset::ZERO;
@@ -912,37 +1126,101 @@ async fn capture_output(master: Arc<AsyncFd<OwnedFd>>, chunk_size: usize, contex
                 if let Some(drain) = &mut post_exit {
                     drain.budget = drain.budget.saturating_sub(n);
                 }
-                // (a) redact once; every downstream consumer (journal, telemetry, sink) sees the
-                // same redacted bytes — the journal is the product read surface and must never
-                // hold raw secrets.
-                let (recorded, masked) = redactor.redact(&buf[..n]);
-                if masked > 0 {
-                    status.add_redacted(masked);
+                fanout
+                    .deliver(
+                        &buf[..n],
+                        &mut offset,
+                        StreamKind::PtyOutput,
+                        CaptureMethod::Pty,
+                    )
+                    .await;
+            }
+            // Post-exit WouldBlock never reaches here — the drain arm handles it with a quiet
+            // re-check above.
+            Err(e) if pty::is_eof_error(&e) => break,
+            Err(_) => break,
+        }
+    }
+}
+
+/// After the leader exits, how long a quiet stdout pipe is given before the drain ends. Pipes
+/// have no flip-buffer race like the PTY, but a helper that inherited stdout may still be writing;
+/// one quiet window this long is treated as drained (the byte budget bounds a chatty helper).
+const POST_EXIT_PIPE_QUIET: Duration = Duration::from_millis(20);
+
+/// Pipe-mode stdout reader: the same single-reader fan-out as the PTY path, reading the stdout
+/// pipe. Ends at EOF, or — once the leader has exited — after a quiet window or the drain budget.
+async fn capture_pipe_output(mut stdout: ChildStdout, chunk_size: usize, context: CaptureContext) {
+    let CaptureContext {
+        fanout,
+        mut leader_exited_rx,
+    } = context;
+    let mut offset = StreamOffset::ZERO;
+    let mut buf = vec![0u8; chunk_size.max(1)];
+    let mut post_exit: Option<usize> = None;
+    loop {
+        let read_result = match post_exit {
+            Some(budget) => {
+                if budget == 0 {
+                    break;
                 }
+                let read_size = budget.min(buf.len());
+                match tokio::time::timeout(POST_EXIT_PIPE_QUIET, stdout.read(&mut buf[..read_size]))
+                    .await
+                {
+                    Ok(result) => result,
+                    Err(_quiet) => break,
+                }
+            }
+            None => tokio::select! {
+                biased;
+                _ = &mut leader_exited_rx => {
+                    post_exit = Some(POST_EXIT_DRAIN_BUDGET);
+                    continue;
+                }
+                result = stdout.read(&mut buf) => result,
+            },
+        };
+        match read_result {
+            Ok(0) => break,
+            Ok(n) => {
+                if let Some(budget) = &mut post_exit {
+                    *budget = budget.saturating_sub(n);
+                }
+                fanout
+                    .deliver(
+                        &buf[..n],
+                        &mut offset,
+                        StreamKind::Stdout,
+                        CaptureMethod::Pipe,
+                    )
+                    .await;
+            }
+            Err(_) => break,
+        }
+    }
+}
 
-                // (b) durable journal append — the sequence minted here is the wire sequence for
-                // both live frames and replays.
-                let seq = {
-                    let mut journal = entry.journal.lock().unwrap_or_else(|e| e.into_inner());
-                    journal.append(&recorded)
-                };
-                let seq = match seq {
-                    Ok(seq) => seq,
-                    Err(error) => {
-                        tracing::error!(%error, session = %entry.session_id,
-                            "session journal append failed; output recording degraded");
-                        status.add_degradation("session-journal-append-failed");
-                        u64::MAX
-                    }
-                };
-
-                // (c) lossy telemetry tap (always on).
-                bus.publish(
-                    &correlation,
-                    CaptureMethod::Pty,
+/// Pipe-mode stderr reader: telemetry only. Diagnostics are recorded (redacted) as `stderr`
+/// `IoChunk`s so the record keeps them, but they never enter the journal or the attach channel —
+/// those carry the protocol stream alone.
+async fn capture_stderr(mut stderr: ChildStderr, chunk_size: usize, fanout: Fanout) {
+    let mut offset = StreamOffset::ZERO;
+    let mut buf = vec![0u8; chunk_size.max(1)];
+    loop {
+        match stderr.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                let (recorded, masked) = fanout.redactor.redact(&buf[..n]);
+                if masked > 0 {
+                    fanout.status.add_redacted(masked);
+                }
+                fanout.bus.publish(
+                    &fanout.correlation,
+                    CaptureMethod::Pipe,
                     Confidence::Observed,
                     EventPayload::IoChunk(IoChunk {
-                        stream: StreamKind::PtyOutput,
+                        stream: StreamKind::Stderr,
                         encoding: Encoding::Base64,
                         byte_count: recorded.len() as u64,
                         stream_offset: offset,
@@ -957,44 +1235,7 @@ async fn capture_output(master: Arc<AsyncFd<OwnedFd>>, chunk_size: usize, contex
                     }),
                 );
                 offset = offset.advance(n as u64);
-
-                // (d) reliable attach fan-out (backpressured). Snapshot the sink under the lock,
-                // then send outside it. A replaying attach holds the gate closed; chunks below
-                // its start_seq are covered by the replay and skipped here. If the gateway queue
-                // is closed (connection gone), clear the stale attachment so we stop trying.
-                let sink = entry
-                    .attached
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .clone();
-                if let Some(sink) = sink {
-                    let mut ready = sink.ready.clone();
-                    // An error means the attach task died before opening the gate; treat the
-                    // attachment as stale and drop it.
-                    let gate_open = ready.wait_for(|open| *open).await.is_ok();
-                    let wanted = gate_open && seq >= sink.start_seq.load(Ordering::SeqCst);
-                    let delivered = if wanted {
-                        let frame =
-                            StreamFrame::data(sink.channel_id.clone(), seq, recorded.as_slice());
-                        sink.out_tx.send(ServerMessage::Stream(frame)).await.is_ok()
-                    } else {
-                        gate_open
-                    };
-                    if !delivered {
-                        let mut guard = entry.attached.lock().unwrap_or_else(|e| e.into_inner());
-                        if guard
-                            .as_ref()
-                            .is_some_and(|s| s.channel_id == sink.channel_id)
-                        {
-                            *guard = None;
-                        }
-                    }
-                }
             }
-            // Post-exit WouldBlock never reaches here — the drain arm handles it with a quiet
-            // re-check above.
-            Err(e) if pty::is_eof_error(&e) => break,
-            Err(_) => break,
         }
     }
 }
@@ -1097,6 +1338,7 @@ mod tests {
             cols,
             rows,
             term: None,
+            mode: SessionMode::Pty,
         }
     }
 
@@ -1672,5 +1914,195 @@ mod tests {
             journal_text.contains("***REDACTED***"),
             "journal should carry the mask: {journal_text:?}"
         );
+    }
+
+    // ---------- pipe mode ----------
+
+    /// A stdin→stdout echo loop in shell builtins only (no `cat` on PATH is assumed).
+    const ECHO_LOOP: &str = "while IFS= read -r line; do echo \"$line\"; done";
+
+    fn pipe_args(args: &[&str]) -> OpenSessionArgs {
+        OpenSessionArgs {
+            mode: SessionMode::Pipe,
+            ..session_args(args, 0, 0)
+        }
+    }
+
+    /// Accumulate `stream` telemetry chunks until `needle` appears (or `within` elapses).
+    async fn wait_for_stream(
+        rx: &mut Receiver<EventEnvelope>,
+        stream: StreamKind,
+        needle: &str,
+        within: Duration,
+    ) -> bool {
+        let mut acc = String::new();
+        let deadline = Instant::now() + within;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            match tokio::time::timeout(remaining, rx.recv()).await {
+                Ok(Ok(env)) => {
+                    if let EventPayload::IoChunk(c) = &env.payload
+                        && c.stream == stream
+                        && let Some(content) = &c.content
+                    {
+                        acc.push_str(&String::from_utf8_lossy(content.as_slice()));
+                    }
+                    if acc.contains(needle) {
+                        return true;
+                    }
+                }
+                _ => return false,
+            }
+        }
+    }
+
+    /// A pipe session has no controlling terminal; stdout reaches the attach channel and the
+    /// journal, stderr reaches telemetry only, and the summary reports the mode.
+    #[tokio::test]
+    async fn pipe_session_has_no_tty_and_keeps_stderr_off_the_channel() {
+        let rt = runtime();
+        let mut rx = rt.bus.subscribe();
+        let opened = rt
+            .open(pipe_args(&[
+                "-c",
+                "if [ -t 1 ]; then echo tty; else echo notty; fi; echo DIAG >&2; echo DONE",
+            ]))
+            .expect("open pipe session");
+        let (tx, mut out_rx) = mpsc::channel(64);
+        let channel = ChannelId::new("chan_pipe_1");
+        rt.attach(&opened.session_id, channel.clone(), tx, Some(0))
+            .await
+            .expect("attach");
+        let (out, exit_code) = attach_output_until_end(&mut out_rx, &channel).await;
+        let text = String::from_utf8_lossy(&out);
+        assert!(
+            text.contains("notty"),
+            "no controlling tty expected: {text:?}"
+        );
+        assert!(
+            text.contains("DONE"),
+            "stdout must reach the channel: {text:?}"
+        );
+        assert!(
+            !text.contains("DIAG"),
+            "stderr must never enter the protocol stream: {text:?}"
+        );
+        assert_eq!(exit_code, Some(0));
+
+        assert!(
+            wait_for_stream(&mut rx, StreamKind::Stderr, "DIAG", Duration::from_secs(4)).await,
+            "stderr must be recorded as telemetry"
+        );
+
+        let out = rt
+            .read_output(&opened.session_id, 0, None)
+            .expect("journal readable");
+        let journal: String = out
+            .chunks
+            .iter()
+            .map(|c| String::from_utf8_lossy(c.data.as_slice()).to_string())
+            .collect();
+        assert!(journal.contains("DONE") && !journal.contains("DIAG"));
+
+        let summary = rt
+            .list()
+            .sessions
+            .into_iter()
+            .find(|s| s.session_id == opened.session_id)
+            .expect("listed");
+        assert_eq!(summary.mode, SessionMode::Pipe);
+        assert_eq!((summary.cols, summary.rows), (0, 0));
+    }
+
+    /// stdin writes reach the leader and are recorded as `stdin`; resize is rejected; the
+    /// tombstone keeps the scrollback.
+    #[tokio::test]
+    async fn pipe_session_stdin_round_trips_and_resize_is_rejected() {
+        let rt = runtime();
+        let mut rx = rt.bus.subscribe();
+        let opened = rt.open(pipe_args(&["-c", ECHO_LOOP])).expect("open cat");
+
+        rt.write_input(&opened.session_id, b"hello pipe\n")
+            .await
+            .expect("write stdin");
+        assert!(
+            wait_for_stream(
+                &mut rx,
+                StreamKind::Stdout,
+                "hello pipe",
+                Duration::from_secs(4)
+            )
+            .await,
+            "stdin must be echoed back on stdout"
+        );
+        let mut rx2 = rt.bus.subscribe();
+        rt.write_input(&opened.session_id, b"second\n")
+            .await
+            .expect("write stdin");
+        assert!(
+            wait_for_stream(
+                &mut rx2,
+                StreamKind::Stdin,
+                "second",
+                Duration::from_secs(4)
+            )
+            .await,
+            "stdin must be recorded as evidence"
+        );
+
+        let err = rt
+            .resize(&opened.session_id, 100, 40)
+            .expect_err("pipe sessions have no terminal");
+        assert!(err.message.contains("no terminal"), "{err:?}");
+
+        rt.close(&opened.session_id).expect("close");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !rt.registry.is_empty() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            rt.registry.is_empty(),
+            "running set should drain after close"
+        );
+        let out = rt
+            .read_output(&opened.session_id, 0, None)
+            .expect("tombstone readable");
+        assert_eq!(out.state, SessionState::Exited);
+        let text: String = out
+            .chunks
+            .iter()
+            .map(|c| String::from_utf8_lossy(c.data.as_slice()).to_string())
+            .collect();
+        assert!(text.contains("hello pipe"), "scrollback survives: {text:?}");
+    }
+
+    /// Reattaching a pipe session from a sequence replays exactly once, then live-tails.
+    #[tokio::test]
+    async fn pipe_session_reattach_replays_then_tails() {
+        let rt = runtime();
+        let mut rx = rt.bus.subscribe();
+        let opened = rt.open(pipe_args(&["-c", ECHO_LOOP])).expect("open cat");
+        rt.write_input(&opened.session_id, b"one\n")
+            .await
+            .expect("write");
+        assert!(wait_for_stream(&mut rx, StreamKind::Stdout, "one", Duration::from_secs(4)).await);
+
+        let (tx, mut out_rx) = mpsc::channel(64);
+        let channel = ChannelId::new("chan_pipe_2");
+        rt.attach(&opened.session_id, channel.clone(), tx, Some(0))
+            .await
+            .expect("attach");
+        rt.write_input(&opened.session_id, b"two\n")
+            .await
+            .expect("write");
+        // Let the leader echo before hanging it up: close() ends the session, it does not flush
+        // pending input through the shell.
+        assert!(wait_for_stream(&mut rx, StreamKind::Stdout, "two", Duration::from_secs(4)).await);
+        rt.close(&opened.session_id).expect("close");
+        let (out, _) = attach_output_until_end(&mut out_rx, &channel).await;
+        assert_eq!(String::from_utf8_lossy(&out), "one\ntwo\n");
     }
 }
