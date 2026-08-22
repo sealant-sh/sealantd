@@ -6,6 +6,7 @@
 //! `docker run -e`. [`BootConfig::from_env`] reads them, parses, and validates *before* any side
 //! effect, so a misconfigured container fails fast rather than booting half-broken.
 
+use sealant_control::WssConfig;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
@@ -63,6 +64,11 @@ const CONSUMED_KEYS: &[&str] = &[
     "SEALANT_LOGIN_SHELL_PATH",
     "SEALANT_BASH_SHELL_PATH",
     "SEALANT_CONTROL_SOCKET",
+    "SEALANT_CONTROL_WSS_LISTEN",
+    "SEALANT_CONTROL_WSS_CERT",
+    "SEALANT_CONTROL_WSS_KEY",
+    "SEALANT_CONTROL_WSS_CLIENT_CA",
+    "SEALANT_CONTROL_WSS_MAX_CONNECTIONS",
     "SEALANT_WATCH_FILESYSTEM",
     "SEALANT_NETWORK_PROXY",
     "SEALANT_SPOOL_DIR",
@@ -359,6 +365,9 @@ pub struct ShellPaths {
 pub struct ControlConfig {
     /// Control socket path.
     pub socket: PathBuf,
+    /// Optional mutual-TLS WebSocket frontend (ADR-0013); `None` unless
+    /// `SEALANT_CONTROL_WSS_LISTEN` is set.
+    pub wss: Option<WssConfig>,
     /// Whether to observe the workspace filesystem.
     pub watch_filesystem: bool,
     /// Whether to route egress through the proxy.
@@ -516,12 +525,22 @@ impl BootConfig {
                 .into(),
         };
 
+        let wss = WssConfig::from_parts(
+            env.get("SEALANT_CONTROL_WSS_LISTEN").as_deref(),
+            env.get("SEALANT_CONTROL_WSS_CERT").as_deref(),
+            env.get("SEALANT_CONTROL_WSS_KEY").as_deref(),
+            env.get("SEALANT_CONTROL_WSS_CLIENT_CA").as_deref(),
+            env.get("SEALANT_CONTROL_WSS_MAX_CONNECTIONS").as_deref(),
+        )
+        .map_err(|message| BootError::config(format!("SEALANT_CONTROL_WSS_*: {message}")))?;
+
         let control = ControlConfig {
             socket: env
                 .get("SEALANT_CONTROL_SOCKET")
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| DEFAULT_CONTROL_SOCKET.to_owned())
                 .into(),
+            wss,
             // Default ON: file evidence is the product; an operator opts *out* with 0/false.
             watch_filesystem: env
                 .get("SEALANT_WATCH_FILESYSTEM")

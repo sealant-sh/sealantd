@@ -7,6 +7,7 @@
 
 pub mod app;
 pub mod boot;
+pub(crate) mod control_frontends;
 pub mod runtime;
 pub mod shutdown;
 

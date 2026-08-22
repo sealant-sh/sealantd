@@ -25,6 +25,19 @@ socket on a shared path, e.g.:
 sealantd --socket /run/sealantd.sock --workspace /workspace --watch-filesystem --network-proxy
 ```
 
+When the controller runs on another host (Kubernetes), add the opt-in mutual-TLS WebSocket
+frontend beside the socket — see [ADR-0013](../adr/0013-websocket-control-transport.md):
+
+```sh
+sealantd --socket /run/sealant/control.sock --workspace /workspace \
+  --wss-listen 0.0.0.0:7443 --wss-cert /run/sealant/tls/tls.crt \
+  --wss-key /run/sealant/tls/tls.key --wss-client-ca /run/sealant/tls/ca.crt
+```
+
+or, under `sealantd boot`, `SEALANT_CONTROL_WSS_LISTEN`, `SEALANT_CONTROL_WSS_CERT`,
+`SEALANT_CONTROL_WSS_KEY`, `SEALANT_CONTROL_WSS_CLIENT_CA` (and optionally
+`SEALANT_CONTROL_WSS_MAX_CONNECTIONS`). Without these the listener does not exist.
+
 Run it as the **same uid** as the controlling process so peer-credential validation passes
 (`SO_PEERCRED`; the socket is also `0600`).
 

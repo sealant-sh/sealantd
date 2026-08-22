@@ -37,3 +37,10 @@ sealant-control = { workspace = true }
 sealant-runtime-core = { workspace = true }
 tokio = { workspace = true }
 tempfile = { workspace = true }
+futures = { workspace = true }
+rcgen = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+rustls-pki-types = { workspace = true }
+tokio-rustls = { workspace = true }
+tokio-tungstenite = { workspace = true }

@@ -5,7 +5,9 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use clap::{Args, Parser, Subcommand};
-use sealant_control::{serve_stdio, serve_unix};
+use sealant_control::{WssConfig, WssListener, serve_stdio};
+
+use crate::control_frontends::{UnixFrontend, spawn_control_frontends};
 use sealant_protocol::{NetworkMode, RuntimeState};
 use sealant_runtime_core::{RuntimeConfig, new_runtime_id};
 use tokio::sync::watch;
@@ -82,6 +84,33 @@ struct ServeArgs {
     /// Tracing log filter (e.g. `info`, `debug`).
     #[arg(long, default_value = "info")]
     log_level: String,
+    /// Also serve the control protocol over mutual-TLS WebSocket on this address (ADR-0013).
+    /// Off unless set; the Unix socket is still served.
+    #[arg(long, requires_all = ["wss_cert", "wss_key", "wss_client_ca"])]
+    wss_listen: Option<String>,
+    /// PEM server certificate chain for `--wss-listen`.
+    #[arg(long)]
+    wss_cert: Option<PathBuf>,
+    /// PEM server private key for `--wss-listen`.
+    #[arg(long)]
+    wss_key: Option<PathBuf>,
+    /// PEM CA bundle that control-plane client certificates must chain to.
+    #[arg(long)]
+    wss_client_ca: Option<PathBuf>,
+    /// Maximum concurrent WebSocket control connections (default 64).
+    #[arg(long)]
+    wss_max_connections: Option<usize>,
+}
+
+fn wss_config(cli: &ServeArgs) -> Result<Option<WssConfig>, String> {
+    let max = cli.wss_max_connections.map(|n| n.to_string());
+    WssConfig::from_parts(
+        cli.wss_listen.as_deref(),
+        cli.wss_cert.as_deref().and_then(|p| p.to_str()),
+        cli.wss_key.as_deref().and_then(|p| p.to_str()),
+        cli.wss_client_ca.as_deref().and_then(|p| p.to_str()),
+        max.as_deref(),
+    )
 }
 
 fn build_config(cli: &ServeArgs) -> RuntimeConfig {
@@ -136,6 +165,19 @@ fn run_serve(cli: ServeArgs) -> ExitCode {
 
     let config = build_config(&cli);
 
+    let wss = match wss_config(&cli) {
+        Ok(wss) => wss,
+        Err(error) => {
+            tracing::error!(%error, "invalid configuration");
+            eprintln!("sealantd: invalid configuration: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if wss.is_some() && cli.stdio {
+        eprintln!("sealantd: invalid configuration: --wss-listen cannot be combined with --stdio");
+        return ExitCode::FAILURE;
+    }
+
     if let Err(error) = config.validate() {
         tracing::error!(%error, "invalid configuration");
         eprintln!("sealantd: invalid configuration: {error}");
@@ -172,7 +214,7 @@ fn run_serve(cli: ServeArgs) -> ExitCode {
         }
     };
 
-    tokio_runtime.block_on(serve(cli, runtime))
+    tokio_runtime.block_on(serve(cli, wss, runtime))
 }
 
 pub(crate) fn spawn_signal_listener(shutdown: Arc<ShutdownSignal>) {
@@ -215,8 +257,22 @@ pub(crate) fn spawn_heartbeat(runtime: Arc<Runtime>) {
     });
 }
 
-async fn serve(cli: ServeArgs, runtime: Arc<Runtime>) -> ExitCode {
+async fn serve(cli: ServeArgs, wss: Option<WssConfig>, runtime: Arc<Runtime>) -> ExitCode {
     let (serve_tx, serve_rx) = watch::channel(false);
+
+    // Bind the optional WSS frontend first: TLS material or address problems are startup errors,
+    // not a silently missing listener.
+    let wss_listener = match wss {
+        None => None,
+        Some(config) => match WssListener::bind(&config).await {
+            Ok(listener) => Some(listener),
+            Err(error) => {
+                tracing::error!(%error, "wss frontend failed to start");
+                eprintln!("sealantd: wss frontend failed to start: {error}");
+                return ExitCode::FAILURE;
+            }
+        },
+    };
 
     spawn_signal_listener(runtime.shutdown().clone());
     spawn_heartbeat(runtime.clone());
@@ -242,9 +298,11 @@ async fn serve(cli: ServeArgs, runtime: Arc<Runtime>) -> ExitCode {
             Ok::<(), std::io::Error>(())
         })
     } else {
-        let path = serve_runtime.socket_path();
-        let allowed = serve_runtime.allowed_peer_uids();
-        tokio::spawn(async move { serve_unix(serve_runtime, &path, allowed, serve_rx).await })
+        let unix = UnixFrontend {
+            path: serve_runtime.socket_path(),
+            allowed_peer_uids: serve_runtime.allowed_peer_uids(),
+        };
+        spawn_control_frontends(serve_runtime, unix, wss_listener, serve_rx)
     };
 
     let serve_finished = tokio::select! {
