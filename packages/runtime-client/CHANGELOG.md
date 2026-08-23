@@ -1,5 +1,20 @@
 # @sealant/runtime-client
 
+## 0.12.0
+
+### Minor Changes
+
+- 633dbcd: Daemon: opt-in mutual-TLS WebSocket control frontend (ADR-0013). `SEALANT_CONTROL_WSS_LISTEN`
+  (boot) / `--wss-listen` (bare CLI) serve the unchanged length-prefixed Protobuf control protocol
+  over `wss://…/control` beside the Unix socket — rustls with `WebPkiClientVerifier` and no anonymous
+  fallback, so no certificate, a foreign CA, or a serverAuth-only certificate fails the handshake
+  before any HTTP byte is read. With the new variables absent the daemon behaves exactly as before.
+
+### Patch Changes
+
+- Updated dependencies [633dbcd]
+  - @sealant/runtime-protocol@0.12.0
+
 ## 0.11.0
 
 ### Minor Changes
