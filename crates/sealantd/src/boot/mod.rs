@@ -330,13 +330,30 @@ async fn boot_serve(runtime: Arc<Runtime>, config: BootConfig) -> ExitCode {
         return shutdown_before_control(&runtime, ExitCode::FAILURE).await;
     }
 
-    // Step 13: control server in-process on the same runtime/bus/registry.
+    // Step 13: control server in-process on the same runtime/bus/registry. The optional WSS
+    // frontend (ADR-0013) binds first so TLS/address problems fail boot loudly.
+    let wss_listener = match &config.control.wss {
+        None => None,
+        Some(wss) => match sealant_control::WssListener::bind(wss).await {
+            Ok(listener) => Some(listener),
+            Err(error) => {
+                tracing::error!(%error, "wss frontend failed to start");
+                eprintln!("sealantd boot: wss frontend failed to start: {error}");
+                return shutdown_before_control(&runtime, ExitCode::FAILURE).await;
+            }
+        },
+    };
     let control_runtime = runtime.clone();
-    let socket = control_runtime.socket_path();
-    let allowed = control_runtime.allowed_peer_uids();
-    let mut control_handle = tokio::spawn(async move {
-        sealant_control::serve_unix(control_runtime, &socket, allowed, serve_rx).await
-    });
+    let unix = crate::control_frontends::UnixFrontend {
+        path: control_runtime.socket_path(),
+        allowed_peer_uids: control_runtime.allowed_peer_uids(),
+    };
+    let mut control_handle = crate::control_frontends::spawn_control_frontends(
+        control_runtime,
+        unix,
+        wss_listener,
+        serve_rx,
+    );
 
     // Print the harness banner (E8) now that prep is done.
     tracing::info!(banner = %config.banner, "{}", config.banner);

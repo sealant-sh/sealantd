@@ -14,5 +14,6 @@
 | [0010](0010-typescript-type-generation-and-compatibility.md) | TypeScript type generation and compatibility |
 | [0011](0011-packaging-static-musl-amd64.md) | Packaging: static musl, amd64-first |
 | [0012](0012-protobuf-wire-format.md) | Protobuf wire format (supersedes 0002 encoding) |
+| [0013](0013-websocket-control-transport.md) | Secure WebSocket control transport (opt-in, mTLS; Kubernetes) |
 
 ADR template: Status, Context, Decision, Consequences, Alternatives considered.
