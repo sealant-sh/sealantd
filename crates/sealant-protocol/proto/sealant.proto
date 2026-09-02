@@ -405,6 +405,9 @@ message AttachSessionArgs {
   optional uint64 from_sequence = 3;
 }
 message SignalSessionArgs { string session_id = 1; Signal signal = 2; }
+// Point a bindable mount's path at a subdirectory of its root (see ADR-0014). An empty subpath
+// unbinds. The root was mounted at workspace start; the path itself becomes a symlink.
+message BindMountArgs { string mount_path = 1; string subpath = 2; }
 message ReadSessionOutputArgs {
   string session_id = 1;
   uint64 from_sequence = 2;
@@ -445,6 +448,7 @@ message Command {
     CloseSftpArgs close_sftp = 24;
     SignalSessionArgs signal_session = 25;
     ReadSessionOutputArgs read_session_output = 26;
+    BindMountArgs bind_mount = 27;
   }
 }
 

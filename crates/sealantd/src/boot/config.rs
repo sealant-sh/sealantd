@@ -12,6 +12,8 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+use sealant_runtime_core::config::{Bind, BindableMount};
+
 use crate::boot::error::BootError;
 
 /// Default workspace root when `SEALANT_WORKSPACE_ROOT` is unset.
@@ -178,6 +180,15 @@ pub struct MountConfig {
     pub host_path: PathBuf,
 }
 
+/// A standby workspace (ADR-0014): the caller-owned ROOT (a project's worktrees directory) is
+/// mounted at a hidden path, and the working directory is bound to one of its subdirectories on
+/// demand — at boot from `SEALANT_BINDS`, later through the `bindMount` command.
+#[derive(Debug, Clone)]
+pub struct StandbyConfig {
+    /// The host path backing the root mount (validated against the operator allowlist).
+    pub root_host_path: PathBuf,
+}
+
 /// How the workspace working directory is provisioned.
 #[derive(Debug, Clone)]
 pub enum WorkspaceSource {
@@ -185,7 +196,12 @@ pub enum WorkspaceSource {
     Clone(RepoConfig),
     /// The working directory is a caller-owned bind mount; the mount IS the repo.
     Mount(MountConfig),
+    /// The working directory is bound later to a subdirectory of a mounted root.
+    Standby(StandbyConfig),
 }
+
+/// Where a standby workspace's root is mounted, relative to the workspace root.
+pub const STANDBY_ROOT_MOUNT_SUBDIR: &str = ".roots/workspace";
 
 /// Git clone authentication (mutually exclusive).
 #[derive(Debug, Clone)]
@@ -389,6 +405,12 @@ pub struct BootConfig {
     pub workspace: WorkspaceConfig,
     /// How the working directory is provisioned (clone or caller-owned mount).
     pub source: WorkspaceSource,
+    /// Mounts whose declared path is bound to a root subdirectory on demand (ADR-0014). A standby
+    /// source always contributes the working directory; extra bindable mounts come from
+    /// `SEALANT_BINDABLE_MOUNTS`.
+    pub bindable_mounts: Vec<BindableMount>,
+    /// Binds the orchestrator wants applied before the harness starts (`SEALANT_BINDS`).
+    pub initial_binds: Vec<Bind>,
     /// Clone authentication (unused for mounted sources).
     pub clone_auth: CloneAuth,
     /// Runtime-applied dotfiles, when configured.
@@ -453,13 +475,17 @@ impl BootConfig {
         };
 
         let source = Self::load_source(env)?;
+        let bindable_mounts = Self::load_bindable_mounts(env, &workspace, &source)?;
+        let initial_binds = Self::load_initial_binds(env, &bindable_mounts)?;
         // Boot writes runtime state (.ssh-runtime) under the workspace root. For a mounted
         // source, the root must therefore live outside the mount, or boot would write into
         // caller-owned contents.
-        if matches!(source, WorkspaceSource::Mount(_))
-            && workspace
-                .workspace_root
-                .starts_with(&workspace.working_directory)
+        if matches!(
+            source,
+            WorkspaceSource::Mount(_) | WorkspaceSource::Standby(_)
+        ) && workspace
+            .workspace_root
+            .starts_with(&workspace.working_directory)
         {
             return Err(BootError::config(format!(
                 "SEALANT_WORKSPACE_ROOT {} must not be inside the mounted working directory {}",
@@ -566,6 +592,8 @@ impl BootConfig {
         Ok(Self {
             workspace,
             source,
+            bindable_mounts,
+            initial_binds,
             clone_auth,
             dotfiles,
             dotfiles_archives,
@@ -612,43 +640,132 @@ impl BootConfig {
                     .filter(|s| !s.is_empty());
                 Ok(WorkspaceSource::Clone(RepoConfig { url, reference }))
             }
-            Some("mount") => {
+            Some(mode @ ("mount" | "standby")) => {
                 if url.is_some() {
-                    return Err(BootError::config(
+                    return Err(BootError::config(format!(
                         "SEALANT_WORKSPACE_REPO_URL must not be set when \
-                         SEALANT_WORKSPACE_SOURCE=mount: a mounted workspace never clones",
-                    ));
+                         SEALANT_WORKSPACE_SOURCE={mode}: a mounted workspace never clones"
+                    )));
                 }
                 let host_path = PathBuf::from(mount_host_path.ok_or_else(|| {
-                    BootError::config(
+                    BootError::config(format!(
                         "SEALANT_WORKSPACE_MOUNT_HOST_PATH is required when \
-                         SEALANT_WORKSPACE_SOURCE=mount",
-                    )
+                         SEALANT_WORKSPACE_SOURCE={mode}"
+                    ))
                 })?);
-                if !crate::boot::mount::is_clean_absolute(&host_path) {
-                    return Err(BootError::config(format!(
-                        "SEALANT_WORKSPACE_MOUNT_HOST_PATH {} must be an absolute path without \
-                         `.` or `..` components",
-                        host_path.display()
-                    )));
-                }
-                let roots = Self::load_allowed_store_roots(env)?;
-                if !roots
-                    .iter()
-                    .any(|root| crate::boot::mount::is_proper_descendant(root, &host_path))
-                {
-                    return Err(BootError::config(format!(
-                        "mount host path {} is outside the operator-configured store roots \
-                         (SEALANT_MOUNT_ALLOWED_STORE_ROOTS); refusing to provision",
-                        host_path.display()
-                    )));
-                }
-                Ok(WorkspaceSource::Mount(MountConfig { host_path }))
+                Self::check_store_path(env, "SEALANT_WORKSPACE_MOUNT_HOST_PATH", &host_path)?;
+                Ok(if mode == "mount" {
+                    WorkspaceSource::Mount(MountConfig { host_path })
+                } else {
+                    WorkspaceSource::Standby(StandbyConfig {
+                        root_host_path: host_path,
+                    })
+                })
             }
             Some(other) => Err(BootError::config(format!(
-                "SEALANT_WORKSPACE_SOURCE has unknown value {other:?} (expected clone|mount)"
+                "SEALANT_WORKSPACE_SOURCE has unknown value {other:?} (expected clone|mount|standby)"
             ))),
         }
+    }
+
+    /// A caller-owned host path must be clean, absolute, and inside the operator's store roots.
+    fn check_store_path(env: &dyn EnvSource, label: &str, path: &Path) -> Result<(), BootError> {
+        if !crate::boot::mount::is_clean_absolute(path) {
+            return Err(BootError::config(format!(
+                "{label} {} must be an absolute path without `.` or `..` components",
+                path.display()
+            )));
+        }
+        let roots = Self::load_allowed_store_roots(env)?;
+        if !roots
+            .iter()
+            .any(|root| crate::boot::mount::is_proper_descendant(root, path))
+        {
+            return Err(BootError::config(format!(
+                "{label} {} is outside the operator-configured store roots \
+                 (SEALANT_MOUNT_ALLOWED_STORE_ROOTS); refusing to provision",
+                path.display()
+            )));
+        }
+        Ok(())
+    }
+
+    /// `SEALANT_BINDABLE_MOUNTS`: a JSON array of `{ mountPath, rootMountPath, hostRootPath? }`
+    /// the orchestrator mounted as roots. A standby source adds the working directory itself,
+    /// rooted at `<workspace root>/.roots/workspace`, unless the list already names it.
+    fn load_bindable_mounts(
+        env: &dyn EnvSource,
+        workspace: &WorkspaceConfig,
+        source: &WorkspaceSource,
+    ) -> Result<Vec<BindableMount>, BootError> {
+        let mut mounts: Vec<BindableMount> = match env
+            .get("SEALANT_BINDABLE_MOUNTS")
+            .filter(|s| !s.trim().is_empty())
+        {
+            None => Vec::new(),
+            Some(raw) => serde_json::from_str(&raw).map_err(|error| {
+                BootError::config(format!(
+                    "SEALANT_BINDABLE_MOUNTS is not valid JSON: {error}"
+                ))
+            })?,
+        };
+        for mount in &mounts {
+            for (label, path) in [
+                ("mountPath", &mount.mount_path),
+                ("rootMountPath", &mount.root_mount_path),
+            ] {
+                if !crate::boot::mount::is_clean_absolute(path) {
+                    return Err(BootError::config(format!(
+                        "SEALANT_BINDABLE_MOUNTS {label} {} must be an absolute path without \
+                         `.` or `..` components",
+                        path.display()
+                    )));
+                }
+            }
+            if mount.root_mount_path.starts_with(&mount.mount_path)
+                || mount.mount_path.starts_with(&mount.root_mount_path)
+            {
+                return Err(BootError::config(format!(
+                    "SEALANT_BINDABLE_MOUNTS {} and its root {} must not nest",
+                    mount.mount_path.display(),
+                    mount.root_mount_path.display()
+                )));
+            }
+        }
+        if let WorkspaceSource::Standby(standby) = source
+            && !mounts
+                .iter()
+                .any(|m| m.mount_path == workspace.working_directory)
+        {
+            mounts.push(BindableMount {
+                mount_path: workspace.working_directory.clone(),
+                root_mount_path: workspace.workspace_root.join(STANDBY_ROOT_MOUNT_SUBDIR),
+                host_root_path: Some(standby.root_host_path.to_string_lossy().into_owned()),
+            });
+        }
+        Ok(mounts)
+    }
+
+    /// `SEALANT_BINDS`: a JSON array of `{ mountPath, subpath }` to apply before the harness starts.
+    fn load_initial_binds(
+        env: &dyn EnvSource,
+        mounts: &[BindableMount],
+    ) -> Result<Vec<Bind>, BootError> {
+        let binds: Vec<Bind> = match env.get("SEALANT_BINDS").filter(|s| !s.trim().is_empty()) {
+            None => Vec::new(),
+            Some(raw) => serde_json::from_str(&raw).map_err(|error| {
+                BootError::config(format!("SEALANT_BINDS is not valid JSON: {error}"))
+            })?,
+        };
+        for bind in &binds {
+            if !mounts.iter().any(|m| m.mount_path == bind.mount_path) {
+                return Err(BootError::config(format!(
+                    "SEALANT_BINDS names {} which is not a bindable mount",
+                    bind.mount_path.display()
+                )));
+            }
+        }
+        Ok(binds)
     }
 
     /// Parse the operator allowlist of mountable store roots (colon-separated absolute paths).
@@ -948,7 +1065,94 @@ mod tests {
         match &cfg.source {
             WorkspaceSource::Clone(repo) => repo,
             WorkspaceSource::Mount(m) => panic!("expected clone source, got mount {m:?}"),
+            WorkspaceSource::Standby(s) => panic!("expected clone source, got standby {s:?}"),
         }
+    }
+
+    fn standby_pairs() -> Vec<(&'static str, &'static str)> {
+        vec![
+            ("SEALANT_WORKSPACE_SOURCE", "standby"),
+            (
+                "SEALANT_WORKSPACE_MOUNT_HOST_PATH",
+                "/srv/mend/store/acme/worktrees",
+            ),
+            ("SEALANT_MOUNT_ALLOWED_STORE_ROOTS", "/srv/mend/store"),
+            ("SEALANT_OS_FAMILY", "fedora"),
+            ("SEALANT_HARNESS_LAUNCH_COMMAND", "sleep infinity"),
+        ]
+    }
+
+    #[test]
+    fn standby_source_makes_the_working_directory_bindable() {
+        let cfg = BootConfig::load(&MapEnv::from_pairs(&standby_pairs())).expect("valid");
+        match &cfg.source {
+            WorkspaceSource::Standby(s) => {
+                assert_eq!(
+                    s.root_host_path,
+                    PathBuf::from("/srv/mend/store/acme/worktrees")
+                );
+            }
+            other => panic!("expected standby source, got {other:?}"),
+        }
+        assert_eq!(cfg.bindable_mounts.len(), 1);
+        let mount = &cfg.bindable_mounts[0];
+        assert_eq!(mount.mount_path, PathBuf::from("/workspace/repo"));
+        assert_eq!(
+            mount.root_mount_path,
+            PathBuf::from("/workspace/.roots/workspace")
+        );
+        assert_eq!(
+            mount.host_root_path.as_deref(),
+            Some("/srv/mend/store/acme/worktrees")
+        );
+        assert!(cfg.initial_binds.is_empty());
+    }
+
+    #[test]
+    fn standby_root_must_be_inside_the_store_roots() {
+        let mut pairs = standby_pairs();
+        pairs[1] = ("SEALANT_WORKSPACE_MOUNT_HOST_PATH", "/elsewhere/worktrees");
+        assert!(BootConfig::load(&MapEnv::from_pairs(&pairs)).is_err());
+    }
+
+    #[test]
+    fn bindable_mounts_and_initial_binds_parse_and_cross_check() {
+        let mut pairs = standby_pairs();
+        pairs.push((
+            "SEALANT_BINDABLE_MOUNTS",
+            r#"[{"mountPath":"/workspace/repos/api","rootMountPath":"/workspace/.roots/repos__api","hostRootPath":"/srv/mend/store/api/worktrees"}]"#,
+        ));
+        pairs.push((
+            "SEALANT_BINDS",
+            r#"[{"mountPath":"/workspace/repo","subpath":"wt-1"},{"mountPath":"/workspace/repos/api","subpath":"wt-main"}]"#,
+        ));
+        let cfg = BootConfig::load(&MapEnv::from_pairs(&pairs)).expect("valid");
+        // The extra bindable mount plus the synthesized standby working directory.
+        assert_eq!(cfg.bindable_mounts.len(), 2);
+        assert_eq!(cfg.initial_binds.len(), 2);
+        assert_eq!(cfg.initial_binds[1].subpath, "wt-main");
+
+        // A bind for an undeclared mount is refused up front.
+        let mut bad = standby_pairs();
+        bad.push((
+            "SEALANT_BINDS",
+            r#"[{"mountPath":"/workspace/other","subpath":"x"}]"#,
+        ));
+        assert!(BootConfig::load(&MapEnv::from_pairs(&bad)).is_err());
+
+        // A root nested inside its own mount path is refused.
+        let mut nested = standby_pairs();
+        nested.push((
+            "SEALANT_BINDABLE_MOUNTS",
+            r#"[{"mountPath":"/workspace/repos/api","rootMountPath":"/workspace/repos/api/.root"}]"#,
+        ));
+        assert!(BootConfig::load(&MapEnv::from_pairs(&nested)).is_err());
+    }
+
+    #[test]
+    fn mount_source_has_no_bindable_mounts() {
+        let cfg = BootConfig::load(&MapEnv::from_pairs(&mount_pairs())).expect("valid");
+        assert!(cfg.bindable_mounts.is_empty());
     }
 
     #[test]

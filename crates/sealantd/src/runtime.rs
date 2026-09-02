@@ -123,6 +123,7 @@ pub struct Runtime {
     network: Arc<NetworkRuntime>,
     forwards: Arc<ForwardRuntime>,
     sftp: Arc<SftpRuntime>,
+    binds: Arc<crate::binds::BindRuntime>,
     extra_env: Arc<Mutex<Vec<(String, String)>>>,
     shutdown: Arc<ShutdownSignal>,
     features: Mutex<HashMap<Feature, bool>>,
@@ -188,6 +189,10 @@ impl Runtime {
         }
         let pidfd_supported = sealant_process::platform::pidfd_supported();
         let sftp = Arc::new(SftpRuntime::new(processes.registry.clone()));
+        let binds = Arc::new(crate::binds::BindRuntime::new(
+            config.bindable_mounts.clone(),
+            std::path::PathBuf::from(crate::binds::BINDS_STATE_FILE),
+        ));
         let features = Mutex::new(default_feature_states(&config));
         Arc::new(Self {
             config,
@@ -202,12 +207,19 @@ impl Runtime {
             network,
             forwards: Arc::new(ForwardRuntime::new()),
             sftp,
+            binds,
             extra_env,
             shutdown,
             features,
             pidfd_supported,
             subreaper,
         })
+    }
+
+    /// The bindable mounts and their live bindings (ADR-0014).
+    #[must_use]
+    pub fn binds(&self) -> &crate::binds::BindRuntime {
+        &self.binds
     }
 
     /// The managed-process registry (used to start the adopted-orphan reaper).
@@ -637,6 +649,13 @@ impl Runtime {
                 self.set_feature(feature, enabled);
                 ControlResponse::accepted(rid)
             }
+            Command::BindMount {
+                mount_path,
+                subpath,
+            } => match self.binds.bind(&mount_path, &subpath) {
+                Ok(()) => ControlResponse::accepted(rid),
+                Err(error) => ControlResponse::error(rid, error),
+            },
             // Streaming commands are routed through dispatch_streaming (they need the ConnHandle).
             Command::AttachSession(_)
             | Command::DetachSession { .. }

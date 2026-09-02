@@ -980,6 +980,13 @@ impl From<Command> for wire::command::Command {
                 enabled,
             }),
             Command::GetRuntimeMetrics => W::GetRuntimeMetrics(wire::Empty {}),
+            Command::BindMount {
+                mount_path,
+                subpath,
+            } => W::BindMount(wire::BindMountArgs {
+                mount_path,
+                subpath,
+            }),
             Command::AttachSession(a) => W::AttachSession(a.into()),
             Command::DetachSession { channel_id } => W::DetachSession(wire::DetachSessionArgs {
                 channel_id: channel_id.into_inner(),
@@ -1053,6 +1060,10 @@ impl TryFrom<wire::command::Command> for Command {
                 enabled: a.enabled,
             },
             W::GetRuntimeMetrics(_) => Command::GetRuntimeMetrics,
+            W::BindMount(a) => Command::BindMount {
+                mount_path: a.mount_path,
+                subpath: a.subpath,
+            },
             W::AttachSession(a) => Command::AttachSession(a.try_into()?),
             W::DetachSession(a) => Command::DetachSession {
                 channel_id: ChannelId::new(a.channel_id),
@@ -1823,6 +1834,19 @@ mod tests {
         ));
         let bytes = encode_server(&msg);
         assert_eq!(decode_server(&bytes).expect("decode"), msg);
+    }
+
+    #[test]
+    fn bind_mount_command_round_trips() {
+        let msg = ClientMessage::Request(ControlRequest::new(
+            RequestId::new("req_b"),
+            Command::BindMount {
+                mount_path: "/workspace/repo".to_owned(),
+                subpath: "wt-1ba1c80a".to_owned(),
+            },
+        ));
+        let bytes = encode_client(&msg);
+        assert_eq!(decode_client(&bytes).expect("decode"), msg);
     }
 
     #[test]

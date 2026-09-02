@@ -127,6 +127,17 @@ fn prepare(config: &BootConfig) -> Result<(), BootError> {
         WorkspaceSource::Mount(mount_config) => {
             mount::verify_mounted_source(&config.workspace.working_directory, mount_config)?;
         }
+        // Standby (ADR-0014): the working directory appears at bind time; the ROOT must be here.
+        WorkspaceSource::Standby(_) => {}
+    }
+    // Every bindable root — the standby root and any extra bindable mount — must be a real,
+    // writable mount, for the same reason a mounted source must: a bind onto a container-local
+    // directory would strand every write in the writable layer.
+    for bindable in &config.bindable_mounts {
+        mount::verify_mount_root(
+            &bindable.root_mount_path,
+            bindable.host_root_path.as_deref().unwrap_or("<unknown>"),
+        )?;
     }
 
     Ok(())
@@ -142,7 +153,6 @@ fn ssh_runtime_dir(config: &BootConfig) -> PathBuf {
 fn prepare_workspace(config: &BootConfig) -> Result<(), BootError> {
     let mut dirs: Vec<PathBuf> = vec![
         config.workspace.workspace_root.clone(),
-        config.workspace.working_directory.clone(),
         ssh_runtime_dir(config),
         PathBuf::from("/root"),
         PathBuf::from("/tmp"),
@@ -151,6 +161,11 @@ fn prepare_workspace(config: &BootConfig) -> Result<(), BootError> {
     ];
     if let Some(parent) = config.control.socket.parent() {
         dirs.push(parent.to_path_buf());
+    }
+    // A standby working directory is a symlink the bind creates; pre-creating a real directory
+    // there would only be removed again (or refused, once something wrote into it).
+    if !matches!(config.source, WorkspaceSource::Standby(_)) {
+        dirs.push(config.workspace.working_directory.clone());
     }
     for dir in &dirs {
         std::fs::create_dir_all(dir).map_err(|e| BootError::io_path("mkdir -p", dir, e))?;
@@ -220,6 +235,7 @@ fn into_runtime_config(config: &BootConfig, secret_env: &[(String, String)]) -> 
     runtime_config.workspace_id = config.control.workspace_id.clone();
     runtime_config.default_execution_id = config.control.execution_id.clone().map(ExecutionId::new);
     runtime_config.default_shell = config.shells.login.display().to_string();
+    runtime_config.bindable_mounts = config.bindable_mounts.clone();
     runtime_config.log_level = "info".to_owned();
     // The harness child's base environment: the passthrough env, the launcher's secret env, and
     // the prep-set identity vars. Every secret value seeds the I/O redactor whatever its name.
@@ -309,6 +325,15 @@ async fn boot_serve(runtime: Arc<Runtime>, config: BootConfig) -> ExitCode {
         tracing::info!(?network_mode, "network observation active");
     }
     runtime.mark_healthy();
+
+    // Step 11b: bind the working directory (and any other bindable mount) the orchestrator asked
+    // for, plus whatever this container's record holds, BEFORE anything can look for the repo
+    // (ADR-0014). A bind the platform promised and cannot deliver is a broken workspace.
+    if let Err(error) = runtime.binds().apply_initial(&config.initial_binds) {
+        tracing::error!(%error, "initial mount bind failed");
+        eprintln!("sealantd boot: {error}");
+        return shutdown_before_control(&runtime, ExitCode::FAILURE).await;
+    }
 
     // Step 12: runtime dotfiles, synchronously, BEFORE the control socket binds. The launching
     // adapter and the gateway treat the socket as the readiness signal, and everything they inject
