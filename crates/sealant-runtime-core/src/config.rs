@@ -15,6 +15,31 @@ pub const DEFAULT_SOCKET_PATH: &str = "/run/sealantd.sock";
 /// Default workspace (repository/observation) root.
 pub const DEFAULT_WORKSPACE_ROOT: &str = "/workspace";
 
+/// A mount whose declared path is bound to a subdirectory of a root mounted elsewhere (ADR-0014).
+/// The orchestrator mounts `root_mount_path` at container start; `mount_path` does not exist
+/// until a `bindMount` command (or a recorded bind at boot) points it at `<root>/<subpath>`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BindableMount {
+    /// The path the workspace sees, e.g. `/workspace/repo` or `/workspace/repos/api`.
+    pub mount_path: PathBuf,
+    /// Where the root is mounted inside the container, e.g. `/workspace/.roots/workspace`.
+    pub root_mount_path: PathBuf,
+    /// The host path backing the root; recorded for provenance only.
+    #[serde(default)]
+    pub host_root_path: Option<String>,
+}
+
+/// One binding: a bindable mount's path pointed at `subpath` under its root.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Bind {
+    /// The bindable mount's declared path.
+    pub mount_path: PathBuf,
+    /// Relative path under the root; empty means unbound.
+    pub subpath: String,
+}
+
 /// All runtime configuration. Values are validated by [`RuntimeConfig::validate`] before the
 /// daemon reports healthy. Secrets are never emitted; [`RuntimeConfig::sanitized_summary`] exposes
 /// only allowlisted, non-secret fields.
@@ -82,6 +107,9 @@ pub struct RuntimeConfig {
     /// root). Empty by default.
     #[serde(default)]
     pub allowed_peer_uids: Vec<u32>,
+    /// Mounts whose paths are bound to a root subdirectory on demand (ADR-0014).
+    #[serde(default)]
+    pub bindable_mounts: Vec<BindableMount>,
 }
 
 /// Default per-segment size cap for session output journals (16 MiB; two segments retained).
@@ -130,6 +158,7 @@ impl RuntimeConfig {
             watch_filesystem: false,
             network_mode: NetworkMode::Off,
             allowed_peer_uids: Vec::new(),
+            bindable_mounts: Vec::new(),
         }
     }
 

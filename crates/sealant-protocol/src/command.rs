@@ -415,6 +415,14 @@ pub enum Command {
         /// Desired enabled state.
         enabled: bool,
     },
+    /// Point a bindable mount's path at a subdirectory of its root; an empty subpath unbinds.
+    #[serde(rename = "bindMount")]
+    BindMount {
+        /// The declared mount path (e.g. `/workspace/repo`), a symlink once bound.
+        mount_path: String,
+        /// Path under the mount's root, relative, no `.`/`..`; empty to unbind.
+        subpath: String,
+    },
     /// Report runtime metrics.
     #[serde(rename = "getRuntimeMetrics")]
     GetRuntimeMetrics,
@@ -480,6 +488,7 @@ impl Command {
             Self::ResizePty { .. } => "resizePty",
             Self::ListSessions => "listSessions",
             Self::SetFeatureState { .. } => "setFeatureState",
+            Self::BindMount { .. } => "bindMount",
             Self::GetRuntimeMetrics => "getRuntimeMetrics",
             Self::AttachSession(_) => "attachSession",
             Self::DetachSession { .. } => "detachSession",

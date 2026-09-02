@@ -377,6 +377,15 @@ export class SealantClient {
     okResult(await this.request({ case: "signalProcess", value: { processId, signal } }));
   }
 
+  /**
+   * Point a bindable mount's path at a subdirectory of its root (ADR-0014): `/workspace/repo` at
+   * `wt-<id>`, or `/workspace/repos/<name>` at a sibling repository's worktree. An empty subpath
+   * unbinds. The daemon records the bind and re-applies it when it restarts in the same container.
+   */
+  async bindMount(mountPath: string, subpath: string): Promise<void> {
+    okResult(await this.request({ case: "bindMount", value: { mountPath, subpath } }));
+  }
+
   async shutdown(graceMillis?: number): Promise<void> {
     const value = graceMillis === undefined ? {} : { graceMillis: BigInt(graceMillis) };
     okResult(await this.request({ case: "runtimeGracefulShutdown", value }));

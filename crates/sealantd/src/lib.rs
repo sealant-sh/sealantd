@@ -6,6 +6,7 @@
 #![forbid(unsafe_code)]
 
 pub mod app;
+pub mod binds;
 pub mod boot;
 pub(crate) mod control_frontends;
 pub mod runtime;

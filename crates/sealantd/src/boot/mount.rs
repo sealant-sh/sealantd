@@ -54,6 +54,36 @@ pub(crate) fn verify_mounted_source(
     Ok(())
 }
 
+/// Verify a bindable root (ADR-0014): it must exist, be a directory, be an actual mountpoint, and
+/// be writable — the same invariants as a mounted source, for the same reason. `host_path` is
+/// only for the message.
+///
+/// # Errors
+/// Returns [`BootError::Config`] if any invariant fails; every failure is fatal to boot.
+pub(crate) fn verify_mount_root(root: &Path, host_path: &str) -> Result<(), BootError> {
+    let metadata = std::fs::metadata(root).map_err(|e| BootError::io_path("stat", root, e))?;
+    if !metadata.is_dir() {
+        return Err(BootError::config(format!(
+            "bindable mount root {} is not a directory",
+            root.display()
+        )));
+    }
+    if !is_mount_point(root) {
+        return Err(BootError::config(format!(
+            "bindable mount root {} is not a mountpoint; the orchestrator must bind-mount the \
+             caller-owned host path {host_path} onto it before the daemon starts",
+            root.display(),
+        )));
+    }
+    if let Err(errno) = nix::unistd::access(root, nix::unistd::AccessFlags::W_OK) {
+        return Err(BootError::config(format!(
+            "bindable mount root {} is not writable ({errno})",
+            root.display()
+        )));
+    }
+    Ok(())
+}
+
 /// Whether `path` is a mountpoint. Primary check: an exact entry in `/proc/self/mountinfo`
 /// (catches same-filesystem bind mounts, which keep their `st_dev`). Fallback when mountinfo is
 /// unavailable: `st_dev` differing from the parent directory's.
