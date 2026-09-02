@@ -1,5 +1,14 @@
 # @sealant/runtime-protocol
 
+## 0.13.0
+
+### Minor Changes
+
+- c18aa16: `bindMount { mountPath, subpath }` (ADR-0014): point a bindable mount's path at a subdirectory of
+  its root, or unbind with an empty subpath. Boot reads `SEALANT_BINDABLE_MOUNTS` and `SEALANT_BINDS`,
+  and `SEALANT_WORKSPACE_SOURCE=standby` makes the working directory itself bindable. The client gains
+  `bindMount(mountPath, subpath)`.
+
 ## 0.12.0
 
 ### Minor Changes
