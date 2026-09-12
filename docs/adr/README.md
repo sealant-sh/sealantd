@@ -15,5 +15,7 @@
 | [0011](0011-packaging-static-musl-amd64.md) | Packaging: static musl, amd64-first |
 | [0012](0012-protobuf-wire-format.md) | Protobuf wire format (supersedes 0002 encoding) |
 | [0013](0013-websocket-control-transport.md) | Secure WebSocket control transport (opt-in, mTLS; Kubernetes) |
+| [0014](0014-bindable-mounts.md) | Bindable mounts: bind a mounted root's subdirectory on demand |
+| [0015](0015-session-capture-and-sync.md) | Session capture and sync: executors are caches of the store (proposed) |
 
 ADR template: Status, Context, Decision, Consequences, Alternatives considered.
