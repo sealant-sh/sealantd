@@ -532,7 +532,7 @@ impl Runtime {
         }
     }
 
-    async fn dispatch(&self, request: ControlRequest) -> ControlResponse {
+    pub(crate) async fn dispatch(&self, request: ControlRequest) -> ControlResponse {
         let rid = request.request_id.clone();
         if matches!(
             self.status.state(),

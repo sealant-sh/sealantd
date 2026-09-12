@@ -247,3 +247,156 @@ impl CaptureRuntime {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+    use std::process::Command as Proc;
+    use std::time::Instant;
+
+    use sealant_capture::registrar::HeadInfo;
+    use sealant_capture::{
+        BlobSink, CaptureConfig, CaptureEngine, CaptureKind as EngineKind, InMemoryRegistrar,
+        LocalDir,
+    };
+    use sealant_protocol::{Command, CommandResult, ControlRequest, RequestId, ResponseOutcome};
+    use sealant_runtime_core::{RuntimeConfig, new_runtime_id};
+
+    use super::*;
+    use crate::shutdown::ShutdownSignal;
+
+    fn git(root: &Path, args: &[&str]) {
+        let out = Proc::new("git")
+            .current_dir(root)
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .args(args)
+            .output()
+            .expect("git");
+        assert!(out.status.success(), "git {args:?}");
+    }
+
+    fn boot(base: &Path) -> (CaptureBoot, Arc<InMemoryRegistrar>) {
+        let root = base.join("ws");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        git(&root, &["init", "-q", "-b", "main"]);
+        git(&root, &["config", "user.email", "t@t"]);
+        git(&root, &["config", "user.name", "t"]);
+        std::fs::write(root.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+        git(&root, &["add", "-A"]);
+        git(&root, &["commit", "-q", "-m", "one"]);
+        let registrar = Arc::new(InMemoryRegistrar::new("wt-hooks", 1, None));
+        let sink: Arc<dyn BlobSink> = Arc::new(LocalDir::new(&base.join("store")).unwrap());
+        let engine = CaptureEngine::open(CaptureConfig::new("wt-hooks", 1, &root), None).unwrap();
+        let dyn_registrar: Arc<dyn Registrar> = registrar.clone();
+        (
+            CaptureBoot {
+                engine,
+                sink,
+                registrar: dyn_registrar,
+                worktree_id: "wt-hooks".to_owned(),
+                epoch: 1,
+            },
+            registrar,
+        )
+    }
+
+    fn wait_chain(registrar: &InMemoryRegistrar, n: usize) -> Vec<HeadInfo> {
+        let start = Instant::now();
+        loop {
+            let chain = registrar.chain();
+            if chain.len() >= n {
+                return chain;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "chain reaches {n}"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    /// `capture.now {kind: turn}`, `capture.flush`, `runtime.gracefulShutdown` and the signal
+    /// listener's `flush_captures` each force a small-class snap ahead of the timers (the tree
+    /// is quiet throughout: no scheduled snap would fire).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn control_hooks_force_a_small_snap_ahead_of_the_timers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (boot, registrar) = boot(tmp.path());
+        let mut config = RuntimeConfig::new(new_runtime_id());
+        config.workspace_root = tmp.path().join("ws");
+        let runtime = Runtime::new(config, Arc::new(ShutdownSignal::new(5_000)));
+        runtime.mark_healthy();
+        let capture = CaptureRuntime::new(boot, 5_000);
+        assert!(runtime.install_capture(capture.clone()));
+        capture.start(runtime.clone(), ProcessId::new("p-harness"));
+        let before = capture.runner().snapshot();
+        assert_eq!(before.small_snaps, 0);
+
+        // Turn boundary: staged now, shipped by the worker.
+        let resp = runtime
+            .dispatch(ControlRequest::new(
+                RequestId::new("r1"),
+                Command::CaptureNow {
+                    kind: CaptureKind::Turn,
+                },
+            ))
+            .await;
+        let ResponseOutcome::Ok {
+            result: Some(CommandResult::CaptureStaged(staged)),
+        } = resp.outcome
+        else {
+            panic!("capture.now: {:?}", resp.outcome);
+        };
+        assert_eq!(staged.kind, CaptureKind::Turn);
+        assert!(!staged.unchanged);
+        let chain = wait_chain(&registrar, 1);
+        assert_eq!(chain[0].manifest.kind, EngineKind::Turn);
+        assert_eq!(capture.runner().snapshot().forced, 1);
+
+        // Flush: a suspend snap, then everything pending registered before it returns.
+        let resp = runtime
+            .dispatch(ControlRequest::new(
+                RequestId::new("r2"),
+                Command::CaptureFlush,
+            ))
+            .await;
+        let ResponseOutcome::Ok {
+            result: Some(CommandResult::CaptureStatus(report)),
+        } = resp.outcome
+        else {
+            panic!("capture.flush: {:?}", resp.outcome);
+        };
+        assert_eq!(report.pending, 0);
+        let chain = registrar.chain();
+        assert_eq!(chain.len(), 2);
+        assert_eq!(chain[1].manifest.kind, EngineKind::Suspend);
+
+        // The signal listener's path (SIGTERM / SIGINT): a final snap, flushed.
+        runtime.flush_captures(CaptureKind::Final).await;
+        let chain = registrar.chain();
+        assert_eq!(chain.len(), 3);
+        assert_eq!(chain[2].manifest.kind, EngineKind::Final);
+
+        // `runtime.gracefulShutdown` flushes before requesting the shutdown.
+        let resp = runtime
+            .dispatch(ControlRequest::new(
+                RequestId::new("r3"),
+                Command::RuntimeGracefulShutdown {
+                    grace_millis: Some(1_000),
+                },
+            ))
+            .await;
+        assert!(matches!(
+            resp.outcome,
+            ResponseOutcome::Ok {
+                result: Some(CommandResult::ShutdownAccepted(_))
+            }
+        ));
+        let chain = registrar.chain();
+        assert_eq!(chain.len(), 4);
+        assert_eq!(chain[3].manifest.kind, EngineKind::Final);
+        let snap = capture.runner().snapshot();
+        assert_eq!(snap.forced, 4, "{snap:?}");
+        assert_eq!(snap.small_snaps, 4, "no scheduled snap fired: {snap:?}");
+    }
+}
