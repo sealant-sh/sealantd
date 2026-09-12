@@ -28,11 +28,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - run: corepack enable
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
       - run: pnpm install --frozen-lockfile --ignore-scripts
-      - uses: changesets/action@v1
+      - uses: changesets/action@v2
         with:
           version: pnpm changeset version
           # No `publish:` — this workflow never publishes. Merge the Version PR, then tag to release.
