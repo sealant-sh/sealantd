@@ -21,6 +21,7 @@ pub mod registrar;
 pub mod ship;
 pub mod sink;
 pub mod tree;
+pub mod watch;
 
 pub use engine::{
     Cadence, CaptureConfig, CaptureEngine, Class, EngineError, SnapRequest, SnapStats,
@@ -31,3 +32,4 @@ pub use materialize::{MaterializeClass, MaterializeReport, MaterializeTargets, M
 pub use registrar::{HttpRegistrar, InMemoryRegistrar, Registrar, RegistrarError};
 pub use ship::{ShipSnapshot, ShipWorker, Shipper, Staging};
 pub use sink::{BlobSink, LocalDir, PresignedHttp, UrlMinter};
+pub use watch::{ChangeSignal, Mode as WatchMode, WatchPolicy};

@@ -1073,6 +1073,8 @@ dependencies = [
  "fastcdc",
  "hex",
  "nix",
+ "notify",
+ "sealant-fs",
  "serde",
  "serde_json",
  "sha2",

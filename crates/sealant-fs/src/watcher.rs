@@ -97,15 +97,17 @@ struct WorkerState {
     watched: HashSet<PathBuf>,
 }
 
-/// Walk `dir` with ignore pruning, returning every non-ignored directory (including `dir` itself).
-fn watchable_dirs(dir: &Path, config: &SnapshotConfig) -> Vec<PathBuf> {
-    let ignores = &config.ignores;
+/// Walk `dir`, returning every directory that `prune` does not cut (including `dir` itself).
+/// `prune(path, name)` is asked for every directory below `dir`; a pruned directory and its
+/// subtree are skipped. Symlinks are never followed. Shared with the capture engine's watcher
+/// (ADR-0015), which registers the same pruned per-directory watch set under its own policy.
+pub fn pruned_dirs(dir: &Path, prune: &dyn Fn(&Path, &str) -> bool) -> Vec<PathBuf> {
     walkdir::WalkDir::new(dir)
         .follow_links(false)
         .into_iter()
         .filter_entry(|e| {
             let name = e.file_name().to_string_lossy();
-            !(e.depth() > 0 && e.file_type().is_dir() && ignores.iter().any(|i| i.as_str() == name))
+            !(e.depth() > 0 && e.file_type().is_dir() && prune(e.path(), &name))
         })
         .flatten()
         .filter(|e| e.file_type().is_dir())
@@ -113,21 +115,18 @@ fn watchable_dirs(dir: &Path, config: &SnapshotConfig) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Register non-recursive watches for every non-ignored directory under (and including) `dir`.
-/// Returns the number of new registrations; failures are logged and skipped (a single unwatchable
-/// directory should not take down observation of the rest of the tree).
-fn watch_tree(
-    watcher_slot: &Mutex<Option<RecommendedWatcher>>,
+/// Register a non-recursive watch on every directory [`pruned_dirs`] yields under `dir` that is
+/// not already in `watched`. Returns the number of new registrations; failures are logged and
+/// skipped (a single unwatchable directory should not take down observation of the rest of the
+/// tree).
+pub fn watch_pruned(
+    watcher: &mut RecommendedWatcher,
     watched: &mut HashSet<PathBuf>,
     dir: &Path,
-    config: &SnapshotConfig,
+    prune: &dyn Fn(&Path, &str) -> bool,
 ) -> usize {
     let mut added = 0;
-    let mut guard = watcher_slot.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(watcher) = guard.as_mut() else {
-        return 0;
-    };
-    for d in watchable_dirs(dir, config) {
+    for d in pruned_dirs(dir, prune) {
         if watched.contains(&d) {
             continue;
         }
@@ -140,6 +139,25 @@ fn watch_tree(
         }
     }
     added
+}
+
+fn ignore_prune(config: &SnapshotConfig) -> impl Fn(&Path, &str) -> bool + '_ {
+    move |_, name| config.ignores.iter().any(|i| i.as_str() == name)
+}
+
+/// Register non-recursive watches for every non-ignored directory under (and including) `dir`.
+/// Returns the number of new registrations.
+fn watch_tree(
+    watcher_slot: &Mutex<Option<RecommendedWatcher>>,
+    watched: &mut HashSet<PathBuf>,
+    dir: &Path,
+    config: &SnapshotConfig,
+) -> usize {
+    let mut guard = watcher_slot.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(watcher) = guard.as_mut() else {
+        return 0;
+    };
+    watch_pruned(watcher, watched, dir, &ignore_prune(config))
 }
 
 /// After a directory create is observed, register watches under it and report its contents: files
@@ -328,19 +346,12 @@ pub(crate) fn build_watcher(
     // subdirectory failures degrade coverage but do not abort.
     watcher.watch(&root, RecursiveMode::NonRecursive)?;
     let mut watched = HashSet::from([root.clone()]);
-    for dir in watchable_dirs(&root, &ctx.snapshot_config) {
-        if watched.contains(&dir) {
-            continue;
-        }
-        match watcher.watch(&dir, RecursiveMode::NonRecursive) {
-            Ok(()) => {
-                watched.insert(dir);
-            }
-            Err(error) => {
-                tracing::warn!(dir = %dir.display(), %error, "could not watch directory");
-            }
-        }
-    }
+    watch_pruned(
+        &mut watcher,
+        &mut watched,
+        &root,
+        &ignore_prune(&ctx.snapshot_config),
+    );
     tracing::debug!(watches = watched.len(), root = %root.display(), "filesystem watches registered");
     *watcher_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(watcher);
 

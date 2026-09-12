@@ -10,6 +10,8 @@ description = "Session capture store engine (ADR-0015): chunk, pack, ship, mater
 workspace = true
 
 [dependencies]
+sealant-fs = { workspace = true }
+notify = { workspace = true }
 fastcdc = { workspace = true }
 zstd = { workspace = true }
 ureq = { workspace = true }
