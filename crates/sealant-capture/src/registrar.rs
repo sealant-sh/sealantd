@@ -13,8 +13,9 @@ use crate::manifest::Manifest;
 /// `plan.get`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlanGetRequest {
-    /// Worktree.
-    pub worktree_id: String,
+    /// Worktree, when the executor knows it (`SEALANT_CAPTURE_WORKTREE_ID`); otherwise the
+    /// session token identifies it and the response says which.
+    pub worktree_id: Option<String>,
     /// Caller's epoch.
     pub epoch: u64,
 }
@@ -35,6 +36,8 @@ pub struct HeadInfo {
 /// `plan.get` response: the head to materialize and GET URLs for what it needs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlanGetResponse {
+    /// The worktree the session token is scoped to.
+    pub worktree_id: String,
     /// Head, or none for an empty chain.
     pub head: Option<HeadInfo>,
     /// Key → presigned GET URL (empty when the sink is a directory).
@@ -186,14 +189,17 @@ struct InMemoryState {
 #[derive(Debug)]
 pub struct InMemoryRegistrar {
     state: Mutex<InMemoryState>,
+    worktree_id: String,
     url_base: Option<String>,
 }
 
 impl InMemoryRegistrar {
-    /// A registrar whose live epoch is `epoch`. With `url_base`, URLs are `<base>/<key>`.
+    /// A registrar for `worktree_id` whose live epoch is `epoch`. With `url_base`, URLs are
+    /// `<base>/<key>`.
     #[must_use]
-    pub fn new(epoch: u64, url_base: Option<String>) -> Self {
+    pub fn new(worktree_id: &str, epoch: u64, url_base: Option<String>) -> Self {
         Self {
+            worktree_id: worktree_id.to_owned(),
             state: Mutex::new(InMemoryState {
                 live_epoch: epoch,
                 chain: Vec::new(),
@@ -267,6 +273,15 @@ impl Registrar for InMemoryRegistrar {
     fn plan_get(&self, req: &PlanGetRequest) -> Result<PlanGetResponse, RegistrarError> {
         let state = self.lock();
         Self::check_epoch(&state, req.epoch)?;
+        if req
+            .worktree_id
+            .as_ref()
+            .is_some_and(|w| *w != self.worktree_id)
+        {
+            return Err(RegistrarError::Protocol(
+                "token is scoped to another worktree".into(),
+            ));
+        }
         let head = state.chain.last().cloned();
         let mut get_urls = BTreeMap::new();
         if let (Some(h), Some(_)) = (&head, &self.url_base) {
@@ -288,7 +303,11 @@ impl Registrar for InMemoryRegistrar {
                 get_urls.insert(k.clone(), self.url(&k));
             }
         }
-        Ok(PlanGetResponse { head, get_urls })
+        Ok(PlanGetResponse {
+            worktree_id: self.worktree_id.clone(),
+            head,
+            get_urls,
+        })
     }
 
     fn upload_urls(&self, req: &UploadUrlsRequest) -> Result<UploadUrlsResponse, RegistrarError> {
@@ -608,7 +627,7 @@ mod tests {
 
     #[test]
     fn cas_lost_ack_wrong_parent_and_fence() {
-        let r = InMemoryRegistrar::new(1, None);
+        let r = InMemoryRegistrar::new("wt", 1, None);
         r.capture_register(&register(0, None, "a", 1)).unwrap();
         // Lost ack: same n and id is fine.
         r.capture_register(&register(0, None, "a", 1)).unwrap();
@@ -634,7 +653,7 @@ mod tests {
 
     #[test]
     fn urls_only_under_own_prefix_and_summary_only_on_head() {
-        let r = InMemoryRegistrar::new(1, Some("http://x".into()));
+        let r = InMemoryRegistrar::new("wt", 1, Some("http://x".into()));
         let resp = r
             .upload_urls(&UploadUrlsRequest {
                 worktree_id: "wt".into(),
@@ -663,7 +682,7 @@ mod tests {
         assert_eq!(r.summaries().len(), 1);
         let plan = r
             .plan_get(&PlanGetRequest {
-                worktree_id: "wt".into(),
+                worktree_id: None,
                 epoch: 1,
             })
             .unwrap();

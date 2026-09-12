@@ -157,9 +157,21 @@ impl GitRepo {
         Ok(stdout_string(&out).lines().map(str::to_owned).collect())
     }
 
-    /// Tree of the index (`git write-tree`); `None` when the index has unmerged entries.
-    pub fn index_tree(&self) -> Result<Option<String>, GitError> {
-        let out = git_command(&self.root).args(["write-tree"]).output()?;
+    /// Tree of the index, written from a scratch copy so a held `index.lock` never matters;
+    /// `None` when there is no index or it has unmerged entries.
+    pub fn index_tree(&self, scratch_dir: &Path) -> Result<Option<String>, GitError> {
+        let real_index = self.git_dir.join("index");
+        if !real_index.exists() {
+            return Ok(None);
+        }
+        fs::create_dir_all(scratch_dir)?;
+        let tmp_index = scratch_dir.join("index-tree");
+        fs::copy(&real_index, &tmp_index)?;
+        let out = git_command(&self.root)
+            .env("GIT_INDEX_FILE", &tmp_index)
+            .args(["write-tree"])
+            .output()?;
+        fs::remove_file(&tmp_index).ok();
         Ok(out.status.success().then(|| stdout_string(&out)))
     }
 
@@ -174,8 +186,13 @@ impl GitRepo {
     }
 
     /// Tree of the working tree: a throwaway copy of the index with `git add -A` applied, then
-    /// `write-tree`. Nested repositories become gitlinks; their paths are returned beside the sha.
-    pub fn worktree_tree(&self, scratch_dir: &Path) -> Result<(String, Vec<String>), GitError> {
+    /// `write-tree`. Nested repositories become gitlinks (or fail to index when they have no
+    /// commit); their paths are returned beside the sha so the chunked class can carry them.
+    pub fn worktree_tree(
+        &self,
+        scratch_dir: &Path,
+        excludes: &[String],
+    ) -> Result<(String, Vec<String>), GitError> {
         fs::create_dir_all(scratch_dir)?;
         let tmp_index = scratch_dir.join("snap-index");
         let real_index = self.git_dir.join("index");
@@ -184,14 +201,34 @@ impl GitRepo {
         } else {
             fs::remove_file(&tmp_index).ok();
         }
-        let add = ["add", "-A", "--", "."];
-        check(
-            &add,
-            git_command(&self.root)
-                .env("GIT_INDEX_FILE", &tmp_index)
-                .args(add)
-                .output()?,
-        )?;
+        // `--ignore-errors` keeps going past paths git cannot index (a nested repository with
+        // no commit checked out); those paths are reported so the chunked class can carry them.
+        let mut add: Vec<String> = ["add", "-A", "--ignore-errors", "--", "."]
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
+        add.extend(
+            excludes
+                .iter()
+                .map(|e| format!(":(exclude){}", e.trim_matches('/'))),
+        );
+        let out = git_command(&self.root)
+            .env("GIT_INDEX_FILE", &tmp_index)
+            .args(&add)
+            .output()?;
+        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+        let mut unindexed: Vec<String> = stderr
+            .lines()
+            .filter_map(|l| l.strip_prefix("error: unable to index file '"))
+            .filter_map(|l| l.strip_suffix('\''))
+            .map(|p| p.trim_end_matches('/').to_owned())
+            .collect();
+        if !out.status.success() && unindexed.is_empty() {
+            return Err(GitError::Command {
+                args: add.join(" "),
+                stderr: stderr.trim().to_owned(),
+            });
+        }
         let wt = ["write-tree"];
         let out = check(
             &wt,
@@ -209,11 +246,14 @@ impl GitRepo {
                 .args(ls)
                 .output()?,
         )?;
-        let gitlinks = String::from_utf8_lossy(&out.stdout)
+        let mut gitlinks: Vec<String> = String::from_utf8_lossy(&out.stdout)
             .split('\0')
             .filter(|l| l.starts_with("160000 "))
             .filter_map(|l| l.split_once('\t').map(|(_, p)| p.to_owned()))
             .collect();
+        gitlinks.append(&mut unindexed);
+        gitlinks.sort();
+        gitlinks.dedup();
         fs::remove_file(&tmp_index).ok();
         Ok((tree, gitlinks))
     }
@@ -274,15 +314,20 @@ pub struct Closure {
     pub gitlinks: Vec<String>,
 }
 
-/// Read the closure (refs, `HEAD`, index, stash, reflog, worktree) in that order.
-pub fn read_closure(repo: &GitRepo, scratch_dir: &Path) -> Result<Closure, GitError> {
+/// Read the closure (refs, `HEAD`, index, stash, reflog, worktree) in that order. `excludes` are
+/// pathspecs (relative to the root) left out of the worktree tree: the daemon directory.
+pub fn read_closure(
+    repo: &GitRepo,
+    scratch_dir: &Path,
+    excludes: &[String],
+) -> Result<Closure, GitError> {
     let mut refs = repo.refs()?;
     let head = repo.head()?;
     let mut tips: Vec<String> = refs.values().cloned().collect();
     if !head.starts_with("refs/") {
         tips.push(head.clone());
     }
-    match repo.index_tree()? {
+    match repo.index_tree(scratch_dir)? {
         Some(tree) => {
             refs.insert(INDEX_TREE_REF.to_owned(), tree.clone());
             tips.push(tree);
@@ -290,7 +335,7 @@ pub fn read_closure(repo: &GitRepo, scratch_dir: &Path) -> Result<Closure, GitEr
         None => tips.extend(repo.index_blobs()?),
     }
     tips.extend(repo.reflog_tips()?);
-    let (wt, gitlinks) = repo.worktree_tree(scratch_dir)?;
+    let (wt, gitlinks) = repo.worktree_tree(scratch_dir, excludes)?;
     refs.insert(WORKTREE_TREE_REF.to_owned(), wt.clone());
     tips.push(wt);
     tips.sort();
@@ -404,17 +449,19 @@ fn pack_once(
 
 /// Build the git class: read the closure, pack it against `previous_tips`, re-read refs and
 /// retry if anything moved or an object went missing, bounded to [`PACK_ATTEMPTS`]; after that,
-/// ship the last pack with `fsck = unverified`.
+/// ship the last pack with `fsck = unverified`. `excludes` are root-relative paths left out of
+/// the worktree tree.
 pub fn build_git_pack(
     repo: &GitRepo,
     out_dir: &Path,
     previous_tips: &[String],
+    excludes: &[String],
 ) -> Result<GitPackResult, GitError> {
     fs::create_dir_all(out_dir)?;
     let negatives = repo.existing(previous_tips)?;
     let mut last: Option<(Option<FinishedGitPack>, Closure)> = None;
     for attempt in 1..=PACK_ATTEMPTS {
-        let closure = read_closure(repo, out_dir)?;
+        let closure = read_closure(repo, out_dir, excludes)?;
         let packed = match pack_once(repo, out_dir, &closure.tips, &negatives, attempt) {
             Ok(p) => p,
             Err(e) => {
@@ -450,7 +497,7 @@ pub fn build_git_pack(
     // Retries exhausted: the last closure is packed once more, shipped unverified.
     let closure = match last {
         Some((_, c)) => c,
-        None => read_closure(repo, out_dir)?,
+        None => read_closure(repo, out_dir, excludes)?,
     };
     let packed = pack_once(repo, out_dir, &closure.tips, &negatives, PACK_ATTEMPTS + 1)?;
     Ok(GitPackResult {
@@ -582,7 +629,7 @@ mod tests {
         let (dir, repo) = fixture();
         fs::write(repo.root.join("b"), "uncommitted\n").unwrap();
         let scratch = dir.path().join("scratch");
-        let r = build_git_pack(&repo, &scratch, &[]).unwrap();
+        let r = build_git_pack(&repo, &scratch, &[], &[]).unwrap();
         assert_eq!(r.fsck, FsckStatus::Verified);
         assert!(r.closure.refs.contains_key(WORKTREE_TREE_REF));
         assert!(r.closure.refs.contains_key(INDEX_TREE_REF));
@@ -596,7 +643,7 @@ mod tests {
 
         // Nothing new: no pack.
         let tips = r.closure.tips.clone();
-        let r2 = build_git_pack(&repo, &scratch, &tips).unwrap();
+        let r2 = build_git_pack(&repo, &scratch, &tips, &[]).unwrap();
         assert!(r2.pack.is_none());
 
         // Materialize into a fresh repo and check the worktree tree out.

@@ -196,42 +196,58 @@ impl Listing {
         }
     }
 
-    /// Mount `abs_dir` at `virtual_prefix`, walking it fully. `prune` decides per directory
-    /// (absolute path, virtual path, name) whether to descend; `include` decides per entry
-    /// whether to keep it — a directory that is not included is still added lazily as the
+    /// Mount `<abs_base>/<rel>` at `<virtual_base>/<rel>`, walking it fully; the base itself and
+    /// the ancestors between the base and `rel` are added as directories. `prune` decides per
+    /// directory (absolute path, virtual path, name) whether to descend; `include` decides per
+    /// entry whether to keep it — a directory that is not included is still added lazily as the
     /// ancestor of an included descendant. Exclusions from [`is_excluded_name`], uncapturable
     /// types and `.pack` files without their `.idx` are applied here. Entries already present are
     /// not overwritten (the first mount wins, so overlays are expressed by mount order).
     pub fn mount<P, I>(
         &mut self,
-        virtual_prefix: &str,
-        abs_dir: &Path,
+        virtual_base: &str,
+        abs_base: &Path,
+        rel: &str,
         mut prune: P,
         mut include: I,
     ) where
         P: FnMut(&Path, &str, &str) -> bool,
         I: FnMut(&Path, &str, &str) -> bool,
     {
-        let Ok(root_meta) = fs::symlink_metadata(abs_dir) else {
+        let rel = rel.trim_matches('/');
+        let abs_dir = if rel.is_empty() {
+            abs_base.to_path_buf()
+        } else {
+            abs_base.join(rel)
+        };
+        let virtual_root = join_virtual(virtual_base, rel);
+        let Ok(root_meta) = fs::symlink_metadata(&abs_dir) else {
             return;
         };
         if !root_meta.is_dir() {
             return;
         }
-        if !virtual_prefix.is_empty() && !self.entries.contains_key(virtual_prefix) {
-            self.add(virtual_prefix.to_owned(), abs_dir.to_path_buf(), root_meta);
+        if !virtual_base.is_empty()
+            && !self.entries.contains_key(virtual_base)
+            && let Ok(meta) = fs::symlink_metadata(abs_base)
+        {
+            self.add(virtual_base.to_owned(), abs_base.to_path_buf(), meta);
+        }
+        if !virtual_root.is_empty() && !self.entries.contains_key(&virtual_root) {
+            self.ensure_ancestors(&virtual_root, virtual_base, abs_base);
+            self.add(virtual_root.clone(), abs_dir.clone(), root_meta);
         }
         // Per-directory name sets, for the `.pack` without `.idx` rule.
         let mut dir_names: HashMap<PathBuf, HashSet<String>> = HashMap::new();
-        let walker = WalkDir::new(abs_dir)
+        let walker = WalkDir::new(&abs_dir)
             .follow_links(false)
             .min_depth(1)
             .sort_by_file_name()
             .into_iter()
             .filter_entry(|e| {
                 let name = e.file_name().to_string_lossy();
-                let rel = e.path().strip_prefix(abs_dir).unwrap_or(e.path());
-                let v = join_virtual(virtual_prefix, &rel.to_string_lossy());
+                let rel = e.path().strip_prefix(&abs_dir).unwrap_or(e.path());
+                let v = join_virtual(&virtual_root, &rel.to_string_lossy());
                 if e.file_type().is_dir() {
                     !prune(e.path(), &v, &name)
                 } else {
@@ -240,7 +256,7 @@ impl Listing {
             });
         for entry in walker.flatten() {
             let path = entry.path();
-            let Ok(rel) = path.strip_prefix(abs_dir) else {
+            let Ok(rel) = path.strip_prefix(&abs_dir) else {
                 continue;
             };
             let Ok(meta) = entry.metadata() else {
@@ -272,14 +288,14 @@ impl Listing {
                     }
                 }
             }
-            let v = join_virtual(virtual_prefix, &rel.to_string_lossy());
+            let v = join_virtual(&virtual_root, &rel.to_string_lossy());
             if !include(path, &v, &name) {
                 continue;
             }
             if self.entries.contains_key(&v) {
                 continue;
             }
-            self.ensure_ancestors(&v, virtual_prefix, abs_dir);
+            self.ensure_ancestors(&v, &virtual_root, &abs_dir);
             self.add(v, path.to_path_buf(), meta);
         }
     }
@@ -308,6 +324,12 @@ impl Listing {
             .map(|n| n.to_string_lossy().to_string());
         if is_excluded_name(&name, parent_name.as_deref()) {
             return;
+        }
+        if !virtual_base.is_empty()
+            && !self.entries.contains_key(virtual_base)
+            && let Ok(base_meta) = fs::symlink_metadata(abs_base)
+        {
+            self.add(virtual_base.to_owned(), abs_base.to_path_buf(), base_meta);
         }
         self.ensure_ancestors(virtual_path, virtual_base, abs_base);
         self.add(virtual_path.to_owned(), abs.to_path_buf(), meta);
@@ -723,7 +745,7 @@ mod tests {
         fs::write(r.join("objects/pack/pack-b.idx"), b"i").unwrap();
         fs::write(r.join("keep.txt"), b"k").unwrap();
         let mut l = Listing::default();
-        l.mount("", r, |_, _, _| false, |_, _, _| true);
+        l.mount("", r, "", |_, _, _| false, |_, _, _| true);
         let keys: Vec<&String> = l.entries.keys().collect();
         assert!(
             !keys
@@ -745,6 +767,38 @@ mod tests {
     }
 
     #[test]
+    fn nested_mounts_get_their_ancestors() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = dir.path();
+        fs::create_dir_all(r.join("vendor/x/.git")).unwrap();
+        fs::write(r.join("vendor/x/v.txt"), b"v").unwrap();
+        fs::write(r.join(".env"), b"e").unwrap();
+        let mut l = Listing::default();
+        l.mount("tree", r, "vendor/x", |_, _, _| false, |_, _, _| true);
+        l.mount_file("tree/.env", "tree", r, &r.join(".env"));
+        for k in [
+            "tree",
+            "tree/vendor",
+            "tree/vendor/x",
+            "tree/vendor/x/.git",
+            "tree/vendor/x/v.txt",
+            "tree/.env",
+        ] {
+            assert!(l.entries.contains_key(k), "missing {k}");
+        }
+        assert!(!l.entries.contains_key("tree/vendor/x/.git/objects"));
+        let mut index = TreeIndex::default();
+        let mut sink = MemSink::default();
+        let built = TreeBuilder::new(&mut index, &key)
+            .build(&l, &mut sink)
+            .unwrap();
+        let root = DirObject::decode(&built.root.bytes).unwrap();
+        assert_eq!(root.entries.len(), 1);
+        assert_eq!(root.entries[0].name, "tree");
+        assert_eq!(built.stats.files, 2);
+    }
+
+    #[test]
     fn builds_groups_hardlinks_and_reuses_index() {
         let dir = tempfile::tempdir().unwrap();
         let r = dir.path();
@@ -755,7 +809,7 @@ mod tests {
         fs::hard_link(r.join("a.txt"), r.join("sub/a-link.txt")).unwrap();
         std::os::unix::fs::symlink("a.txt", r.join("l")).unwrap();
         let mut l = Listing::default();
-        l.mount("", r, |_, _, _| false, |_, _, _| true);
+        l.mount("", r, "", |_, _, _| false, |_, _, _| true);
 
         let mut index = TreeIndex::default();
         let mut sink = MemSink::default();
@@ -793,7 +847,7 @@ mod tests {
         // Touch a file: only it is re-read, and the tree changes.
         fs::write(r.join("a.txt"), b"alpha2").unwrap();
         let mut l = Listing::default();
-        l.mount("", r, |_, _, _| false, |_, _, _| true);
+        l.mount("", r, "", |_, _, _| false, |_, _, _| true);
         let built3 = TreeBuilder::new(&mut index, &key)
             .build(&l, &mut sink)
             .unwrap();

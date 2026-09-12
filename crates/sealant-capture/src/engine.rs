@@ -368,9 +368,9 @@ impl CaptureEngine {
                 || v == ".git/gitdir"
                 || v.starts_with(".git/refs/"))
         };
-        listing.mount(".git", &repo.git_dir, git_prune, git_include);
+        listing.mount(".git", &repo.git_dir, "", git_prune, git_include);
         if repo.common_dir != repo.git_dir {
-            listing.mount(".git", &repo.common_dir, git_prune, git_include);
+            listing.mount(".git", &repo.common_dir, "", git_prune, git_include);
         }
 
         let bulk = self.config.bulk_dirs.clone();
@@ -400,16 +400,16 @@ impl CaptureEngine {
             {
                 continue;
             }
-            let v = format!("tree/{rel}");
             if is_dir {
                 listing.mount(
-                    &v,
-                    &abs,
+                    "tree",
+                    &root,
+                    rel,
                     |abs, _, name| bulk.iter().any(|b| b == name) || self.is_daemon_path(abs),
                     |_, _, _| true,
                 );
             } else {
-                listing.mount_file(&v, "tree", &root, &abs);
+                listing.mount_file(&format!("tree/{rel}"), "tree", &root, &abs);
             }
         }
         if let Some(home) = &self.config.harness_home
@@ -422,6 +422,7 @@ impl CaptureEngine {
             listing.mount(
                 "harness",
                 home,
+                "",
                 |_, _, _| false,
                 |abs, _, _| !creds.iter().any(|c| c == abs),
             );
@@ -437,6 +438,7 @@ impl CaptureEngine {
         listing.mount(
             "",
             &root,
+            "",
             |abs, v, name| v == ".git" || name == DAEMON_DIR || self.is_daemon_path(abs),
             |abs, _, _| {
                 abs.strip_prefix(&root)
@@ -548,7 +550,11 @@ impl CaptureEngine {
                     .as_ref()
                     .map(|p| p.manifest.git_tips())
                     .unwrap_or_default();
-                let git = gitpack::build_git_pack(&repo, &objects, &previous_tips)?;
+                let mut excludes = vec![DAEMON_DIR.to_owned()];
+                if let Ok(rel) = self.config.staging_dir().strip_prefix(&self.config.root) {
+                    excludes.push(rel.to_string_lossy().to_string());
+                }
+                let git = gitpack::build_git_pack(&repo, &objects, &previous_tips, &excludes)?;
                 stats.git_attempts = git.attempts;
                 let mut git_packs: Vec<String> = self
                     .previous
