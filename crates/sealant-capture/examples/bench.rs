@@ -124,8 +124,14 @@ fn main() {
     let t = Instant::now();
     let fsck = GitRepo::open(&restore).unwrap().fsck().unwrap();
     println!("restore fsck: {fsck:?} in {:?}", t.elapsed());
-    let orig = GitRepo::open(&root).unwrap().status_porcelain().unwrap();
-    let back = GitRepo::open(&restore).unwrap().status_porcelain().unwrap();
+    let without_daemon_dir = |s: String| {
+        s.lines()
+            .filter(|l| !l.ends_with(".sealantd/"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let orig = without_daemon_dir(GitRepo::open(&root).unwrap().status_porcelain().unwrap());
+    let back = without_daemon_dir(GitRepo::open(&restore).unwrap().status_porcelain().unwrap());
     println!("status identical: {}", orig == back);
     if orig != back {
         println!("--- original\n{orig}\n--- restore\n{back}");

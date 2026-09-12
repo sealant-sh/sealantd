@@ -91,17 +91,21 @@ pub enum ShipError {
 #[derive(Debug)]
 pub struct Staging {
     dir: PathBuf,
+    epoch: u64,
     in_flight: Mutex<Option<u64>>,
 }
 
 impl Staging {
-    /// Open (and create) staging at `dir`.
-    pub fn open(dir: &Path) -> io::Result<Self> {
-        for sub in ["objects", "queue", "uploaded", "scratch", "index", "cache"] {
+    /// Open (and create) staging at `dir` for `epoch`. Upload acks are kept per epoch: an object
+    /// acked under a prior epoch was written under a prior prefix and must be uploaded again.
+    pub fn open(dir: &Path, epoch: u64) -> io::Result<Self> {
+        for sub in ["objects", "queue", "scratch", "index", "cache"] {
             fs::create_dir_all(dir.join(sub))?;
         }
+        fs::create_dir_all(dir.join("uploaded").join(epoch.to_string()))?;
         Ok(Self {
             dir: dir.to_path_buf(),
+            epoch,
             in_flight: Mutex::new(None),
         })
     }
@@ -141,7 +145,10 @@ impl Staging {
     }
 
     fn marker_path(&self, file: &str) -> PathBuf {
-        self.dir.join("uploaded").join(file)
+        self.dir
+            .join("uploaded")
+            .join(self.epoch.to_string())
+            .join(file)
     }
 
     /// Whether an object file was acked as uploaded.
@@ -231,10 +238,11 @@ impl Staging {
             .iter()
             .flat_map(|e| e.uploads.iter().map(|u| u.file.clone()))
             .collect();
+        // Object bytes go; the ack markers stay, so an unchanged dir object or pack listed by a
+        // later capture is neither re-staged nor re-uploaded within this epoch.
         for u in &removed.uploads {
             if !still.contains(&u.file) {
                 fs::remove_file(self.objects_dir().join(&u.file)).ok();
-                fs::remove_file(self.marker_path(&u.file)).ok();
             }
         }
         Ok(())

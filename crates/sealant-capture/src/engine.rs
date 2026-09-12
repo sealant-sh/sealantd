@@ -258,6 +258,10 @@ pub struct CaptureEngine {
     workspace_index: TreeIndex,
     bulk_index: TreeIndex,
     chunks: ChunkMap,
+    /// Every tip the last git pack covered (refs, reflog entries, index and worktree trees):
+    /// the negatives of the next pack. The manifest only carries refs, so reflog-only history
+    /// would otherwise be packed again on every snap.
+    last_tips: Vec<String>,
 }
 
 impl std::fmt::Debug for CaptureEngine {
@@ -281,11 +285,15 @@ impl CaptureEngine {
         config: CaptureConfig,
         previous: Option<EncodedManifest>,
     ) -> Result<Self, EngineError> {
-        let staging = Arc::new(Staging::open(&config.staging_dir())?);
+        let staging = Arc::new(Staging::open(&config.staging_dir(), config.epoch)?);
         let index_dir = staging.index_dir();
         let workspace_index = TreeIndex::load(&index_dir.join("workspace.json"));
         let bulk_index = TreeIndex::load(&index_dir.join("bulk.json"));
         let chunks: ChunkMap = fs::read(index_dir.join("chunks.json"))
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default();
+        let last_tips: Vec<String> = fs::read(index_dir.join("git-tips.json"))
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok())
             .unwrap_or_default();
@@ -308,7 +316,28 @@ impl CaptureEngine {
             workspace_index,
             bulk_index,
             chunks,
+            last_tips,
         })
+    }
+
+    /// After materializing `previous` into the root: record the repository's current closure as
+    /// already stored, so the next pack ships only what is new. Call once at pickup; never on a
+    /// root whose objects did not come from the chain.
+    pub fn seed_tips_from_repo(&mut self) -> Result<(), EngineError> {
+        let repo = GitRepo::open(&self.config.root)?;
+        let closure =
+            gitpack::read_closure(&repo, &self.staging.scratch_dir(), &self.daemon_excludes())?;
+        self.last_tips = closure.tips;
+        self.persist()?;
+        Ok(())
+    }
+
+    fn daemon_excludes(&self) -> Vec<String> {
+        let mut excludes = vec![DAEMON_DIR.to_owned()];
+        if let Ok(rel) = self.config.staging_dir().strip_prefix(&self.config.root) {
+            excludes.push(rel.to_string_lossy().to_string());
+        }
+        excludes
     }
 
     /// Configuration.
@@ -341,7 +370,10 @@ impl CaptureEngine {
         self.bulk_index.save(&dir.join("bulk.json"))?;
         let tmp = dir.join("chunks.tmp");
         fs::write(&tmp, serde_json::to_vec(&self.chunks)?)?;
-        fs::rename(tmp, dir.join("chunks.json"))
+        fs::rename(tmp, dir.join("chunks.json"))?;
+        let tmp = dir.join("git-tips.tmp");
+        fs::write(&tmp, serde_json::to_vec(&self.last_tips)?)?;
+        fs::rename(tmp, dir.join("git-tips.json"))
     }
 
     fn is_daemon_path(&self, abs: &Path) -> bool {
@@ -545,16 +577,17 @@ impl CaptureEngine {
         let sections = match req.class {
             Class::Small => {
                 let repo = GitRepo::open(&self.config.root)?;
-                let previous_tips = self
+                let mut previous_tips = self
                     .previous
                     .as_ref()
                     .map(|p| p.manifest.git_tips())
                     .unwrap_or_default();
-                let mut excludes = vec![DAEMON_DIR.to_owned()];
-                if let Ok(rel) = self.config.staging_dir().strip_prefix(&self.config.root) {
-                    excludes.push(rel.to_string_lossy().to_string());
-                }
+                previous_tips.extend(self.last_tips.iter().cloned());
+                previous_tips.sort();
+                previous_tips.dedup();
+                let excludes = self.daemon_excludes();
                 let git = gitpack::build_git_pack(&repo, &objects, &previous_tips, &excludes)?;
+                self.last_tips = git.closure.tips.clone();
                 stats.git_attempts = git.attempts;
                 let mut git_packs: Vec<String> = self
                     .previous
