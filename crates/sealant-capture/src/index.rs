@@ -363,6 +363,21 @@ pub trait ChunkSink {
     fn contains(&self, id: &ChunkId) -> bool;
     /// Store a new chunk.
     fn put(&mut self, id: ChunkId, data: &[u8]) -> io::Result<()>;
+    /// Whether the builder should stop at the next chunk boundary and hand back what it has
+    /// (a due small-class snap is waiting on a bulk build). Never asked by a small-class build.
+    fn should_yield(&self) -> bool {
+        false
+    }
+}
+
+/// The build stopped at a chunk boundary because the sink asked it to; the index holds every
+/// file read so far, the sink every chunk, so the next attempt resumes without re-reading them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Yielded;
+
+/// Whether `error` is the builder's yield marker.
+fn is_yield(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::Interrupted
 }
 
 /// Counters from one build.
@@ -434,25 +449,45 @@ impl<'a> TreeBuilder<'a> {
         abs: &Path,
         sink: &mut dyn ChunkSink,
         stats: &mut BuildStats,
-    ) -> Option<(Vec<ChunkId>, FileStat, bool)> {
+    ) -> Result<Option<(Vec<ChunkId>, FileStat, bool)>, Yielded> {
         for _ in 0..READ_ATTEMPTS {
-            let before = FileStat::of(&fs::symlink_metadata(abs).ok()?);
-            let (chunks, bytes) = self.chunk_file(abs, sink, stats).ok()?;
-            let after = FileStat::of(&fs::symlink_metadata(abs).ok()?);
+            let Some(before) = fs::symlink_metadata(abs).ok().map(|m| FileStat::of(&m)) else {
+                return Ok(None);
+            };
+            let Some((chunks, bytes)) = Self::chunk_or_yield(self.chunk_file(abs, sink, stats))?
+            else {
+                return Ok(None);
+            };
+            let Some(after) = fs::symlink_metadata(abs).ok().map(|m| FileStat::of(&m)) else {
+                return Ok(None);
+            };
             stats.files_read += 1;
             stats.bytes_read += bytes;
             if before == after {
-                return Some((chunks, after, false));
+                return Ok(Some((chunks, after, false)));
             }
             tracing::debug!(path = %abs.display(), "file changed while reading; retrying");
         }
         // Last attempt: ship what we read, marked torn.
-        let (chunks, bytes) = self.chunk_file(abs, sink, stats).ok()?;
-        let after = FileStat::of(&fs::symlink_metadata(abs).ok()?);
+        let Some((chunks, bytes)) = Self::chunk_or_yield(self.chunk_file(abs, sink, stats))? else {
+            return Ok(None);
+        };
+        let Some(after) = fs::symlink_metadata(abs).ok().map(|m| FileStat::of(&m)) else {
+            return Ok(None);
+        };
         stats.files_read += 1;
         stats.bytes_read += bytes;
         stats.torn += 1;
-        Some((chunks, after, true))
+        Ok(Some((chunks, after, true)))
+    }
+
+    /// A chunking result: `Ok(Some)` read, `Ok(None)` vanished or unreadable, `Err` yielded.
+    fn chunk_or_yield<T>(result: io::Result<T>) -> Result<Option<T>, Yielded> {
+        match result {
+            Ok(v) => Ok(Some(v)),
+            Err(e) if is_yield(&e) => Err(Yielded),
+            Err(_) => Ok(None),
+        }
     }
 
     fn chunk_file(
@@ -470,6 +505,9 @@ impl<'a> TreeBuilder<'a> {
             if !sink.contains(&chunk.id) {
                 sink.put(chunk.id, &chunk.data)?;
                 stats.chunks_new += 1;
+                if sink.should_yield() {
+                    return Err(io::Error::new(io::ErrorKind::Interrupted, "build yielded"));
+                }
             }
             chunks.push(chunk.id);
         }
@@ -484,23 +522,28 @@ impl<'a> TreeBuilder<'a> {
         src: &Source,
         sink: &mut dyn ChunkSink,
         stats: &mut BuildStats,
-    ) -> Option<(Vec<ChunkId>, FileStat, bool)> {
+    ) -> Result<Option<(Vec<ChunkId>, FileStat, bool)>, Yielded> {
         let stat = FileStat::of(&src.meta);
         if let Some(prev) = self.index.files.get(v)
             && prev.stat == stat
             && prev.chunks.iter().all(|c| sink.contains(c))
         {
-            return Some((prev.chunks.clone(), stat, false));
+            return Ok(Some((prev.chunks.clone(), stat, false)));
+        }
+        if sink.should_yield() {
+            return Err(Yielded);
         }
         self.read_file(&src.abs, sink, stats)
     }
 
-    /// Build the tree for `listing`.
+    /// Build the tree for `listing`. `Ok(None)` when the sink asked the build to yield: the index
+    /// keeps every file read so far (stale entries are harmless, the next successful build
+    /// replaces the index wholesale), so the resumed build skips them.
     pub fn build(
         mut self,
         listing: &Listing,
         sink: &mut dyn ChunkSink,
-    ) -> Result<BuiltTree, io::Error> {
+    ) -> Result<Option<BuiltTree>, io::Error> {
         let mut stats = BuildStats::default();
         // Hardlink groups: canonical member = first in path order.
         let mut canonical: HashMap<(u64, u64), String> = HashMap::new();
@@ -561,10 +604,16 @@ impl<'a> TreeBuilder<'a> {
                         grouped.insert(v.clone());
                         grouped.insert(base_v.clone());
                         stats.files += 2;
-                        let Some(group) = self.read_group(&base_v, db, v, wal, sink, &mut stats)
-                        else {
-                            stats.vanished += 2;
-                            continue;
+                        let group = match self.read_group(&base_v, db, v, wal, sink, &mut stats) {
+                            Ok(Some(group)) => group,
+                            Ok(None) => {
+                                stats.vanished += 2;
+                                continue;
+                            }
+                            Err(Yielded) => {
+                                self.index.files.extend(new_index);
+                                return Ok(None);
+                            }
                         };
                         for (path, src, chunks, stat, torn) in group {
                             let mut e = DirEntry::file(
@@ -617,10 +666,16 @@ impl<'a> TreeBuilder<'a> {
                         ));
                         continue;
                     }
-                    let Some((chunks, stat, torn)) = self.file_chunks(v, src, sink, &mut stats)
-                    else {
-                        stats.vanished += 1;
-                        continue;
+                    let (chunks, stat, torn) = match self.file_chunks(v, src, sink, &mut stats) {
+                        Ok(Some(read)) => read,
+                        Ok(None) => {
+                            stats.vanished += 1;
+                            continue;
+                        }
+                        Err(Yielded) => {
+                            self.index.files.extend(new_index);
+                            return Ok(None);
+                        }
                     };
                     let mut e = DirEntry::file(name, mode, stat.size, stat.mtime, chunks.clone());
                     e.torn = torn.then_some(true);
@@ -639,12 +694,12 @@ impl<'a> TreeBuilder<'a> {
         stats.chunks = chunks_all.len() as u64;
         self.index.files = new_index;
         let root = root.unwrap_or_else(|| DirObject::default().encode());
-        Ok(BuiltTree {
+        Ok(Some(BuiltTree {
             root,
             dirs,
             chunks: chunks_all,
             stats,
-        })
+        }))
     }
 
     /// Read a SQLite `db` + `-wal` group: `-wal` first, then `db`; re-read both if either changed,
@@ -658,13 +713,18 @@ impl<'a> TreeBuilder<'a> {
         wal: &'s Source,
         sink: &mut dyn ChunkSink,
         stats: &mut BuildStats,
-    ) -> Option<Vec<(String, &'s Source, Vec<ChunkId>, FileStat, bool)>> {
-        let mut last = None;
-        for attempt in 0..READ_ATTEMPTS {
-            let before = (
+    ) -> Result<Option<Vec<(String, &'s Source, Vec<ChunkId>, FileStat, bool)>>, Yielded> {
+        let stat_both = || -> Option<(FileStat, FileStat)> {
+            Some((
                 FileStat::of(&fs::symlink_metadata(&wal.abs).ok()?),
                 FileStat::of(&fs::symlink_metadata(&db.abs).ok()?),
-            );
+            ))
+        };
+        let mut last = None;
+        for attempt in 0..READ_ATTEMPTS {
+            let Some(before) = stat_both() else {
+                return Ok(None);
+            };
             let reuse = self
                 .index
                 .files
@@ -682,17 +742,27 @@ impl<'a> TreeBuilder<'a> {
             let (wal_chunks, db_chunks) = match reuse {
                 Some(r) => r,
                 None => {
-                    let (w, wb) = self.chunk_file(&wal.abs, sink, stats).ok()?;
-                    let (d, db_bytes) = self.chunk_file(&db.abs, sink, stats).ok()?;
+                    if sink.should_yield() {
+                        return Err(Yielded);
+                    }
+                    let Some((w, wb)) =
+                        Self::chunk_or_yield(self.chunk_file(&wal.abs, sink, stats))?
+                    else {
+                        return Ok(None);
+                    };
+                    let Some((d, db_bytes)) =
+                        Self::chunk_or_yield(self.chunk_file(&db.abs, sink, stats))?
+                    else {
+                        return Ok(None);
+                    };
                     stats.files_read += 2;
                     stats.bytes_read += wb + db_bytes;
                     (w, d)
                 }
             };
-            let after = (
-                FileStat::of(&fs::symlink_metadata(&wal.abs).ok()?),
-                FileStat::of(&fs::symlink_metadata(&db.abs).ok()?),
-            );
+            let Some(after) = stat_both() else {
+                return Ok(None);
+            };
             let torn = before != after;
             last = Some(vec![
                 (wal_v.to_owned(), wal, wal_chunks, after.0, torn),
@@ -706,7 +776,7 @@ impl<'a> TreeBuilder<'a> {
         if last.as_ref().is_some_and(|g| g[0].4) {
             stats.torn += 2;
         }
-        last
+        Ok(last)
     }
 }
 
@@ -791,6 +861,7 @@ mod tests {
         let mut sink = MemSink::default();
         let built = TreeBuilder::new(&mut index, &key)
             .build(&l, &mut sink)
+            .unwrap()
             .unwrap();
         let root = DirObject::decode(&built.root.bytes).unwrap();
         assert_eq!(root.entries.len(), 1);
@@ -815,6 +886,7 @@ mod tests {
         let mut sink = MemSink::default();
         let built = TreeBuilder::new(&mut index, &key)
             .build(&l, &mut sink)
+            .unwrap()
             .unwrap();
         assert_eq!(built.stats.files, 4);
         assert_eq!(built.stats.files_read, 3); // db, wal, a.txt (the link is not read)
@@ -840,6 +912,7 @@ mod tests {
         // Second build: nothing re-read.
         let built2 = TreeBuilder::new(&mut index, &key)
             .build(&l, &mut sink)
+            .unwrap()
             .unwrap();
         assert_eq!(built2.stats.files_read, 0);
         assert_eq!(built2.root.sha256, built.root.sha256);
@@ -850,8 +923,67 @@ mod tests {
         l.mount("", r, "", |_, _, _| false, |_, _, _| true);
         let built3 = TreeBuilder::new(&mut index, &key)
             .build(&l, &mut sink)
+            .unwrap()
             .unwrap();
         assert_eq!(built3.stats.files_read, 1);
         assert_ne!(built3.root.sha256, built.root.sha256);
+    }
+
+    /// A sink that asks the build to yield after `after` new chunks.
+    struct YieldSink {
+        inner: MemSink,
+        after: usize,
+    }
+    impl ChunkSink for YieldSink {
+        fn contains(&self, id: &ChunkId) -> bool {
+            self.inner.contains(id)
+        }
+        fn put(&mut self, id: ChunkId, data: &[u8]) -> io::Result<()> {
+            self.inner.put(id, data)
+        }
+        fn should_yield(&self) -> bool {
+            self.inner.0.len() >= self.after
+        }
+    }
+
+    #[test]
+    fn a_yielded_build_resumes_without_rereading() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = dir.path();
+        for i in 0..6 {
+            fs::write(r.join(format!("f{i}.txt")), format!("content {i}")).unwrap();
+        }
+        let mut l = Listing::default();
+        l.mount("", r, "", |_, _, _| false, |_, _, _| true);
+        let mut index = TreeIndex::default();
+        let mut sink = YieldSink {
+            inner: MemSink::default(),
+            after: 3,
+        };
+        let first = TreeBuilder::new(&mut index, &key)
+            .build(&l, &mut sink)
+            .unwrap();
+        assert!(first.is_none(), "the build yields after three chunks");
+        assert_eq!(sink.inner.0.len(), 3, "every chunk read stays in the sink");
+        assert_eq!(
+            index.files.len(),
+            2,
+            "files read whole are kept; the file cut mid-read is re-read on resume"
+        );
+        sink.after = usize::MAX;
+        let done = TreeBuilder::new(&mut index, &key)
+            .build(&l, &mut sink)
+            .unwrap()
+            .unwrap();
+        assert_eq!(done.stats.files, 6);
+        assert_eq!(
+            done.stats.files_read, 4,
+            "the resumed build reads only the rest"
+        );
+        assert_eq!(
+            done.stats.chunks_new, 3,
+            "chunks already in the sink are not put again"
+        );
+        assert_eq!(index.files.len(), 6);
     }
 }

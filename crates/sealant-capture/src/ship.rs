@@ -93,6 +93,10 @@ pub struct Staging {
     dir: PathBuf,
     epoch: u64,
     in_flight: Mutex<Option<u64>>,
+    /// Held by the engine from `coalescible` to `replace` / `enqueue`, and by the shipper while
+    /// it claims an entry: a pending `auto` capture is never coalesced away under a shipper that
+    /// has started on it, and never claimed once replaced.
+    coalesce: Mutex<()>,
 }
 
 impl Staging {
@@ -107,6 +111,7 @@ impl Staging {
             dir: dir.to_path_buf(),
             epoch,
             in_flight: Mutex::new(None),
+            coalesce: Mutex::new(()),
         })
     }
 
@@ -192,8 +197,53 @@ impl Staging {
         Ok(entries)
     }
 
+    /// Hold while deciding to coalesce and until the replacement is enqueued
+    /// ([`Staging::coalescible`] → [`Staging::replace`]); the shipper waits on it to claim.
+    pub fn coalesce_guard(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.coalesce
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn read_entry(&self, n: u64) -> Option<QueueEntry> {
+        fs::read(self.queue_path(n))
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+    }
+
+    /// Claim `entry` for shipping: mark it in flight if it is still queued unchanged. `false`
+    /// when it was coalesced away (or acked) meanwhile; the caller re-reads the queue.
+    #[must_use]
+    pub fn claim(&self, entry: &QueueEntry) -> bool {
+        let _g = self.coalesce_guard();
+        let current = self.read_entry(entry.n);
+        let mut in_flight = self
+            .in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match current {
+            Some(e) if e.capture_id == entry.capture_id => {
+                *in_flight = Some(entry.n);
+                true
+            }
+            _ => {
+                *in_flight = None;
+                false
+            }
+        }
+    }
+
+    /// The shipper is done with the claimed entry (shipped or failed).
+    pub fn release(&self) {
+        *self
+            .in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+
     /// The newest pending entry if it is an `auto` capture not yet being shipped: the one a new
-    /// `auto` snap may coalesce with (taking its `n` and parent).
+    /// `auto` snap may coalesce with (taking its `n` and parent). Call under
+    /// [`Staging::coalesce_guard`] and keep the guard until the replacement is enqueued.
     pub fn coalescible(&self) -> io::Result<Option<QueueEntry>> {
         let pending = self.pending()?;
         let Some(last) = pending.last() else {
@@ -560,22 +610,18 @@ impl Shipper {
         let mut shipped = 0;
         let mut cycle = DutyCycle::new(self.cpu_fraction);
         for entry in self.staging.pending()? {
-            *self
-                .staging
-                .in_flight
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(entry.n);
+            if !self.staging.claim(&entry) {
+                // Coalesced away since the queue was read: the replacement sits at the same
+                // `n`; the next pass ships it (never skip ahead — the chain is ordered).
+                break;
+            }
             let result = (|| {
                 for u in &entry.uploads {
                     self.upload_one(u, &mut cycle)?;
                 }
                 self.register_one(&entry)
             })();
-            *self
-                .staging
-                .in_flight
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            self.staging.release();
             match result {
                 Ok(()) => {
                     self.staging.ack(&entry)?;
@@ -686,6 +732,69 @@ impl Drop for ShipWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn entry(n: u64, id: &str) -> QueueEntry {
+        QueueEntry {
+            n,
+            capture_id: id.to_owned(),
+            kind: CaptureKind::Auto,
+            uploads: Vec::new(),
+            register: crate::registrar::RegisterRequest {
+                worktree_id: "wt".into(),
+                epoch: 1,
+                n,
+                parent: None,
+                capture_id: id.to_owned(),
+                manifest_key: String::new(),
+                manifest: crate::manifest::Manifest {
+                    worktree_id: "wt".into(),
+                    n,
+                    parent: None,
+                    epoch: 1,
+                    seq: 0,
+                    kind: CaptureKind::Auto,
+                    created_at: String::new(),
+                    sections: crate::manifest::Sections {
+                        git: crate::manifest::GitSection {
+                            packs: Vec::new(),
+                            refs: std::collections::BTreeMap::new(),
+                            head: "HEAD".into(),
+                            fsck: crate::manifest::FsckStatus::Unverified,
+                        },
+                        workspace: crate::manifest::WorkspaceSection {
+                            root: String::new(),
+                            packs: Vec::new(),
+                        },
+                        bulk: crate::manifest::BulkState::pending(),
+                    },
+                    checkpoint: None,
+                },
+            },
+        }
+    }
+
+    /// A claimed entry is not coalescible; a replaced entry cannot be claimed.
+    #[test]
+    fn claim_and_coalesce_exclude_each_other() {
+        let dir = tempfile::tempdir().unwrap();
+        let staging = Staging::open(dir.path(), 1).unwrap();
+        let first = entry(0, "a");
+        staging.enqueue(&first).unwrap();
+        assert_eq!(
+            staging.coalescible().unwrap().map(|e| e.capture_id),
+            Some("a".into())
+        );
+        assert!(staging.claim(&first));
+        assert!(staging.coalescible().unwrap().is_none(), "in flight");
+        staging.release();
+        let second = entry(0, "b");
+        staging.replace(&first, &second).unwrap();
+        assert!(!staging.claim(&first), "replaced entries are never shipped");
+        assert!(staging.claim(&second));
+        staging.release();
+        staging.ack(&second).unwrap();
+        assert!(staging.pending().unwrap().is_empty());
+    }
 
     #[test]
     fn duty_cycle_sleeps_when_over_budget() {

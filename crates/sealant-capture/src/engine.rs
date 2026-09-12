@@ -1,6 +1,6 @@
 //! `CaptureEngine`: index the roots, snap, pack, write the manifest, stage.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -27,6 +27,7 @@ use crate::registrar::RegisterRequest;
 use crate::registrar::Registrar;
 use crate::ship::{DutyCycle, QueueEntry, ShipError, Shipper, Staging, Upload};
 use crate::sink::BlobSink;
+use crate::watch::WatchPolicy;
 
 /// Snap cadence (ADR-0015 *Cadence and budgets*).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,8 +36,11 @@ pub struct Cadence {
     pub quiet: Duration,
     /// Longest interval between small-class snaps while the tree stays dirty.
     pub max_interval: Duration,
-    /// Bulk-class interval.
-    pub bulk_interval: Duration,
+    /// Quiet period after a bulk change before a bulk-class snap.
+    pub bulk_quiet: Duration,
+    /// Longest interval between bulk-class snaps while the bulk tree stays dirty (and the
+    /// polling interval when bulk is not watched).
+    pub bulk_max_interval: Duration,
     /// Lease heartbeat interval.
     pub heartbeat: Duration,
     /// Lease TTL: pause the agent once this elapses without a successful heartbeat.
@@ -48,7 +52,8 @@ impl Default for Cadence {
         Self {
             quiet: Duration::from_secs(2),
             max_interval: Duration::from_secs(10),
-            bulk_interval: Duration::from_secs(120),
+            bulk_quiet: Duration::from_secs(30),
+            bulk_max_interval: Duration::from_secs(120),
             heartbeat: Duration::from_secs(10),
             lease_ttl: Duration::from_secs(30),
         }
@@ -85,6 +90,8 @@ pub struct CaptureConfig {
     pub capture_bulk: bool,
     /// Cadence.
     pub cadence: Cadence,
+    /// How the cadence learns about changes.
+    pub watch: WatchPolicy,
     /// CPU budget for snapping and shipping, as a fraction of one core.
     pub cpu_fraction: f64,
     /// `<os>-<arch>-<libc>` stamped on bulk captures.
@@ -109,6 +116,7 @@ impl CaptureConfig {
                 .collect(),
             capture_bulk: true,
             cadence: Cadence::default(),
+            watch: WatchPolicy::default(),
             cpu_fraction: crate::ship::DEFAULT_CPU_FRACTION,
             platform: default_platform(),
             pack_cap: MAX_PACK_BYTES,
@@ -233,16 +241,19 @@ struct ChunkMap {
     packs: HashMap<ChunkId, String>,
 }
 
-/// Chunk sink over a pack builder plus the known-chunk map.
+/// Chunk sink over a pack builder plus the known-chunk map (and, for a resumed bulk build, the
+/// packs a yielded attempt already wrote).
 struct PackSink<'a> {
     builder: PackBuilder,
     known: &'a HashMap<ChunkId, String>,
+    carried: &'a HashMap<ChunkId, String>,
     cycle: DutyCycle,
+    preempt: Option<&'a (dyn Fn() -> bool + 'a)>,
 }
 
 impl ChunkSink for PackSink<'_> {
     fn contains(&self, id: &ChunkId) -> bool {
-        self.known.contains_key(id) || self.builder.contains(id)
+        self.known.contains_key(id) || self.carried.contains_key(id) || self.builder.contains(id)
     }
 
     fn put(&mut self, id: ChunkId, data: &[u8]) -> io::Result<()> {
@@ -250,6 +261,30 @@ impl ChunkSink for PackSink<'_> {
         self.cycle.pace();
         Ok(())
     }
+
+    fn should_yield(&self) -> bool {
+        self.preempt.is_some_and(|p| p())
+    }
+}
+
+/// A class build's working set: the index it updates and the packs it finished. For a bulk
+/// build this outlives yields (`bulk_work`), holding the packs the yielded attempts wrote. Nothing here is persisted until the capture is staged, so a crash
+/// mid-build leaves only unreferenced pack files in staging, never a chunk map pointing at a
+/// pack that was not shipped.
+#[derive(Debug, Default)]
+struct ClassWork {
+    index: TreeIndex,
+    packs: Vec<Upload>,
+    chunks: HashMap<ChunkId, String>,
+}
+
+/// The outcome of a preemptible snap.
+#[derive(Debug, Clone)]
+pub enum SnapOutcome {
+    /// Staged (or unchanged).
+    Staged(Box<StagedCapture>),
+    /// A bulk build stopped at a chunk boundary because `preempt` asked; call again to resume.
+    Preempted,
 }
 
 /// The engine.
@@ -260,6 +295,7 @@ pub struct CaptureEngine {
     previous: Option<EncodedManifest>,
     workspace_index: TreeIndex,
     bulk_index: TreeIndex,
+    bulk_work: Option<ClassWork>,
     chunks: ChunkMap,
     /// Every tip the last git pack covered (refs, reflog entries, index and worktree trees):
     /// the negatives of the next pack. The manifest only carries refs, so reflog-only history
@@ -318,6 +354,7 @@ impl CaptureEngine {
             previous,
             workspace_index,
             bulk_index,
+            bulk_work: None,
             chunks,
             last_tips,
         })
@@ -483,35 +520,62 @@ impl CaptureEngine {
         listing
     }
 
-    /// Build a chunked class into new packs; returns the root key, the pack keys the tree needs,
-    /// the new dir objects and stats.
+    /// Build a chunked class into new packs; returns the root key and the pack keys the tree
+    /// needs, or `None` when a bulk build yielded to `preempt` (its progress is kept in
+    /// `bulk_work`; the next bulk build resumes it).
     fn build_class(
         &mut self,
         listing: &Listing,
         class: Class,
         uploads: &mut Vec<Upload>,
         stats: &mut SnapStats,
-    ) -> Result<(String, Vec<String>), EngineError> {
+        preempt: &dyn Fn() -> bool,
+    ) -> Result<Option<(String, Vec<String>)>, EngineError> {
         let objects = self.staging.objects_dir();
         let prefix = self.prefix.clone();
         let key_for_dir = move |sha: &str| prefix.tree(sha);
+        let mut work = match class {
+            Class::Small => ClassWork {
+                index: std::mem::take(&mut self.workspace_index),
+                ..ClassWork::default()
+            },
+            Class::Bulk => self.bulk_work.take().unwrap_or_else(|| ClassWork {
+                index: self.bulk_index.clone(),
+                ..ClassWork::default()
+            }),
+        };
         let mut sink = PackSink {
             builder: PackBuilder::new(&objects, self.config.pack_cap),
             known: &self.chunks.packs,
+            carried: &work.chunks,
             cycle: DutyCycle::new(self.config.cpu_fraction),
+            preempt: (class == Class::Bulk).then_some(preempt),
         };
-        let index = match class {
-            Class::Small => &mut self.workspace_index,
-            Class::Bulk => &mut self.bulk_index,
+        let built = TreeBuilder::new(&mut work.index, &key_for_dir).build(listing, &mut sink);
+        let (built, packs) = match built {
+            Ok(built) => (built, sink.builder.finish()),
+            Err(e) => {
+                if class == Class::Small {
+                    self.workspace_index = work.index;
+                }
+                return Err(e.into());
+            }
         };
-        let built = TreeBuilder::new(index, &key_for_dir).build(listing, &mut sink)?;
-        let packs = sink.builder.finish()?;
+        let packs = match packs {
+            Ok(packs) => packs,
+            Err(e) => {
+                if class == Class::Small {
+                    self.workspace_index = work.index;
+                }
+                return Err(e.into());
+            }
+        };
         for p in &packs {
             let key = self.prefix.pack(&p.sha256);
             for e in &p.entries {
-                self.chunks.packs.insert(e.hash, key.clone());
+                work.chunks.insert(e.hash, key.clone());
             }
-            uploads.push(Upload {
+            work.packs.push(Upload {
                 key,
                 file: p.sha256.clone(),
                 bytes: p.bytes,
@@ -519,6 +583,23 @@ impl CaptureEngine {
             stats.cdc_packs += 1;
             stats.cdc_pack_bytes += p.bytes;
         }
+        let Some(built) = built else {
+            if class == Class::Small {
+                // Never asked to yield; keep the index whole if it ever does.
+                self.workspace_index = work.index;
+                return Err(io::Error::other("small-class build yielded").into());
+            }
+            // Yielded: keep the progress for the next attempt; nothing is committed.
+            self.bulk_work = Some(work);
+            return Ok(None);
+        };
+        // Commit: the index, the chunk map and the pack uploads.
+        match class {
+            Class::Small => self.workspace_index = work.index,
+            Class::Bulk => self.bulk_index = work.index,
+        }
+        self.chunks.packs.extend(work.chunks);
+        uploads.extend(work.packs);
         let mut needed: BTreeSet<String> = BTreeSet::new();
         for c in &built.chunks {
             if let Some(k) = self.chunks.packs.get(c) {
@@ -557,14 +638,36 @@ impl CaptureEngine {
         stats.chunks += chunks;
         stats.chunks_new += chunks_new;
         stats.torn += torn;
-        Ok((
+        Ok(Some((
             self.prefix.tree(&built.root.sha256),
             needed.into_iter().collect(),
-        ))
+        )))
     }
 
     /// Take a snap and stage it.
     pub fn snap(&mut self, req: SnapRequest) -> Result<StagedCapture, EngineError> {
+        match self.snap_preemptible(req, &|| false)? {
+            SnapOutcome::Staged(staged) => Ok(*staged),
+            SnapOutcome::Preempted => {
+                Err(io::Error::other("snap preempted without a preempt hook").into())
+            }
+        }
+    }
+
+    /// Whether a bulk build is paused mid-way (it yielded to a small-class snap).
+    #[must_use]
+    pub fn bulk_in_progress(&self) -> bool {
+        self.bulk_work.is_some()
+    }
+
+    /// Take a snap and stage it; a bulk build stops at the next chunk boundary whenever
+    /// `preempt` returns `true` and reports [`SnapOutcome::Preempted`], keeping what it read so
+    /// far for the next call. Small-class snaps are never preempted.
+    pub fn snap_preemptible(
+        &mut self,
+        req: SnapRequest,
+        preempt: &dyn Fn() -> bool,
+    ) -> Result<SnapOutcome, EngineError> {
         if req.class == Class::Bulk && self.previous.is_none() {
             // A bulk capture copies the small sections from its predecessor; make one first.
             self.snap(SnapRequest {
@@ -614,8 +717,11 @@ impl CaptureEngine {
                     git_packs.push(key);
                 }
                 let listing = self.workspace_listing(&repo, &git.closure.gitlinks)?;
-                let (root, packs) =
-                    self.build_class(&listing, Class::Small, &mut uploads, &mut stats)?;
+                let Some((root, packs)) =
+                    self.build_class(&listing, Class::Small, &mut uploads, &mut stats, preempt)?
+                else {
+                    return Err(io::Error::other("small-class build yielded").into());
+                };
                 Sections {
                     git: GitSection {
                         packs: git_packs,
@@ -632,8 +738,16 @@ impl CaptureEngine {
             }
             Class::Bulk => {
                 let listing = self.bulk_listing();
-                let (root, packs) =
-                    self.build_class(&listing, Class::Bulk, &mut uploads, &mut stats)?;
+                let Some((root, packs)) =
+                    self.build_class(&listing, Class::Bulk, &mut uploads, &mut stats, preempt)?
+                else {
+                    tracing::debug!(
+                        files_read = stats.files_read,
+                        cdc_packs = stats.cdc_packs,
+                        "bulk build yielded to a small-class snap"
+                    );
+                    return Ok(SnapOutcome::Preempted);
+                };
                 let prev = self
                     .previous
                     .as_ref()
@@ -656,11 +770,15 @@ impl CaptureEngine {
             && let Some(prev) = &self.previous
             && prev.manifest.sections == sections
         {
+            let dropped: HashSet<&String> = uploads.iter().map(|u| &u.key).collect();
+            // A pack that is not staged must not be the location of any chunk (a torn read can
+            // leave chunks the final tree does not reference in a pack no capture lists).
+            self.chunks.packs.retain(|_, k| !dropped.contains(k));
             for u in &uploads {
                 fs::remove_file(objects.join(&u.file)).ok();
             }
             stats.elapsed_ms = start.elapsed().as_millis() as u64;
-            return Ok(StagedCapture {
+            return Ok(SnapOutcome::Staged(Box::new(StagedCapture {
                 n: prev.manifest.n,
                 manifest: prev.clone(),
                 manifest_key: self.prefix.manifest(&prev.capture_id),
@@ -668,10 +786,13 @@ impl CaptureEngine {
                 class: req.class,
                 stats,
                 unchanged: true,
-            });
+            })));
         }
 
-        // Chain position: coalesce with a pending, not-yet-shipping auto capture.
+        // Chain position: coalesce with a pending, not-yet-shipping auto capture. The guard keeps
+        // the shipper from claiming that capture until its replacement is in the queue.
+        let staging = Arc::clone(&self.staging);
+        let coalesce_guard = staging.coalesce_guard();
         let coalesce = if req.kind == CaptureKind::Auto {
             self.staging.coalescible()?
         } else {
@@ -740,6 +861,7 @@ impl CaptureEngine {
             Some(old) => self.staging.replace(old, &entry)?,
             None => self.staging.enqueue(&entry)?,
         }
+        drop(coalesce_guard);
         self.previous = Some(manifest.clone());
         self.persist()?;
         stats.elapsed_ms = start.elapsed().as_millis() as u64;
@@ -753,7 +875,7 @@ impl CaptureEngine {
             chunks_new = stats.chunks_new,
             "capture staged"
         );
-        Ok(StagedCapture {
+        Ok(SnapOutcome::Staged(Box::new(StagedCapture {
             n,
             manifest,
             manifest_key,
@@ -761,7 +883,7 @@ impl CaptureEngine {
             class: req.class,
             stats,
             unchanged: false,
-        })
+        })))
     }
 
     /// Final small-class snap, then ship everything pending, bounded by `deadline`.
