@@ -151,8 +151,12 @@ impl GitRepo {
         }
     }
 
-    /// Every sha a reflog entry points at.
+    /// Every sha a reflog entry points at; empty when the repository has no reflog at all (a
+    /// freshly materialized one), where `git rev-list --reflog` exits with its usage text.
     pub fn reflog_tips(&self) -> Result<Vec<String>, GitError> {
+        if !self.git_dir.join("logs").exists() {
+            return Ok(Vec::new());
+        }
         let out = self.run(&["rev-list", "--no-walk=unsorted", "--reflog"])?;
         Ok(stdout_string(&out).lines().map(str::to_owned).collect())
     }
@@ -622,6 +626,18 @@ mod tests {
         repo.run(&["add", "a"]).unwrap();
         repo.run(&["commit", "-q", "-m", "one"]).unwrap();
         (dir, repo)
+    }
+
+    /// A repository with no reflog (nothing ever updated a ref through git) has no tips, and
+    /// asking is not an error.
+    #[test]
+    fn reflog_tips_of_a_repo_without_a_reflog_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = GitRepo::init(&dir.path().join("r")).unwrap();
+        assert!(!repo.git_dir.join("logs").exists());
+        assert!(repo.reflog_tips().unwrap().is_empty());
+        let (_dir, committed) = fixture();
+        assert_eq!(committed.reflog_tips().unwrap().len(), 1);
     }
 
     #[test]

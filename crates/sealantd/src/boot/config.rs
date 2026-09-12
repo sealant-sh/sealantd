@@ -1022,7 +1022,9 @@ fn passthrough_env(env: &dyn EnvSource) -> Vec<(String, String)> {
 const MAX_SECRET_ENV_ENTRIES: usize = 256;
 
 /// Whether `name` is a well-formed, non-platform environment variable name: `[A-Za-z_][A-Za-z0-9_]*`,
-/// at most 128 bytes, and not in the daemon's own `SEALANT_` namespace.
+/// at most 128 bytes, and not in the daemon's own `SEALANT_` namespace — except the capture
+/// token, which the launcher seals into this very file under the daemon's own name
+/// (`SEALANT_CAPTURE_TOKEN`) and which is stripped from the harness environment before launch.
 fn is_acceptable_secret_env_name(name: &str) -> bool {
     let mut chars = name.chars();
     let Some(first) = chars.next() else {
@@ -1033,7 +1035,7 @@ fn is_acceptable_secret_env_name(name: &str) -> bool {
     }
     name.len() <= 128
         && chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
-        && !name.to_ascii_uppercase().starts_with("SEALANT_")
+        && (name == super::capture::TOKEN_KEY || !name.to_ascii_uppercase().starts_with("SEALANT_"))
 }
 
 /// Read the launcher-provided secret environment: a JSON object mapping variable names to string
@@ -1742,6 +1744,28 @@ mod tests {
         let nul = secret_file("{\"HAS_NUL\":\"a\\u0000b\"}");
         let err = load_secret_env(nul.path()).expect_err("NUL value");
         assert!(err.to_string().contains("HAS_NUL"), "{err}");
+    }
+
+    /// The capture token is the one `SEALANT_` name the secret file may carry.
+    #[test]
+    fn load_secret_env_accepts_the_capture_token_and_no_other_platform_name() {
+        let file = secret_file(r#"{"SEALANT_CAPTURE_TOKEN":"tok","OTHER":"x"}"#);
+        let entries = load_secret_env(file.path()).expect("capture token is acceptable");
+        assert_eq!(
+            entries,
+            vec![
+                ("OTHER".to_owned(), "x".to_owned()),
+                ("SEALANT_CAPTURE_TOKEN".to_owned(), "tok".to_owned()),
+            ]
+        );
+        for bad_name in [
+            "SEALANT_CAPTURE_ENDPOINT",
+            "sealant_capture_token",
+            "SEALANT_X",
+        ] {
+            let file = secret_file(&format!(r#"{{"{bad_name}":"v"}}"#));
+            assert!(load_secret_env(file.path()).is_err(), "{bad_name}");
+        }
     }
 
     #[test]
