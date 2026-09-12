@@ -44,7 +44,7 @@ jobs:
         with:
           persist-credentials: false
       - run: corepack enable
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
       # --ignore-scripts: never run dependency lifecycle scripts (untrusted on fork PRs).
