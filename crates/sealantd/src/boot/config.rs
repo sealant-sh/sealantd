@@ -39,6 +39,7 @@ const CONSUMED_KEYS: &[&str] = &[
     "SEALANT_CAPTURE_ENDPOINT",
     "SEALANT_CAPTURE_WORKTREE_ID",
     "SEALANT_CAPTURE_HARNESS_HOME",
+    "SEALANT_CAPTURE_INOTIFY_RAISE",
     "SEALANT_WORKSPACE_MOUNT_HOST_PATH",
     "SEALANT_MOUNT_ALLOWED_STORE_ROOTS",
     "SEALANT_WORKSPACE_REPO_URL",
@@ -203,6 +204,9 @@ pub struct CaptureSourceConfig {
     pub worktree_id: Option<String>,
     /// `SEALANT_CAPTURE_HARNESS_HOME`: the harness home captured with the workspace class.
     pub harness_home: Option<PathBuf>,
+    /// `SEALANT_CAPTURE_INOTIFY_RAISE`: try to raise `fs.inotify.max_user_watches` when the
+    /// watch budget does not fit (never fails boot; a refusal is logged and the class polls).
+    pub raise_inotify_limit: bool,
 }
 
 /// How the workspace working directory is provisioned.
@@ -704,6 +708,9 @@ impl BootConfig {
                         .get("SEALANT_CAPTURE_HARNESS_HOME")
                         .filter(|s| !s.trim().is_empty())
                         .map(PathBuf::from),
+                    raise_inotify_limit: env
+                        .get("SEALANT_CAPTURE_INOTIFY_RAISE")
+                        .is_some_and(|v| matches!(v.trim(), "1" | "true" | "yes")),
                 }))
             }
             Some(other) => Err(BootError::config(format!(

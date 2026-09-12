@@ -87,6 +87,7 @@ pub fn materialize(
 
     let mut config = CaptureConfig::new(&worktree_id, epoch, working_directory);
     config.harness_home = source.harness_home.clone();
+    config.watch.raise_limit = source.raise_inotify_limit;
 
     let previous = match &plan.head {
         Some(head) => {

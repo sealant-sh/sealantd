@@ -9,6 +9,7 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 #![forbid(unsafe_code)]
 
+pub mod cadence;
 pub mod chunk;
 pub mod engine;
 pub mod gitpack;
@@ -23,8 +24,9 @@ pub mod sink;
 pub mod tree;
 pub mod watch;
 
+pub use cadence::{CadenceRunner, CadenceSnapshot};
 pub use engine::{
-    Cadence, CaptureConfig, CaptureEngine, Class, EngineError, SnapRequest, SnapStats,
+    Cadence, CaptureConfig, CaptureEngine, Class, EngineError, SnapOutcome, SnapRequest, SnapStats,
     StagedCapture,
 };
 pub use manifest::{CaptureKind, EncodedManifest, FsckStatus, Manifest};
