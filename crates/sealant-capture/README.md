@@ -26,3 +26,63 @@ a class dirty on every create/modify/remove. Small class: `quiet` (2 s) after th
 (`CadenceRunner::snap`, `flush`) preempt a bulk build. Directories are counted before watching;
 over budget (half the sysctl, or `WatchPolicy::budget`) the class polls; `raise_limit` tries the
 sysctl first and never fails boot. `tests/cadence.rs` measures all of it against the real watcher.
+
+## Wire additions (multipart uploads)
+
+Measured (R1, 2026-09): one presigned PUT from a Cloudflare sandbox to R2 runs at 37–47 MB/s,
+four multipart parts in flight at 63.6 MB/s; AWS single-stream is ≈ 100 MB/s per flow. So the
+shipper uploads objects at or above `MultipartConfig::threshold` (default 16 MiB; parts 16 MiB,
+4 in flight) as S3-style multipart uploads, and the executor still never holds bucket
+credentials: the registrar performs `CreateMultipartUpload` and `CompleteMultipartUpload`
+server-side, the executor only PUTs parts to presigned part URLs and reports their ETags. Two
+additions to the session channel, both additive (a registrar that ignores `sizes` and answers
+`urls` alone gets single PUTs, as today):
+
+`upload.urls` — request gains `sizes` (key → bytes) for the keys the executor would upload as
+multipart; response gains `multipart` (key → upload) for the keys the registrar takes that way.
+The object is cut into `part_size`-byte parts (the last shorter); part *i* (1-based) is PUT to
+`part_urls[i-1]` with `Content-Length` and no conditional header; `urls` omits a multipart key.
+
+```json
+→ {"worktree_id":"wt","epoch":3,"keys":["captures/wt/3/packs/<sha>"],
+   "sizes":{"captures/wt/3/packs/<sha>":150000000}}
+← {"urls":{},
+   "multipart":{"captures/wt/3/packs/<sha>":{"upload_id":"<store upload id>",
+                "part_size":16777216,
+                "part_urls":["https://…?partNumber=1&uploadId=…","https://…?partNumber=2&…"]}}}
+```
+
+`upload.complete` — new call. The registrar runs the store's complete with `If-None-Match: *`
+(R2 enforces it on `CompleteMultipartUpload` and `CreateMultipartUpload`; S3 on complete) and
+answers 409 `{"reason":"exists"}` when the key already holds an object; the executor treats that
+as an identical object already present, keys being content-addressed. `size` in the response is
+optional; when present the executor checks it against the file it uploaded.
+
+```json
+→ {"worktree_id":"wt","epoch":3,"key":"captures/wt/3/packs/<sha>","upload_id":"…",
+   "parts":[{"part_number":1,"etag":"\"9b2c…\""},{"part_number":2,"etag":"\"…\""}]}
+← 200 {"size":150000000}          |   409 {"reason":"exists","key":"captures/wt/3/packs/<sha>"}
+```
+
+Rules the registrar (Mend) implements: part URLs are minted only while the lease predicate
+holds, like PUT URLs, and each counts against the URL quota; `part_size` is the registrar's
+choice (≥ 5 MiB, equal for every part but the last — R2 requires it; ≤ 10,000 parts); ETags go
+back to the store verbatim (quotes included); a key must be under the caller's epoch prefix;
+`upload.complete` carries the usual 409s (`stale-epoch`, `lease-lost`) as well. An abandoned
+upload (executor died, or the object was retried under a fresh `upload_id` after a part failed
+past its retries) is expired by a bucket lifecycle rule for incomplete multipart uploads; there
+is no `upload.abort` in v1.
+
+Executor side: `BlobSink::put_multipart` (`sink.rs`) — per-part retry with backoff, parts in
+flight from scoped threads whose CPU is charged to the shipper's duty cycle (network waits are
+not), one complete with retry on transport loss, size check from the registrar's `size` or a
+ranged GET where a GET URL exists. `LocalDir` writes the parts concatenated. `InMemoryRegistrar`
+implements Create/Complete with a pluggable completer for tests (`tests/ship_multipart.rs`).
+
+## Deviations from ADR-0015 pending amendment
+
+- §"Capture format", CDC packs: "≤ 64 MiB, one PUT, never multipart" → packs stay ≤ 64 MiB but
+  are uploaded as multipart at or above the shipper's threshold (default 16 MiB); git packs may
+  exceed 64 MiB and are always multipart above it. The pack container is unchanged.
+- §"Executor credentials": an executor also holds presigned per-part `UploadPart` URLs for its
+  own keys, same scope and TTL as PUT URLs; Create and Complete stay with the registrar.
