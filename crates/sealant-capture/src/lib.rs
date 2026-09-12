@@ -11,6 +11,7 @@
 
 pub mod cadence;
 pub mod chunk;
+mod cpu;
 pub mod engine;
 pub mod gitpack;
 pub mod index;
