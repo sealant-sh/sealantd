@@ -197,8 +197,9 @@ impl Listing {
     }
 
     /// Mount `abs_dir` at `virtual_prefix`, walking it fully. `prune` decides per directory
-    /// (virtual path, name) whether to descend; `include` decides per non-directory entry
-    /// (virtual path, name) whether to keep it. Exclusions from [`is_excluded_name`], uncapturable
+    /// (absolute path, virtual path, name) whether to descend; `include` decides per entry
+    /// whether to keep it — a directory that is not included is still added lazily as the
+    /// ancestor of an included descendant. Exclusions from [`is_excluded_name`], uncapturable
     /// types and `.pack` files without their `.idx` are applied here. Entries already present are
     /// not overwritten (the first mount wins, so overlays are expressed by mount order).
     pub fn mount<P, I>(
@@ -208,8 +209,8 @@ impl Listing {
         mut prune: P,
         mut include: I,
     ) where
-        P: FnMut(&str, &str) -> bool,
-        I: FnMut(&str, &str) -> bool,
+        P: FnMut(&Path, &str, &str) -> bool,
+        I: FnMut(&Path, &str, &str) -> bool,
     {
         let Ok(root_meta) = fs::symlink_metadata(abs_dir) else {
             return;
@@ -232,7 +233,7 @@ impl Listing {
                 let rel = e.path().strip_prefix(abs_dir).unwrap_or(e.path());
                 let v = join_virtual(virtual_prefix, &rel.to_string_lossy());
                 if e.file_type().is_dir() {
-                    !prune(&v, &name)
+                    !prune(e.path(), &v, &name)
                 } else {
                     true
                 }
@@ -272,7 +273,7 @@ impl Listing {
                 }
             }
             let v = join_virtual(virtual_prefix, &rel.to_string_lossy());
-            if !meta.is_dir() && !include(&v, &name) {
+            if !include(path, &v, &name) {
                 continue;
             }
             if self.entries.contains_key(&v) {
@@ -722,7 +723,7 @@ mod tests {
         fs::write(r.join("objects/pack/pack-b.idx"), b"i").unwrap();
         fs::write(r.join("keep.txt"), b"k").unwrap();
         let mut l = Listing::default();
-        l.mount("", r, |_, _| false, |_, _| true);
+        l.mount("", r, |_, _, _| false, |_, _, _| true);
         let keys: Vec<&String> = l.entries.keys().collect();
         assert!(
             !keys
@@ -754,7 +755,7 @@ mod tests {
         fs::hard_link(r.join("a.txt"), r.join("sub/a-link.txt")).unwrap();
         std::os::unix::fs::symlink("a.txt", r.join("l")).unwrap();
         let mut l = Listing::default();
-        l.mount("", r, |_, _| false, |_, _| true);
+        l.mount("", r, |_, _, _| false, |_, _, _| true);
 
         let mut index = TreeIndex::default();
         let mut sink = MemSink::default();
@@ -792,7 +793,7 @@ mod tests {
         // Touch a file: only it is re-read, and the tree changes.
         fs::write(r.join("a.txt"), b"alpha2").unwrap();
         let mut l = Listing::default();
-        l.mount("", r, |_, _| false, |_, _| true);
+        l.mount("", r, |_, _, _| false, |_, _, _| true);
         let built3 = TreeBuilder::new(&mut index, &key)
             .build(&l, &mut sink)
             .unwrap();
