@@ -320,6 +320,23 @@ fn is_pack_file(name: &str) -> bool {
     stem.len() == 64 && stem.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
+/// Worktree-relative paths the git section never indexes: the daemon directory and the staging
+/// directory when it lies elsewhere under the root.
+fn daemon_excludes(config: &CaptureConfig) -> Vec<String> {
+    let mut excludes = vec![DAEMON_DIR.to_owned()];
+    if let Ok(rel) = config.staging_dir().strip_prefix(&config.root) {
+        let rel = rel.to_string_lossy().trim_matches('/').to_owned();
+        if !rel.is_empty()
+            && !excludes
+                .iter()
+                .any(|e| rel == *e || rel.starts_with(&format!("{e}/")))
+        {
+            excludes.push(rel);
+        }
+    }
+    excludes
+}
+
 impl CaptureEngine {
     /// Open the engine. `previous` is the chain head this executor continues from (the plan's
     /// head after materialize), or `None` for an empty chain.
@@ -328,6 +345,16 @@ impl CaptureEngine {
         previous: Option<EncodedManifest>,
     ) -> Result<Self, EngineError> {
         let staging = Arc::new(Staging::open(&config.staging_dir(), config.epoch)?);
+        // Staging sits inside the worktree: keep it out of the user's index (an agent's or a
+        // checkpoint's `git add -A`) through the repository's local excludes, never the user's
+        // `.gitignore`. A root that is not a repository yet gets the entry when materialized.
+        if let Ok(repo) = GitRepo::open(&config.root) {
+            for e in daemon_excludes(&config) {
+                if let Err(error) = repo.exclude_locally(&format!("/{e}/")) {
+                    tracing::warn!(%error, exclude = %e, "could not add the local git exclude");
+                }
+            }
+        }
         let index_dir = staging.index_dir();
         let workspace_index = TreeIndex::load(&index_dir.join("workspace.json"));
         let bulk_index = TreeIndex::load(&index_dir.join("bulk.json"));
@@ -376,11 +403,7 @@ impl CaptureEngine {
     }
 
     fn daemon_excludes(&self) -> Vec<String> {
-        let mut excludes = vec![DAEMON_DIR.to_owned()];
-        if let Ok(rel) = self.config.staging_dir().strip_prefix(&self.config.root) {
-            excludes.push(rel.to_string_lossy().to_string());
-        }
-        excludes
+        daemon_excludes(&self.config)
     }
 
     /// Configuration.

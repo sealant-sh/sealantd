@@ -104,6 +104,41 @@ impl GitRepo {
         Self::open(root)
     }
 
+    /// Add `pattern` to the repository's local excludes (`info/exclude` in the common dir) unless
+    /// it is there already. The user's `.gitignore` is never touched.
+    pub fn exclude_locally(&self, pattern: &str) -> Result<(), GitError> {
+        let info = self.common_dir.join("info");
+        fs::create_dir_all(&info)?;
+        let path = info.join("exclude");
+        let mut text = fs::read_to_string(&path).unwrap_or_default();
+        if text.lines().any(|l| l.trim() == pattern) {
+            return Ok(());
+        }
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str(pattern);
+        text.push('\n');
+        let tmp = info.join("exclude.capture-tmp");
+        fs::write(&tmp, text)?;
+        fs::rename(tmp, path)?;
+        Ok(())
+    }
+
+    /// Whether `path` (worktree-relative) is ignored by the repository's ignore rules.
+    pub fn is_ignored(&self, path: &str) -> Result<bool, GitError> {
+        let args = ["check-ignore", "-q", "--", path];
+        let out = git_command(&self.root).args(args).output()?;
+        match out.status.code() {
+            Some(0) => Ok(true),
+            Some(1) => Ok(false),
+            _ => Err(GitError::Command {
+                args: args.join(" "),
+                stderr: String::from_utf8_lossy(&out.stderr).trim().to_owned(),
+            }),
+        }
+    }
+
     /// Run a git command in the working tree and return its output on success.
     pub fn run(&self, args: &[&str]) -> Result<Output, GitError> {
         check(args, git_command(&self.root).args(args).output()?)
@@ -211,11 +246,15 @@ impl GitRepo {
             .iter()
             .map(|s| (*s).to_owned())
             .collect();
-        add.extend(
-            excludes
-                .iter()
-                .map(|e| format!(":(exclude){}", e.trim_matches('/'))),
-        );
+        // An exclude git already ignores (the local exclude the engine adds at boot) is skipped
+        // by `.` on its own; naming it in a pathspec makes `git add` report it as an ignored
+        // path and exit 1. Only the excludes git would otherwise index get a pathspec item.
+        for e in excludes {
+            let e = e.trim_matches('/');
+            if !e.is_empty() && !self.is_ignored(e)? {
+                add.push(format!(":(exclude){e}"));
+            }
+        }
         let out = git_command(&self.root)
             .env("GIT_INDEX_FILE", &tmp_index)
             .args(&add)

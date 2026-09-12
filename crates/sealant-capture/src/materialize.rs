@@ -13,6 +13,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::chunk::{ChunkId, sha256_hex};
 use crate::gitpack::{self, GitError, GitRepo};
+use crate::index::DAEMON_DIR;
 use crate::keys::key_digest;
 use crate::manifest::{EncodedManifest, FsckStatus, INDEX_TREE_REF, Manifest, WORKTREE_TREE_REF};
 use crate::pack::{PackError, PackReader};
@@ -240,6 +241,11 @@ impl<'a> Materializer<'a> {
             let root = self.targets.root.clone();
             self.write_dir(&store, &bulk.root, &root, &root, &mut links, &mut report)?;
             self.link_all(&links, &mut report)?;
+        }
+        // After every class (the workspace class restores `.git/info/exclude` as captured):
+        // the daemon directory stays out of the restored tree's index before anything runs in it.
+        if matches!(class, MaterializeClass::Git | MaterializeClass::All) {
+            GitRepo::open(&self.targets.root)?.exclude_locally(&format!("/{DAEMON_DIR}/"))?;
         }
         Ok(report)
     }
