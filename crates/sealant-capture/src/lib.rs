@@ -33,6 +33,6 @@ pub use engine::{
 pub use manifest::{CaptureKind, EncodedManifest, FsckStatus, Manifest};
 pub use materialize::{MaterializeClass, MaterializeReport, MaterializeTargets, Materializer};
 pub use registrar::{HttpRegistrar, InMemoryRegistrar, Registrar, RegistrarError};
-pub use ship::{ShipSnapshot, ShipWorker, Shipper, Staging};
+pub use ship::{MultipartConfig, ShipSnapshot, ShipWorker, Shipper, Staging};
 pub use sink::{BlobSink, LocalDir, PresignedHttp, UrlMinter};
 pub use watch::{ChangeSignal, Mode as WatchMode, WatchPolicy};

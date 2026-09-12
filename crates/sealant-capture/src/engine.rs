@@ -25,7 +25,7 @@ use crate::materialize::{
 use crate::pack::{MAX_PACK_BYTES, PackBuilder, PackError};
 use crate::registrar::RegisterRequest;
 use crate::registrar::Registrar;
-use crate::ship::{DutyCycle, QueueEntry, ShipError, Shipper, Staging, Upload};
+use crate::ship::{DutyCycle, MultipartConfig, QueueEntry, ShipError, Shipper, Staging, Upload};
 use crate::sink::BlobSink;
 use crate::watch::WatchPolicy;
 
@@ -94,6 +94,8 @@ pub struct CaptureConfig {
     pub watch: WatchPolicy,
     /// CPU budget for snapping and shipping, as a fraction of one core.
     pub cpu_fraction: f64,
+    /// How the shipper uploads large objects.
+    pub multipart: MultipartConfig,
     /// `<os>-<arch>-<libc>` stamped on bulk captures.
     pub platform: String,
     /// CDC pack cap.
@@ -118,6 +120,7 @@ impl CaptureConfig {
             cadence: Cadence::default(),
             watch: WatchPolicy::default(),
             cpu_fraction: crate::ship::DEFAULT_CPU_FRACTION,
+            multipart: MultipartConfig::DEFAULT,
             platform: default_platform(),
             pack_cap: MAX_PACK_BYTES,
         }
@@ -401,7 +404,9 @@ impl CaptureEngine {
     /// A shipper for this engine's staging.
     #[must_use]
     pub fn shipper(&self, sink: Arc<dyn BlobSink>, registrar: Arc<dyn Registrar>) -> Shipper {
-        Shipper::new(self.staging(), sink, registrar).with_cpu_fraction(self.config.cpu_fraction)
+        Shipper::new(self.staging(), sink, registrar)
+            .with_cpu_fraction(self.config.cpu_fraction)
+            .with_multipart(self.config.multipart)
     }
 
     fn persist(&self) -> io::Result<()> {

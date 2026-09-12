@@ -2,7 +2,9 @@
 //! (the same filesystem as the tree); a worker uploads oldest-first with retry and coalescing,
 //! then registers. The queue follows the `Spool` discipline of ADR-0007 (append → replay → ack,
 //! a disk bound), not its record format: one JSON entry per capture, one ack marker per object.
-//! The shipper is throttled to ≤ 50% of one core as a CPU-time duty cycle from `getrusage`.
+//! The shipper is throttled to ≤ 50% of one core as a CPU-time duty cycle from `getrusage`;
+//! objects at or above [`MultipartConfig::threshold`] go up as multipart uploads with several
+//! parts in flight, whose threads' CPU is charged to the same cycle (network waits are not).
 
 use std::collections::HashSet;
 use std::fs;
@@ -13,15 +15,43 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use nix::sys::resource::{UsageWho, getrusage};
 use serde::{Deserialize, Serialize};
 
+use crate::cpu::thread_cpu;
 use crate::manifest::CaptureKind;
 use crate::registrar::{RegisterRequest, Registrar, RegistrarError};
 use crate::sink::{BlobSink, BlobSource, SinkError};
 
 /// Default shipper CPU budget: half of one core.
 pub const DEFAULT_CPU_FRACTION: f64 = 0.5;
+
+/// How large objects are uploaded. Measured (R1, 2026-09): one presigned PUT from a sandbox to
+/// R2 runs at 37–47 MB/s, four multipart parts in flight at 63.6 MB/s; AWS single-stream is
+/// ≈ 100 MB/s per flow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MultipartConfig {
+    /// Objects at or above this size are uploaded as multipart (below: one PUT).
+    pub threshold: u64,
+    /// Preferred part size; a store that fixes its own (the registrar's `part_size`) wins.
+    pub part_size: u64,
+    /// Parts uploading at once per object.
+    pub parts_in_flight: usize,
+}
+
+impl MultipartConfig {
+    /// 16 MiB threshold, 16 MiB parts, 4 in flight.
+    pub const DEFAULT: Self = Self {
+        threshold: 16 * 1024 * 1024,
+        part_size: 16 * 1024 * 1024,
+        parts_in_flight: 4,
+    };
+}
+
+impl Default for MultipartConfig {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
 
 /// One object to upload: a key and a file under the staging objects directory.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -311,20 +341,6 @@ impl Staging {
     }
 }
 
-/// CPU time of the calling thread.
-fn thread_cpu() -> Duration {
-    match getrusage(UsageWho::RUSAGE_THREAD) {
-        Ok(u) => {
-            let ut = u.user_time();
-            let st = u.system_time();
-            let micros = (ut.tv_sec() as i128 * 1_000_000 + ut.tv_usec() as i128)
-                + (st.tv_sec() as i128 * 1_000_000 + st.tv_usec() as i128);
-            Duration::from_micros(u64::try_from(micros.max(0)).unwrap_or(0))
-        }
-        Err(_) => Duration::ZERO,
-    }
-}
-
 /// A CPU-time duty cycle (amendment decision 12): after each unit of work, if this thread's CPU
 /// time since the cycle began exceeds `fraction` of the wall time, sleep the difference.
 #[derive(Debug)]
@@ -332,6 +348,8 @@ pub struct DutyCycle {
     fraction: f64,
     started: Instant,
     cpu_start: Duration,
+    /// CPU burnt on this cycle's behalf by other threads.
+    charged: Duration,
     /// Total time slept.
     pub slept: Duration,
 }
@@ -344,8 +362,14 @@ impl DutyCycle {
             fraction: fraction.clamp(0.01, 1.0),
             started: Instant::now(),
             cpu_start: thread_cpu(),
+            charged: Duration::ZERO,
             slept: Duration::ZERO,
         }
+    }
+
+    /// Count CPU time another thread burnt for this cycle (part-upload workers).
+    pub fn charge(&mut self, cpu: Duration) {
+        self.charged += cpu;
     }
 
     /// Sleep if over budget.
@@ -353,7 +377,7 @@ impl DutyCycle {
         if self.fraction >= 1.0 {
             return;
         }
-        let cpu = thread_cpu().saturating_sub(self.cpu_start).as_secs_f64();
+        let cpu = (thread_cpu().saturating_sub(self.cpu_start) + self.charged).as_secs_f64();
         let wall = self.started.elapsed().as_secs_f64();
         let allowed = wall * self.fraction;
         if cpu > allowed {
@@ -446,6 +470,7 @@ pub struct Shipper {
     registrar: Arc<dyn Registrar>,
     cpu_fraction: f64,
     retry: RetryPolicy,
+    multipart: MultipartConfig,
     /// Counters.
     pub status: Arc<ShipStatus>,
 }
@@ -474,8 +499,16 @@ impl Shipper {
             registrar,
             cpu_fraction: DEFAULT_CPU_FRACTION,
             retry: RetryPolicy::default(),
+            multipart: MultipartConfig::DEFAULT,
             status,
         }
+    }
+
+    /// Multipart threshold, part size and parts in flight.
+    #[must_use]
+    pub fn with_multipart(mut self, multipart: MultipartConfig) -> Self {
+        self.multipart = multipart;
+        self
     }
 
     /// CPU budget as a fraction of one core.
@@ -528,7 +561,19 @@ impl Shipper {
                     }
                 }
             } else {
-                match self.sink.put_if_absent(&u.key, BlobSource::File(&path)) {
+                let helper_before = self.sink.helper_cpu();
+                let result = if u.bytes >= self.multipart.threshold {
+                    self.sink.put_multipart(
+                        &u.key,
+                        &path,
+                        self.multipart.part_size,
+                        self.multipart.parts_in_flight,
+                    )
+                } else {
+                    self.sink.put_if_absent(&u.key, BlobSource::File(&path))
+                };
+                cycle.charge(self.sink.helper_cpu().saturating_sub(helper_before));
+                match result {
                     Ok(outcome) => {
                         match outcome {
                             crate::sink::PutOutcome::Stored => {
@@ -813,5 +858,14 @@ mod tests {
         let mut never = DutyCycle::new(1.0);
         never.pace();
         assert_eq!(never.slept, Duration::ZERO);
+    }
+
+    /// CPU charged from helper threads counts like the cycle's own.
+    #[test]
+    fn duty_cycle_counts_charged_cpu() {
+        let mut c = DutyCycle::new(0.5);
+        c.charge(Duration::from_millis(100));
+        c.pace();
+        assert!(c.slept >= Duration::from_millis(50), "slept {:?}", c.slept);
     }
 }
