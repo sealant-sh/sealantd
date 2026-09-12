@@ -10,7 +10,10 @@
 #![forbid(unsafe_code)]
 
 pub mod chunk;
+pub mod gitpack;
+pub mod index;
 pub mod keys;
 pub mod manifest;
 pub mod pack;
+pub mod sink;
 pub mod tree;
