@@ -1231,6 +1231,7 @@ dependencies = [
  "rustls",
  "rustls-pemfile",
  "rustls-pki-types",
+ "sealant-capture",
  "sealant-control",
  "sealant-eventlog",
  "sealant-fs",

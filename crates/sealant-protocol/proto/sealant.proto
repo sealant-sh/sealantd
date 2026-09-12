@@ -408,6 +408,16 @@ message SignalSessionArgs { string session_id = 1; Signal signal = 2; }
 // Point a bindable mount's path at a subdirectory of its root (see ADR-0014). An empty subpath
 // unbinds. The root was mounted at workspace start; the path itself becomes a symlink.
 message BindMountArgs { string mount_path = 1; string subpath = 2; }
+// Session capture store (ADR-0015).
+enum CaptureKind {
+  CAPTURE_KIND_UNSPECIFIED = 0;
+  CAPTURE_KIND_AUTO = 1;
+  CAPTURE_KIND_TURN = 2;
+  CAPTURE_KIND_CHECKPOINT = 3;
+  CAPTURE_KIND_SUSPEND = 4;
+  CAPTURE_KIND_FINAL = 5;
+}
+message CaptureNowArgs { CaptureKind kind = 1; }
 message ReadSessionOutputArgs {
   string session_id = 1;
   uint64 from_sequence = 2;
@@ -449,6 +459,10 @@ message Command {
     SignalSessionArgs signal_session = 25;
     ReadSessionOutputArgs read_session_output = 26;
     BindMountArgs bind_mount = 27;
+    CaptureNowArgs capture_now = 28;
+    Empty capture_flush = 29;
+    Empty capture_status = 30;
+    Empty lease_epoch = 31;
   }
 }
 
@@ -555,6 +569,21 @@ message StreamAttached { string channel_id = 1; }
 message ForwardOpened { string channel_id = 1; }
 message SftpOpened { string channel_id = 1; }
 message ProcessAttached { string process_id = 1; int32 pid = 2; int32 pgid = 3; string channel_id = 4; }
+message CaptureStaged { uint64 n = 1; string capture_id = 2; CaptureKind kind = 3; bool unchanged = 4; }
+message CaptureStatusReport {
+  uint64 epoch = 1;
+  string worktree_id = 2;
+  optional uint64 head_n = 3;
+  uint64 pending = 4;
+  uint64 staged_bytes = 5;
+  uint64 uploaded_objects = 6;
+  uint64 uploaded_bytes = 7;
+  uint64 registered = 8;
+  bool fenced = 9;
+  bool paused = 10;
+  optional uint64 last_snap_unix_ms = 11;
+}
+message LeaseEpochReport { uint64 epoch = 1; string worktree_id = 2; bool fenced = 3; }
 
 message CommandResult {
   oneof result {
@@ -572,6 +601,9 @@ message CommandResult {
     SftpOpened sftp_opened = 12;
     ProcessAttached process_attached = 13;
     SessionOutput session_output = 14;
+    CaptureStaged capture_staged = 15;
+    CaptureStatusReport capture_status = 16;
+    LeaseEpochReport lease_epoch = 17;
   }
 }
 

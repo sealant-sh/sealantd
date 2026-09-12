@@ -36,6 +36,9 @@ const CONSUMED_KEYS: &[&str] = &[
     "SEALANT_WORKSPACE_ROOT",
     "SEALANT_WORKING_DIRECTORY",
     "SEALANT_WORKSPACE_SOURCE",
+    "SEALANT_CAPTURE_ENDPOINT",
+    "SEALANT_CAPTURE_WORKTREE_ID",
+    "SEALANT_CAPTURE_HARNESS_HOME",
     "SEALANT_WORKSPACE_MOUNT_HOST_PATH",
     "SEALANT_MOUNT_ALLOWED_STORE_ROOTS",
     "SEALANT_WORKSPACE_REPO_URL",
@@ -189,6 +192,19 @@ pub struct StandbyConfig {
     pub root_host_path: PathBuf,
 }
 
+/// A capture-store workspace (ADR-0015): the working directory is materialized at boot from the
+/// worktree's chain head through the session channel, and captured back on the cadence.
+#[derive(Debug, Clone)]
+pub struct CaptureSourceConfig {
+    /// `SEALANT_CAPTURE_ENDPOINT`: the session channel the registrar calls go to.
+    pub endpoint: String,
+    /// `SEALANT_CAPTURE_WORKTREE_ID`, when Core set it; otherwise `plan.get` says which worktree
+    /// the session token is scoped to.
+    pub worktree_id: Option<String>,
+    /// `SEALANT_CAPTURE_HARNESS_HOME`: the harness home captured with the workspace class.
+    pub harness_home: Option<PathBuf>,
+}
+
 /// How the workspace working directory is provisioned.
 #[derive(Debug, Clone)]
 pub enum WorkspaceSource {
@@ -198,6 +214,8 @@ pub enum WorkspaceSource {
     Mount(MountConfig),
     /// The working directory is bound later to a subdirectory of a mounted root.
     Standby(StandbyConfig),
+    /// The working directory is materialized from the capture store and captured back.
+    Capture(CaptureSourceConfig),
 }
 
 /// Where a standby workspace's root is mounted, relative to the workspace root.
@@ -662,8 +680,35 @@ impl BootConfig {
                     })
                 })
             }
+            Some("capture") => {
+                if url.is_some() || mount_host_path.is_some() {
+                    return Err(BootError::config(
+                        "SEALANT_WORKSPACE_REPO_URL and SEALANT_WORKSPACE_MOUNT_HOST_PATH must not \
+                         be set when SEALANT_WORKSPACE_SOURCE=capture: the store is the source",
+                    ));
+                }
+                let endpoint = env
+                    .get("SEALANT_CAPTURE_ENDPOINT")
+                    .filter(|s| !s.trim().is_empty())
+                    .ok_or_else(|| {
+                        BootError::config(
+                            "SEALANT_CAPTURE_ENDPOINT is required when SEALANT_WORKSPACE_SOURCE=capture",
+                        )
+                    })?;
+                Ok(WorkspaceSource::Capture(CaptureSourceConfig {
+                    endpoint,
+                    worktree_id: env
+                        .get("SEALANT_CAPTURE_WORKTREE_ID")
+                        .filter(|s| !s.trim().is_empty()),
+                    harness_home: env
+                        .get("SEALANT_CAPTURE_HARNESS_HOME")
+                        .filter(|s| !s.trim().is_empty())
+                        .map(PathBuf::from),
+                }))
+            }
             Some(other) => Err(BootError::config(format!(
-                "SEALANT_WORKSPACE_SOURCE has unknown value {other:?} (expected clone|mount|standby)"
+                "SEALANT_WORKSPACE_SOURCE has unknown value {other:?} (expected \
+                 clone|mount|standby|capture)"
             ))),
         }
     }
@@ -1066,6 +1111,7 @@ mod tests {
             WorkspaceSource::Clone(repo) => repo,
             WorkspaceSource::Mount(m) => panic!("expected clone source, got mount {m:?}"),
             WorkspaceSource::Standby(s) => panic!("expected clone source, got standby {s:?}"),
+            WorkspaceSource::Capture(c) => panic!("expected clone source, got capture {c:?}"),
         }
     }
 
@@ -1563,6 +1609,60 @@ mod tests {
         let file = tempfile::NamedTempFile::new().expect("tempfile");
         std::fs::write(file.path(), contents).expect("write");
         file
+    }
+
+    #[test]
+    fn capture_source_reads_endpoint_and_optional_worktree_id() {
+        let mut pairs: Vec<(&str, &str)> = base_pairs()
+            .into_iter()
+            .filter(|(k, _)| *k != "SEALANT_WORKSPACE_REPO_URL")
+            .collect();
+        pairs.extend_from_slice(&[
+            ("SEALANT_WORKSPACE_SOURCE", "capture"),
+            (
+                "SEALANT_CAPTURE_ENDPOINT",
+                "https://mend.example/api/session/abc",
+            ),
+            ("SEALANT_CAPTURE_HARNESS_HOME", "/root/.harness"),
+        ]);
+        let cfg = BootConfig::load(&MapEnv::from_pairs(&pairs)).expect("valid");
+        match &cfg.source {
+            WorkspaceSource::Capture(c) => {
+                assert_eq!(c.endpoint, "https://mend.example/api/session/abc");
+                assert_eq!(c.worktree_id, None);
+                assert_eq!(c.harness_home.as_deref(), Some(Path::new("/root/.harness")));
+            }
+            other => panic!("expected capture source, got {other:?}"),
+        }
+        assert!(
+            !cfg.passthrough_env
+                .iter()
+                .any(|(k, _)| k.starts_with("SEALANT_CAPTURE_"))
+        );
+
+        pairs.push(("SEALANT_CAPTURE_WORKTREE_ID", "wt-1"));
+        let cfg = BootConfig::load(&MapEnv::from_pairs(&pairs)).expect("valid");
+        assert!(matches!(
+            &cfg.source,
+            WorkspaceSource::Capture(c) if c.worktree_id.as_deref() == Some("wt-1")
+        ));
+    }
+
+    #[test]
+    fn capture_source_requires_the_endpoint_and_refuses_a_repo_url() {
+        let without_url: Vec<(&str, &str)> = base_pairs()
+            .into_iter()
+            .filter(|(k, _)| *k != "SEALANT_WORKSPACE_REPO_URL")
+            .chain([("SEALANT_WORKSPACE_SOURCE", "capture")])
+            .collect();
+        let err = BootConfig::load(&MapEnv::from_pairs(&without_url)).expect_err("endpoint");
+        assert!(format!("{err}").contains("SEALANT_CAPTURE_ENDPOINT"));
+        let err = load_with(&[
+            ("SEALANT_WORKSPACE_SOURCE", "capture"),
+            ("SEALANT_CAPTURE_ENDPOINT", "https://x"),
+        ])
+        .expect_err("repo url");
+        assert!(format!("{err}").contains("SEALANT_WORKSPACE_REPO_URL"));
     }
 
     #[test]

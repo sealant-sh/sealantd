@@ -19,6 +19,7 @@ sealant-pty = { workspace = true }
 sealant-fs = { workspace = true }
 sealant-network = { workspace = true }
 sealant-control = { workspace = true }
+sealant-capture = { workspace = true }
 tokio = { workspace = true }
 clap = { workspace = true }
 tracing = { workspace = true }

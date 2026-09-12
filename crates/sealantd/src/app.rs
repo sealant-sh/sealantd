@@ -217,7 +217,9 @@ fn run_serve(cli: ServeArgs) -> ExitCode {
     tokio_runtime.block_on(serve(cli, wss, runtime))
 }
 
-pub(crate) fn spawn_signal_listener(shutdown: Arc<ShutdownSignal>) {
+/// On `SIGTERM` / `SIGINT`: flush captures (a final small-class snap, ship, register — bounded by
+/// the grace period; a no-op without a capture engine), then request graceful shutdown.
+pub(crate) fn spawn_signal_listener(runtime: Arc<Runtime>) {
     tokio::spawn(async move {
         use tokio::signal::unix::{SignalKind, signal};
         let mut terminate = match signal(SignalKind::terminate()) {
@@ -238,7 +240,10 @@ pub(crate) fn spawn_signal_listener(shutdown: Arc<ShutdownSignal>) {
             _ = terminate.recv() => tracing::info!("received SIGTERM"),
             _ = interrupt.recv() => tracing::info!("received SIGINT"),
         }
-        shutdown.request_graceful(None);
+        runtime
+            .flush_captures(sealant_protocol::CaptureKind::Final)
+            .await;
+        runtime.shutdown().request_graceful(None);
     });
 }
 
@@ -274,7 +279,7 @@ async fn serve(cli: ServeArgs, wss: Option<WssConfig>, runtime: Arc<Runtime>) ->
         },
     };
 
-    spawn_signal_listener(runtime.shutdown().clone());
+    spawn_signal_listener(runtime.clone());
     spawn_heartbeat(runtime.clone());
     // Reap descendants that reparent to us as subreaper / PID 1 (no-op off Linux).
     sealant_process::platform::spawn_orphan_reaper(runtime.process_registry());

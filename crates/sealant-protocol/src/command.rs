@@ -464,6 +464,38 @@ pub enum Command {
     /// Read a batch of a session's durable output journal from a sequence.
     #[serde(rename = "readSessionOutput")]
     ReadSessionOutput(ReadSessionOutputArgs),
+    /// Take a small-class capture of the workspace now and stage it for shipping (ADR-0015).
+    #[serde(rename = "capture.now")]
+    CaptureNow {
+        /// Why the capture is taken.
+        kind: CaptureKind,
+    },
+    /// Final small-class capture, then ship and register everything staged, bounded by the
+    /// shutdown grace period (the platform's suspend / terminate hooks call this).
+    #[serde(rename = "capture.flush")]
+    CaptureFlush,
+    /// Report the capture engine's state.
+    #[serde(rename = "capture.status")]
+    CaptureStatus,
+    /// Report the worktree lease epoch this executor holds.
+    #[serde(rename = "lease.epoch")]
+    LeaseEpoch,
+}
+
+/// Why a capture is taken (ADR-0015 manifest `kind`).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum CaptureKind {
+    /// Cadence-driven.
+    Auto,
+    /// Agent turn boundary.
+    Turn,
+    /// Explicit checkpoint.
+    Checkpoint,
+    /// Suspend hook.
+    Suspend,
+    /// Session end.
+    Final,
 }
 
 impl Command {
@@ -498,6 +530,10 @@ impl Command {
             Self::CloseSftp { .. } => "closeSftp",
             Self::SignalSession { .. } => "signalSession",
             Self::ReadSessionOutput(_) => "readSessionOutput",
+            Self::CaptureNow { .. } => "capture.now",
+            Self::CaptureFlush => "capture.flush",
+            Self::CaptureStatus => "capture.status",
+            Self::LeaseEpoch => "lease.epoch",
         }
     }
 }
@@ -842,6 +878,62 @@ pub struct SftpOpened {
     pub channel_id: ChannelId,
 }
 
+/// Result of `capture.now`: the capture staged for shipping (or the unchanged head).
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CaptureStaged {
+    /// Chain position.
+    pub n: u64,
+    /// Capture id (sha256 of the manifest bytes).
+    pub capture_id: String,
+    /// Kind.
+    pub kind: CaptureKind,
+    /// Nothing changed since the previous capture; `n` and `capture_id` name that one.
+    pub unchanged: bool,
+}
+
+/// Result of `capture.status` and `capture.flush`.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CaptureStatusReport {
+    /// Lease epoch this executor holds.
+    pub epoch: u64,
+    /// Worktree the chain belongs to.
+    pub worktree_id: String,
+    /// Highest registered chain position, when any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_n: Option<u64>,
+    /// Captures staged and not yet registered.
+    pub pending: u64,
+    /// Bytes staged on local disk awaiting upload.
+    pub staged_bytes: u64,
+    /// Objects uploaded this process lifetime.
+    pub uploaded_objects: u64,
+    /// Bytes uploaded this process lifetime.
+    pub uploaded_bytes: u64,
+    /// Captures registered this process lifetime.
+    pub registered: u64,
+    /// The registrar fenced this epoch; shipping stopped.
+    pub fenced: bool,
+    /// The harness process group is paused (`SIGSTOP`) pending a successful heartbeat.
+    pub paused: bool,
+    /// Wall-clock time of the last snap, Unix milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_snap_unix_ms: Option<u64>,
+}
+
+/// Result of `lease.epoch`.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct LeaseEpochReport {
+    /// Lease epoch this executor holds.
+    pub epoch: u64,
+    /// Worktree the lease is on.
+    pub worktree_id: String,
+    /// Whether the registrar has fenced this epoch.
+    pub fenced: bool,
+}
+
 /// The acknowledgement payload carried by a successful [`crate::ControlResponse`].
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "camelCase")]
@@ -872,6 +964,12 @@ pub enum CommandResult {
     SftpOpened(SftpOpened),
     /// A batch of session journal output.
     SessionOutput(SessionOutput),
+    /// A capture was staged.
+    CaptureStaged(CaptureStaged),
+    /// Capture engine state.
+    CaptureStatus(CaptureStatusReport),
+    /// Lease epoch.
+    LeaseEpoch(LeaseEpochReport),
     /// Generic acknowledgement with no data.
     Accepted,
 }

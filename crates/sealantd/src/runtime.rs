@@ -14,8 +14,8 @@ use sealant_process::{ProcessRegistry, ProcessRuntime, SftpRuntime};
 use sealant_protocol::{
     Capabilities, Command, CommandResult, Confidence, ControlError, ControlRequest,
     ControlResponse, EventEnvelope, EventPayload, ExecutionId, Feature, FeatureMatrix,
-    FeatureState, ForwardOpened, HealthReport, NetworkMode, ProcessAttached, ProcessList,
-    ProcessState, RuntimeHeartbeat, RuntimeMetrics, RuntimeState, RuntimeStateChanged,
+    FeatureState, ForwardOpened, HealthReport, NetworkMode, ProcessAttached, ProcessId,
+    ProcessList, ProcessState, RuntimeHeartbeat, RuntimeMetrics, RuntimeState, RuntimeStateChanged,
     SCHEMA_VERSION, SftpOpened, ShutdownAccepted, Signal, StreamAttached,
 };
 use sealant_pty::{SessionRegistry, SessionRuntime};
@@ -124,6 +124,8 @@ pub struct Runtime {
     forwards: Arc<ForwardRuntime>,
     sftp: Arc<SftpRuntime>,
     binds: Arc<crate::binds::BindRuntime>,
+    /// The capture engine (ADR-0015), installed by boot once the harness is running.
+    capture: std::sync::OnceLock<Arc<crate::capture::CaptureRuntime>>,
     extra_env: Arc<Mutex<Vec<(String, String)>>>,
     shutdown: Arc<ShutdownSignal>,
     features: Mutex<HashMap<Feature, bool>>,
@@ -208,6 +210,7 @@ impl Runtime {
             forwards: Arc::new(ForwardRuntime::new()),
             sftp,
             binds,
+            capture: std::sync::OnceLock::new(),
             extra_env,
             shutdown,
             features,
@@ -220,6 +223,45 @@ impl Runtime {
     #[must_use]
     pub fn binds(&self) -> &crate::binds::BindRuntime {
         &self.binds
+    }
+
+    /// Install the capture engine (once). Returns `false` if one is already installed.
+    pub fn install_capture(&self, capture: Arc<crate::capture::CaptureRuntime>) -> bool {
+        self.capture.set(capture).is_ok()
+    }
+
+    /// The capture engine, when this workspace is a capture-store workspace.
+    #[must_use]
+    pub fn capture(&self) -> Option<Arc<crate::capture::CaptureRuntime>> {
+        self.capture.get().cloned()
+    }
+
+    /// Flush captures: a final small-class snap, ship and register, bounded by the shutdown
+    /// grace period. A no-op without a capture engine; errors are logged, never fatal.
+    pub async fn flush_captures(&self, kind: sealant_protocol::CaptureKind) {
+        let Some(capture) = self.capture() else {
+            return;
+        };
+        let grace = Duration::from_millis(self.shutdown.grace_ms());
+        match tokio::task::spawn_blocking(move || capture.flush(kind, grace)).await {
+            Ok(Ok(report)) => {
+                tracing::info!(head_n = ?report.head_n, pending = report.pending, "captures flushed");
+            }
+            Ok(Err(error)) => tracing::warn!(%error, "capture flush failed"),
+            Err(error) => tracing::warn!(%error, "capture flush task failed"),
+        }
+    }
+
+    /// Deliver a signal to a managed process's group (the capture fence pauses the harness).
+    ///
+    /// # Errors
+    /// Returns [`ControlError`] if the process is unknown or signalling fails.
+    pub fn signal_process(
+        &self,
+        process_id: &ProcessId,
+        signal: Signal,
+    ) -> Result<(), ControlError> {
+        self.processes.signal(process_id, signal)
     }
 
     /// The managed-process registry (used to start the adopted-orphan reaper).
@@ -500,7 +542,9 @@ impl Runtime {
             match &request.command {
                 Command::RuntimeHealth
                 | Command::GetRuntimeMetrics
-                | Command::ListProcesses { .. } => {}
+                | Command::ListProcesses { .. }
+                | Command::CaptureStatus
+                | Command::LeaseEpoch => {}
                 _ => {
                     return ControlResponse::error(
                         rid,
@@ -521,6 +565,8 @@ impl Runtime {
                 ControlResponse::ok_with(rid, CommandResult::Metrics(self.metrics()))
             }
             Command::RuntimeGracefulShutdown { grace_millis } => {
+                self.flush_captures(sealant_protocol::CaptureKind::Final)
+                    .await;
                 self.shutdown.request_graceful(grace_millis);
                 ControlResponse::ok_with(
                     rid,
@@ -655,6 +701,51 @@ impl Runtime {
             } => match self.binds.bind(&mount_path, &subpath) {
                 Ok(()) => ControlResponse::accepted(rid),
                 Err(error) => ControlResponse::error(rid, error),
+            },
+            Command::CaptureNow { kind } => match self.capture() {
+                None => ControlResponse::error(rid, crate::capture::not_enabled()),
+                Some(capture) => {
+                    match tokio::task::spawn_blocking(move || capture.snap(kind)).await {
+                        Ok(Ok(staged)) => {
+                            ControlResponse::ok_with(rid, CommandResult::CaptureStaged(staged))
+                        }
+                        Ok(Err(error)) => ControlResponse::error(rid, error),
+                        Err(error) => {
+                            ControlResponse::error(rid, ControlError::internal(error.to_string()))
+                        }
+                    }
+                }
+            },
+            Command::CaptureFlush => match self.capture() {
+                None => ControlResponse::error(rid, crate::capture::not_enabled()),
+                Some(capture) => {
+                    let grace = Duration::from_millis(self.shutdown.grace_ms());
+                    match tokio::task::spawn_blocking(move || {
+                        capture.flush(sealant_protocol::CaptureKind::Suspend, grace)
+                    })
+                    .await
+                    {
+                        Ok(Ok(report)) => {
+                            ControlResponse::ok_with(rid, CommandResult::CaptureStatus(report))
+                        }
+                        Ok(Err(error)) => ControlResponse::error(rid, error),
+                        Err(error) => {
+                            ControlResponse::error(rid, ControlError::internal(error.to_string()))
+                        }
+                    }
+                }
+            },
+            Command::CaptureStatus => match self.capture() {
+                None => ControlResponse::error(rid, crate::capture::not_enabled()),
+                Some(capture) => {
+                    ControlResponse::ok_with(rid, CommandResult::CaptureStatus(capture.status()))
+                }
+            },
+            Command::LeaseEpoch => match self.capture() {
+                None => ControlResponse::error(rid, crate::capture::not_enabled()),
+                Some(capture) => {
+                    ControlResponse::ok_with(rid, CommandResult::LeaseEpoch(capture.lease_epoch()))
+                }
             },
             // Streaming commands are routed through dispatch_streaming (they need the ConnHandle).
             Command::AttachSession(_)

@@ -11,6 +11,7 @@
 //! daemon over the control socket and drives sessions/forwards through the control protocol. Only the
 //! SSH *client* survives (git-over-SSH clone, see [`git`]).
 
+pub mod capture;
 pub mod config;
 mod dotfiles;
 mod error;
@@ -57,15 +58,10 @@ pub fn run_boot(log_level: &str) -> ExitCode {
         }
     };
 
-    if let Err(error) = prepare(&config) {
-        tracing::error!(%error, "boot preparation failed");
-        eprintln!("sealantd boot: {error}");
-        return ExitCode::FAILURE;
-    }
-
     // The launcher-provided secret environment is read exactly once, here, and handed straight to
     // the runtime config: it never rides `BootConfig` (which is `Debug`) and never touches this
-    // process's own environment.
+    // process's own environment. A capture-store workspace also reads its session token from it
+    // during preparation.
     let secret_env = match &config.secret_env_file {
         None => Vec::new(),
         Some(path) => match config::load_secret_env(path) {
@@ -78,7 +74,16 @@ pub fn run_boot(log_level: &str) -> ExitCode {
         },
     };
 
-    run_supervised(config, secret_env)
+    let capture_boot = match prepare(&config, &secret_env) {
+        Ok(capture_boot) => capture_boot,
+        Err(error) => {
+            tracing::error!(%error, "boot preparation failed");
+            eprintln!("sealantd boot: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    run_supervised(config, secret_env, capture_boot)
 }
 
 fn init_tracing(log_level: &str) {
@@ -91,8 +96,12 @@ fn init_tracing(log_level: &str) {
 }
 
 /// Synchronous boot preparation (steps 2–7): all side effects that must complete, in order, before
-/// the async runtime and the harness start.
-fn prepare(config: &BootConfig) -> Result<(), BootError> {
+/// the async runtime and the harness start. A capture-store workspace comes back materialized,
+/// with its engine ready to install once the harness is running.
+fn prepare(
+    config: &BootConfig,
+    secret_env: &[(String, String)],
+) -> Result<Option<capture::CaptureBoot>, BootError> {
     // Step 2: become subreaper BEFORE any fork so double-forked orphans reparent here.
     if cfg!(target_os = "linux") {
         if !sealant_process::platform::set_child_subreaper() {
@@ -112,6 +121,7 @@ fn prepare(config: &BootConfig) -> Result<(), BootError> {
     }
 
     // Steps 5–7: provision the working directory per source mode.
+    let mut capture_boot = None;
     match &config.source {
         // Clone with scoped credentials, then wipe them.
         WorkspaceSource::Clone(repo) => {
@@ -129,6 +139,25 @@ fn prepare(config: &BootConfig) -> Result<(), BootError> {
         }
         // Standby (ADR-0014): the working directory appears at bind time; the ROOT must be here.
         WorkspaceSource::Standby(_) => {}
+        // Capture store (ADR-0015): materialize the chain head from the session channel.
+        WorkspaceSource::Capture(source) => {
+            let token = secret_env
+                .iter()
+                .find(|(key, _)| key == capture::TOKEN_KEY)
+                .map(|(_, value)| value.as_str())
+                .ok_or_else(|| {
+                    BootError::config(format!(
+                        "{} is required in the secret environment when \
+                         SEALANT_WORKSPACE_SOURCE=capture",
+                        capture::TOKEN_KEY
+                    ))
+                })?;
+            capture_boot = Some(capture::materialize(
+                source,
+                token,
+                &config.workspace.working_directory,
+            )?);
+        }
     }
     // Every bindable root — the standby root and any extra bindable mount — must be a real,
     // writable mount, for the same reason a mounted source must: a bind onto a container-local
@@ -140,7 +169,7 @@ fn prepare(config: &BootConfig) -> Result<(), BootError> {
         )?;
     }
 
-    Ok(())
+    Ok(capture_boot)
 }
 
 /// The SSH-runtime / credential directory under the workspace root.
@@ -259,6 +288,10 @@ fn harness_child_env(config: &BootConfig, secret_env: &[(String, String)]) -> Ve
             tracing::warn!(key, "secret env entry ignored: the key is owned by boot");
             continue;
         }
+        // The capture session token is the daemon's credential, never the harness's.
+        if key == capture::TOKEN_KEY {
+            continue;
+        }
         map.insert(key.clone(), value.clone());
     }
     map.insert("HOME".to_owned(), "/root".to_owned());
@@ -284,7 +317,11 @@ fn harness_child_env(config: &BootConfig, secret_env: &[(String, String)]) -> Ve
 }
 
 /// Steps 9–18: build the runtime, enter Tokio, run the control server and supervise the harness.
-fn run_supervised(config: BootConfig, secret_env: Vec<(String, String)>) -> ExitCode {
+fn run_supervised(
+    config: BootConfig,
+    secret_env: Vec<(String, String)>,
+    capture_boot: Option<capture::CaptureBoot>,
+) -> ExitCode {
     let runtime_config = into_runtime_config(&config, &secret_env);
     // Nothing downstream needs the values in this form; the runtime config owns them now.
     drop(secret_env);
@@ -307,15 +344,19 @@ fn run_supervised(config: BootConfig, secret_env: Vec<(String, String)>) -> Exit
         }
     };
 
-    tokio_runtime.block_on(boot_serve(runtime, config))
+    tokio_runtime.block_on(boot_serve(runtime, config, capture_boot))
 }
 
 /// The async supervisor body (steps 11–18).
-async fn boot_serve(runtime: Arc<Runtime>, config: BootConfig) -> ExitCode {
+async fn boot_serve(
+    runtime: Arc<Runtime>,
+    config: BootConfig,
+    capture_boot: Option<capture::CaptureBoot>,
+) -> ExitCode {
     let (serve_tx, serve_rx) = watch::channel(false);
 
     // Step 11: same background machinery app.rs::serve starts.
-    crate::app::spawn_signal_listener(runtime.shutdown().clone());
+    crate::app::spawn_signal_listener(runtime.clone());
     crate::app::spawn_heartbeat(runtime.clone());
     sealant_process::platform::spawn_orphan_reaper(runtime.process_registry());
     runtime.start_telemetry();
@@ -409,6 +450,16 @@ async fn boot_serve(runtime: Arc<Runtime>, config: BootConfig) -> ExitCode {
         }
     };
 
+    // Step 15b: the capture engine runs beside the harness: cadence snaps, heartbeats, and the
+    // fence that pauses the harness process group (ADR-0015).
+    if let Some(boot) = capture_boot {
+        let capture_runtime =
+            crate::capture::CaptureRuntime::new(boot, runtime.shutdown().grace_ms());
+        if runtime.install_capture(capture_runtime.clone()) {
+            capture_runtime.start(runtime.clone(), harness_process_id.clone());
+        }
+    }
+
     // Step 16: supervise — wait for the harness exit OR a shutdown signal.
     let exit_code = tokio::select! {
         status = await_exit_on(&mut harness_events, &harness_process_id) => {
@@ -426,6 +477,12 @@ async fn boot_serve(runtime: Arc<Runtime>, config: BootConfig) -> ExitCode {
             ExitCode::FAILURE
         }
     };
+
+    // Step 16b: the final capture (a no-op when the signal listener or a gracefulShutdown command
+    // already flushed).
+    runtime
+        .flush_captures(sealant_protocol::CaptureKind::Final)
+        .await;
 
     // Steps 17–18.
     shutdown_with(&runtime, &serve_tx, control_handle, exit_code).await

@@ -38,6 +38,9 @@ pub struct HeadInfo {
 pub struct PlanGetResponse {
     /// The worktree the session token is scoped to.
     pub worktree_id: String,
+    /// The lease epoch this session holds (Mend claims the lease at launch; the executor learns
+    /// its epoch here and carries it on every later call).
+    pub epoch: u64,
     /// Head, or none for an empty chain.
     pub head: Option<HeadInfo>,
     /// Key → presigned GET URL (empty when the sink is a directory).
@@ -272,7 +275,9 @@ impl InMemoryRegistrar {
 impl Registrar for InMemoryRegistrar {
     fn plan_get(&self, req: &PlanGetRequest) -> Result<PlanGetResponse, RegistrarError> {
         let state = self.lock();
-        Self::check_epoch(&state, req.epoch)?;
+        if req.epoch != 0 {
+            Self::check_epoch(&state, req.epoch)?;
+        }
         if req
             .worktree_id
             .as_ref()
@@ -305,6 +310,7 @@ impl Registrar for InMemoryRegistrar {
         }
         Ok(PlanGetResponse {
             worktree_id: self.worktree_id.clone(),
+            epoch: state.live_epoch,
             head,
             get_urls,
         })

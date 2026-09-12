@@ -211,6 +211,9 @@ pub struct StagedCapture {
     pub class: Class,
     /// Numbers.
     pub stats: SnapStats,
+    /// Nothing changed since the previous capture: nothing was staged, and `n`, `manifest` and
+    /// `manifest_key` name the previous capture.
+    pub unchanged: bool,
 }
 
 /// A snap request.
@@ -648,6 +651,26 @@ impl CaptureEngine {
             }
         };
 
+        // Nothing changed: an `auto` snap stages nothing rather than growing the chain.
+        if req.kind == CaptureKind::Auto
+            && let Some(prev) = &self.previous
+            && prev.manifest.sections == sections
+        {
+            for u in &uploads {
+                fs::remove_file(objects.join(&u.file)).ok();
+            }
+            stats.elapsed_ms = start.elapsed().as_millis() as u64;
+            return Ok(StagedCapture {
+                n: prev.manifest.n,
+                manifest: prev.clone(),
+                manifest_key: self.prefix.manifest(&prev.capture_id),
+                kind: req.kind,
+                class: req.class,
+                stats,
+                unchanged: true,
+            });
+        }
+
         // Chain position: coalesce with a pending, not-yet-shipping auto capture.
         let coalesce = if req.kind == CaptureKind::Auto {
             self.staging.coalescible()?
@@ -737,6 +760,7 @@ impl CaptureEngine {
             kind: req.kind,
             class: req.class,
             stats,
+            unchanged: false,
         })
     }
 
