@@ -79,6 +79,8 @@ enum CaptureCmd {
     Flush,
     /// Report the capture engine's state.
     Status,
+    /// Fetch the plan again and bring the workspace to it (a standby taking its worktree).
+    Replan,
 }
 
 #[derive(Debug, Subcommand)]
@@ -137,6 +139,7 @@ async fn main() -> ExitCode {
             },
             CaptureCmd::Flush => (Command::CaptureFlush, false),
             CaptureCmd::Status => (Command::CaptureStatus, false),
+            CaptureCmd::Replan => (Command::CaptureReplan, false),
         },
         Cmd::Lease { action } => match action {
             LeaseCmd::Epoch => (Command::LeaseEpoch, false),

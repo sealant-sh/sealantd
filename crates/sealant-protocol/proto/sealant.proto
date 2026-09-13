@@ -463,6 +463,7 @@ message Command {
     Empty capture_flush = 29;
     Empty capture_status = 30;
     Empty lease_epoch = 31;
+    Empty capture_replan = 32;
   }
 }
 
@@ -584,6 +585,18 @@ message CaptureStatusReport {
   optional uint64 last_snap_unix_ms = 11;
 }
 message LeaseEpochReport { uint64 epoch = 1; string worktree_id = 2; bool fenced = 3; }
+message CaptureReplanned {
+  string worktree_id = 1;
+  uint64 epoch = 2;
+  optional uint64 head_n = 3;
+  optional string head_capture_id = 4;
+  uint64 files_written = 5;
+  uint64 bytes_written = 6;
+  uint64 files_skipped = 7;
+  uint64 bytes_skipped = 8;
+  uint64 removed = 9;
+  bool unchanged = 10;
+}
 
 message CommandResult {
   oneof result {
@@ -604,6 +617,7 @@ message CommandResult {
     CaptureStaged capture_staged = 15;
     CaptureStatusReport capture_status = 16;
     LeaseEpochReport lease_epoch = 17;
+    CaptureReplanned capture_replanned = 18;
   }
 }
 

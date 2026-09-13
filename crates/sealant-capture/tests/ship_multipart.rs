@@ -78,7 +78,7 @@ struct Fixture {
 
 fn fixture(multipart: bool) -> Fixture {
     let dir = tempfile::tempdir().unwrap();
-    let staging = Arc::new(Staging::open(&dir.path().join("staging"), 1).unwrap());
+    let staging = Arc::new(Staging::open(&dir.path().join("staging"), "wt", 1).unwrap());
     let server = serve();
     let completer = server.completer();
     let registrar = InMemoryRegistrar::new("wt", 1, Some(server.base.clone()));

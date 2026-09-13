@@ -40,6 +40,21 @@
 //! A multipart upload the executor abandons (it dies, or a part fails past its retries and the
 //! object is retried under a fresh `upload_id`) is the registrar's to expire: a bucket lifecycle
 //! rule for incomplete multipart uploads, no `upload.abort` call in v1.
+//!
+//! # `platform` on `plan.get`
+//!
+//! The request names the executor's `<os>-<arch>-<libc>` (the key the bulk class stamps on its
+//! captures, `engine::default_platform`). A registrar answers the head's bulk section as
+//! `"pending"` when it was captured for another platform — the executor must not restore a
+//! dependency tree built elsewhere; the install runs on the control plane's side instead — and
+//! leaves the plan unchanged when the field is absent (an older executor) or the platforms
+//! match. The materializer treats `"pending"` as "nothing to restore, nothing to sweep".
+//!
+//! ```json
+//! → {"worktree_id":"wt","epoch":0,"platform":"linux-x86_64-gnu"}
+//! ← {"worktree_id":"wt","epoch":3,"head":{"n":7,"capture_id":"…","manifest_key":"…",
+//!    "manifest":{…,"sections":{…,"bulk":"pending"}}},"get_urls":{…}}
+//! ```
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
@@ -47,7 +62,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::manifest::Manifest;
+use crate::manifest::{BulkState, Manifest};
 
 /// `plan.get`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -55,8 +70,24 @@ pub struct PlanGetRequest {
     /// Worktree, when the executor knows it (`SEALANT_CAPTURE_WORKTREE_ID`); otherwise the
     /// session token identifies it and the response says which.
     pub worktree_id: Option<String>,
-    /// Caller's epoch.
+    /// Caller's epoch; 0 = not claimed yet (the plan of a booting executor claims the lease).
     pub epoch: u64,
+    /// The executor's `<os>-<arch>-<libc>`: the registrar answers the bulk section as
+    /// `"pending"` when the head's was captured for another platform. Absent = the head as is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform: Option<String>,
+}
+
+impl PlanGetRequest {
+    /// The request a booting executor sends: `epoch` 0 and this build's platform.
+    #[must_use]
+    pub fn booting(worktree_id: Option<String>) -> Self {
+        Self {
+            worktree_id,
+            epoch: 0,
+            platform: Some(crate::engine::default_platform()),
+        }
+    }
 }
 
 /// The chain head.
@@ -347,7 +378,7 @@ struct InMemoryState {
 /// In-memory registrar: one worktree, one chain, a live epoch, a lease flag.
 pub struct InMemoryRegistrar {
     state: Mutex<InMemoryState>,
-    worktree_id: String,
+    worktree_id: Mutex<String>,
     url_base: Option<String>,
     multipart: Option<MultipartPolicy>,
     completer: Option<Arc<dyn MultipartCompleter>>,
@@ -356,7 +387,7 @@ pub struct InMemoryRegistrar {
 impl std::fmt::Debug for InMemoryRegistrar {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("InMemoryRegistrar")
-            .field("worktree_id", &self.worktree_id)
+            .field("worktree_id", &self.worktree_id())
             .field("url_base", &self.url_base)
             .field("multipart", &self.multipart)
             .finish_non_exhaustive()
@@ -369,7 +400,7 @@ impl InMemoryRegistrar {
     #[must_use]
     pub fn new(worktree_id: &str, epoch: u64, url_base: Option<String>) -> Self {
         Self {
-            worktree_id: worktree_id.to_owned(),
+            worktree_id: Mutex::new(worktree_id.to_owned()),
             state: Mutex::new(InMemoryState {
                 live_epoch: epoch,
                 chain: Vec::new(),
@@ -428,6 +459,34 @@ impl InMemoryRegistrar {
         self.lock().live_epoch = epoch;
     }
 
+    /// The worktree `plan.get` answers.
+    #[must_use]
+    pub fn worktree_id(&self) -> String {
+        self.worktree_id
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Answer `plan.get` as `worktree_id` from now on: the standby's placeholder gave way to
+    /// the worktree the control plane assigned (tests of `capture.replan`).
+    pub fn set_worktree_id(&self, worktree_id: &str) {
+        *self
+            .worktree_id
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = worktree_id.to_owned();
+    }
+
+    /// Re-stamp the head's bulk section as captured for `platform` (tests of the `plan.get`
+    /// platform rule); a head without a bulk section is left alone.
+    pub fn set_bulk_platform(&self, platform: &str) {
+        if let Some(head) = self.lock().chain.last_mut()
+            && let BulkState::Ready(bulk) = &mut head.manifest.sections.bulk
+        {
+            bulk.platform = platform.to_owned();
+        }
+    }
+
     /// Whether heartbeats find a lease.
     pub fn set_lease_alive(&self, alive: bool) {
         self.lock().lease_alive = alive;
@@ -481,16 +540,23 @@ impl Registrar for InMemoryRegistrar {
         if req.epoch != 0 {
             Self::check_epoch(&state, req.epoch)?;
         }
-        if req
-            .worktree_id
-            .as_ref()
-            .is_some_and(|w| *w != self.worktree_id)
-        {
+        let worktree_id = self.worktree_id();
+        if req.worktree_id.as_ref().is_some_and(|w| *w != worktree_id) {
             return Err(RegistrarError::Protocol(
                 "token is scoped to another worktree".into(),
             ));
         }
-        let head = state.chain.last().cloned();
+        let mut head = state.chain.last().cloned();
+        // Another platform's dependency tree is not this executor's to restore.
+        if let (Some(h), Some(platform)) = (head.as_mut(), &req.platform)
+            && h.manifest
+                .sections
+                .bulk
+                .section()
+                .is_some_and(|b| b.platform != *platform)
+        {
+            h.manifest.sections.bulk = BulkState::pending();
+        }
         let mut get_urls = BTreeMap::new();
         if let (Some(h), Some(_)) = (&head, &self.url_base) {
             let s = &h.manifest.sections;
@@ -512,7 +578,7 @@ impl Registrar for InMemoryRegistrar {
             }
         }
         Ok(PlanGetResponse {
-            worktree_id: self.worktree_id.clone(),
+            worktree_id,
             epoch: state.live_epoch,
             head,
             get_urls,
@@ -826,17 +892,17 @@ impl Registrar for HttpRegistrar {
 }
 
 /// A [`crate::sink::UrlMinter`] over a registrar: PUT and part URLs come from `upload.urls`,
-/// multipart completes go to `upload.complete`, GET URLs come from the plan.
+/// multipart completes go to `upload.complete`, GET URLs come from the plan. A re-plan
+/// ([`Self::reset`]) moves it to the new identity and the new plan's GET URLs.
 #[derive(Debug)]
-pub struct RegistrarMinter<R: Registrar> {
+pub struct RegistrarMinter<R: Registrar + ?Sized> {
     registrar: std::sync::Arc<R>,
-    worktree_id: String,
-    epoch: u64,
+    identity: Mutex<(String, u64)>,
     put_cache: Mutex<BTreeMap<String, String>>,
     get_urls: Mutex<BTreeMap<String, String>>,
 }
 
-impl<R: Registrar> RegistrarMinter<R> {
+impl<R: Registrar + ?Sized> RegistrarMinter<R> {
     /// Mint for `worktree_id` at `epoch`, seeded with the plan's GET URLs.
     #[must_use]
     pub fn new(
@@ -847,18 +913,44 @@ impl<R: Registrar> RegistrarMinter<R> {
     ) -> Self {
         Self {
             registrar,
-            worktree_id: worktree_id.to_owned(),
-            epoch,
+            identity: Mutex::new((worktree_id.to_owned(), epoch)),
             put_cache: Mutex::new(BTreeMap::new()),
             get_urls: Mutex::new(get_urls),
         }
     }
 
+    /// The worktree and epoch URLs are minted for.
+    #[must_use]
+    pub fn identity(&self) -> (String, u64) {
+        self.identity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Mint for `worktree_id` at `epoch` from now on, with `get_urls` from the new plan;
+    /// PUT URLs minted under the previous identity are forgotten.
+    pub fn reset(&self, worktree_id: &str, epoch: u64, get_urls: BTreeMap<String, String>) {
+        *self
+            .identity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = (worktree_id.to_owned(), epoch);
+        self.put_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        *self
+            .get_urls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = get_urls;
+    }
+
     /// Pre-mint PUT URLs for a batch of keys (one channel call).
     pub fn prefetch_put(&self, keys: &[String]) -> Result<(), RegistrarError> {
+        let (worktree_id, epoch) = self.identity();
         let resp = self.registrar.upload_urls(&UploadUrlsRequest::new(
-            &self.worktree_id,
-            self.epoch,
+            &worktree_id,
+            epoch,
             keys.to_vec(),
         ))?;
         self.put_cache
@@ -869,7 +961,7 @@ impl<R: Registrar> RegistrarMinter<R> {
     }
 }
 
-impl<R: Registrar> crate::sink::UrlMinter for RegistrarMinter<R> {
+impl<R: Registrar + ?Sized> crate::sink::UrlMinter for RegistrarMinter<R> {
     fn put_url(&self, key: &str) -> Result<String, String> {
         if let Some(u) = self
             .put_cache
@@ -898,7 +990,8 @@ impl<R: Registrar> crate::sink::UrlMinter for RegistrarMinter<R> {
     }
 
     fn multipart_urls(&self, key: &str, size: u64) -> Result<Option<MultipartUrls>, String> {
-        let mut req = UploadUrlsRequest::new(&self.worktree_id, self.epoch, vec![key.to_owned()]);
+        let (worktree_id, epoch) = self.identity();
+        let mut req = UploadUrlsRequest::new(&worktree_id, epoch, vec![key.to_owned()]);
         req.sizes.insert(key.to_owned(), size);
         let mut resp = self
             .registrar
@@ -921,9 +1014,10 @@ impl<R: Registrar> crate::sink::UrlMinter for RegistrarMinter<R> {
         parts: &[CompletedPart],
     ) -> Result<crate::sink::Completed, crate::sink::SinkError> {
         use crate::sink::{Completed, PutOutcome, SinkError};
+        let (worktree_id, epoch) = self.identity();
         match self.registrar.upload_complete(&UploadCompleteRequest {
-            worktree_id: self.worktree_id.clone(),
-            epoch: self.epoch,
+            worktree_id,
+            epoch,
             key: key.to_owned(),
             upload_id: upload_id.to_owned(),
             parts: parts.to_vec(),
@@ -953,7 +1047,7 @@ impl<R: Registrar> crate::sink::UrlMinter for RegistrarMinter<R> {
 mod tests {
     use super::*;
     use crate::manifest::{
-        BulkState, CaptureKind, FsckStatus, GitSection, Sections, WorkspaceSection,
+        BulkSection, BulkState, CaptureKind, FsckStatus, GitSection, Sections, WorkspaceSection,
     };
 
     fn manifest(n: u64, parent: Option<&str>) -> Manifest {
@@ -1053,9 +1147,79 @@ mod tests {
             .plan_get(&PlanGetRequest {
                 worktree_id: None,
                 epoch: 1,
+                platform: None,
             })
             .unwrap();
         assert_eq!(plan.head.unwrap().capture_id, "a");
+    }
+
+    /// `plan.get` names the executor's platform; a head whose bulk section was captured for
+    /// another one comes back with bulk `"pending"` and no bulk packs to fetch, an absent or
+    /// matching platform gets the head as is, and the field stays off the wire when unset.
+    #[test]
+    fn plan_get_answers_bulk_pending_for_another_platform() {
+        let r = InMemoryRegistrar::new("wt", 1, Some("http://x".into()));
+        let mut m = manifest(0, None);
+        m.sections.bulk = BulkState::Ready(BulkSection {
+            root: "captures/wt/1/trees/b".into(),
+            packs: vec!["captures/wt/1/packs/bulkpack".into()],
+            platform: "linux-x86_64-gnu".into(),
+        });
+        r.capture_register(&RegisterRequest {
+            manifest: m,
+            ..register(0, None, "a", 1)
+        })
+        .unwrap();
+        let plan = |platform: Option<&str>| {
+            r.plan_get(&PlanGetRequest {
+                worktree_id: None,
+                epoch: 0,
+                platform: platform.map(str::to_owned),
+            })
+            .unwrap()
+        };
+        let same = plan(Some("linux-x86_64-gnu"));
+        assert!(
+            same.head
+                .unwrap()
+                .manifest
+                .sections
+                .bulk
+                .section()
+                .is_some()
+        );
+        assert!(same.get_urls.contains_key("captures/wt/1/packs/bulkpack"));
+        let absent = plan(None);
+        assert!(
+            absent
+                .head
+                .unwrap()
+                .manifest
+                .sections
+                .bulk
+                .section()
+                .is_some()
+        );
+        let other = plan(Some("linux-aarch64-musl"));
+        let head = other.head.unwrap();
+        assert_eq!(head.manifest.sections.bulk, BulkState::pending());
+        assert!(!other.get_urls.contains_key("captures/wt/1/packs/bulkpack"));
+        assert_eq!(head.capture_id, "a", "the head itself is unchanged");
+
+        let booting = PlanGetRequest::booting(Some("wt".into()));
+        let json = serde_json::to_value(&booting).unwrap();
+        assert_eq!(json["epoch"], 0);
+        assert_eq!(json["platform"], crate::engine::default_platform());
+        let bare = serde_json::to_value(PlanGetRequest {
+            worktree_id: None,
+            epoch: 1,
+            platform: None,
+        })
+        .unwrap();
+        assert!(bare.get("platform").is_none());
+        let back: PlanGetRequest =
+            serde_json::from_str(r#"{"worktree_id":null,"epoch":2}"#).unwrap();
+        assert_eq!(back.platform, None);
     }
 
     fn parts(n: u32) -> Vec<CompletedPart> {

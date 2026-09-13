@@ -609,6 +609,12 @@ impl CadenceRunner {
         f(&self.shared.engine())
     }
 
+    /// Run `f` with the engine mutably (a re-plan); no snap runs meanwhile, and the clocks
+    /// resume where they were once `f` returns.
+    pub fn with_engine_mut<R>(&self, f: impl FnOnce(&mut CaptureEngine) -> R) -> R {
+        f(&mut self.shared.engine())
+    }
+
     /// Counters and modes.
     #[must_use]
     pub fn snapshot(&self) -> CadenceSnapshot {

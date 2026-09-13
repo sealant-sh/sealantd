@@ -480,6 +480,12 @@ pub enum Command {
     /// Report the worktree lease epoch this executor holds.
     #[serde(rename = "lease.epoch")]
     LeaseEpoch,
+    /// Fetch the plan again and bring the workspace to it: a standby executor that booted on
+    /// the project base takes the worktree the control plane assigned it (its id, its lease
+    /// epoch, its chain head materialized as a delta over the disk) and continues the chain
+    /// from there. Idempotent: a plan that names what the executor already has does nothing.
+    #[serde(rename = "capture.replan")]
+    CaptureReplan,
 }
 
 /// Why a capture is taken (ADR-0015 manifest `kind`).
@@ -534,6 +540,7 @@ impl Command {
             Self::CaptureFlush => "capture.flush",
             Self::CaptureStatus => "capture.status",
             Self::LeaseEpoch => "lease.epoch",
+            Self::CaptureReplan => "capture.replan",
         }
     }
 }
@@ -922,6 +929,35 @@ pub struct CaptureStatusReport {
     pub last_snap_unix_ms: Option<u64>,
 }
 
+/// Result of `capture.replan`: the identity the executor now acts under and what the delta
+/// materialize did.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CaptureReplanned {
+    /// Worktree the plan named.
+    pub worktree_id: String,
+    /// Lease epoch the plan named.
+    pub epoch: u64,
+    /// The chain head materialized, when the chain has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_n: Option<u64>,
+    /// Its capture id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_capture_id: Option<String>,
+    /// Files written.
+    pub files_written: u64,
+    /// Bytes written.
+    pub bytes_written: u64,
+    /// Files already on disk as the plan has them.
+    pub files_skipped: u64,
+    /// Bytes those files hold.
+    pub bytes_skipped: u64,
+    /// Files and symlinks removed because the plan no longer names them.
+    pub removed: u64,
+    /// The plan named the worktree, epoch and head the executor already had; nothing was done.
+    pub unchanged: bool,
+}
+
 /// Result of `lease.epoch`.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -970,6 +1006,8 @@ pub enum CommandResult {
     CaptureStatus(CaptureStatusReport),
     /// Lease epoch.
     LeaseEpoch(LeaseEpochReport),
+    /// The plan was fetched again and the workspace brought to it.
+    CaptureReplanned(CaptureReplanned),
     /// Generic acknowledgement with no data.
     Accepted,
 }

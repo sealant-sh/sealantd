@@ -530,6 +530,7 @@ fn fence_stops_shipping_and_a_new_epoch_continues_the_chain() {
         .plan_get(&sealant_capture::registrar::PlanGetRequest {
             worktree_id: None,
             epoch: 2,
+            platform: None,
         })
         .unwrap();
     assert_eq!(plan.worktree_id, "wt-fixture");

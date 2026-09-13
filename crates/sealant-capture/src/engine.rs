@@ -11,20 +11,20 @@ use serde::{Deserialize, Serialize};
 
 use crate::chunk::ChunkId;
 use crate::gitpack::{self, GitError, GitRepo};
-use crate::index::{
-    self, BuildStats, ChunkSink, DAEMON_DIR, Listing, TreeBuilder, TreeIndex, has_component_in,
-};
+use crate::index::{self, BuildStats, ChunkSink, DAEMON_DIR, Listing, TreeBuilder, TreeIndex};
 use crate::keys::KeyPrefix;
 use crate::manifest::{
     BulkSection, BulkState, CaptureKind, EncodedManifest, GitSection, Manifest, Sections,
     WorkspaceSection, rfc3339_now,
 };
 use crate::materialize::{
-    MaterializeClass, MaterializeError, MaterializeReport, MaterializeTargets, Materializer,
+    DiskState, MaterializeClass, MaterializeError, MaterializeReport, MaterializeTargets,
+    Materializer,
 };
 use crate::pack::{MAX_PACK_BYTES, PackBuilder, PackError};
 use crate::registrar::RegisterRequest;
 use crate::registrar::Registrar;
+use crate::roots::ClassRoots;
 use crate::ship::{DutyCycle, MultipartConfig, QueueEntry, ShipError, Shipper, Staging, Upload};
 use crate::sink::BlobSink;
 use crate::watch::WatchPolicy;
@@ -344,7 +344,11 @@ impl CaptureEngine {
         config: CaptureConfig,
         previous: Option<EncodedManifest>,
     ) -> Result<Self, EngineError> {
-        let staging = Arc::new(Staging::open(&config.staging_dir(), config.epoch)?);
+        let staging = Arc::new(Staging::open(
+            &config.staging_dir(),
+            &config.worktree_id,
+            config.epoch,
+        )?);
         // Staging sits inside the worktree: keep it out of the user's index (an agent's or a
         // checkpoint's `git add -A`) through the repository's local excludes, never the user's
         // `.gitignore`. A root that is not a repository yet gets the entry when materialized.
@@ -406,6 +410,78 @@ impl CaptureEngine {
         daemon_excludes(&self.config)
     }
 
+    /// Continue from `previous` as `worktree_id` at `epoch` (a re-plan: the control plane
+    /// assigned this executor its worktree, or moved its epoch). Staging follows, entries
+    /// staged under the old identity are dropped, chunk locations under the old prefix are
+    /// forgotten (a new epoch never skips an upload because a prior one holds the bytes), a
+    /// bulk build in progress is abandoned, and the repository's closure is re-read as the
+    /// negatives of the next pack. Call after the plan's head is on disk.
+    pub fn rebase(
+        &mut self,
+        worktree_id: &str,
+        epoch: u64,
+        previous: Option<EncodedManifest>,
+    ) -> Result<(), EngineError> {
+        self.config.worktree_id = worktree_id.to_owned();
+        self.config.epoch = epoch;
+        self.prefix = self.config.prefix();
+        self.staging.set_identity(worktree_id, epoch)?;
+        let dropped = self.staging.discard_foreign()?;
+        let base = format!("{}/", self.prefix.base());
+        self.chunks.packs.retain(|_, k| k.starts_with(&base));
+        self.bulk_work = None;
+        let seeded = previous.is_some();
+        self.previous = previous;
+        if seeded {
+            self.seed_tips_from_repo()?;
+        } else {
+            self.last_tips.clear();
+            self.persist()?;
+        }
+        tracing::info!(
+            worktree = worktree_id,
+            epoch,
+            dropped,
+            "capture engine rebased"
+        );
+        Ok(())
+    }
+
+    /// The materialize targets for this engine's root, staging and roots policy.
+    #[must_use]
+    pub fn materialize_targets(&self) -> MaterializeTargets {
+        let mut targets =
+            MaterializeTargets::new(&self.config.root, self.config.harness_home.clone());
+        targets.cache_dir = self.staging.cache_dir();
+        targets.scratch_dir = self.staging.scratch_dir();
+        targets.index_dir = self.staging.index_dir();
+        targets.staging_dir = self.config.staging_dir();
+        targets.bulk_dirs = self.config.bulk_dirs.clone();
+        targets
+    }
+
+    /// Bring this engine's root to `manifest` from `sink`, writing only the delta against what
+    /// the engine's own indexes say is on disk, and keep the indexes the materializer updated.
+    pub fn materialize_delta(
+        &mut self,
+        sink: &dyn BlobSink,
+        manifest: &Manifest,
+        class: MaterializeClass,
+    ) -> Result<MaterializeReport, EngineError> {
+        let targets = self.materialize_targets();
+        let mut state = DiskState::load(&targets.index_dir);
+        state.workspace = std::mem::take(&mut self.workspace_index);
+        state.bulk = std::mem::take(&mut self.bulk_index);
+        let result = Materializer::new(sink, targets.clone())
+            .materialize_with_state(manifest, class, &mut state);
+        let saved = state.save(&targets.index_dir);
+        self.workspace_index = state.workspace;
+        self.bulk_index = state.bulk;
+        let report = result?;
+        saved?;
+        Ok(report)
+    }
+
     /// Configuration.
     #[must_use]
     pub fn config(&self) -> &CaptureConfig {
@@ -444,10 +520,15 @@ impl CaptureEngine {
         fs::rename(tmp, dir.join("git-tips.json"))
     }
 
-    fn is_daemon_path(&self, abs: &Path) -> bool {
-        abs == self.config.staging_dir()
-            || abs == self.config.root.join(DAEMON_DIR)
-            || self.config.harness_home.as_deref() == Some(abs)
+    /// The class roots this engine captures (and a materializer sweeps).
+    #[must_use]
+    pub fn roots(&self) -> ClassRoots {
+        ClassRoots {
+            root: self.config.root.clone(),
+            harness_home: self.config.harness_home.clone(),
+            bulk_dirs: self.config.bulk_dirs.clone(),
+            staging_dir: self.config.staging_dir(),
+        }
     }
 
     /// The workspace class listing: `.git/` bookkeeping, `tree/` (ignored files and nested
@@ -457,95 +538,12 @@ impl CaptureEngine {
         repo: &GitRepo,
         gitlinks: &[String],
     ) -> Result<Listing, EngineError> {
-        let mut listing = Listing::default();
-        let git_prune = |_: &Path, v: &str, _: &str| {
-            v == ".git/objects" || v == ".git/worktrees" || v == ".git/lfs"
-        };
-        let git_include = |_: &Path, v: &str, _: &str| {
-            !(v == ".git/HEAD"
-                || v == ".git/packed-refs"
-                || v == ".git/commondir"
-                || v == ".git/gitdir"
-                || v.starts_with(".git/refs/"))
-        };
-        listing.mount(".git", &repo.git_dir, "", git_prune, git_include);
-        if repo.common_dir != repo.git_dir {
-            listing.mount(".git", &repo.common_dir, "", git_prune, git_include);
-        }
-
-        let bulk = self.config.bulk_dirs.clone();
-        let root = self.config.root.clone();
-        let mut tree_roots: Vec<String> = Vec::new();
-        let out = repo.run(&[
-            "ls-files",
-            "-o",
-            "-i",
-            "--exclude-standard",
-            "--directory",
-            "-z",
-        ])?;
-        for rel in String::from_utf8_lossy(&out.stdout).split('\0') {
-            if !rel.is_empty() {
-                tree_roots.push(rel.to_owned());
-            }
-        }
-        tree_roots.extend(gitlinks.iter().map(|g| format!("{g}/")));
-        for rel in tree_roots {
-            let is_dir = rel.ends_with('/');
-            let rel = rel.trim_end_matches('/');
-            let abs = root.join(rel);
-            if has_component_in(Path::new(rel), &bulk)
-                || rel == DAEMON_DIR
-                || self.is_daemon_path(&abs)
-            {
-                continue;
-            }
-            if is_dir {
-                listing.mount(
-                    "tree",
-                    &root,
-                    rel,
-                    |abs, _, name| bulk.iter().any(|b| b == name) || self.is_daemon_path(abs),
-                    |_, _, _| true,
-                );
-            } else {
-                listing.mount_file(&format!("tree/{rel}"), "tree", &root, &abs);
-            }
-        }
-        if let Some(home) = &self.config.harness_home
-            && home.is_dir()
-        {
-            let creds: Vec<PathBuf> = index::CREDENTIAL_FILES
-                .iter()
-                .map(|c| home.join(c))
-                .collect();
-            listing.mount(
-                "harness",
-                home,
-                "",
-                |_, _, _| false,
-                |abs, _, _| !creds.iter().any(|c| c == abs),
-            );
-        }
-        Ok(listing)
+        Ok(self.roots().workspace_listing(repo, gitlinks)?)
     }
 
     /// The bulk class listing: every bulk directory under the root.
     fn bulk_listing(&self) -> Listing {
-        let mut listing = Listing::default();
-        let bulk = self.config.bulk_dirs.clone();
-        let root = self.config.root.clone();
-        listing.mount(
-            "",
-            &root,
-            "",
-            |abs, v, name| v == ".git" || name == DAEMON_DIR || self.is_daemon_path(abs),
-            |abs, _, _| {
-                abs.strip_prefix(&root)
-                    .is_ok_and(|rel| has_component_in(rel, &bulk))
-            },
-        );
-        listing
+        self.roots().bulk_listing()
     }
 
     /// Build a chunked class into new packs; returns the root key and the pack keys the tree
@@ -930,17 +928,14 @@ impl CaptureEngine {
         Ok(shipper.flush(deadline)?)
     }
 
-    /// Materialize `manifest` from `sink` into this engine's root (and harness home).
+    /// Materialize `manifest` from `sink` into this engine's root (and harness home), against
+    /// the disk state on disk rather than this engine's indexes (see [`Self::materialize_delta`]).
     pub fn materialize(
         &self,
         sink: &dyn BlobSink,
         manifest: &Manifest,
         class: MaterializeClass,
     ) -> Result<MaterializeReport, EngineError> {
-        let mut targets =
-            MaterializeTargets::new(&self.config.root, self.config.harness_home.clone());
-        targets.cache_dir = self.staging.cache_dir();
-        targets.scratch_dir = self.staging.scratch_dir();
-        Ok(Materializer::new(sink, targets).materialize(manifest, class)?)
+        Ok(Materializer::new(sink, self.materialize_targets()).materialize(manifest, class)?)
     }
 }

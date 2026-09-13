@@ -25,6 +25,43 @@ carries none of its bytes. The flag stays as belt and braces. A nested repositor
 ignores is carried by the ignored-files walk instead and is never named in a pathspec (naming an
 ignored path makes `git add` exit 1).
 
+## Materialize is a delta (`materialize.rs`, `roots.rs`)
+
+`Materializer::materialize` brings the disk to a manifest rather than writing it out: a file
+whose `(size, mtime, inode)` and chunk list in the `DiskState` index (the engine's
+`workspace.json` / `bulk.json` under `.sealantd/capture/index/`, written by the materializer
+for every file it lays down) match the plan entry is skipped, a symlink with the same text and
+a hardlink member already on the canonical inode likewise; git packs already installed are not
+fetched; the working tree moves from the tree last checked out to the plan's worktree
+pseudo-ref through a two-tree `read-tree --reset -u` (a full `checkout-index` when nothing is
+known about the disk). Files, symlinks and emptied directories the plan no longer names are
+removed, and only inside what a capture would list (`ClassRoots`, the same policy the engine's
+listings use): never the staging directory, excluded names, credentials, or the bulk
+directories of a `"pending"` bulk section. `tests/delta.rs` measures it: a head applied over a
+materialized base wrote 9 files / 213 KB where a fresh materialize writes 427 files / 1.7 MB,
+the two trees compare identical (bytes, modes, mtimes, links), and the head over itself writes
+nothing. This is what lets a standby executor pre-materialize the project base and apply the
+claimed worktree's head over it (`capture.replan`).
+
+## Re-plan (`capture.replan`)
+
+A standby executor boots on the project base under a placeholder worktree id and epoch (Mend's
+`standby-<id>`). When the control plane assigns it a worktree, `capture.replan` fetches
+`plan.get` again (epoch 0, this build's platform, no worktree named: the token decides), takes
+the worktree id and epoch the answer names, materializes the head as a delta over the disk with
+the engine's own indexes (`CaptureEngine::materialize_delta`), and `CaptureEngine::rebase`s:
+the key prefix moves, `Staging` moves its identity (ack markers live under
+`uploaded/<worktree>/<epoch>/`, so nothing acked under the placeholder counts), queue entries
+staged under the old identity are *foreign* — dropped by the rebase, and by the shipper if one
+was in flight, whose fence then belongs to the old identity and is not this executor's —, chunk
+locations under the old prefix are forgotten, a bulk build in progress is abandoned, the
+repository closure is re-read as the negatives of the next pack, and the shipper's fence is
+lifted. No snap runs meanwhile; the cadence resumes where it was. The daemon's heartbeat,
+status and `lease.epoch` follow the new identity. A plan naming what the executor already has
+is answered `unchanged`. `crates/sealantd/src/capture.rs` tests it end to end: base captured
+for `wt-real`, standby boots as `standby-1`/epoch 7, the chain moves on, re-plan, the next
+capture registers as `wt-real`/epoch 1 with the head as its parent.
+
 ## Cadence (`cadence.rs`, `watch.rs`)
 
 `CadenceRunner` owns the engine and two clocks. `watch.rs` runs the `sealant-fs` pruned
@@ -37,7 +74,25 @@ a class dirty on every create/modify/remove. Small class: `quiet` (2 s) after th
 over budget (half the sysctl, or `WatchPolicy::budget`) the class polls; `raise_limit` tries the
 sysctl first and never fails boot. `tests/cadence.rs` measures all of it against the real watcher.
 
-## Wire additions (multipart uploads)
+## Wire additions
+
+### `platform` on `plan.get`
+
+The request carries the executor's `<os>-<arch>-<libc>` (the same key the bulk class stamps on
+its captures, `engine::default_platform`). A registrar answers the head's bulk section as
+`"pending"` when it was captured for another platform and omits its packs from `get_urls`:
+the executor never restores a dependency tree built elsewhere, the control plane runs the
+project's install in the workspace instead. A registrar that ignores the field, or a request
+without it (an older executor), gets the head as is. `InMemoryRegistrar` implements the rule;
+the materializer treats `"pending"` as nothing to restore and nothing to sweep.
+
+```json
+→ {"worktree_id":"wt","epoch":0,"platform":"linux-x86_64-gnu"}
+← {"worktree_id":"wt","epoch":3,"head":{"n":7,"capture_id":"…","manifest_key":"…",
+   "manifest":{…,"sections":{…,"bulk":"pending"}}},"get_urls":{…}}
+```
+
+### Multipart uploads
 
 Measured (R1, 2026-09): one presigned PUT from a Cloudflare sandbox to R2 runs at 37–47 MB/s,
 four multipart parts in flight at 63.6 MB/s; AWS single-stream is ≈ 100 MB/s per flow. So the

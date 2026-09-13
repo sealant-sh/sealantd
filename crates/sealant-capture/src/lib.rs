@@ -20,6 +20,7 @@ pub mod manifest;
 pub mod materialize;
 pub mod pack;
 pub mod registrar;
+pub mod roots;
 pub mod ship;
 pub mod sink;
 pub mod tree;
@@ -31,7 +32,9 @@ pub use engine::{
     StagedCapture,
 };
 pub use manifest::{CaptureKind, EncodedManifest, FsckStatus, Manifest};
-pub use materialize::{MaterializeClass, MaterializeReport, MaterializeTargets, Materializer};
+pub use materialize::{
+    DiskState, MaterializeClass, MaterializeReport, MaterializeTargets, Materializer,
+};
 pub use registrar::{HttpRegistrar, InMemoryRegistrar, Registrar, RegistrarError};
 pub use ship::{MultipartConfig, ShipSnapshot, ShipWorker, Shipper, Staging};
 pub use sink::{BlobSink, LocalDir, PresignedHttp, UrlMinter};

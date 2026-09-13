@@ -8,8 +8,8 @@
 use std::fs;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -312,6 +312,31 @@ pub trait UrlMinter: Send + Sync {
             key: key.to_owned(),
             reason: "this minter cannot complete multipart uploads".to_owned(),
         })
+    }
+}
+
+/// A shared minter is a minter: the daemon keeps the handle a re-plan resets while the sink
+/// owns a clone.
+impl<M: UrlMinter + ?Sized> UrlMinter for Arc<M> {
+    fn put_url(&self, key: &str) -> Result<String, String> {
+        (**self).put_url(key)
+    }
+
+    fn get_url(&self, key: &str) -> Result<String, String> {
+        (**self).get_url(key)
+    }
+
+    fn multipart_urls(&self, key: &str, size: u64) -> Result<Option<MultipartUrls>, String> {
+        (**self).multipart_urls(key, size)
+    }
+
+    fn complete_multipart(
+        &self,
+        key: &str,
+        upload_id: &str,
+        parts: &[CompletedPart],
+    ) -> Result<Completed, SinkError> {
+        (**self).complete_multipart(key, upload_id, parts)
     }
 }
 

@@ -634,20 +634,28 @@ pub fn build_git_pack(
 // Materialize side.
 // ---------------------------------------------------------------------------------------------
 
+/// Whether the pack named by `sha256` is installed already (pack and index both present).
+#[must_use]
+pub fn pack_installed(repo: &GitRepo, sha256: &str) -> bool {
+    let dir = repo.common_dir.join("objects").join("pack");
+    dir.join(format!("pack-{sha256}.pack")).exists()
+        && dir.join(format!("pack-{sha256}.idx")).exists()
+}
+
 /// Install a pack (and its index; regenerated with `git index-pack` when absent) into
-/// `objects/pack`.
+/// `objects/pack`. `Ok(false)` when it was there already.
 pub fn install_pack(
     repo: &GitRepo,
     sha256: &str,
     pack: &[u8],
     idx: Option<&[u8]>,
-) -> Result<(), GitError> {
+) -> Result<bool, GitError> {
     let dir = repo.common_dir.join("objects").join("pack");
     fs::create_dir_all(&dir)?;
     let pack_path = dir.join(format!("pack-{sha256}.pack"));
     let idx_path = dir.join(format!("pack-{sha256}.idx"));
     if pack_path.exists() && idx_path.exists() {
-        return Ok(());
+        return Ok(false);
     }
     let tmp = dir.join(format!("tmp-capture-{sha256}.pack"));
     fs::write(&tmp, pack)?;
@@ -661,7 +669,7 @@ pub fn install_pack(
     }
     fs::rename(tmp.with_extension("idx"), &idx_path)?;
     fs::rename(&tmp, &pack_path)?;
-    Ok(())
+    Ok(true)
 }
 
 /// Write `packed-refs` from `refs`, skipping the pseudo-refs, and remove loose refs that would
@@ -699,12 +707,10 @@ pub fn write_head(repo: &GitRepo, head: &str) -> Result<(), GitError> {
     Ok(())
 }
 
-/// Check `tree` out into the working tree through a throwaway index (files only; nothing is
-/// removed), then either restore the real index from `index_bytes` or read it from `index_tree`.
+/// Check `tree` out into the working tree through a throwaway index: every file of the tree
+/// is written (nothing is removed). See [`checkout_tree_from`] for the delta form.
 pub fn checkout_tree(repo: &GitRepo, tree: &str, scratch_dir: &Path) -> Result<(), GitError> {
-    fs::create_dir_all(scratch_dir)?;
-    let tmp_index = scratch_dir.join("materialize-index");
-    fs::remove_file(&tmp_index).ok();
+    let tmp_index = scratch_index(scratch_dir)?;
     let rt = ["read-tree", tree];
     check(
         &rt,
@@ -723,6 +729,106 @@ pub fn checkout_tree(repo: &GitRepo, tree: &str, scratch_dir: &Path) -> Result<(
     )?;
     fs::remove_file(&tmp_index).ok();
     Ok(())
+}
+
+/// Move a working tree that holds `from` to `to` through a throwaway index: a two-tree
+/// `read-tree --reset -u`, which writes the paths that differ between the trees, deletes the
+/// ones `to` dropped and leaves the rest untouched (the index is trusted for them, so the
+/// caller vouches that the working tree still holds `from`). Returns the number of paths the
+/// tree diff names.
+pub fn checkout_tree_from(
+    repo: &GitRepo,
+    from: &str,
+    to: &str,
+    scratch_dir: &Path,
+) -> Result<u64, GitError> {
+    if from == to {
+        return Ok(0);
+    }
+    let tmp_index = scratch_index(scratch_dir)?;
+    let seed = ["read-tree", from];
+    check(
+        &seed,
+        git_command(&repo.root)
+            .env("GIT_INDEX_FILE", &tmp_index)
+            .args(seed)
+            .output()?,
+    )?;
+    let merge = ["read-tree", "--reset", "-u", from, to];
+    check(
+        &merge,
+        git_command(&repo.root)
+            .env("GIT_INDEX_FILE", &tmp_index)
+            .args(merge)
+            .output()?,
+    )?;
+    fs::remove_file(&tmp_index).ok();
+    let diff = [
+        "diff-tree",
+        "-r",
+        "--name-only",
+        "--no-renames",
+        "-z",
+        from,
+        to,
+    ];
+    let out = check(&diff, git_command(&repo.root).args(diff).output()?)?;
+    Ok(out
+        .stdout
+        .split(|b| *b == 0)
+        .filter(|p| !p.is_empty())
+        .count() as u64)
+}
+
+/// Files under the working tree that `tree` does not have and git would not ignore, relative
+/// to the root: the leftovers of an earlier checkout. Nested repositories (a lone `dir/` entry)
+/// and anything under `excludes` are not listed.
+pub fn untracked_against(
+    repo: &GitRepo,
+    tree: &str,
+    scratch_dir: &Path,
+    excludes: &[String],
+) -> Result<Vec<String>, GitError> {
+    let tmp_index = scratch_index(scratch_dir)?;
+    let rt = ["read-tree", tree];
+    check(
+        &rt,
+        git_command(&repo.root)
+            .env("GIT_INDEX_FILE", &tmp_index)
+            .args(rt)
+            .output()?,
+    )?;
+    let mut args: Vec<String> = ["ls-files", "-o", "--exclude-standard", "-z"]
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect();
+    for e in excludes {
+        let e = e.trim_matches('/');
+        if !e.is_empty() {
+            args.push(format!("--exclude=/{e}/"));
+        }
+    }
+    let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+    let out = check(
+        &argv,
+        git_command(&repo.root)
+            .env("GIT_INDEX_FILE", &tmp_index)
+            .args(&argv)
+            .output()?,
+    )?;
+    fs::remove_file(&tmp_index).ok();
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .split('\0')
+        .filter(|p| !p.is_empty() && !p.ends_with('/'))
+        .map(str::to_owned)
+        .collect())
+}
+
+fn scratch_index(scratch_dir: &Path) -> Result<PathBuf, GitError> {
+    fs::create_dir_all(scratch_dir)?;
+    let tmp_index = scratch_dir.join("materialize-index");
+    fs::remove_file(&tmp_index).ok();
+    Ok(tmp_index)
 }
 
 /// Rebuild the real index from `tree` (used when the workspace class carried no index).

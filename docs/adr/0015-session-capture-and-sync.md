@@ -243,10 +243,11 @@ has none), `materialize.rs`, `sink.rs`.
 Wiring in existing crates, all verified against today's tree:
 
 - `crates/sealant-protocol/src/command.rs` `pub enum Command` (adjacently tagged `cmd`/`args`)
-  gains `capture.now { kind }`, `capture.flush`, `capture.status`, `lease.epoch`; results beside
+  gains `capture.now { kind }`, `capture.flush`, `capture.status`, `lease.epoch`, `capture.replan`
+  (fetch the plan again and bring the workspace to it: a standby taking its worktree); results beside
   `ShutdownAccepted`; the protobuf mirror in `crates/sealant-protocol/proto/sealant.proto` and
   `convert.rs` per ADR-0012.
-- `crates/sealantctl/src/main.rs` `enum Cmd` gains `capture flush`, which the platform hooks run
+- `crates/sealantctl/src/main.rs` `enum Cmd` gains `capture flush` (and `capture replan`), which the platform hooks run
   (`/suspend`, `/terminate` on MicroVMs; a container `preStop`).
 - `crates/sealantd/src/boot/config.rs` `WorkspaceSource` (`Clone | Mount | Standby`) gains
   `Capture(CaptureConfig)`, selected by `SEALANT_WORKSPACE_SOURCE=capture`; the boot match in
