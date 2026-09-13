@@ -11,8 +11,8 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 use sealant_control::{read_frame, write_frame};
 use sealant_protocol::{
-    ClientMessage, Command, ControlRequest, DEFAULT_MAX_FRAME_BYTES, EventPayload, ExecArgs,
-    RequestId, ServerMessage,
+    CaptureKind, ClientMessage, Command, ControlRequest, DEFAULT_MAX_FRAME_BYTES, EventPayload,
+    ExecArgs, RequestId, ServerMessage,
 };
 use tokio::net::UnixStream;
 
@@ -55,6 +55,47 @@ enum Cmd {
         #[arg(long)]
         grace: Option<u64>,
     },
+    /// Session capture store (ADR-0015).
+    Capture {
+        #[command(subcommand)]
+        action: CaptureCmd,
+    },
+    /// Worktree lease.
+    Lease {
+        #[command(subcommand)]
+        action: LeaseCmd,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum CaptureCmd {
+    /// Take a small-class capture now and stage it for shipping.
+    Now {
+        /// Why: auto | turn | checkpoint | suspend | final.
+        #[arg(long, default_value = "checkpoint")]
+        kind: String,
+    },
+    /// Final capture, then ship and register everything staged (the suspend/terminate hook).
+    Flush,
+    /// Report the capture engine's state.
+    Status,
+}
+
+#[derive(Debug, Subcommand)]
+enum LeaseCmd {
+    /// Report the lease epoch this executor holds.
+    Epoch,
+}
+
+fn parse_kind(kind: &str) -> Option<CaptureKind> {
+    match kind {
+        "auto" => Some(CaptureKind::Auto),
+        "turn" => Some(CaptureKind::Turn),
+        "checkpoint" => Some(CaptureKind::Checkpoint),
+        "suspend" => Some(CaptureKind::Suspend),
+        "final" => Some(CaptureKind::Final),
+        _ => None,
+    }
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -84,6 +125,22 @@ async fn main() -> ExitCode {
             },
             false,
         ),
+        Cmd::Capture { action } => match action {
+            CaptureCmd::Now { kind } => match parse_kind(&kind) {
+                Some(kind) => (Command::CaptureNow { kind }, false),
+                None => {
+                    eprintln!(
+                        "sealantctl: unknown capture kind {kind:?} (auto|turn|checkpoint|suspend|final)"
+                    );
+                    return ExitCode::FAILURE;
+                }
+            },
+            CaptureCmd::Flush => (Command::CaptureFlush, false),
+            CaptureCmd::Status => (Command::CaptureStatus, false),
+        },
+        Cmd::Lease { action } => match action {
+            LeaseCmd::Epoch => (Command::LeaseEpoch, false),
+        },
         Cmd::Exec {
             executable,
             args,

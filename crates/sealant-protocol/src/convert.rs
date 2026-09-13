@@ -9,16 +9,17 @@ use crate::ids::{
 };
 use crate::wire;
 use crate::{
-    ArtifactRef, AttachMode, AttachSessionArgs, Base64Bytes, Capabilities, CaptureMethod,
-    CaptureMode, CapturePolicy, ClientMessage, Command, CommandResult, Confidence, ControlError,
-    ControlErrorCode, ControlRequest, ControlResponse, Encoding, EnvVar, EventEnvelope,
-    EventPayload, ExecAccepted, ExecArgs, ExecutionStartArgs, ExitReason, Feature, FeatureMatrix,
-    FeatureState, ForwardOpened, ForwardProtocol, HealthReport, IoChunk, Limits, NetworkMode,
-    OpenForwardArgs, OpenSessionArgs, OpenSftpArgs, ProcessAttached, ProcessExited, ProcessList,
-    ProcessStarted, ProcessState, ProcessSummary, ResponseOutcome, RuntimeHeartbeat,
-    RuntimeMetrics, RuntimeState, RuntimeStateChanged, ServerMessage, SessionList, SessionOpened,
-    SessionSummary, SftpOpened, ShutdownAccepted, Signal, StreamAttached, StreamEnd, StreamFrame,
-    StreamKind, StreamPayload, TelemetryDropped, TransformMeta,
+    ArtifactRef, AttachMode, AttachSessionArgs, Base64Bytes, Capabilities, CaptureKind,
+    CaptureMethod, CaptureMode, CapturePolicy, CaptureStaged, CaptureStatusReport, ClientMessage,
+    Command, CommandResult, Confidence, ControlError, ControlErrorCode, ControlRequest,
+    ControlResponse, Encoding, EnvVar, EventEnvelope, EventPayload, ExecAccepted, ExecArgs,
+    ExecutionStartArgs, ExitReason, Feature, FeatureMatrix, FeatureState, ForwardOpened,
+    ForwardProtocol, HealthReport, IoChunk, LeaseEpochReport, Limits, NetworkMode, OpenForwardArgs,
+    OpenSessionArgs, OpenSftpArgs, ProcessAttached, ProcessExited, ProcessList, ProcessStarted,
+    ProcessState, ProcessSummary, ResponseOutcome, RuntimeHeartbeat, RuntimeMetrics, RuntimeState,
+    RuntimeStateChanged, ServerMessage, SessionList, SessionOpened, SessionSummary, SftpOpened,
+    ShutdownAccepted, Signal, StreamAttached, StreamEnd, StreamFrame, StreamKind, StreamPayload,
+    TelemetryDropped, TransformMeta,
 };
 use crate::{
     FileChange, FileChangeKind, FileDiffAvailable, FileEntry, FileSnapshotCompleted, FileType,
@@ -121,6 +122,12 @@ enum_pair!(
     crate::EventPriority,
     wire::EventPriority,
     [Critical, Normal, Low]
+);
+enum_pair!(
+    capture_kind,
+    CaptureKind,
+    wire::CaptureKind,
+    [Auto, Turn, Checkpoint, Suspend, Final]
 );
 enum_pair!(
     feature,
@@ -987,6 +994,12 @@ impl From<Command> for wire::command::Command {
                 mount_path,
                 subpath,
             }),
+            Command::CaptureNow { kind } => W::CaptureNow(wire::CaptureNowArgs {
+                kind: enum_i32::<_, wire::CaptureKind>(kind),
+            }),
+            Command::CaptureFlush => W::CaptureFlush(wire::Empty {}),
+            Command::CaptureStatus => W::CaptureStatus(wire::Empty {}),
+            Command::LeaseEpoch => W::LeaseEpoch(wire::Empty {}),
             Command::AttachSession(a) => W::AttachSession(a.into()),
             Command::DetachSession { channel_id } => W::DetachSession(wire::DetachSessionArgs {
                 channel_id: channel_id.into_inner(),
@@ -1064,6 +1077,12 @@ impl TryFrom<wire::command::Command> for Command {
                 mount_path: a.mount_path,
                 subpath: a.subpath,
             },
+            W::CaptureNow(a) => Command::CaptureNow {
+                kind: capture_kind(a.kind)?,
+            },
+            W::CaptureFlush(_) => Command::CaptureFlush,
+            W::CaptureStatus(_) => Command::CaptureStatus,
+            W::LeaseEpoch(_) => Command::LeaseEpoch,
             W::AttachSession(a) => Command::AttachSession(a.try_into()?),
             W::DetachSession(a) => Command::DetachSession {
                 channel_id: ChannelId::new(a.channel_id),
@@ -1325,6 +1344,30 @@ impl From<CommandResult> for wire::command_result::Result {
             CommandResult::ShutdownAccepted(s) => W::ShutdownAccepted(wire::ShutdownAccepted {
                 grace_millis: s.grace_millis,
             }),
+            CommandResult::CaptureStaged(c) => W::CaptureStaged(wire::CaptureStaged {
+                n: c.n,
+                capture_id: c.capture_id,
+                kind: enum_i32::<_, wire::CaptureKind>(c.kind),
+                unchanged: c.unchanged,
+            }),
+            CommandResult::CaptureStatus(c) => W::CaptureStatus(wire::CaptureStatusReport {
+                epoch: c.epoch,
+                worktree_id: c.worktree_id,
+                head_n: c.head_n,
+                pending: c.pending,
+                staged_bytes: c.staged_bytes,
+                uploaded_objects: c.uploaded_objects,
+                uploaded_bytes: c.uploaded_bytes,
+                registered: c.registered,
+                fenced: c.fenced,
+                paused: c.paused,
+                last_snap_unix_ms: c.last_snap_unix_ms,
+            }),
+            CommandResult::LeaseEpoch(l) => W::LeaseEpoch(wire::LeaseEpochReport {
+                epoch: l.epoch,
+                worktree_id: l.worktree_id,
+                fenced: l.fenced,
+            }),
             CommandResult::StreamAttached(s) => W::StreamAttached(wire::StreamAttached {
                 channel_id: s.channel_id.into_inner(),
             }),
@@ -1389,6 +1432,30 @@ impl TryFrom<wire::command_result::Result> for CommandResult {
             }),
             W::ShutdownAccepted(s) => CommandResult::ShutdownAccepted(ShutdownAccepted {
                 grace_millis: s.grace_millis,
+            }),
+            W::CaptureStaged(c) => CommandResult::CaptureStaged(CaptureStaged {
+                n: c.n,
+                capture_id: c.capture_id,
+                kind: capture_kind(c.kind)?,
+                unchanged: c.unchanged,
+            }),
+            W::CaptureStatus(c) => CommandResult::CaptureStatus(CaptureStatusReport {
+                epoch: c.epoch,
+                worktree_id: c.worktree_id,
+                head_n: c.head_n,
+                pending: c.pending,
+                staged_bytes: c.staged_bytes,
+                uploaded_objects: c.uploaded_objects,
+                uploaded_bytes: c.uploaded_bytes,
+                registered: c.registered,
+                fenced: c.fenced,
+                paused: c.paused,
+                last_snap_unix_ms: c.last_snap_unix_ms,
+            }),
+            W::LeaseEpoch(l) => CommandResult::LeaseEpoch(LeaseEpochReport {
+                epoch: l.epoch,
+                worktree_id: l.worktree_id,
+                fenced: l.fenced,
             }),
             W::StreamAttached(s) => CommandResult::StreamAttached(StreamAttached {
                 channel_id: ChannelId::new(s.channel_id),
@@ -1847,6 +1914,53 @@ mod tests {
         ));
         let bytes = encode_client(&msg);
         assert_eq!(decode_client(&bytes).expect("decode"), msg);
+    }
+
+    #[test]
+    fn capture_commands_and_results_round_trip() {
+        for command in [
+            Command::CaptureNow {
+                kind: CaptureKind::Checkpoint,
+            },
+            Command::CaptureFlush,
+            Command::CaptureStatus,
+            Command::LeaseEpoch,
+        ] {
+            let msg = ClientMessage::Request(ControlRequest::new(RequestId::new("req_c"), command));
+            let bytes = encode_client(&msg);
+            assert_eq!(decode_client(&bytes).expect("decode"), msg);
+        }
+        for result in [
+            CommandResult::CaptureStaged(CaptureStaged {
+                n: 3,
+                capture_id: "abc".to_owned(),
+                kind: CaptureKind::Final,
+                unchanged: false,
+            }),
+            CommandResult::CaptureStatus(CaptureStatusReport {
+                epoch: 2,
+                worktree_id: "wt".to_owned(),
+                head_n: Some(3),
+                pending: 1,
+                staged_bytes: 10,
+                uploaded_objects: 4,
+                uploaded_bytes: 500,
+                registered: 3,
+                fenced: false,
+                paused: true,
+                last_snap_unix_ms: None,
+            }),
+            CommandResult::LeaseEpoch(LeaseEpochReport {
+                epoch: 2,
+                worktree_id: "wt".to_owned(),
+                fenced: true,
+            }),
+        ] {
+            let msg =
+                ServerMessage::Response(ControlResponse::ok_with(RequestId::new("req_c"), result));
+            let bytes = encode_server(&msg);
+            assert_eq!(decode_server(&bytes).expect("decode"), msg);
+        }
     }
 
     #[test]

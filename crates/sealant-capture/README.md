@@ -1,0 +1,98 @@
+# sealant-capture
+
+> Status (PR sealantd#71): the cadence is watcher-fed. The small class snaps 2 s after the last
+> change and at most every 10 s while dirty; the bulk class has its own 30 s / 120 s clocks and
+> yields to small snaps at chunk boundaries; turn boundaries, checkpoints, `capture.flush` and the
+> SIGTERM/SIGINT/`gracefulShutdown` paths force a small snap ahead of the timers. Watch budget not
+> met, `IN_Q_OVERFLOW` or no backend → that class polls at its maximum interval (the stat walk).
+> Still open: the registrar wire shape is provisional (`registrar.rs`).
+
+The executor-side half of the session capture store (ADR-0015). A workspace is captured as two
+classes of content-addressed objects in a bucket-shaped `BlobSink`: git objects as self-contained
+git packs (`gitpack`), everything else as content-defined chunks in CDC packs (`chunk`, `pack`)
+described by dir objects (`tree`). A `Manifest` ties one capture together; `ship` stages, uploads
+and registers it through a `Registrar`; `materialize` rebuilds a workspace from a manifest.
+`CaptureEngine` is the front door: `snap(class, kind)` stages a capture, `snap_preemptible` lets a
+bulk build yield.
+
+Nested repositories (a directory under the worktree holding a `.git`, with or without a commit
+checked out, tracked as a gitlink or not) never enter the worktree tree: `GitRepo::worktree_tree`
+enumerates them before its `git add -A` and names each in an `:(exclude)` pathspec, and the
+chunked class carries their bytes (`tree/<path>/`). This does not depend on the git version: on
+git 2.52 a commit-less nested repository is fatal to `git add -A` even with `--ignore-errors`,
+and on any version an embedded repository with a commit would otherwise become a gitlink that
+carries none of its bytes. The flag stays as belt and braces. A nested repository git already
+ignores is carried by the ignored-files walk instead and is never named in a pathspec (naming an
+ignored path makes `git add` exit 1).
+
+## Cadence (`cadence.rs`, `watch.rs`)
+
+`CadenceRunner` owns the engine and two clocks. `watch.rs` runs the `sealant-fs` pruned
+per-directory inotify watcher over the capture roots (the worktree minus bulk directories, the
+git dir, the harness home; bulk directories separately) under the capture ignore policy and marks
+a class dirty on every create/modify/remove. Small class: `quiet` (2 s) after the last change,
+`max_interval` (10 s) from the first; bulk class: `bulk_quiet` (30 s) / `bulk_max_interval`
+(120 s), one bulk snap in flight, resumed after every yield without re-reading. Forced snaps
+(`CadenceRunner::snap`, `flush`) preempt a bulk build. Directories are counted before watching;
+over budget (half the sysctl, or `WatchPolicy::budget`) the class polls; `raise_limit` tries the
+sysctl first and never fails boot. `tests/cadence.rs` measures all of it against the real watcher.
+
+## Wire additions (multipart uploads)
+
+Measured (R1, 2026-09): one presigned PUT from a Cloudflare sandbox to R2 runs at 37–47 MB/s,
+four multipart parts in flight at 63.6 MB/s; AWS single-stream is ≈ 100 MB/s per flow. So the
+shipper uploads objects at or above `MultipartConfig::threshold` (default 16 MiB; parts 16 MiB,
+4 in flight) as S3-style multipart uploads, and the executor still never holds bucket
+credentials: the registrar performs `CreateMultipartUpload` and `CompleteMultipartUpload`
+server-side, the executor only PUTs parts to presigned part URLs and reports their ETags. Two
+additions to the session channel, both additive (a registrar that ignores `sizes` and answers
+`urls` alone gets single PUTs, as today):
+
+`upload.urls` — request gains `sizes` (key → bytes) for the keys the executor would upload as
+multipart; response gains `multipart` (key → upload) for the keys the registrar takes that way.
+The object is cut into `part_size`-byte parts (the last shorter); part *i* (1-based) is PUT to
+`part_urls[i-1]` with `Content-Length` and no conditional header; `urls` omits a multipart key.
+
+```json
+→ {"worktree_id":"wt","epoch":3,"keys":["captures/wt/3/packs/<sha>"],
+   "sizes":{"captures/wt/3/packs/<sha>":150000000}}
+← {"urls":{},
+   "multipart":{"captures/wt/3/packs/<sha>":{"upload_id":"<store upload id>",
+                "part_size":16777216,
+                "part_urls":["https://…?partNumber=1&uploadId=…","https://…?partNumber=2&…"]}}}
+```
+
+`upload.complete` — new call. The registrar runs the store's complete with `If-None-Match: *`
+(R2 enforces it on `CompleteMultipartUpload` and `CreateMultipartUpload`; S3 on complete) and
+answers 409 `{"reason":"exists"}` when the key already holds an object; the executor treats that
+as an identical object already present, keys being content-addressed. `size` in the response is
+optional; when present the executor checks it against the file it uploaded.
+
+```json
+→ {"worktree_id":"wt","epoch":3,"key":"captures/wt/3/packs/<sha>","upload_id":"…",
+   "parts":[{"part_number":1,"etag":"\"9b2c…\""},{"part_number":2,"etag":"\"…\""}]}
+← 200 {"size":150000000}          |   409 {"reason":"exists","key":"captures/wt/3/packs/<sha>"}
+```
+
+Rules the registrar (Mend) implements: part URLs are minted only while the lease predicate
+holds, like PUT URLs, and each counts against the URL quota; `part_size` is the registrar's
+choice (≥ 5 MiB, equal for every part but the last — R2 requires it; ≤ 10,000 parts); ETags go
+back to the store verbatim (quotes included); a key must be under the caller's epoch prefix;
+`upload.complete` carries the usual 409s (`stale-epoch`, `lease-lost`) as well. An abandoned
+upload (executor died, or the object was retried under a fresh `upload_id` after a part failed
+past its retries) is expired by a bucket lifecycle rule for incomplete multipart uploads; there
+is no `upload.abort` in v1.
+
+Executor side: `BlobSink::put_multipart` (`sink.rs`) — per-part retry with backoff, parts in
+flight from scoped threads whose CPU is charged to the shipper's duty cycle (network waits are
+not), one complete with retry on transport loss, size check from the registrar's `size` or a
+ranged GET where a GET URL exists. `LocalDir` writes the parts concatenated. `InMemoryRegistrar`
+implements Create/Complete with a pluggable completer for tests (`tests/ship_multipart.rs`).
+
+## Deviations from ADR-0015 pending amendment
+
+- §"Capture format", CDC packs: "≤ 64 MiB, one PUT, never multipart" → packs stay ≤ 64 MiB but
+  are uploaded as multipart at or above the shipper's threshold (default 16 MiB); git packs may
+  exceed 64 MiB and are always multipart above it. The pack container is unchanged.
+- §"Executor credentials": an executor also holds presigned per-part `UploadPart` URLs for its
+  own keys, same scope and TTL as PUT URLs; Create and Complete stay with the registrar.

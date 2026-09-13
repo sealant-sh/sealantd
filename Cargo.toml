@@ -49,11 +49,17 @@ hex = "0.4"
 sha2 = "0.10"
 getrandom = "0.2"
 tempfile = "3"
+# session capture store (ADR-0015): content-defined chunking, per-chunk zstd (the C library built by
+# cc, as ring already is; no system zstd), presigned-URL HTTP via ureq on rustls+ring (no
+# native-tls, no openssl).
+fastcdc = "5"
+zstd = { version = "0.14", default-features = false }
+ureq = { version = "3", default-features = false, features = ["rustls"] }
 # filesystem telemetry (plan §13)
 notify = "8"
 walkdir = "2"
 # linux syscalls (prefer rustix/nix over raw libc)
-nix = { version = "0.31", features = ["process", "signal", "term", "fs", "user", "poll", "ioctl", "socket"] }
+nix = { version = "0.31", features = ["process", "signal", "term", "fs", "user", "poll", "ioctl", "socket", "resource"] }
 rustix = { version = "0.38", features = ["process", "fs", "termios", "pipe", "stdio"] }
 libc = "0.2"
 # protobuf wire format (ADR-0012)
@@ -72,6 +78,7 @@ sealant-eventlog = { path = "crates/sealant-eventlog" }
 sealant-fs = { path = "crates/sealant-fs" }
 sealant-network = { path = "crates/sealant-network" }
 sealant-control = { path = "crates/sealant-control" }
+sealant-capture = { path = "crates/sealant-capture" }
 
 [profile.release]
 opt-level = 3
