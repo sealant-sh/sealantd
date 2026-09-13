@@ -18,7 +18,8 @@ use crate::manifest::{
     WorkspaceSection, rfc3339_now,
 };
 use crate::materialize::{
-    MaterializeClass, MaterializeError, MaterializeReport, MaterializeTargets, Materializer,
+    DiskState, MaterializeClass, MaterializeError, MaterializeReport, MaterializeTargets,
+    Materializer,
 };
 use crate::pack::{MAX_PACK_BYTES, PackBuilder, PackError};
 use crate::registrar::RegisterRequest;
@@ -343,7 +344,11 @@ impl CaptureEngine {
         config: CaptureConfig,
         previous: Option<EncodedManifest>,
     ) -> Result<Self, EngineError> {
-        let staging = Arc::new(Staging::open(&config.staging_dir(), config.epoch)?);
+        let staging = Arc::new(Staging::open(
+            &config.staging_dir(),
+            &config.worktree_id,
+            config.epoch,
+        )?);
         // Staging sits inside the worktree: keep it out of the user's index (an agent's or a
         // checkpoint's `git add -A`) through the repository's local excludes, never the user's
         // `.gitignore`. A root that is not a repository yet gets the entry when materialized.
@@ -403,6 +408,78 @@ impl CaptureEngine {
 
     fn daemon_excludes(&self) -> Vec<String> {
         daemon_excludes(&self.config)
+    }
+
+    /// Continue from `previous` as `worktree_id` at `epoch` (a re-plan: the control plane
+    /// assigned this executor its worktree, or moved its epoch). Staging follows, entries
+    /// staged under the old identity are dropped, chunk locations under the old prefix are
+    /// forgotten (a new epoch never skips an upload because a prior one holds the bytes), a
+    /// bulk build in progress is abandoned, and the repository's closure is re-read as the
+    /// negatives of the next pack. Call after the plan's head is on disk.
+    pub fn rebase(
+        &mut self,
+        worktree_id: &str,
+        epoch: u64,
+        previous: Option<EncodedManifest>,
+    ) -> Result<(), EngineError> {
+        self.config.worktree_id = worktree_id.to_owned();
+        self.config.epoch = epoch;
+        self.prefix = self.config.prefix();
+        self.staging.set_identity(worktree_id, epoch)?;
+        let dropped = self.staging.discard_foreign()?;
+        let base = format!("{}/", self.prefix.base());
+        self.chunks.packs.retain(|_, k| k.starts_with(&base));
+        self.bulk_work = None;
+        let seeded = previous.is_some();
+        self.previous = previous;
+        if seeded {
+            self.seed_tips_from_repo()?;
+        } else {
+            self.last_tips.clear();
+            self.persist()?;
+        }
+        tracing::info!(
+            worktree = worktree_id,
+            epoch,
+            dropped,
+            "capture engine rebased"
+        );
+        Ok(())
+    }
+
+    /// The materialize targets for this engine's root, staging and roots policy.
+    #[must_use]
+    pub fn materialize_targets(&self) -> MaterializeTargets {
+        let mut targets =
+            MaterializeTargets::new(&self.config.root, self.config.harness_home.clone());
+        targets.cache_dir = self.staging.cache_dir();
+        targets.scratch_dir = self.staging.scratch_dir();
+        targets.index_dir = self.staging.index_dir();
+        targets.staging_dir = self.config.staging_dir();
+        targets.bulk_dirs = self.config.bulk_dirs.clone();
+        targets
+    }
+
+    /// Bring this engine's root to `manifest` from `sink`, writing only the delta against what
+    /// the engine's own indexes say is on disk, and keep the indexes the materializer updated.
+    pub fn materialize_delta(
+        &mut self,
+        sink: &dyn BlobSink,
+        manifest: &Manifest,
+        class: MaterializeClass,
+    ) -> Result<MaterializeReport, EngineError> {
+        let targets = self.materialize_targets();
+        let mut state = DiskState::load(&targets.index_dir);
+        state.workspace = std::mem::take(&mut self.workspace_index);
+        state.bulk = std::mem::take(&mut self.bulk_index);
+        let result = Materializer::new(sink, targets.clone())
+            .materialize_with_state(manifest, class, &mut state);
+        let saved = state.save(&targets.index_dir);
+        self.workspace_index = state.workspace;
+        self.bulk_index = state.bulk;
+        let report = result?;
+        saved?;
+        Ok(report)
     }
 
     /// Configuration.
@@ -851,20 +928,14 @@ impl CaptureEngine {
         Ok(shipper.flush(deadline)?)
     }
 
-    /// Materialize `manifest` from `sink` into this engine's root (and harness home).
+    /// Materialize `manifest` from `sink` into this engine's root (and harness home), against
+    /// the disk state on disk rather than this engine's indexes (see [`Self::materialize_delta`]).
     pub fn materialize(
         &self,
         sink: &dyn BlobSink,
         manifest: &Manifest,
         class: MaterializeClass,
     ) -> Result<MaterializeReport, EngineError> {
-        let mut targets =
-            MaterializeTargets::new(&self.config.root, self.config.harness_home.clone());
-        targets.cache_dir = self.staging.cache_dir();
-        targets.scratch_dir = self.staging.scratch_dir();
-        targets.index_dir = self.staging.index_dir();
-        targets.staging_dir = self.config.staging_dir();
-        targets.bulk_dirs = self.config.bulk_dirs.clone();
-        Ok(Materializer::new(sink, targets).materialize(manifest, class)?)
+        Ok(Materializer::new(sink, self.materialize_targets()).materialize(manifest, class)?)
     }
 }

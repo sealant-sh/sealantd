@@ -10,16 +10,16 @@ use crate::ids::{
 use crate::wire;
 use crate::{
     ArtifactRef, AttachMode, AttachSessionArgs, Base64Bytes, Capabilities, CaptureKind,
-    CaptureMethod, CaptureMode, CapturePolicy, CaptureStaged, CaptureStatusReport, ClientMessage,
-    Command, CommandResult, Confidence, ControlError, ControlErrorCode, ControlRequest,
-    ControlResponse, Encoding, EnvVar, EventEnvelope, EventPayload, ExecAccepted, ExecArgs,
-    ExecutionStartArgs, ExitReason, Feature, FeatureMatrix, FeatureState, ForwardOpened,
-    ForwardProtocol, HealthReport, IoChunk, LeaseEpochReport, Limits, NetworkMode, OpenForwardArgs,
-    OpenSessionArgs, OpenSftpArgs, ProcessAttached, ProcessExited, ProcessList, ProcessStarted,
-    ProcessState, ProcessSummary, ResponseOutcome, RuntimeHeartbeat, RuntimeMetrics, RuntimeState,
-    RuntimeStateChanged, ServerMessage, SessionList, SessionOpened, SessionSummary, SftpOpened,
-    ShutdownAccepted, Signal, StreamAttached, StreamEnd, StreamFrame, StreamKind, StreamPayload,
-    TelemetryDropped, TransformMeta,
+    CaptureMethod, CaptureMode, CapturePolicy, CaptureReplanned, CaptureStaged,
+    CaptureStatusReport, ClientMessage, Command, CommandResult, Confidence, ControlError,
+    ControlErrorCode, ControlRequest, ControlResponse, Encoding, EnvVar, EventEnvelope,
+    EventPayload, ExecAccepted, ExecArgs, ExecutionStartArgs, ExitReason, Feature, FeatureMatrix,
+    FeatureState, ForwardOpened, ForwardProtocol, HealthReport, IoChunk, LeaseEpochReport, Limits,
+    NetworkMode, OpenForwardArgs, OpenSessionArgs, OpenSftpArgs, ProcessAttached, ProcessExited,
+    ProcessList, ProcessStarted, ProcessState, ProcessSummary, ResponseOutcome, RuntimeHeartbeat,
+    RuntimeMetrics, RuntimeState, RuntimeStateChanged, ServerMessage, SessionList, SessionOpened,
+    SessionSummary, SftpOpened, ShutdownAccepted, Signal, StreamAttached, StreamEnd, StreamFrame,
+    StreamKind, StreamPayload, TelemetryDropped, TransformMeta,
 };
 use crate::{
     FileChange, FileChangeKind, FileDiffAvailable, FileEntry, FileSnapshotCompleted, FileType,
@@ -1000,6 +1000,7 @@ impl From<Command> for wire::command::Command {
             Command::CaptureFlush => W::CaptureFlush(wire::Empty {}),
             Command::CaptureStatus => W::CaptureStatus(wire::Empty {}),
             Command::LeaseEpoch => W::LeaseEpoch(wire::Empty {}),
+            Command::CaptureReplan => W::CaptureReplan(wire::Empty {}),
             Command::AttachSession(a) => W::AttachSession(a.into()),
             Command::DetachSession { channel_id } => W::DetachSession(wire::DetachSessionArgs {
                 channel_id: channel_id.into_inner(),
@@ -1083,6 +1084,7 @@ impl TryFrom<wire::command::Command> for Command {
             W::CaptureFlush(_) => Command::CaptureFlush,
             W::CaptureStatus(_) => Command::CaptureStatus,
             W::LeaseEpoch(_) => Command::LeaseEpoch,
+            W::CaptureReplan(_) => Command::CaptureReplan,
             W::AttachSession(a) => Command::AttachSession(a.try_into()?),
             W::DetachSession(a) => Command::DetachSession {
                 channel_id: ChannelId::new(a.channel_id),
@@ -1368,6 +1370,18 @@ impl From<CommandResult> for wire::command_result::Result {
                 worktree_id: l.worktree_id,
                 fenced: l.fenced,
             }),
+            CommandResult::CaptureReplanned(r) => W::CaptureReplanned(wire::CaptureReplanned {
+                worktree_id: r.worktree_id,
+                epoch: r.epoch,
+                head_n: r.head_n,
+                head_capture_id: r.head_capture_id,
+                files_written: r.files_written,
+                bytes_written: r.bytes_written,
+                files_skipped: r.files_skipped,
+                bytes_skipped: r.bytes_skipped,
+                removed: r.removed,
+                unchanged: r.unchanged,
+            }),
             CommandResult::StreamAttached(s) => W::StreamAttached(wire::StreamAttached {
                 channel_id: s.channel_id.into_inner(),
             }),
@@ -1456,6 +1470,18 @@ impl TryFrom<wire::command_result::Result> for CommandResult {
                 epoch: l.epoch,
                 worktree_id: l.worktree_id,
                 fenced: l.fenced,
+            }),
+            W::CaptureReplanned(r) => CommandResult::CaptureReplanned(CaptureReplanned {
+                worktree_id: r.worktree_id,
+                epoch: r.epoch,
+                head_n: r.head_n,
+                head_capture_id: r.head_capture_id,
+                files_written: r.files_written,
+                bytes_written: r.bytes_written,
+                files_skipped: r.files_skipped,
+                bytes_skipped: r.bytes_skipped,
+                removed: r.removed,
+                unchanged: r.unchanged,
             }),
             W::StreamAttached(s) => CommandResult::StreamAttached(StreamAttached {
                 channel_id: ChannelId::new(s.channel_id),
@@ -1925,6 +1951,7 @@ mod tests {
             Command::CaptureFlush,
             Command::CaptureStatus,
             Command::LeaseEpoch,
+            Command::CaptureReplan,
         ] {
             let msg = ClientMessage::Request(ControlRequest::new(RequestId::new("req_c"), command));
             let bytes = encode_client(&msg);
@@ -1954,6 +1981,30 @@ mod tests {
                 epoch: 2,
                 worktree_id: "wt".to_owned(),
                 fenced: true,
+            }),
+            CommandResult::CaptureReplanned(CaptureReplanned {
+                worktree_id: "wt-real".to_owned(),
+                epoch: 1,
+                head_n: Some(4),
+                head_capture_id: Some("abc".to_owned()),
+                files_written: 9,
+                bytes_written: 212_994,
+                files_skipped: 418,
+                bytes_skipped: 1_512_825,
+                removed: 2,
+                unchanged: false,
+            }),
+            CommandResult::CaptureReplanned(CaptureReplanned {
+                worktree_id: "wt-real".to_owned(),
+                epoch: 1,
+                head_n: None,
+                head_capture_id: None,
+                files_written: 0,
+                bytes_written: 0,
+                files_skipped: 0,
+                bytes_skipped: 0,
+                removed: 0,
+                unchanged: true,
             }),
         ] {
             let msg =

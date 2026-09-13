@@ -747,6 +747,21 @@ impl Runtime {
                     ControlResponse::ok_with(rid, CommandResult::LeaseEpoch(capture.lease_epoch()))
                 }
             },
+            Command::CaptureReplan => match self.capture() {
+                None => ControlResponse::error(rid, crate::capture::not_enabled()),
+                Some(capture) => {
+                    match tokio::task::spawn_blocking(move || capture.replan()).await {
+                        Ok(Ok(replanned)) => ControlResponse::ok_with(
+                            rid,
+                            CommandResult::CaptureReplanned(replanned),
+                        ),
+                        Ok(Err(error)) => ControlResponse::error(rid, error),
+                        Err(error) => {
+                            ControlResponse::error(rid, ControlError::internal(error.to_string()))
+                        }
+                    }
+                }
+            },
             // Streaming commands are routed through dispatch_streaming (they need the ConnHandle).
             Command::AttachSession(_)
             | Command::DetachSession { .. }

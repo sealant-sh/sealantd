@@ -25,6 +25,9 @@ const CHANNEL_TIMEOUT: Duration = Duration::from_secs(60);
 /// Per-object timeout for presigned PUT/GET (a 64 MiB pack on a slow link).
 const OBJECT_TIMEOUT: Duration = Duration::from_secs(600);
 
+/// The URL minter behind a presigned sink, shared with the daemon so a re-plan can reset it.
+pub type SharedMinter = Arc<RegistrarMinter<dyn Registrar>>;
+
 /// A materialized capture-store workspace, ready to run.
 pub struct CaptureBoot {
     /// The engine, seeded with the chain head.
@@ -33,6 +36,9 @@ pub struct CaptureBoot {
     pub sink: Arc<dyn BlobSink>,
     /// The session channel.
     pub registrar: Arc<dyn Registrar>,
+    /// The URL minter behind a presigned sink, for a re-plan to point at the new plan's URLs;
+    /// none when the sink reads the store directly.
+    pub minter: Option<SharedMinter>,
     /// Worktree the lease is on.
     pub worktree_id: String,
     /// Lease epoch this session holds.
@@ -100,16 +106,17 @@ pub(crate) fn boot_from(
         "capture plan fetched"
     );
 
-    let sink: Arc<dyn BlobSink> = match sink {
-        Some(sink) => sink,
+    let (sink, minter): (Arc<dyn BlobSink>, Option<SharedMinter>) = match sink {
+        Some(sink) => (sink, None),
         None => {
-            let minter = RegistrarMinter::new(
+            let minter = Arc::new(RegistrarMinter::new(
                 registrar.clone(),
                 &worktree_id,
                 epoch,
                 plan.get_urls.clone(),
-            );
-            Arc::new(PresignedHttp::new(Box::new(minter), OBJECT_TIMEOUT))
+            ));
+            let sink = PresignedHttp::new(Box::new(minter.clone()), OBJECT_TIMEOUT);
+            (Arc::new(sink), Some(minter))
         }
     };
 
@@ -171,6 +178,7 @@ pub(crate) fn boot_from(
         engine,
         sink,
         registrar,
+        minter,
         worktree_id,
         epoch,
     })

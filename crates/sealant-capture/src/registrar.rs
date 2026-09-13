@@ -378,7 +378,7 @@ struct InMemoryState {
 /// In-memory registrar: one worktree, one chain, a live epoch, a lease flag.
 pub struct InMemoryRegistrar {
     state: Mutex<InMemoryState>,
-    worktree_id: String,
+    worktree_id: Mutex<String>,
     url_base: Option<String>,
     multipart: Option<MultipartPolicy>,
     completer: Option<Arc<dyn MultipartCompleter>>,
@@ -387,7 +387,7 @@ pub struct InMemoryRegistrar {
 impl std::fmt::Debug for InMemoryRegistrar {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("InMemoryRegistrar")
-            .field("worktree_id", &self.worktree_id)
+            .field("worktree_id", &self.worktree_id())
             .field("url_base", &self.url_base)
             .field("multipart", &self.multipart)
             .finish_non_exhaustive()
@@ -400,7 +400,7 @@ impl InMemoryRegistrar {
     #[must_use]
     pub fn new(worktree_id: &str, epoch: u64, url_base: Option<String>) -> Self {
         Self {
-            worktree_id: worktree_id.to_owned(),
+            worktree_id: Mutex::new(worktree_id.to_owned()),
             state: Mutex::new(InMemoryState {
                 live_epoch: epoch,
                 chain: Vec::new(),
@@ -457,6 +457,24 @@ impl InMemoryRegistrar {
     /// Fence: bump the live epoch (a replacement executor claimed the worktree).
     pub fn set_live_epoch(&self, epoch: u64) {
         self.lock().live_epoch = epoch;
+    }
+
+    /// The worktree `plan.get` answers.
+    #[must_use]
+    pub fn worktree_id(&self) -> String {
+        self.worktree_id
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Answer `plan.get` as `worktree_id` from now on: the standby's placeholder gave way to
+    /// the worktree the control plane assigned (tests of `capture.replan`).
+    pub fn set_worktree_id(&self, worktree_id: &str) {
+        *self
+            .worktree_id
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = worktree_id.to_owned();
     }
 
     /// Re-stamp the head's bulk section as captured for `platform` (tests of the `plan.get`
@@ -522,11 +540,8 @@ impl Registrar for InMemoryRegistrar {
         if req.epoch != 0 {
             Self::check_epoch(&state, req.epoch)?;
         }
-        if req
-            .worktree_id
-            .as_ref()
-            .is_some_and(|w| *w != self.worktree_id)
-        {
+        let worktree_id = self.worktree_id();
+        if req.worktree_id.as_ref().is_some_and(|w| *w != worktree_id) {
             return Err(RegistrarError::Protocol(
                 "token is scoped to another worktree".into(),
             ));
@@ -563,7 +578,7 @@ impl Registrar for InMemoryRegistrar {
             }
         }
         Ok(PlanGetResponse {
-            worktree_id: self.worktree_id.clone(),
+            worktree_id,
             epoch: state.live_epoch,
             head,
             get_urls,
@@ -877,12 +892,12 @@ impl Registrar for HttpRegistrar {
 }
 
 /// A [`crate::sink::UrlMinter`] over a registrar: PUT and part URLs come from `upload.urls`,
-/// multipart completes go to `upload.complete`, GET URLs come from the plan.
+/// multipart completes go to `upload.complete`, GET URLs come from the plan. A re-plan
+/// ([`Self::reset`]) moves it to the new identity and the new plan's GET URLs.
 #[derive(Debug)]
 pub struct RegistrarMinter<R: Registrar + ?Sized> {
     registrar: std::sync::Arc<R>,
-    worktree_id: String,
-    epoch: u64,
+    identity: Mutex<(String, u64)>,
     put_cache: Mutex<BTreeMap<String, String>>,
     get_urls: Mutex<BTreeMap<String, String>>,
 }
@@ -898,18 +913,44 @@ impl<R: Registrar + ?Sized> RegistrarMinter<R> {
     ) -> Self {
         Self {
             registrar,
-            worktree_id: worktree_id.to_owned(),
-            epoch,
+            identity: Mutex::new((worktree_id.to_owned(), epoch)),
             put_cache: Mutex::new(BTreeMap::new()),
             get_urls: Mutex::new(get_urls),
         }
     }
 
+    /// The worktree and epoch URLs are minted for.
+    #[must_use]
+    pub fn identity(&self) -> (String, u64) {
+        self.identity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Mint for `worktree_id` at `epoch` from now on, with `get_urls` from the new plan;
+    /// PUT URLs minted under the previous identity are forgotten.
+    pub fn reset(&self, worktree_id: &str, epoch: u64, get_urls: BTreeMap<String, String>) {
+        *self
+            .identity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = (worktree_id.to_owned(), epoch);
+        self.put_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        *self
+            .get_urls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = get_urls;
+    }
+
     /// Pre-mint PUT URLs for a batch of keys (one channel call).
     pub fn prefetch_put(&self, keys: &[String]) -> Result<(), RegistrarError> {
+        let (worktree_id, epoch) = self.identity();
         let resp = self.registrar.upload_urls(&UploadUrlsRequest::new(
-            &self.worktree_id,
-            self.epoch,
+            &worktree_id,
+            epoch,
             keys.to_vec(),
         ))?;
         self.put_cache
@@ -949,7 +990,8 @@ impl<R: Registrar + ?Sized> crate::sink::UrlMinter for RegistrarMinter<R> {
     }
 
     fn multipart_urls(&self, key: &str, size: u64) -> Result<Option<MultipartUrls>, String> {
-        let mut req = UploadUrlsRequest::new(&self.worktree_id, self.epoch, vec![key.to_owned()]);
+        let (worktree_id, epoch) = self.identity();
+        let mut req = UploadUrlsRequest::new(&worktree_id, epoch, vec![key.to_owned()]);
         req.sizes.insert(key.to_owned(), size);
         let mut resp = self
             .registrar
@@ -972,9 +1014,10 @@ impl<R: Registrar + ?Sized> crate::sink::UrlMinter for RegistrarMinter<R> {
         parts: &[CompletedPart],
     ) -> Result<crate::sink::Completed, crate::sink::SinkError> {
         use crate::sink::{Completed, PutOutcome, SinkError};
+        let (worktree_id, epoch) = self.identity();
         match self.registrar.upload_complete(&UploadCompleteRequest {
-            worktree_id: self.worktree_id.clone(),
-            epoch: self.epoch,
+            worktree_id,
+            epoch,
             key: key.to_owned(),
             upload_id: upload_id.to_owned(),
             parts: parts.to_vec(),

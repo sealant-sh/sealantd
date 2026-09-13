@@ -43,6 +43,25 @@ the two trees compare identical (bytes, modes, mtimes, links), and the head over
 nothing. This is what lets a standby executor pre-materialize the project base and apply the
 claimed worktree's head over it (`capture.replan`).
 
+## Re-plan (`capture.replan`)
+
+A standby executor boots on the project base under a placeholder worktree id and epoch (Mend's
+`standby-<id>`). When the control plane assigns it a worktree, `capture.replan` fetches
+`plan.get` again (epoch 0, this build's platform, no worktree named: the token decides), takes
+the worktree id and epoch the answer names, materializes the head as a delta over the disk with
+the engine's own indexes (`CaptureEngine::materialize_delta`), and `CaptureEngine::rebase`s:
+the key prefix moves, `Staging` moves its identity (ack markers live under
+`uploaded/<worktree>/<epoch>/`, so nothing acked under the placeholder counts), queue entries
+staged under the old identity are *foreign* — dropped by the rebase, and by the shipper if one
+was in flight, whose fence then belongs to the old identity and is not this executor's —, chunk
+locations under the old prefix are forgotten, a bulk build in progress is abandoned, the
+repository closure is re-read as the negatives of the next pack, and the shipper's fence is
+lifted. No snap runs meanwhile; the cadence resumes where it was. The daemon's heartbeat,
+status and `lease.epoch` follow the new identity. A plan naming what the executor already has
+is answered `unchanged`. `crates/sealantd/src/capture.rs` tests it end to end: base captured
+for `wt-real`, standby boots as `standby-1`/epoch 7, the chain moves on, re-plan, the next
+capture registers as `wt-real`/epoch 1 with the head as its parent.
+
 ## Cadence (`cadence.rs`, `watch.rs`)
 
 `CadenceRunner` owns the engine and two clocks. `watch.rs` runs the `sealant-fs` pruned

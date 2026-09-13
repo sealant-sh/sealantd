@@ -121,7 +121,9 @@ pub enum ShipError {
 #[derive(Debug)]
 pub struct Staging {
     dir: PathBuf,
-    epoch: u64,
+    /// The worktree and epoch this executor stages under. A re-plan (`capture.replan`) moves
+    /// it; entries staged under another identity are foreign and never shipped.
+    identity: Mutex<(String, u64)>,
     in_flight: Mutex<Option<u64>>,
     /// Held by the engine from `coalescible` to `replace` / `enqueue`, and by the shipper while
     /// it claims an entry: a pending `auto` capture is never coalesced away under a shipper that
@@ -130,19 +132,68 @@ pub struct Staging {
 }
 
 impl Staging {
-    /// Open (and create) staging at `dir` for `epoch`. Upload acks are kept per epoch: an object
-    /// acked under a prior epoch was written under a prior prefix and must be uploaded again.
-    pub fn open(dir: &Path, epoch: u64) -> io::Result<Self> {
+    /// Open (and create) staging at `dir` for `worktree_id` at `epoch`. Upload acks are kept
+    /// per worktree and epoch: an object acked under a prior identity was written under a
+    /// prior prefix and must be uploaded again.
+    pub fn open(dir: &Path, worktree_id: &str, epoch: u64) -> io::Result<Self> {
         for sub in ["objects", "queue", "scratch", "index", "cache"] {
             fs::create_dir_all(dir.join(sub))?;
         }
-        fs::create_dir_all(dir.join("uploaded").join(epoch.to_string()))?;
-        Ok(Self {
+        let staging = Self {
             dir: dir.to_path_buf(),
-            epoch,
+            identity: Mutex::new((worktree_id.to_owned(), epoch)),
             in_flight: Mutex::new(None),
             coalesce: Mutex::new(()),
-        })
+        };
+        fs::create_dir_all(staging.marker_dir())?;
+        Ok(staging)
+    }
+
+    /// The worktree and epoch entries are staged under.
+    #[must_use]
+    pub fn identity(&self) -> (String, u64) {
+        self.identity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Move to `worktree_id` at `epoch` (a re-plan). Ack markers of the previous identity stay
+    /// on disk and stop counting; entries already queued become foreign.
+    pub fn set_identity(&self, worktree_id: &str, epoch: u64) -> io::Result<()> {
+        *self
+            .identity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = (worktree_id.to_owned(), epoch);
+        fs::create_dir_all(self.marker_dir())
+    }
+
+    /// Whether `entry` was staged under another identity than the current one.
+    #[must_use]
+    pub fn is_foreign(&self, entry: &QueueEntry) -> bool {
+        let (worktree_id, epoch) = self.identity();
+        entry.register.worktree_id != worktree_id || entry.register.epoch != epoch
+    }
+
+    /// Drop every queued entry staged under another identity that the shipper is not on right
+    /// now, with the object files only they referenced. Returns how many went. Call with the
+    /// engine held: a later `auto` snap must not coalesce with a foreign entry.
+    pub fn discard_foreign(&self) -> io::Result<usize> {
+        let _g = self.coalesce_guard();
+        let in_flight = *self
+            .in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut dropped = 0;
+        for entry in self.pending()? {
+            if !self.is_foreign(&entry) || in_flight == Some(entry.n) {
+                continue;
+            }
+            fs::remove_file(self.queue_path(entry.n)).ok();
+            self.sweep(&entry)?;
+            dropped += 1;
+        }
+        Ok(dropped)
     }
 
     /// Root.
@@ -179,11 +230,16 @@ impl Staging {
         self.dir.join("queue").join(format!("{n:020}.json"))
     }
 
-    fn marker_path(&self, file: &str) -> PathBuf {
+    fn marker_dir(&self) -> PathBuf {
+        let (worktree_id, epoch) = self.identity();
         self.dir
             .join("uploaded")
-            .join(self.epoch.to_string())
-            .join(file)
+            .join(worktree_id.replace('/', "_"))
+            .join(epoch.to_string())
+    }
+
+    fn marker_path(&self, file: &str) -> PathBuf {
+        self.marker_dir().join(file)
     }
 
     /// Whether an object file was acked as uploaded.
@@ -531,6 +587,15 @@ impl Shipper {
         self.status.fenced.load(Ordering::Relaxed)
     }
 
+    /// Lift the fence after a re-plan gave this executor a fresh identity: what was fenced was
+    /// the previous epoch. `head_n` is the plan's head, or none for an empty chain.
+    pub fn reset_after_replan(&self, head_n: Option<u64>) {
+        self.status.fenced.store(false, Ordering::Relaxed);
+        self.status
+            .head_n
+            .store(head_n.unwrap_or(u64::MAX), Ordering::Relaxed);
+    }
+
     fn backoff(&self, attempt: u32) -> Duration {
         let mult = 1u32 << attempt.min(10);
         (self.retry.backoff * mult).min(self.retry.max_backoff)
@@ -622,7 +687,11 @@ impl Shipper {
                     return Ok(());
                 }
                 Err(e @ RegistrarError::Fenced { .. }) => {
-                    self.status.fenced.store(true, Ordering::Relaxed);
+                    // A fence on an entry staged under a previous identity is that identity's
+                    // (a re-plan raced the shipper), not this executor's.
+                    if !self.staging.is_foreign(entry) {
+                        self.status.fenced.store(true, Ordering::Relaxed);
+                    }
                     return Err(ShipError::Fenced(e));
                 }
                 Err(e @ RegistrarError::WrongParent { .. }) => return Err(ShipError::Conflict(e)),
@@ -659,6 +728,13 @@ impl Shipper {
                 // Coalesced away since the queue was read: the replacement sits at the same
                 // `n`; the next pass ships it (never skip ahead — the chain is ordered).
                 break;
+            }
+            if self.staging.is_foreign(&entry) {
+                // Staged under an identity a re-plan replaced: nothing of it can register.
+                self.staging.release();
+                self.staging.ack(&entry)?;
+                tracing::info!(n = entry.n, worktree = %entry.register.worktree_id, epoch = entry.register.epoch, "foreign capture dropped");
+                continue;
             }
             let result = (|| {
                 for u in &entry.uploads {
@@ -822,7 +898,7 @@ mod tests {
     #[test]
     fn claim_and_coalesce_exclude_each_other() {
         let dir = tempfile::tempdir().unwrap();
-        let staging = Staging::open(dir.path(), 1).unwrap();
+        let staging = Staging::open(dir.path(), "wt", 1).unwrap();
         let first = entry(0, "a");
         staging.enqueue(&first).unwrap();
         assert_eq!(
