@@ -55,7 +55,25 @@ a class dirty on every create/modify/remove. Small class: `quiet` (2 s) after th
 over budget (half the sysctl, or `WatchPolicy::budget`) the class polls; `raise_limit` tries the
 sysctl first and never fails boot. `tests/cadence.rs` measures all of it against the real watcher.
 
-## Wire additions (multipart uploads)
+## Wire additions
+
+### `platform` on `plan.get`
+
+The request carries the executor's `<os>-<arch>-<libc>` (the same key the bulk class stamps on
+its captures, `engine::default_platform`). A registrar answers the head's bulk section as
+`"pending"` when it was captured for another platform and omits its packs from `get_urls`:
+the executor never restores a dependency tree built elsewhere, the control plane runs the
+project's install in the workspace instead. A registrar that ignores the field, or a request
+without it (an older executor), gets the head as is. `InMemoryRegistrar` implements the rule;
+the materializer treats `"pending"` as nothing to restore and nothing to sweep.
+
+```json
+→ {"worktree_id":"wt","epoch":0,"platform":"linux-x86_64-gnu"}
+← {"worktree_id":"wt","epoch":3,"head":{"n":7,"capture_id":"…","manifest_key":"…",
+   "manifest":{…,"sections":{…,"bulk":"pending"}}},"get_urls":{…}}
+```
+
+### Multipart uploads
 
 Measured (R1, 2026-09): one presigned PUT from a Cloudflare sandbox to R2 runs at 37–47 MB/s,
 four multipart parts in flight at 63.6 MB/s; AWS single-stream is ≈ 100 MB/s per flow. So the
