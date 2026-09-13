@@ -25,6 +25,24 @@ carries none of its bytes. The flag stays as belt and braces. A nested repositor
 ignores is carried by the ignored-files walk instead and is never named in a pathspec (naming an
 ignored path makes `git add` exit 1).
 
+## Materialize is a delta (`materialize.rs`, `roots.rs`)
+
+`Materializer::materialize` brings the disk to a manifest rather than writing it out: a file
+whose `(size, mtime, inode)` and chunk list in the `DiskState` index (the engine's
+`workspace.json` / `bulk.json` under `.sealantd/capture/index/`, written by the materializer
+for every file it lays down) match the plan entry is skipped, a symlink with the same text and
+a hardlink member already on the canonical inode likewise; git packs already installed are not
+fetched; the working tree moves from the tree last checked out to the plan's worktree
+pseudo-ref through a two-tree `read-tree --reset -u` (a full `checkout-index` when nothing is
+known about the disk). Files, symlinks and emptied directories the plan no longer names are
+removed, and only inside what a capture would list (`ClassRoots`, the same policy the engine's
+listings use): never the staging directory, excluded names, credentials, or the bulk
+directories of a `"pending"` bulk section. `tests/delta.rs` measures it: a head applied over a
+materialized base wrote 9 files / 213 KB where a fresh materialize writes 427 files / 1.7 MB,
+the two trees compare identical (bytes, modes, mtimes, links), and the head over itself writes
+nothing. This is what lets a standby executor pre-materialize the project base and apply the
+claimed worktree's head over it (`capture.replan`).
+
 ## Cadence (`cadence.rs`, `watch.rs`)
 
 `CadenceRunner` owns the engine and two clocks. `watch.rs` runs the `sealant-fs` pruned

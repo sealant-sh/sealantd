@@ -11,9 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::chunk::ChunkId;
 use crate::gitpack::{self, GitError, GitRepo};
-use crate::index::{
-    self, BuildStats, ChunkSink, DAEMON_DIR, Listing, TreeBuilder, TreeIndex, has_component_in,
-};
+use crate::index::{self, BuildStats, ChunkSink, DAEMON_DIR, Listing, TreeBuilder, TreeIndex};
 use crate::keys::KeyPrefix;
 use crate::manifest::{
     BulkSection, BulkState, CaptureKind, EncodedManifest, GitSection, Manifest, Sections,
@@ -25,6 +23,7 @@ use crate::materialize::{
 use crate::pack::{MAX_PACK_BYTES, PackBuilder, PackError};
 use crate::registrar::RegisterRequest;
 use crate::registrar::Registrar;
+use crate::roots::ClassRoots;
 use crate::ship::{DutyCycle, MultipartConfig, QueueEntry, ShipError, Shipper, Staging, Upload};
 use crate::sink::BlobSink;
 use crate::watch::WatchPolicy;
@@ -444,10 +443,15 @@ impl CaptureEngine {
         fs::rename(tmp, dir.join("git-tips.json"))
     }
 
-    fn is_daemon_path(&self, abs: &Path) -> bool {
-        abs == self.config.staging_dir()
-            || abs == self.config.root.join(DAEMON_DIR)
-            || self.config.harness_home.as_deref() == Some(abs)
+    /// The class roots this engine captures (and a materializer sweeps).
+    #[must_use]
+    pub fn roots(&self) -> ClassRoots {
+        ClassRoots {
+            root: self.config.root.clone(),
+            harness_home: self.config.harness_home.clone(),
+            bulk_dirs: self.config.bulk_dirs.clone(),
+            staging_dir: self.config.staging_dir(),
+        }
     }
 
     /// The workspace class listing: `.git/` bookkeeping, `tree/` (ignored files and nested
@@ -457,95 +461,12 @@ impl CaptureEngine {
         repo: &GitRepo,
         gitlinks: &[String],
     ) -> Result<Listing, EngineError> {
-        let mut listing = Listing::default();
-        let git_prune = |_: &Path, v: &str, _: &str| {
-            v == ".git/objects" || v == ".git/worktrees" || v == ".git/lfs"
-        };
-        let git_include = |_: &Path, v: &str, _: &str| {
-            !(v == ".git/HEAD"
-                || v == ".git/packed-refs"
-                || v == ".git/commondir"
-                || v == ".git/gitdir"
-                || v.starts_with(".git/refs/"))
-        };
-        listing.mount(".git", &repo.git_dir, "", git_prune, git_include);
-        if repo.common_dir != repo.git_dir {
-            listing.mount(".git", &repo.common_dir, "", git_prune, git_include);
-        }
-
-        let bulk = self.config.bulk_dirs.clone();
-        let root = self.config.root.clone();
-        let mut tree_roots: Vec<String> = Vec::new();
-        let out = repo.run(&[
-            "ls-files",
-            "-o",
-            "-i",
-            "--exclude-standard",
-            "--directory",
-            "-z",
-        ])?;
-        for rel in String::from_utf8_lossy(&out.stdout).split('\0') {
-            if !rel.is_empty() {
-                tree_roots.push(rel.to_owned());
-            }
-        }
-        tree_roots.extend(gitlinks.iter().map(|g| format!("{g}/")));
-        for rel in tree_roots {
-            let is_dir = rel.ends_with('/');
-            let rel = rel.trim_end_matches('/');
-            let abs = root.join(rel);
-            if has_component_in(Path::new(rel), &bulk)
-                || rel == DAEMON_DIR
-                || self.is_daemon_path(&abs)
-            {
-                continue;
-            }
-            if is_dir {
-                listing.mount(
-                    "tree",
-                    &root,
-                    rel,
-                    |abs, _, name| bulk.iter().any(|b| b == name) || self.is_daemon_path(abs),
-                    |_, _, _| true,
-                );
-            } else {
-                listing.mount_file(&format!("tree/{rel}"), "tree", &root, &abs);
-            }
-        }
-        if let Some(home) = &self.config.harness_home
-            && home.is_dir()
-        {
-            let creds: Vec<PathBuf> = index::CREDENTIAL_FILES
-                .iter()
-                .map(|c| home.join(c))
-                .collect();
-            listing.mount(
-                "harness",
-                home,
-                "",
-                |_, _, _| false,
-                |abs, _, _| !creds.iter().any(|c| c == abs),
-            );
-        }
-        Ok(listing)
+        Ok(self.roots().workspace_listing(repo, gitlinks)?)
     }
 
     /// The bulk class listing: every bulk directory under the root.
     fn bulk_listing(&self) -> Listing {
-        let mut listing = Listing::default();
-        let bulk = self.config.bulk_dirs.clone();
-        let root = self.config.root.clone();
-        listing.mount(
-            "",
-            &root,
-            "",
-            |abs, v, name| v == ".git" || name == DAEMON_DIR || self.is_daemon_path(abs),
-            |abs, _, _| {
-                abs.strip_prefix(&root)
-                    .is_ok_and(|rel| has_component_in(rel, &bulk))
-            },
-        );
-        listing
+        self.roots().bulk_listing()
     }
 
     /// Build a chunked class into new packs; returns the root key and the pack keys the tree
@@ -941,6 +862,9 @@ impl CaptureEngine {
             MaterializeTargets::new(&self.config.root, self.config.harness_home.clone());
         targets.cache_dir = self.staging.cache_dir();
         targets.scratch_dir = self.staging.scratch_dir();
+        targets.index_dir = self.staging.index_dir();
+        targets.staging_dir = self.config.staging_dir();
+        targets.bulk_dirs = self.config.bulk_dirs.clone();
         Ok(Materializer::new(sink, targets).materialize(manifest, class)?)
     }
 }
