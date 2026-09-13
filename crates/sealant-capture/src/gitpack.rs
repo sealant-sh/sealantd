@@ -224,9 +224,98 @@ impl GitRepo {
             .collect())
     }
 
+    /// Nested repositories under the worktree (directories holding a `.git`, the root's own
+    /// excluded), relative to the root: the untracked ones git lists as a lone `dir/` entry
+    /// (it never descends into an embedded repository) plus the tracked gitlinks whose
+    /// directory holds a `.git` on disk. Ignored ones are not listed; they are carried by the
+    /// ignored-files walk already. Read against `index` when given, else the real index.
+    pub fn nested_repositories(&self, index: Option<&Path>) -> Result<Vec<String>, GitError> {
+        let mut cmd = git_command(&self.root);
+        if let Some(index) = index {
+            cmd.env("GIT_INDEX_FILE", index);
+        }
+        let others = ["ls-files", "-o", "--exclude-standard", "-z"];
+        let out = check(&others, cmd.args(others).output()?)?;
+        let mut nested: Vec<String> = String::from_utf8_lossy(&out.stdout)
+            .split('\0')
+            .filter_map(|l| l.strip_suffix('/'))
+            .filter(|d| !d.is_empty() && self.root.join(d).join(".git").exists())
+            .map(str::to_owned)
+            .collect();
+        let mut cmd = git_command(&self.root);
+        if let Some(index) = index {
+            cmd.env("GIT_INDEX_FILE", index);
+        }
+        let staged = ["ls-files", "-s", "-z"];
+        let out = check(&staged, cmd.args(staged).output()?)?;
+        nested.extend(
+            String::from_utf8_lossy(&out.stdout)
+                .split('\0')
+                .filter(|l| l.starts_with("160000 "))
+                .filter_map(|l| l.split_once('\t').map(|(_, p)| p))
+                .filter(|p| self.root.join(p).join(".git").exists())
+                .map(str::to_owned),
+        );
+        nested.sort();
+        nested.dedup();
+        Ok(nested)
+    }
+
+    /// The `git add` argv for [`Self::worktree_tree`] and the nested repositories it leaves
+    /// out. `excludes` and every nested repository under the root become `:(exclude)`
+    /// pathspec items, so `add -A` never reaches a path git cannot index: a nested
+    /// repository with no commit checked out is a fatal error on git 2.52 (`--ignore-errors`
+    /// does not cover "does not have a commit checked out" there) and a skipped "unable to
+    /// index" error on 2.55; one with a commit would become an embedded gitlink that carries
+    /// none of its bytes. The chunked class carries the bytes in both cases, so both are
+    /// excluded alike and returned.
+    /// An exclude git already ignores (the local exclude the engine adds at boot) is skipped by
+    /// `.` on its own; naming it in a pathspec makes `git add` report it as an ignored path and
+    /// exit 1, so only the paths git would otherwise index get a pathspec item. Nested
+    /// repositories below an exclude are left out of the returned list: they are not part of
+    /// the tree the worktree tree describes.
+    fn worktree_add_args(
+        &self,
+        tmp_index: &Path,
+        excludes: &[String],
+    ) -> Result<(Vec<String>, Vec<String>), GitError> {
+        // `--ignore-errors` stays as belt and braces for anything the enumeration missed.
+        let mut add: Vec<String> = ["add", "-A", "--ignore-errors", "--", "."]
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
+        let excludes: Vec<&str> = excludes
+            .iter()
+            .map(|e| e.trim_matches('/'))
+            .filter(|e| !e.is_empty())
+            .collect();
+        for e in &excludes {
+            if !self.is_ignored(e)? {
+                add.push(format!(":(exclude){e}"));
+            }
+        }
+        let under_exclude = |p: &str| {
+            excludes
+                .iter()
+                .any(|e| p == *e || p.strip_prefix(e).is_some_and(|r| r.starts_with('/')))
+        };
+        let mut nested = Vec::new();
+        for n in self.nested_repositories(Some(tmp_index))? {
+            if under_exclude(&n) {
+                continue;
+            }
+            if !self.is_ignored(&n)? {
+                add.push(format!(":(exclude){n}"));
+            }
+            nested.push(n);
+        }
+        Ok((add, nested))
+    }
+
     /// Tree of the working tree: a throwaway copy of the index with `git add -A` applied, then
-    /// `write-tree`. Nested repositories become gitlinks (or fail to index when they have no
-    /// commit); their paths are returned beside the sha so the chunked class can carry them.
+    /// `write-tree`. Nested repositories are left out of the add (see
+    /// [`Self::worktree_add_args`]) and their paths are returned beside the sha so the chunked
+    /// class can carry them; a tracked gitlink keeps the entry the index already had.
     pub fn worktree_tree(
         &self,
         scratch_dir: &Path,
@@ -240,25 +329,13 @@ impl GitRepo {
         } else {
             fs::remove_file(&tmp_index).ok();
         }
-        // `--ignore-errors` keeps going past paths git cannot index (a nested repository with
-        // no commit checked out); those paths are reported so the chunked class can carry them.
-        let mut add: Vec<String> = ["add", "-A", "--ignore-errors", "--", "."]
-            .iter()
-            .map(|s| (*s).to_owned())
-            .collect();
-        // An exclude git already ignores (the local exclude the engine adds at boot) is skipped
-        // by `.` on its own; naming it in a pathspec makes `git add` report it as an ignored
-        // path and exit 1. Only the excludes git would otherwise index get a pathspec item.
-        for e in excludes {
-            let e = e.trim_matches('/');
-            if !e.is_empty() && !self.is_ignored(e)? {
-                add.push(format!(":(exclude){e}"));
-            }
-        }
+        let (add, mut nested) = self.worktree_add_args(&tmp_index, excludes)?;
         let out = git_command(&self.root)
             .env("GIT_INDEX_FILE", &tmp_index)
             .args(&add)
             .output()?;
+        // Belt and braces: anything `--ignore-errors` skipped past that the enumeration did not
+        // name joins the chunked class the same way.
         let stderr = String::from_utf8_lossy(&out.stderr).to_string();
         let mut unindexed: Vec<String> = stderr
             .lines()
@@ -295,6 +372,7 @@ impl GitRepo {
             .filter_map(|l| l.split_once('\t').map(|(_, p)| p.to_owned()))
             .collect();
         gitlinks.append(&mut unindexed);
+        gitlinks.append(&mut nested);
         gitlinks.sort();
         gitlinks.dedup();
         fs::remove_file(&tmp_index).ok();
@@ -353,7 +431,8 @@ pub struct Closure {
     /// Every positive tip: ref values, `HEAD`, reflog entries, index and worktree trees (or the
     /// index blobs when the index is unmerged).
     pub tips: Vec<String>,
-    /// Paths of nested repositories (gitlinks in the worktree tree).
+    /// Paths of nested repositories under the worktree (left out of the worktree tree; the
+    /// chunked class carries their bytes).
     pub gitlinks: Vec<String>,
 }
 
@@ -725,5 +804,96 @@ mod tests {
                 .keys()
                 .any(|k| k.starts_with(PSEUDO_REF_PREFIX))
         );
+    }
+
+    /// Every nested repository is named in an `:(exclude)` pathspec ahead of `git add -A`, so
+    /// the add succeeds without `--ignore-errors` (git 2.52 makes a commit-less nested
+    /// repository fatal even with it) alongside an ignored exclude, which is never named. The
+    /// tree carries neither nested repository; both come back for the chunked class.
+    #[test]
+    fn nested_repositories_are_excluded_from_the_add_without_ignore_errors() {
+        let (dir, repo) = fixture();
+        let root = repo.root.clone();
+        fs::write(root.join(".gitignore"), "ign/\n").unwrap();
+        // Commit-less nested repository, one with a commit, one under an ignored directory.
+        let nested_a = GitRepo::init(&root.join("vendor/x")).unwrap();
+        fs::write(nested_a.root.join("v.txt"), "vendored\n").unwrap();
+        let nested_b = GitRepo::init(&root.join("vendor/y")).unwrap();
+        nested_b.run(&["config", "user.email", "t@t"]).unwrap();
+        nested_b.run(&["config", "user.name", "t"]).unwrap();
+        fs::write(nested_b.root.join("w.txt"), "committed\n").unwrap();
+        nested_b.run(&["add", "w.txt"]).unwrap();
+        nested_b.run(&["commit", "-q", "-m", "w"]).unwrap();
+        GitRepo::init(&root.join("ign/z")).unwrap();
+        fs::write(root.join("plain.txt"), "plain\n").unwrap();
+        fs::create_dir_all(root.join("keep-out")).unwrap();
+        fs::write(root.join("keep-out/k.txt"), "k\n").unwrap();
+
+        assert_eq!(
+            repo.nested_repositories(None).unwrap(),
+            vec!["vendor/x".to_owned(), "vendor/y".to_owned()],
+            "ignored nested repositories are not enumerated"
+        );
+
+        let scratch = dir.path().join("scratch");
+        fs::create_dir_all(&scratch).unwrap();
+        let tmp_index = scratch.join("idx");
+        fs::copy(repo.git_dir.join("index"), &tmp_index).unwrap();
+        let excludes = vec!["ign".to_owned(), "keep-out/".to_owned()];
+        let (args, nested) = repo.worktree_add_args(&tmp_index, &excludes).unwrap();
+        assert_eq!(nested, vec!["vendor/x".to_owned(), "vendor/y".to_owned()]);
+        assert!(args.contains(&":(exclude)vendor/x".to_owned()), "{args:?}");
+        assert!(args.contains(&":(exclude)vendor/y".to_owned()), "{args:?}");
+        assert!(args.contains(&":(exclude)keep-out".to_owned()), "{args:?}");
+        assert!(
+            !args.iter().any(|a| a.starts_with(":(exclude)ign")),
+            "an ignored exclude is never named: {args:?}"
+        );
+
+        // The argv works on its own: drop the flag and run it.
+        let without_flag: Vec<&String> = args.iter().filter(|a| *a != "--ignore-errors").collect();
+        let out = git_command(&root)
+            .env("GIT_INDEX_FILE", &tmp_index)
+            .args(&without_flag)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {without_flag:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let out = git_command(&root)
+            .env("GIT_INDEX_FILE", &tmp_index)
+            .args(["ls-files", "-s"])
+            .output()
+            .unwrap();
+        let listing = String::from_utf8_lossy(&out.stdout).to_string();
+        assert!(listing.contains("plain.txt"), "{listing}");
+        assert!(!listing.contains("vendor/"), "{listing}");
+        assert!(!listing.contains("keep-out"), "{listing}");
+        assert!(!listing.contains("ign/"), "{listing}");
+
+        // The helper itself: same tree, both nested repositories reported.
+        let (tree, gitlinks) = repo.worktree_tree(&scratch, &excludes).unwrap();
+        assert_eq!(gitlinks, vec!["vendor/x".to_owned(), "vendor/y".to_owned()]);
+        let out = repo.run(&["ls-tree", "-r", "--name-only", &tree]).unwrap();
+        let names = stdout_string(&out);
+        assert!(names.contains("plain.txt"), "{names}");
+        assert!(!names.contains("vendor"), "{names}");
+
+        // A tracked gitlink (an embedded repository someone already added) is treated alike:
+        // excluded from the add, its index entry kept, reported for the chunked class.
+        repo.run(&["-c", "advice.addEmbeddedRepo=false", "add", "vendor/y"])
+            .unwrap();
+        assert_eq!(
+            repo.nested_repositories(None).unwrap(),
+            vec!["vendor/x".to_owned(), "vendor/y".to_owned()]
+        );
+        let (tree, gitlinks) = repo.worktree_tree(&scratch, &excludes).unwrap();
+        assert_eq!(gitlinks, vec!["vendor/x".to_owned(), "vendor/y".to_owned()]);
+        let out = repo.run(&["ls-tree", "-r", &tree]).unwrap();
+        let entries = stdout_string(&out);
+        assert!(entries.contains("160000 commit"), "{entries}");
+        assert!(!entries.contains("vendor/x"), "{entries}");
     }
 }

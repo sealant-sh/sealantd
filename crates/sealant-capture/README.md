@@ -15,6 +15,16 @@ and registers it through a `Registrar`; `materialize` rebuilds a workspace from 
 `CaptureEngine` is the front door: `snap(class, kind)` stages a capture, `snap_preemptible` lets a
 bulk build yield.
 
+Nested repositories (a directory under the worktree holding a `.git`, with or without a commit
+checked out, tracked as a gitlink or not) never enter the worktree tree: `GitRepo::worktree_tree`
+enumerates them before its `git add -A` and names each in an `:(exclude)` pathspec, and the
+chunked class carries their bytes (`tree/<path>/`). This does not depend on the git version: on
+git 2.52 a commit-less nested repository is fatal to `git add -A` even with `--ignore-errors`,
+and on any version an embedded repository with a commit would otherwise become a gitlink that
+carries none of its bytes. The flag stays as belt and braces. A nested repository git already
+ignores is carried by the ignored-files walk instead and is never named in a pathspec (naming an
+ignored path makes `git add` exit 1).
+
 ## Cadence (`cadence.rs`, `watch.rs`)
 
 `CadenceRunner` owns the engine and two clocks. `watch.rs` runs the `sealant-fs` pruned
