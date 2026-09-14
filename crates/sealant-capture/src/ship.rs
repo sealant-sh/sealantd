@@ -18,12 +18,16 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use crate::cpu::thread_cpu;
+use crate::engine::Class;
 use crate::manifest::CaptureKind;
 use crate::registrar::{RegisterRequest, Registrar, RegistrarError};
 use crate::sink::{BlobSink, BlobSource, SinkError};
 
 /// Default shipper CPU budget: half of one core.
 pub const DEFAULT_CPU_FRACTION: f64 = 0.5;
+
+/// Most single-PUT objects whose URLs are minted in one channel call.
+pub const PREFETCH_BATCH: usize = 500;
 
 /// How large objects are uploaded. Measured (R1, 2026-09): one presigned PUT from a sandbox to
 /// R2 runs at 37–47 MB/s, four multipart parts in flight at 63.6 MB/s; AWS single-stream is
@@ -73,6 +77,9 @@ pub struct QueueEntry {
     pub capture_id: String,
     /// Kind.
     pub kind: CaptureKind,
+    /// The class the snap built; `None` for an entry an older daemon staged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub class: Option<Class>,
     /// Objects in write order (packs, trees), the manifest last.
     pub uploads: Vec<Upload>,
     /// The register call.
@@ -369,19 +376,27 @@ impl Staging {
     }
 
     fn sweep(&self, removed: &QueueEntry) -> io::Result<()> {
+        self.discard_unreferenced(&removed.uploads).map(|_| ())
+    }
+
+    /// Remove the object files of `uploads` that no queued entry lists; the names removed.
+    /// Object bytes go; the ack markers stay, so an unchanged dir object or pack listed by a
+    /// later capture is neither re-staged nor re-uploaded within this epoch. A file a queued
+    /// entry still lists stays: the shipper reads it from here when that entry's turn comes.
+    pub fn discard_unreferenced(&self, uploads: &[Upload]) -> io::Result<HashSet<String>> {
         let still: HashSet<String> = self
             .pending()?
             .iter()
             .flat_map(|e| e.uploads.iter().map(|u| u.file.clone()))
             .collect();
-        // Object bytes go; the ack markers stay, so an unchanged dir object or pack listed by a
-        // later capture is neither re-staged nor re-uploaded within this epoch.
-        for u in &removed.uploads {
+        let mut removed = HashSet::new();
+        for u in uploads {
             if !still.contains(&u.file) {
                 fs::remove_file(self.objects_dir().join(&u.file)).ok();
+                removed.insert(u.file.clone());
             }
         }
-        Ok(())
+        Ok(removed)
     }
 
     /// Bytes of staged objects not yet acked.
@@ -677,6 +692,44 @@ impl Shipper {
         })
     }
 
+    /// Upload `uploads` in order, a batch at a time: the PUT URLs of a batch's single-PUT
+    /// objects are minted in one channel call ahead of the PUTs ([`BlobSink::prefetch_put`]),
+    /// so a capture with thousands of dir objects costs a handful of `upload.urls` calls, not
+    /// one per object (each call still counts every URL against the registrar's quota). A
+    /// batch holds at most [`PREFETCH_BATCH`] objects and ends at an object that is uploaded
+    /// already, missing from staging, or multipart-sized: its parts mint their own URLs, and a
+    /// URL minted ahead of a minutes-long upload could expire before its PUT.
+    fn upload_all(&self, uploads: &[Upload], cycle: &mut DutyCycle) -> Result<(), ShipError> {
+        let objects = self.staging.objects_dir();
+        let single_put = |u: &Upload| {
+            u.bytes < self.multipart.threshold
+                && !self.staging.is_uploaded(&u.file)
+                && objects.join(&u.file).exists()
+        };
+        let mut start = 0;
+        while start < uploads.len() {
+            let mut end = start;
+            while end < uploads.len() && end - start < PREFETCH_BATCH && single_put(&uploads[end]) {
+                end += 1;
+            }
+            if end == start {
+                self.upload_one(&uploads[start], cycle)?;
+                start += 1;
+                continue;
+            }
+            let keys: Vec<String> = uploads[start..end].iter().map(|u| u.key.clone()).collect();
+            if let Err(error) = self.sink.prefetch_put(&keys) {
+                // Each PUT mints its own then, and reports what stands in the way.
+                tracing::warn!(keys = keys.len(), %error, "batch URL mint failed");
+            }
+            for u in &uploads[start..end] {
+                self.upload_one(u, cycle)?;
+            }
+            start = end;
+        }
+        Ok(())
+    }
+
     fn register_one(&self, entry: &QueueEntry) -> Result<(), ShipError> {
         let mut last = None;
         for attempt in 0..self.retry.attempts {
@@ -736,12 +789,9 @@ impl Shipper {
                 tracing::info!(n = entry.n, worktree = %entry.register.worktree_id, epoch = entry.register.epoch, "foreign capture dropped");
                 continue;
             }
-            let result = (|| {
-                for u in &entry.uploads {
-                    self.upload_one(u, &mut cycle)?;
-                }
-                self.register_one(&entry)
-            })();
+            let result = self
+                .upload_all(&entry.uploads, &mut cycle)
+                .and_then(|()| self.register_one(&entry));
             self.staging.release();
             match result {
                 Ok(()) => {
@@ -859,6 +909,7 @@ mod tests {
             n,
             capture_id: id.to_owned(),
             kind: CaptureKind::Auto,
+            class: None,
             uploads: Vec::new(),
             register: crate::registrar::RegisterRequest {
                 worktree_id: "wt".into(),

@@ -15,8 +15,10 @@
 //! roots that the plan does not name are removed — and only those: the roots are listed with
 //! the engine's own policy ([`ClassRoots`]), so the staging directory, excluded names
 //! (`*.lock`, credentials, …), bulk directories of a pending bulk section and everything
-//! outside the roots are never touched. A standby executor materializes the project base at
-//! boot and applies the head over it at claim (`capture.replan`).
+//! outside the roots are never touched; nor is `.git/index`, which the git class rebuilds from
+//! the index pseudo-ref and owns whenever the workspace class carries none. A standby executor
+//! materializes the project base at boot and applies the head over it at claim
+//! (`capture.replan`).
 
 use std::collections::{BTreeSet, HashMap};
 use std::fs::{self, File};
@@ -227,6 +229,15 @@ impl DiskState {
     }
 }
 
+/// Workspace-class virtual paths the git class owns and the workspace sweep never removes:
+/// the index is rebuilt from [`INDEX_TREE_REF`] (and overwritten by the captured bytes when
+/// the workspace class carries them). A plan whose workspace class does not name it — a base
+/// capture the control plane authored from a bare repository has an empty workspace root —
+/// must not lose it: without an index git takes every tracked path that matches an ignore
+/// rule for an ignored file, and the next snap's worktree tree drops it (observed as
+/// `D tooling/typescript/core.json` against a `.gitignore` line `core.*`).
+const GIT_CLASS_FILES: &[&str] = &[".git/index"];
+
 /// Verify `bytes` against a content-addressed key.
 fn verify_key(key: &str, bytes: &[u8]) -> Result<(), MaterializeError> {
     if let Some(expected) = key_digest(key)
@@ -389,7 +400,14 @@ impl<'a> Materializer<'a> {
                 .into_iter()
                 .flatten()
                 .collect();
-                Self::sweep(&listing, &write.planned, &keep, write.index, &mut report)?;
+                Self::sweep(
+                    &listing,
+                    &write.planned,
+                    &keep,
+                    GIT_CLASS_FILES,
+                    write.index,
+                    &mut report,
+                )?;
             }
             Self::restore_dirs(&write.dirs);
         }
@@ -420,6 +438,7 @@ impl<'a> Materializer<'a> {
                 &listing,
                 &bulk_only,
                 std::slice::from_ref(&root),
+                &[],
                 write.index,
                 &mut report,
             )?;
@@ -672,19 +691,21 @@ impl<'a> Materializer<'a> {
     }
 
     /// Remove what the class would capture but the plan does not name: files and symlinks
-    /// first, then directories that emptied out (never a listing root in `keep`). The index
-    /// ends up naming the plan's files and nothing else.
+    /// first, then directories that emptied out (never a listing root in `keep`, never a
+    /// virtual path in `protected`). The index ends up naming the plan's files and nothing
+    /// else.
     fn sweep(
         listing: &Listing,
         planned: &BTreeSet<String>,
         keep: &[PathBuf],
+        protected: &[&str],
         index: &mut TreeIndex,
         report: &mut MaterializeReport,
     ) -> Result<(), MaterializeError> {
         let mut stale: Vec<(&String, &index::Source)> = listing
             .entries
             .iter()
-            .filter(|(v, _)| !planned.contains(v.as_str()))
+            .filter(|(v, _)| !planned.contains(v.as_str()) && !protected.contains(&v.as_str()))
             .collect();
         // Children sort before their parents (a child's path is longer), so a directory is
         // tried once everything under it went.

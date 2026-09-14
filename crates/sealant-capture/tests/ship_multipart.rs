@@ -32,6 +32,7 @@ fn entry(n: u64, uploads: Vec<Upload>) -> QueueEntry {
         n,
         capture_id: id.clone(),
         kind: CaptureKind::Auto,
+        class: None,
         uploads,
         register: RegisterRequest {
             worktree_id: "wt".into(),

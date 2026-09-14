@@ -320,6 +320,10 @@ fn is_pack_file(name: &str) -> bool {
     stem.len() == 64 && stem.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
+fn is_tree_file(name: &str) -> bool {
+    name.strip_prefix("tree-").is_some_and(is_pack_file)
+}
+
 /// Worktree-relative paths the git section never indexes: the daemon directory and the staging
 /// directory when it lies elsewhere under the root.
 fn daemon_excludes(config: &CaptureConfig) -> Vec<String> {
@@ -394,14 +398,16 @@ impl CaptureEngine {
         })
     }
 
-    /// After materializing `previous` into the root: record the repository's current closure as
-    /// already stored, so the next pack ships only what is new. Call once at pickup; never on a
-    /// root whose objects did not come from the chain.
+    /// After materializing `previous` into the root: record the tips the repository got from
+    /// the chain (refs, `HEAD`, reflog entries — [`gitpack::stored_tips`]) as already stored,
+    /// so the next pack ships only what is new. The index and worktree trees are not among
+    /// them: they are written afresh at every snap and exist only locally until a pack carries
+    /// them, so anything the disk differs by from the head (the harness wrote a file between
+    /// materialize and this call, a tracked file the head lacked) ships with the next pack.
+    /// Call once at pickup; never on a root whose objects did not come from the chain.
     pub fn seed_tips_from_repo(&mut self) -> Result<(), EngineError> {
         let repo = GitRepo::open(&self.config.root)?;
-        let closure =
-            gitpack::read_closure(&repo, &self.staging.scratch_dir(), &self.daemon_excludes())?;
-        self.last_tips = closure.tips;
+        self.last_tips = gitpack::stored_tips(&repo)?;
         self.persist()?;
         Ok(())
     }
@@ -414,8 +420,8 @@ impl CaptureEngine {
     /// assigned this executor its worktree, or moved its epoch). Staging follows, entries
     /// staged under the old identity are dropped, chunk locations under the old prefix are
     /// forgotten (a new epoch never skips an upload because a prior one holds the bytes), a
-    /// bulk build in progress is abandoned, and the repository's closure is re-read as the
-    /// negatives of the next pack. Call after the plan's head is on disk.
+    /// bulk build in progress is abandoned, and the repository's stored tips are re-read as
+    /// the negatives of the next pack. Call after the plan's head is on disk.
     pub fn rebase(
         &mut self,
         worktree_id: &str,
@@ -796,13 +802,20 @@ impl CaptureEngine {
             && let Some(prev) = &self.previous
             && prev.manifest.sections == sections
         {
-            let dropped: HashSet<&String> = uploads.iter().map(|u| &u.key).collect();
-            // A pack that is not staged must not be the location of any chunk (a torn read can
-            // leave chunks the final tree does not reference in a pack no capture lists).
+            // Only the objects no queued capture lists go: a dir object this build listed
+            // again because it is not uploaded yet is, as often as not, staged by an entry the
+            // shipper has not reached (a bulk capture ahead of it in the queue takes minutes),
+            // and removing its bytes from under that entry stalls shipping for good (observed:
+            // `upload …/trees/<sha>: no GET url in plan` on every pass). A pack that is not
+            // staged must not be the location of any chunk either (a torn read can leave
+            // chunks the final tree does not reference in a pack no capture lists).
+            let removed = self.staging.discard_unreferenced(&uploads)?;
+            let dropped: HashSet<&String> = uploads
+                .iter()
+                .filter(|u| removed.contains(&u.file))
+                .map(|u| &u.key)
+                .collect();
             self.chunks.packs.retain(|_, k| !dropped.contains(k));
-            for u in &uploads {
-                fs::remove_file(objects.join(&u.file)).ok();
-            }
             stats.elapsed_ms = start.elapsed().as_millis() as u64;
             return Ok(SnapOutcome::Staged(Box::new(StagedCapture {
                 n: prev.manifest.n,
@@ -848,12 +861,17 @@ impl CaptureEngine {
         fs::write(objects.join(&manifest_file), &manifest.bytes)?;
         let mut all_uploads: Vec<Upload> = Vec::new();
         if let Some(old) = &coalesce {
-            // Keep the packs the coalesced capture staged (the new manifest may list them);
-            // its trees and manifest are superseded.
+            // Keep the packs the coalesced capture staged (the new manifest may list them).
+            // Its dir objects are superseded only when this snap rebuilt the same class: the
+            // build lists every dir object of the new tree that is not uploaded yet, shared
+            // ones included. Across classes the old class's sections are copied into the new
+            // manifest as they are, dir objects and all, so those ride along too; only the old
+            // manifest is superseded either way.
+            let rebuilt = old.class == Some(req.class);
             all_uploads.extend(
                 old.uploads
                     .iter()
-                    .filter(|u| is_pack_file(&u.file))
+                    .filter(|u| is_pack_file(&u.file) || (!rebuilt && is_tree_file(&u.file)))
                     .cloned(),
             );
         }
@@ -872,6 +890,7 @@ impl CaptureEngine {
             n,
             capture_id: manifest.capture_id.clone(),
             kind: req.kind,
+            class: Some(req.class),
             uploads: all_uploads,
             register: RegisterRequest {
                 worktree_id: self.config.worktree_id.clone(),
