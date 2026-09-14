@@ -92,6 +92,39 @@ the materializer treats `"pending"` as nothing to restore and nothing to sweep.
    "manifest":{…,"sections":{…,"bulk":"pending"}}},"get_urls":{…}}
 ```
 
+### `sizes` on every `upload.urls`, and byte-quota refusals
+
+`upload.urls` carries `sizes` for **every** key of the batch, not only the keys the executor
+would upload as multipart (`RegistrarMinter::prefetch_put`), so the registrar can price a whole
+batch before it mints anything. The one key that still travels unsized is the single-key fallback
+mint (`put_url` on a cache miss), which the register-time backstop prices.
+
+The registrar prices a key once and refuses what would take the session past its byte budget:
+413 on `upload.urls`, before a URL is minted, and 409 `byte-quota` on `capture.register` as the
+backstop for keys it was never sent a size for. Both bodies carry the numbers.
+
+```json
+→ {"worktree_id":"wt","epoch":3,"keys":["captures/wt/3/trees/<sha>", …],
+   "sizes":{"captures/wt/3/trees/<sha>":812, …}}
+← 413 {"reason":"byte-quota","limit":8589934592,"used":8570000000,"requested":775000000}
+← 409 {"reason":"byte-quota","limit":8589934592,"used":8570000000,"requested":775000000}
+```
+
+Executor side, both answers are `RegistrarError::QuotaRefused` — terminal, never retried. The
+shipper drops that queue entry with its staged bytes (and every queued capture that descends from
+it: they name it as their parent), logs the capture's `n`, class and the numbers, and marks the
+class `refused` in `capture.status`. A refused bulk class takes no further snap until the next
+epoch or `capture.replan` (`Shipper::is_refused`, checked by the cadence's bulk loop); the small
+class keeps snapping and shipping — its batches are small enough to fit what is left. The engine
+reads the refusal at its next snap: the chain continues from the refused capture's parent, and
+the chunk locations of packs that never went up — with the indexed files that reference them —
+are forgotten, so the next capture packs those bytes again instead of naming a pack that does not
+exist. Before this, a 409 was classified as a wrong parent and a 413 as a protocol error: both
+stopped the pass, neither dropped the entry, and the ship worker re-ran the same call every 5 s
+for good (observed on the cluster, 2026-09-14: a 775 MB bulk capture uploaded in full, then
+`ship pass failed error=register n=4: … http 413` on every tick). `InMemoryRegistrar` takes a
+byte quota (`with_byte_quota`) so both refusal points are tested (`tests/quota_refusals.rs`).
+
 ### Multipart uploads
 
 Measured (R1, 2026-09): one presigned PUT from a Cloudflare sandbox to R2 runs at 37–47 MB/s,

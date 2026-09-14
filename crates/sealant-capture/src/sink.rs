@@ -14,7 +14,7 @@ use std::thread;
 use std::time::Duration;
 
 use crate::cpu::thread_cpu;
-use crate::registrar::{CompletedPart, MultipartUrls};
+use crate::registrar::{CompletedPart, MultipartUrls, opt};
 
 /// Bytes to store: in memory or a file on disk (streamed).
 #[derive(Debug, Clone, Copy)]
@@ -91,6 +91,19 @@ pub enum SinkError {
         /// Why.
         reason: String,
     },
+    /// The registrar refused the bytes for the session's byte quota (413 at `upload.urls`, 409
+    /// `byte-quota` at the register). Terminal: no retry, no other key, no later tick.
+    #[error("refused ({reason}): limit {}, used {}, requested {}", opt(.limit), opt(.used), opt(.requested))]
+    QuotaRefused {
+        /// The registrar's reason code (`byte-quota`).
+        reason: String,
+        /// The session's budget in bytes, when the answer names it.
+        limit: Option<u64>,
+        /// Bytes priced against the session so far.
+        used: Option<u64>,
+        /// Bytes the refused call asked for.
+        requested: Option<u64>,
+    },
     /// A multipart upload could not be assembled: the registrar minted the wrong number of part
     /// URLs, a part answered without an ETag, the complete was refused, or the assembled object
     /// has the wrong size.
@@ -113,7 +126,10 @@ impl SinkError {
         match self {
             Self::Transport { .. } | Self::Io(_) => true,
             Self::Http { status, .. } => *status >= 500 || *status == 429 || *status == 408,
-            Self::NoUrl { .. } | Self::NotFound(_) | Self::Multipart { .. } => false,
+            Self::NoUrl { .. }
+            | Self::NotFound(_)
+            | Self::Multipart { .. }
+            | Self::QuotaRefused { .. } => false,
         }
     }
 }
@@ -175,10 +191,12 @@ pub trait BlobSink: Send + Sync {
         let _ = (part_size, parts_in_flight);
         self.put_if_absent(key, BlobSource::File(file))
     }
-    /// Prepare to store `keys` with single PUTs: a presigned sink mints their URLs in one
-    /// channel call instead of one per key. Advisory — a PUT of a key that was not (or could
-    /// not be) prepared mints on its own. The default does nothing.
-    fn prefetch_put(&self, keys: &[String]) -> Result<(), SinkError> {
+    /// Prepare to store `keys` (each `(key, bytes)`) with single PUTs: a presigned sink mints
+    /// their URLs in one channel call instead of one per key, and the sizes let the registrar
+    /// price the batch before it mints. Advisory — a PUT of a key that was not (or could not be)
+    /// prepared mints on its own — except a [`SinkError::QuotaRefused`], which is terminal. The
+    /// default does nothing.
+    fn prefetch_put(&self, keys: &[(String, u64)]) -> Result<(), SinkError> {
         let _ = keys;
         Ok(())
     }
@@ -297,18 +315,19 @@ impl BlobSink for LocalDir {
 /// credentials, only URLs.
 pub trait UrlMinter: Send + Sync {
     /// A PUT URL for `key`.
-    fn put_url(&self, key: &str) -> Result<String, String>;
-    /// Mint PUT URLs for `keys` ahead of their [`UrlMinter::put_url`] calls, in one channel
-    /// call. The default mints nothing (every `put_url` then mints its own).
-    fn prefetch_put(&self, keys: &[String]) -> Result<(), String> {
+    fn put_url(&self, key: &str) -> Result<String, SinkError>;
+    /// Mint PUT URLs for `keys` (each `(key, bytes)`) ahead of their [`UrlMinter::put_url`]
+    /// calls, in one channel call carrying every size. The default mints nothing (every
+    /// `put_url` then mints its own).
+    fn prefetch_put(&self, keys: &[(String, u64)]) -> Result<(), SinkError> {
         let _ = keys;
         Ok(())
     }
     /// A GET URL for `key`.
-    fn get_url(&self, key: &str) -> Result<String, String>;
+    fn get_url(&self, key: &str) -> Result<String, SinkError>;
     /// Part URLs for a multipart upload of `key` (`size` bytes), or none when the store takes
     /// the key as a single PUT (below the registrar's threshold, or no multipart support).
-    fn multipart_urls(&self, key: &str, size: u64) -> Result<Option<MultipartUrls>, String> {
+    fn multipart_urls(&self, key: &str, size: u64) -> Result<Option<MultipartUrls>, SinkError> {
         let _ = (key, size);
         Ok(None)
     }
@@ -331,19 +350,19 @@ pub trait UrlMinter: Send + Sync {
 /// A shared minter is a minter: the daemon keeps the handle a re-plan resets while the sink
 /// owns a clone.
 impl<M: UrlMinter + ?Sized> UrlMinter for Arc<M> {
-    fn put_url(&self, key: &str) -> Result<String, String> {
+    fn put_url(&self, key: &str) -> Result<String, SinkError> {
         (**self).put_url(key)
     }
 
-    fn prefetch_put(&self, keys: &[String]) -> Result<(), String> {
+    fn prefetch_put(&self, keys: &[(String, u64)]) -> Result<(), SinkError> {
         (**self).prefetch_put(keys)
     }
 
-    fn get_url(&self, key: &str) -> Result<String, String> {
+    fn get_url(&self, key: &str) -> Result<String, SinkError> {
         (**self).get_url(key)
     }
 
-    fn multipart_urls(&self, key: &str, size: u64) -> Result<Option<MultipartUrls>, String> {
+    fn multipart_urls(&self, key: &str, size: u64) -> Result<Option<MultipartUrls>, SinkError> {
         (**self).multipart_urls(key, size)
     }
 
@@ -396,15 +415,11 @@ impl PresignedHttp {
     }
 
     fn url(&self, key: &str, put: bool) -> Result<String, SinkError> {
-        let r = if put {
+        if put {
             self.minter.put_url(key)
         } else {
             self.minter.get_url(key)
-        };
-        r.map_err(|reason| SinkError::NoUrl {
-            key: key.to_owned(),
-            reason,
-        })
+        }
     }
 }
 
@@ -563,16 +578,11 @@ impl PresignedHttp {
 }
 
 impl BlobSink for PresignedHttp {
-    fn prefetch_put(&self, keys: &[String]) -> Result<(), SinkError> {
+    fn prefetch_put(&self, keys: &[(String, u64)]) -> Result<(), SinkError> {
         if keys.is_empty() {
             return Ok(());
         }
-        self.minter
-            .prefetch_put(keys)
-            .map_err(|reason| SinkError::NoUrl {
-                key: format!("{} keys from {}", keys.len(), keys[0]),
-                reason,
-            })
+        self.minter.prefetch_put(keys)
     }
 
     fn put_if_absent(&self, key: &str, source: BlobSource<'_>) -> Result<PutOutcome, SinkError> {
@@ -612,12 +622,7 @@ impl BlobSink for PresignedHttp {
         let plan = if size == 0 {
             None
         } else {
-            self.minter
-                .multipart_urls(key, size)
-                .map_err(|reason| SinkError::NoUrl {
-                    key: key.to_owned(),
-                    reason,
-                })?
+            self.minter.multipart_urls(key, size)?
         };
         let Some(plan) = plan else {
             return self.put_if_absent(key, BlobSource::File(file));

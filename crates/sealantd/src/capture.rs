@@ -13,7 +13,7 @@ use sealant_capture::{
     BlobSink, CadenceRunner, CaptureKind as EngineKind, MaterializeClass, Materializer, Registrar,
 };
 use sealant_protocol::{
-    CaptureKind, CaptureReplanned, CaptureStaged, CaptureStatusReport, ControlError,
+    CaptureClass, CaptureKind, CaptureReplanned, CaptureStaged, CaptureStatusReport, ControlError,
     LeaseEpochReport, ProcessId, Signal,
 };
 
@@ -358,6 +358,13 @@ impl CaptureRuntime {
             fenced: ship.fenced,
             paused: self.paused.load(Ordering::Relaxed),
             last_snap_unix_ms: (last != 0).then_some(last),
+            refused: [
+                ship.refused_small.then_some(CaptureClass::Small),
+                ship.refused_bulk.then_some(CaptureClass::Bulk),
+            ]
+            .into_iter()
+            .flatten()
+            .collect(),
         }
     }
 
@@ -532,6 +539,27 @@ mod tests {
         let snap = capture.runner().snapshot();
         assert_eq!(snap.forced, 4, "{snap:?}");
         assert_eq!(snap.small_snaps, 4, "no scheduled snap fired: {snap:?}");
+    }
+
+    /// A class the registrar refused for the session's byte quota is named in `capture.status`,
+    /// and a re-plan lifts it (the refusal belonged to the previous epoch).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn capture_status_names_the_refused_classes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (boot, _registrar) = boot(tmp.path());
+        let capture = CaptureRuntime::new(boot, 5_000);
+        assert!(capture.status().refused.is_empty());
+
+        capture
+            .runner()
+            .shipper()
+            .status
+            .refused_bulk
+            .store(true, Ordering::Relaxed);
+        assert_eq!(capture.status().refused, vec![CaptureClass::Bulk]);
+
+        capture.runner().shipper().reset_after_replan(Some(0));
+        assert!(capture.status().refused.is_empty());
     }
 
     /// The standby flow end to end: the project base is captured for `wt-real` (epoch 1); a

@@ -418,6 +418,13 @@ enum CaptureKind {
   CAPTURE_KIND_FINAL = 5;
 }
 message CaptureNowArgs { CaptureKind kind = 1; }
+// What a capture snapped: the small class (git, `.git` bookkeeping, harness home) or the bulk
+// class (dependencies, build outputs).
+enum CaptureClass {
+  CAPTURE_CLASS_UNSPECIFIED = 0;
+  CAPTURE_CLASS_SMALL = 1;
+  CAPTURE_CLASS_BULK = 2;
+}
 message ReadSessionOutputArgs {
   string session_id = 1;
   uint64 from_sequence = 2;
@@ -583,6 +590,9 @@ message CaptureStatusReport {
   bool fenced = 9;
   bool paused = 10;
   optional uint64 last_snap_unix_ms = 11;
+  // Classes the registrar refused for the session's byte quota; nothing of such a class ships
+  // again until the next epoch or capture.replan.
+  repeated CaptureClass refused = 12;
 }
 message LeaseEpochReport { uint64 epoch = 1; string worktree_id = 2; bool fenced = 3; }
 message CaptureReplanned {
