@@ -186,6 +186,14 @@ impl GitRepo {
         }
     }
 
+    /// The tree `HEAD` points at, or `None` when `HEAD` names no commit (an unborn branch).
+    pub fn head_tree(&self) -> Result<Option<String>, GitError> {
+        let out = git_command(&self.root)
+            .args(["rev-parse", "--verify", "-q", "HEAD^{tree}"])
+            .output()?;
+        Ok(out.status.success().then(|| stdout_string(&out)))
+    }
+
     /// Every sha a reflog entry points at; empty when the repository has no reflog at all (a
     /// freshly materialized one), where `git rev-list --reflog` exits with its usage text.
     pub fn reflog_tips(&self) -> Result<Vec<String>, GitError> {
@@ -316,6 +324,13 @@ impl GitRepo {
     /// `write-tree`. Nested repositories are left out of the add (see
     /// [`Self::worktree_add_args`]) and their paths are returned beside the sha so the chunked
     /// class can carry them; a tracked gitlink keeps the entry the index already had.
+    ///
+    /// Tracked always wins: a path the index holds is part of the tree whatever the ignore rules
+    /// say (`git add -A` only consults them for untracked paths). Without an index on disk the
+    /// throwaway one is seeded from `HEAD`'s tree, so the tracked files of the checked-out
+    /// commit keep that standing — from an empty index, a tracked file that happens to match
+    /// `.gitignore` (`core.*` against a tracked `core.json`) would be taken for an ignored one
+    /// and dropped from the tree.
     pub fn worktree_tree(
         &self,
         scratch_dir: &Path,
@@ -324,10 +339,18 @@ impl GitRepo {
         fs::create_dir_all(scratch_dir)?;
         let tmp_index = scratch_dir.join("snap-index");
         let real_index = self.git_dir.join("index");
+        fs::remove_file(&tmp_index).ok();
         if real_index.exists() {
             fs::copy(&real_index, &tmp_index)?;
-        } else {
-            fs::remove_file(&tmp_index).ok();
+        } else if let Some(head_tree) = self.head_tree()? {
+            let rt = ["read-tree", &head_tree];
+            check(
+                &rt,
+                git_command(&self.root)
+                    .env("GIT_INDEX_FILE", &tmp_index)
+                    .args(rt)
+                    .output()?,
+            )?;
         }
         let (add, mut nested) = self.worktree_add_args(&tmp_index, excludes)?;
         let out = git_command(&self.root)
@@ -470,6 +493,27 @@ pub fn read_closure(
     })
 }
 
+/// The tips whose objects a materialized repository got from the chain: ref values, a detached
+/// `HEAD`, reflog entries. These are what a snap after a materialize may hold as negatives.
+///
+/// Deliberately not [`read_closure`]: that writes the index and worktree trees afresh, and
+/// those objects exist only locally unless they happen to equal the chain head's pseudo-refs
+/// (the head's own tips are negatives already). Seeding them as "stored" hid every tree the
+/// materialized disk differed by from the next pack — observed as a capture whose root tree
+/// named subtrees no pack of the chain held (`fatal: unable to read tree`).
+pub fn stored_tips(repo: &GitRepo) -> Result<Vec<String>, GitError> {
+    let refs = repo.refs()?;
+    let head = repo.head()?;
+    let mut tips: Vec<String> = refs.into_values().collect();
+    if !head.starts_with("refs/") {
+        tips.push(head);
+    }
+    tips.extend(repo.reflog_tips()?);
+    tips.sort();
+    tips.dedup();
+    Ok(tips)
+}
+
 /// A finished, self-contained git pack with its index.
 #[derive(Debug, Clone)]
 pub struct FinishedGitPack {
@@ -550,10 +594,12 @@ fn pack_once(
         fs::remove_file(&tmp).ok();
         return Ok(None);
     }
-    // `git index-pack <file.pack>` writes `<file>.idx` beside it and verifies the pack.
+    // `git index-pack <file.pack>` writes `<file>.idx` beside it and verifies the pack; git
+    // 2.41+ also writes `<file>.rev`, which nothing here uses.
     let tmp_str = tmp.to_string_lossy().to_string();
     let args = ["index-pack", &tmp_str];
     check(&args, git_command(&repo.root).args(args).output()?)?;
+    fs::remove_file(tmp.with_extension("rev")).ok();
     let bytes = fs::read(&tmp)?;
     let sha256 = sha256_hex(&bytes);
     let path = out_dir.join(&sha256);
@@ -665,6 +711,7 @@ pub fn install_pack(
             let tmp_str = tmp.to_string_lossy().to_string();
             let args = ["index-pack", &tmp_str];
             check(&args, git_command(&repo.root).args(args).output()?)?;
+            fs::remove_file(tmp.with_extension("rev")).ok();
         }
     }
     fs::rename(tmp.with_extension("idx"), &idx_path)?;
@@ -910,6 +957,49 @@ mod tests {
                 .keys()
                 .any(|k| k.starts_with(PSEUDO_REF_PREFIX))
         );
+    }
+
+    /// A tracked file that matches `.gitignore` stays in the worktree tree, with or without an
+    /// index on disk: tracked always wins, ignore rules only sort untracked paths.
+    #[test]
+    fn tracked_files_matching_gitignore_stay_in_the_worktree_tree() {
+        let (dir, repo) = fixture();
+        let root = repo.root.clone();
+        fs::write(root.join(".gitignore"), "core.*\n").unwrap();
+        fs::create_dir_all(root.join("tooling")).unwrap();
+        fs::write(root.join("tooling/core.json"), "{}\n").unwrap();
+        fs::write(root.join("core.1234"), "dump\n").unwrap();
+        repo.run(&["add", "-f", ".gitignore", "tooling/core.json"])
+            .unwrap();
+        repo.run(&["commit", "-q", "-m", "core"]).unwrap();
+        fs::write(root.join("tooling/core.json"), "{\"edited\":true}\n").unwrap();
+        let scratch = dir.path().join("scratch");
+        let names =
+            |tree: &str| stdout_string(&repo.run(&["ls-tree", "-r", "--name-only", tree]).unwrap());
+
+        let (tree, _) = repo.worktree_tree(&scratch, &[]).unwrap();
+        let listed = names(&tree);
+        assert!(listed.contains("tooling/core.json"), "{listed}");
+        assert!(!listed.contains("core.1234"), "{listed}");
+        let out = repo
+            .run(&["show", &format!("{tree}:tooling/core.json")])
+            .unwrap();
+        assert_eq!(
+            stdout_string(&out),
+            "{\"edited\":true}",
+            "the edit is in the tree"
+        );
+
+        // No index at all (a materialized base whose workspace class carried none): the tree
+        // is seeded from HEAD, so the tracked file keeps its standing.
+        fs::remove_file(repo.git_dir.join("index")).unwrap();
+        let (tree_without_index, _) = repo.worktree_tree(&scratch, &[]).unwrap();
+        assert_eq!(tree_without_index, tree);
+        assert!(
+            !repo.git_dir.join("index").exists(),
+            "the real index is never written"
+        );
+        assert!(stored_tips(&repo).unwrap().iter().all(|t| t != &tree));
     }
 
     /// Every nested repository is named in an `:(exclude)` pathspec ahead of `git add -A`, so

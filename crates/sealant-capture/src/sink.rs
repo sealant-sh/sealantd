@@ -175,6 +175,13 @@ pub trait BlobSink: Send + Sync {
         let _ = (part_size, parts_in_flight);
         self.put_if_absent(key, BlobSource::File(file))
     }
+    /// Prepare to store `keys` with single PUTs: a presigned sink mints their URLs in one
+    /// channel call instead of one per key. Advisory — a PUT of a key that was not (or could
+    /// not be) prepared mints on its own. The default does nothing.
+    fn prefetch_put(&self, keys: &[String]) -> Result<(), SinkError> {
+        let _ = keys;
+        Ok(())
+    }
     /// Read the bytes at `key`.
     fn get(&self, key: &str) -> Result<Vec<u8>, SinkError>;
     /// Whether `key` holds bytes.
@@ -291,6 +298,12 @@ impl BlobSink for LocalDir {
 pub trait UrlMinter: Send + Sync {
     /// A PUT URL for `key`.
     fn put_url(&self, key: &str) -> Result<String, String>;
+    /// Mint PUT URLs for `keys` ahead of their [`UrlMinter::put_url`] calls, in one channel
+    /// call. The default mints nothing (every `put_url` then mints its own).
+    fn prefetch_put(&self, keys: &[String]) -> Result<(), String> {
+        let _ = keys;
+        Ok(())
+    }
     /// A GET URL for `key`.
     fn get_url(&self, key: &str) -> Result<String, String>;
     /// Part URLs for a multipart upload of `key` (`size` bytes), or none when the store takes
@@ -320,6 +333,10 @@ pub trait UrlMinter: Send + Sync {
 impl<M: UrlMinter + ?Sized> UrlMinter for Arc<M> {
     fn put_url(&self, key: &str) -> Result<String, String> {
         (**self).put_url(key)
+    }
+
+    fn prefetch_put(&self, keys: &[String]) -> Result<(), String> {
+        (**self).prefetch_put(keys)
     }
 
     fn get_url(&self, key: &str) -> Result<String, String> {
@@ -546,6 +563,18 @@ impl PresignedHttp {
 }
 
 impl BlobSink for PresignedHttp {
+    fn prefetch_put(&self, keys: &[String]) -> Result<(), SinkError> {
+        if keys.is_empty() {
+            return Ok(());
+        }
+        self.minter
+            .prefetch_put(keys)
+            .map_err(|reason| SinkError::NoUrl {
+                key: format!("{} keys from {}", keys.len(), keys[0]),
+                reason,
+            })
+    }
+
     fn put_if_absent(&self, key: &str, source: BlobSource<'_>) -> Result<PutOutcome, SinkError> {
         let url = self.url(key, true)?;
         let len = source.len()?;

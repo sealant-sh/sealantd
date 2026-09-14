@@ -891,8 +891,9 @@ impl Registrar for HttpRegistrar {
     }
 }
 
-/// A [`crate::sink::UrlMinter`] over a registrar: PUT and part URLs come from `upload.urls`,
-/// multipart completes go to `upload.complete`, GET URLs come from the plan. A re-plan
+/// A [`crate::sink::UrlMinter`] over a registrar: PUT and part URLs come from `upload.urls`
+/// (a batch at a time through [`Self::prefetch_put`], one key on a cache miss), multipart
+/// completes go to `upload.complete`, GET URLs come from the plan. A re-plan
 /// ([`Self::reset`]) moves it to the new identity and the new plan's GET URLs.
 #[derive(Debug)]
 pub struct RegistrarMinter<R: Registrar + ?Sized> {
@@ -962,6 +963,10 @@ impl<R: Registrar + ?Sized> RegistrarMinter<R> {
 }
 
 impl<R: Registrar + ?Sized> crate::sink::UrlMinter for RegistrarMinter<R> {
+    fn prefetch_put(&self, keys: &[String]) -> Result<(), String> {
+        Self::prefetch_put(self, keys).map_err(|e| e.to_string())
+    }
+
     fn put_url(&self, key: &str) -> Result<String, String> {
         if let Some(u) = self
             .put_cache
