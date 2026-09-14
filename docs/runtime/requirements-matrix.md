@@ -48,10 +48,13 @@ down ✅; invalid UTF-8 / NUL round-trip ✅; protocol output never mixed with d
 - **PROC adversarial matrix** (plan §24): stdin streaming, grandchild/orphan reaping via
   process-group kill, SIGTERM-ignore → SIGKILL escalation, concurrent stdout/stderr, large-output
   chunking with contiguous offsets, command-not-found, nonzero exit, timeout.
-- **PROC-6 subreaper + reaping**: `PR_SET_CHILD_SUBREAPER` + a SIGCHLD-driven, registry-guarded
-  orphan reaper (`waitid(WNOWAIT)` peek; never steals Tokio-owned children; 2 s sweep) — covers
-  double-fork adopted descendants and the PID-1 (container init) case
-  (`crates/sealant-process/tests/orphan_reaping.rs`).
+- **PROC-6 subreaper + reaping**: `PR_SET_CHILD_SUBREAPER` + a SIGCHLD-driven orphan reaper
+  (`waitid(WNOWAIT)` peek; 2 s sweep) gated on the process-wide spawned-pid set
+  (`sealant-process/src/spawn.rs`): it reaps only pids this process did not spawn, so no spawner —
+  Tokio exec, a PTY/pipe leader, the capture engine's `git`, a boot helper — ever loses its child's
+  exit status to `ECHILD`. Covers double-fork adopted descendants and the PID-1 (container init)
+  case (`crates/sealant-process/tests/orphan_reaping.rs`,
+  `crates/sealantd/tests/capture_reap_gate.rs`).
 - **pidfd**: kernel capability detected (`/proc/sys/kernel/osrelease` ≥ 5.3) and reported in
   `capabilities.features.pidfd`/`subreaper`; signalling still uses `killpg` while the process is
   live (documented PID-reuse-safe fallback, plan §10.4). `process.started.pidfd` stays `false` until

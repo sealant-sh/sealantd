@@ -190,7 +190,7 @@ impl Runtime {
             tracing::debug!("PR_SET_NO_NEW_PRIVS engaged");
         }
         let pidfd_supported = sealant_process::platform::pidfd_supported();
-        let sftp = Arc::new(SftpRuntime::new(processes.registry.clone()));
+        let sftp = Arc::new(SftpRuntime::new());
         let binds = Arc::new(crate::binds::BindRuntime::new(
             config.bindable_mounts.clone(),
             std::path::PathBuf::from(crate::binds::BINDS_STATE_FILE),
@@ -262,12 +262,6 @@ impl Runtime {
         signal: Signal,
     ) -> Result<(), ControlError> {
         self.processes.signal(process_id, signal)
-    }
-
-    /// The managed-process registry (used to start the adopted-orphan reaper).
-    #[must_use]
-    pub fn process_registry(&self) -> Arc<ProcessRegistry> {
-        self.processes.registry.clone()
     }
 
     /// The interactive-session runtime (used by tests to drive PTY input/attachment directly).

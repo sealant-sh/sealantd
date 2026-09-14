@@ -12,6 +12,7 @@
 use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
 
+use sealant_process::CommandGateExt;
 use sealant_protocol::ControlError;
 use sealant_runtime_core::config::{Bind, BindableMount};
 use serde::{Deserialize, Serialize};
@@ -252,7 +253,8 @@ fn mark_git_safe(target: &Path) {
     let value = target.to_string_lossy().into_owned();
     let listed = std::process::Command::new("git")
         .args(["config", "--system", "--get-all", "safe.directory"])
-        .output()
+        .stdin(std::process::Stdio::null())
+        .output_gated()
         .ok()
         .map(|out| {
             String::from_utf8_lossy(&out.stdout)
@@ -265,7 +267,7 @@ fn mark_git_safe(target: &Path) {
     }
     if let Err(error) = std::process::Command::new("git")
         .args(["config", "--system", "--add", "safe.directory", &value])
-        .status()
+        .status_gated()
     {
         tracing::warn!(%error, target = %target.display(), "could not mark the bound repository safe for git");
     }

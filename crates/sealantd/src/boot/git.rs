@@ -10,6 +10,7 @@ use std::process::Command;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
+use sealant_process::CommandGateExt;
 
 use crate::boot::config::{CloneAuth, RepoConfig};
 use crate::boot::error::BootError;
@@ -155,7 +156,7 @@ pub(crate) fn clone_repo_if_absent(
         "cloning workspace repository"
     );
     let status = command
-        .status()
+        .status_gated()
         .map_err(|e| BootError::Clone(format!("could not spawn git: {e}")))?;
     if !status.success() {
         return Err(BootError::Clone(format!("git clone exited with {status}")));

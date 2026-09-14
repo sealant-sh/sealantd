@@ -9,6 +9,7 @@ use std::io;
 use std::path::Path;
 use std::process::Stdio;
 
+use sealant_process::SpawnedPid;
 use tokio::process::{ChildStderr, ChildStdin, ChildStdout};
 
 /// A spawned pipe-mode leader: the three pipes, the child, and its OS pid.
@@ -24,6 +25,9 @@ pub struct PipeChild {
     pub child: tokio::process::Child,
     /// The child's OS pid (also its session id / process-group id).
     pub pid: i32,
+    /// Keeps the orphan reaper off this pid until the caller has waited for the child; drop it
+    /// as soon as `child.wait()` returns (see `sealant_process::spawn`).
+    pub spawned: SpawnedPid,
 }
 
 /// Start `program` as a session leader with piped stdio.
@@ -60,8 +64,10 @@ pub fn spawn(
         });
     }
 
-    let mut child = command.spawn()?;
-    let pid = child.id().map_or(-1, |p| p as i32);
+    // Spawn through the process-wide gate: sealantd is PID 1 in the workspace and its orphan
+    // reaper must not reap the leader out from under the session's own `wait()`.
+    let (mut child, spawned) = sealant_process::spawn::spawn_tokio(&mut command)?;
+    let pid = spawned.pid();
     let stdin = child
         .stdin
         .take()
@@ -80,5 +86,6 @@ pub fn spawn(
         stderr,
         child,
         pid,
+        spawned,
     })
 }

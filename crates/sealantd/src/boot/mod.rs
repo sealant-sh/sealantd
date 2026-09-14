@@ -358,7 +358,7 @@ async fn boot_serve(
     // Step 11: same background machinery app.rs::serve starts.
     crate::app::spawn_signal_listener(runtime.clone());
     crate::app::spawn_heartbeat(runtime.clone());
-    sealant_process::platform::spawn_orphan_reaper(runtime.process_registry());
+    sealant_process::platform::spawn_orphan_reaper();
     runtime.start_telemetry();
     runtime.start_filesystem();
     let network_mode = runtime.start_network().await;

@@ -282,7 +282,7 @@ async fn serve(cli: ServeArgs, wss: Option<WssConfig>, runtime: Arc<Runtime>) ->
     spawn_signal_listener(runtime.clone());
     spawn_heartbeat(runtime.clone());
     // Reap descendants that reparent to us as subreaper / PID 1 (no-op off Linux).
-    sealant_process::platform::spawn_orphan_reaper(runtime.process_registry());
+    sealant_process::platform::spawn_orphan_reaper();
     // Start durable telemetry delivery: replay the spool, then deliver live events.
     runtime.start_telemetry();
     // Begin filesystem observation if enabled (no-op otherwise).

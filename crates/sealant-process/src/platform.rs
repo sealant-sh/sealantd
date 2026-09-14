@@ -3,13 +3,10 @@
 //!
 //! With `PR_SET_CHILD_SUBREAPER` (or when running as PID 1) a process that double-forks an orphan
 //! has that orphan reparented to the daemon. The [`spawn_orphan_reaper`] task reaps such orphans so
-//! they do not linger as zombies — without stealing children that Tokio owns and reaps itself
-//! (those are registered in the [`ProcessRegistry`] owned-pid set and left alone; each sweep
-//! holds the spawn↔reap gate so a registration in flight is never missed).
-
-use std::sync::Arc;
-
-use crate::registry::ProcessRegistry;
+//! they do not linger as zombies — and only those: a pid this process spawned belongs to whoever
+//! spawned it, and is left alone whether that is Tokio, the capture engine's `git`, or a boot
+//! helper (see [`crate::spawn`], whose gate each sweep holds so a registration in flight is never
+//! missed).
 
 /// Make the current process a child subreaper. Returns whether it took effect.
 #[cfg(target_os = "linux")]
@@ -69,7 +66,7 @@ fn kernel_at_least(release: &str, major: u32, minor: u32) -> bool {
 
 /// Spawn the adopted-orphan reaper task. No-op off Linux.
 #[cfg(target_os = "linux")]
-pub fn spawn_orphan_reaper(registry: Arc<ProcessRegistry>) {
+pub fn spawn_orphan_reaper() {
     use tokio::signal::unix::{SignalKind, signal};
     tokio::spawn(async move {
         let mut sigchld = match signal(SignalKind::child()) {
@@ -79,12 +76,12 @@ pub fn spawn_orphan_reaper(registry: Arc<ProcessRegistry>) {
                 return;
             }
         };
-        // A periodic sweep catches any zombie missed because we stopped at a Tokio-owned one.
+        // A periodic sweep catches any zombie missed because we stopped at a spawned child.
         let mut sweep = tokio::time::interval(std::time::Duration::from_secs(2));
         loop {
             tokio::select! {
-                _ = sigchld.recv() => reap_orphans(&registry),
-                _ = sweep.tick() => reap_orphans(&registry),
+                _ = sigchld.recv() => reap_orphans(),
+                _ = sweep.tick() => reap_orphans(),
             }
         }
     });
@@ -92,14 +89,17 @@ pub fn spawn_orphan_reaper(registry: Arc<ProcessRegistry>) {
 
 /// Off Linux there are no adopted orphans to reap.
 #[cfg(not(target_os = "linux"))]
-pub fn spawn_orphan_reaper(_registry: Arc<ProcessRegistry>) {}
+pub fn spawn_orphan_reaper() {}
 
 #[cfg(target_os = "linux")]
-fn reap_orphans(registry: &ProcessRegistry) {
+fn reap_orphans() {
     use nix::sys::wait::{Id, WaitPidFlag, waitid, waitpid};
-    // Hold the spawn↔reap gate for the whole sweep: a spawn path registers its pid under the
-    // same lock, so we can never observe an exited child whose ownership is still being recorded.
-    let owned = registry.owned_pids();
+
+    use crate::spawn::{self, ReapDecision};
+
+    // Hold the spawn↔reap gate for the whole sweep: every spawn path registers its pid under the
+    // same lock, so we can never observe an exited child whose registration is still in flight.
+    let spawned = spawn::lock_gate();
     // Peek at each waitable child WITHOUT reaping it (WNOWAIT); `Err` (ECHILD/transient) ends the loop.
     while let Ok(status) = waitid(
         Id::All,
@@ -108,9 +108,9 @@ fn reap_orphans(registry: &ProcessRegistry) {
         let Some(pid) = status.pid() else {
             break; // StillAlive: a child exists but none has exited.
         };
-        if owned.contains(&pid.as_raw()) {
-            // Tokio owns and will reap this one. Stop so we don't spin on it; the periodic sweep
-            // retries any orphans queued behind it.
+        if spawn::decide(&spawned, pid.as_raw()) == ReapDecision::LeaveToSpawner {
+            // This process spawned it and will reap it itself. Stop so we don't spin on it (the
+            // peek is not skippable); the periodic sweep retries any orphans queued behind it.
             break;
         }
         // Adopted orphan: actually reap it.

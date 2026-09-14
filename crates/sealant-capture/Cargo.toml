@@ -11,6 +11,7 @@ workspace = true
 
 [dependencies]
 sealant-fs = { workspace = true }
+sealant-process = { workspace = true }
 notify = { workspace = true }
 fastcdc = { workspace = true }
 zstd = { workspace = true }

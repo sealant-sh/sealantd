@@ -10,6 +10,8 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
+use sealant_process::CommandGateExt;
+
 use crate::chunk::sha256_hex;
 use crate::manifest::{FsckStatus, INDEX_TREE_REF, PSEUDO_REF_PREFIX, WORKTREE_TREE_REF};
 
@@ -47,6 +49,12 @@ pub struct GitRepo {
 }
 
 /// Run git with a clean environment (no inherited `GIT_DIR`/`GIT_INDEX_FILE`/`GIT_WORK_TREE`).
+///
+/// Every child started from this command must be spawned through the process-wide spawn gate
+/// (`sealant_process::CommandGateExt`: `output_gated`/`spawn_gated`, never `output`/`spawn`).
+/// sealantd is PID 1 in the workspace and its orphan reaper reaps any waitable child it did not
+/// spawn — an ungated `git` that exits mid-sweep is reaped out from under us and the `wait()`
+/// here fails with `ECHILD` ("No child process"), which is how a `capture.flush` died under load.
 fn git_command(cwd: &Path) -> Command {
     let mut c = Command::new("git");
     c.current_dir(cwd)
@@ -79,7 +87,7 @@ impl GitRepo {
     pub fn open(root: &Path) -> Result<Self, GitError> {
         let out = git_command(root)
             .args(["rev-parse", "--git-dir", "--git-common-dir"])
-            .output()?;
+            .output_gated()?;
         if !out.status.success() {
             return Err(GitError::NotARepo(root.to_path_buf()));
         }
@@ -99,7 +107,7 @@ impl GitRepo {
         fs::create_dir_all(root)?;
         if !root.join(".git").exists() {
             let args = ["init", "-q"];
-            check(&args, git_command(root).args(args).output()?)?;
+            check(&args, git_command(root).args(args).output_gated()?)?;
         }
         Self::open(root)
     }
@@ -128,7 +136,7 @@ impl GitRepo {
     /// Whether `path` (worktree-relative) is ignored by the repository's ignore rules.
     pub fn is_ignored(&self, path: &str) -> Result<bool, GitError> {
         let args = ["check-ignore", "-q", "--", path];
-        let out = git_command(&self.root).args(args).output()?;
+        let out = git_command(&self.root).args(args).output_gated()?;
         match out.status.code() {
             Some(0) => Ok(true),
             Some(1) => Ok(false),
@@ -141,7 +149,7 @@ impl GitRepo {
 
     /// Run a git command in the working tree and return its output on success.
     pub fn run(&self, args: &[&str]) -> Result<Output, GitError> {
-        check(args, git_command(&self.root).args(args).output()?)
+        check(args, git_command(&self.root).args(args).output_gated()?)
     }
 
     /// Run a git command with stdin.
@@ -151,8 +159,8 @@ impl GitRepo {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .spawn()?;
-        if let Some(mut pipe) = child.stdin.take() {
+            .spawn_gated()?;
+        if let Some(mut pipe) = child.take_stdin() {
             // A closed pipe (git exited early) surfaces as the command's status.
             let _ = pipe.write_all(stdin);
         }
@@ -173,7 +181,7 @@ impl GitRepo {
     pub fn head(&self) -> Result<String, GitError> {
         let out = git_command(&self.root)
             .args(["symbolic-ref", "-q", "HEAD"])
-            .output()?;
+            .output_gated()?;
         if out.status.success() {
             return Ok(stdout_string(&out));
         }
@@ -190,7 +198,7 @@ impl GitRepo {
     pub fn head_tree(&self) -> Result<Option<String>, GitError> {
         let out = git_command(&self.root)
             .args(["rev-parse", "--verify", "-q", "HEAD^{tree}"])
-            .output()?;
+            .output_gated()?;
         Ok(out.status.success().then(|| stdout_string(&out)))
     }
 
@@ -217,7 +225,7 @@ impl GitRepo {
         let out = git_command(&self.root)
             .env("GIT_INDEX_FILE", &tmp_index)
             .args(["write-tree"])
-            .output()?;
+            .output_gated()?;
         fs::remove_file(&tmp_index).ok();
         Ok(out.status.success().then(|| stdout_string(&out)))
     }
@@ -243,7 +251,7 @@ impl GitRepo {
             cmd.env("GIT_INDEX_FILE", index);
         }
         let others = ["ls-files", "-o", "--exclude-standard", "-z"];
-        let out = check(&others, cmd.args(others).output()?)?;
+        let out = check(&others, cmd.args(others).output_gated()?)?;
         let mut nested: Vec<String> = String::from_utf8_lossy(&out.stdout)
             .split('\0')
             .filter_map(|l| l.strip_suffix('/'))
@@ -255,7 +263,7 @@ impl GitRepo {
             cmd.env("GIT_INDEX_FILE", index);
         }
         let staged = ["ls-files", "-s", "-z"];
-        let out = check(&staged, cmd.args(staged).output()?)?;
+        let out = check(&staged, cmd.args(staged).output_gated()?)?;
         nested.extend(
             String::from_utf8_lossy(&out.stdout)
                 .split('\0')
@@ -349,14 +357,14 @@ impl GitRepo {
                 git_command(&self.root)
                     .env("GIT_INDEX_FILE", &tmp_index)
                     .args(rt)
-                    .output()?,
+                    .output_gated()?,
             )?;
         }
         let (add, mut nested) = self.worktree_add_args(&tmp_index, excludes)?;
         let out = git_command(&self.root)
             .env("GIT_INDEX_FILE", &tmp_index)
             .args(&add)
-            .output()?;
+            .output_gated()?;
         // Belt and braces: anything `--ignore-errors` skipped past that the enumeration did not
         // name joins the chunked class the same way.
         let stderr = String::from_utf8_lossy(&out.stderr).to_string();
@@ -378,7 +386,7 @@ impl GitRepo {
             git_command(&self.root)
                 .env("GIT_INDEX_FILE", &tmp_index)
                 .args(wt)
-                .output()?,
+                .output_gated()?,
         )?;
         let tree = stdout_string(&out);
         let ls = ["ls-files", "-s", "-z"];
@@ -387,7 +395,7 @@ impl GitRepo {
             git_command(&self.root)
                 .env("GIT_INDEX_FILE", &tmp_index)
                 .args(ls)
-                .output()?,
+                .output_gated()?,
         )?;
         let mut gitlinks: Vec<String> = String::from_utf8_lossy(&out.stdout)
             .split('\0')
@@ -421,7 +429,7 @@ impl GitRepo {
     pub fn fsck(&self) -> Result<FsckStatus, GitError> {
         let out = git_command(&self.root)
             .args(["fsck", "--connectivity-only", "--no-dangling"])
-            .output()?;
+            .output_gated()?;
         Ok(if out.status.success() {
             FsckStatus::Verified
         } else {
@@ -580,8 +588,8 @@ fn pack_once(
         .stdin(Stdio::piped())
         .stdout(Stdio::from(file))
         .stderr(Stdio::piped())
-        .spawn()?;
-    if let Some(mut pipe) = child.stdin.take() {
+        .spawn_gated()?;
+    if let Some(mut pipe) = child.take_stdin() {
         let _ = pipe.write_all(input.as_bytes());
     }
     let out = child.wait_with_output()?;
@@ -598,7 +606,7 @@ fn pack_once(
     // 2.41+ also writes `<file>.rev`, which nothing here uses.
     let tmp_str = tmp.to_string_lossy().to_string();
     let args = ["index-pack", &tmp_str];
-    check(&args, git_command(&repo.root).args(args).output()?)?;
+    check(&args, git_command(&repo.root).args(args).output_gated()?)?;
     fs::remove_file(tmp.with_extension("rev")).ok();
     let bytes = fs::read(&tmp)?;
     let sha256 = sha256_hex(&bytes);
@@ -710,7 +718,7 @@ pub fn install_pack(
         None => {
             let tmp_str = tmp.to_string_lossy().to_string();
             let args = ["index-pack", &tmp_str];
-            check(&args, git_command(&repo.root).args(args).output()?)?;
+            check(&args, git_command(&repo.root).args(args).output_gated()?)?;
             fs::remove_file(tmp.with_extension("rev")).ok();
         }
     }
@@ -764,7 +772,7 @@ pub fn checkout_tree(repo: &GitRepo, tree: &str, scratch_dir: &Path) -> Result<(
         git_command(&repo.root)
             .env("GIT_INDEX_FILE", &tmp_index)
             .args(rt)
-            .output()?,
+            .output_gated()?,
     )?;
     let co = ["checkout-index", "-a", "-f", "-q"];
     check(
@@ -772,7 +780,7 @@ pub fn checkout_tree(repo: &GitRepo, tree: &str, scratch_dir: &Path) -> Result<(
         git_command(&repo.root)
             .env("GIT_INDEX_FILE", &tmp_index)
             .args(co)
-            .output()?,
+            .output_gated()?,
     )?;
     fs::remove_file(&tmp_index).ok();
     Ok(())
@@ -799,7 +807,7 @@ pub fn checkout_tree_from(
         git_command(&repo.root)
             .env("GIT_INDEX_FILE", &tmp_index)
             .args(seed)
-            .output()?,
+            .output_gated()?,
     )?;
     let merge = ["read-tree", "--reset", "-u", from, to];
     check(
@@ -807,7 +815,7 @@ pub fn checkout_tree_from(
         git_command(&repo.root)
             .env("GIT_INDEX_FILE", &tmp_index)
             .args(merge)
-            .output()?,
+            .output_gated()?,
     )?;
     fs::remove_file(&tmp_index).ok();
     let diff = [
@@ -819,7 +827,7 @@ pub fn checkout_tree_from(
         from,
         to,
     ];
-    let out = check(&diff, git_command(&repo.root).args(diff).output()?)?;
+    let out = check(&diff, git_command(&repo.root).args(diff).output_gated()?)?;
     Ok(out
         .stdout
         .split(|b| *b == 0)
@@ -843,7 +851,7 @@ pub fn untracked_against(
         git_command(&repo.root)
             .env("GIT_INDEX_FILE", &tmp_index)
             .args(rt)
-            .output()?,
+            .output_gated()?,
     )?;
     let mut args: Vec<String> = ["ls-files", "-o", "--exclude-standard", "-z"]
         .iter()
@@ -861,7 +869,7 @@ pub fn untracked_against(
         git_command(&repo.root)
             .env("GIT_INDEX_FILE", &tmp_index)
             .args(&argv)
-            .output()?,
+            .output_gated()?,
     )?;
     fs::remove_file(&tmp_index).ok();
     Ok(String::from_utf8_lossy(&out.stdout)

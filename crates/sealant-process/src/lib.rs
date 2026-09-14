@@ -12,7 +12,9 @@ pub mod registry;
 pub mod runtime;
 pub mod sftp;
 pub mod signals;
+pub mod spawn;
 
 pub use registry::{ProcessEntry, ProcessRegistry};
 pub use runtime::ProcessRuntime;
 pub use sftp::SftpRuntime;
+pub use spawn::{CommandGateExt, GatedChild, SpawnedPid};
