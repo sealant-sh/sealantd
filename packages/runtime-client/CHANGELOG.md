@@ -1,5 +1,27 @@
 # @sealant/runtime-client
 
+## 0.15.2
+
+### Patch Changes
+
+- 888dc6b: Byte-quota refusals are terminal (daemon-only; the packages ride the release train). A 413, or a
+  409 whose `reason` is `byte-quota`, is now `RegistrarError::QuotaRefused` with the body's `limit`,
+  `used` and `requested` instead of a wrong parent (409) or a protocol error (413): the shipper drops
+  that queue entry with its staged bytes and every queued capture that descends from it, logs the
+  capture's `n`, class and the numbers, and marks the class `refused` in `capture.status` (a new
+  `refused` field, one `CaptureClass` per refused class). A refused bulk class takes no further snap
+  until the next epoch or `capture.replan`; the small class keeps snapping and shipping, and the
+  engine continues the chain from the refused capture's parent, forgetting the chunk locations of
+  packs that never went up. Before this, neither status dropped the entry, so the ship worker re-ran
+  the same refused call every 5 s for good (observed on the cluster: a 775 MB bulk capture uploaded
+  in full, then `register n=4: … http 413` on every tick). `upload.urls` also carries `sizes` for
+  every key of a batch, not only multipart-sized ones, so the registrar can price a whole batch
+  before it mints a URL.
+- fa65ce0: The orphan reaper now reaps only pids the daemon did not spawn. sealantd runs as PID 1 / child subreaper, and its reaper peeked every waitable child and reaped whatever the process registry did not list — so the capture engine's blocking `git` children (`rev-list`, `pack-objects`, `index-pack`, and since 0.15.1 `head_tree` and `stored_tips`), the PTY/pipe session leaders and the boot helpers, none of which were registry-owned, could be reaped mid-sweep and their own `wait()` failed with `ECHILD`: "No child process (os error 10)". A `capture.flush` that landed on the same SIGCHLD as the harness command's exit was refused that way (Mend 0.27.3's amd64 acceptance; reproduced in 1 of 8 runs on a 2-CPU daemon). Ownership now lives in a process-wide spawned-pid gate (`sealant-process/src/spawn.rs`) that every daemon-internal spawn goes through and the reaper holds for a whole sweep; a pid is released the moment its spawner has reaped it. Adopted orphans are still reaped exactly as before.
+- Updated dependencies [888dc6b]
+- Updated dependencies [fa65ce0]
+  - @sealant/runtime-protocol@0.15.2
+
 ## 0.15.1
 
 ### Patch Changes
