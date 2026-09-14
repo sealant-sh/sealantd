@@ -304,6 +304,11 @@ pub struct CaptureEngine {
     /// the negatives of the next pack. The manifest only carries refs, so reflog-only history
     /// would otherwise be packed again on every snap.
     last_tips: Vec<String>,
+    /// The manifest the oldest queued capture names as its parent — the chain head as far as
+    /// this executor knows — and the tips as of that capture. A capture the registrar refuses
+    /// for good is dropped with everything staged after it, and the chain continues from here.
+    base: Option<EncodedManifest>,
+    base_tips: Vec<String>,
 }
 
 impl std::fmt::Debug for CaptureEngine {
@@ -389,6 +394,8 @@ impl CaptureEngine {
             config,
             prefix,
             staging,
+            base: previous.clone(),
+            base_tips: last_tips.clone(),
             previous,
             workspace_index,
             bulk_index,
@@ -444,6 +451,9 @@ impl CaptureEngine {
             self.last_tips.clear();
             self.persist()?;
         }
+        let _ = self.staging.take_refusals();
+        self.base = self.previous.clone();
+        self.base_tips = self.last_tips.clone();
         tracing::info!(
             worktree = worktree_id,
             epoch,
@@ -692,6 +702,73 @@ impl CaptureEngine {
         self.bulk_work.is_some()
     }
 
+    /// Apply what the shipper dropped as refused (the registrar answered `byte-quota`): continue
+    /// the chain from the refused capture's parent, and forget everything that pointed at its
+    /// staged objects — the chunk locations of packs that never went up, and the indexed files
+    /// that reference those chunks, which would otherwise be listed in the next tree and packed
+    /// into nothing. Called at the head of every snap.
+    fn apply_refusals(&mut self) -> Result<(), EngineError> {
+        let refusals = self.staging.take_refusals();
+        if refusals.is_empty() {
+            return Ok(());
+        }
+        for refusal in &refusals {
+            // The refused capture was the oldest queued one, so its parent is the chain head
+            // this executor knows: `base`, kept from the snap that emptied the queue.
+            let base_is_parent =
+                self.base.as_ref().map(|b| b.capture_id.as_str()) == refusal.parent.as_deref();
+            if !base_is_parent {
+                tracing::warn!(
+                    n = refusal.n,
+                    parent = ?refusal.parent,
+                    base = ?self.base.as_ref().map(|b| b.manifest.n),
+                    "refused capture's parent is not the chain head this executor kept; the next \
+                     capture may find a wrong parent until a re-plan"
+                );
+            } else if self
+                .previous
+                .as_ref()
+                .is_some_and(|p| p.manifest.n >= refusal.n)
+            {
+                self.previous = self.base.clone();
+                self.last_tips = self.base_tips.clone();
+            }
+            let gone: HashSet<&String> = refusal
+                .uploads
+                .iter()
+                .filter(|u| !self.staging.is_uploaded(&u.file))
+                .map(|u| &u.key)
+                .collect();
+            let orphaned: HashSet<ChunkId> = self
+                .chunks
+                .packs
+                .iter()
+                .filter(|(_, key)| gone.contains(key))
+                .map(|(chunk, _)| *chunk)
+                .collect();
+            self.chunks.packs.retain(|_, key| !gone.contains(key));
+            for index in [&mut self.workspace_index, &mut self.bulk_index] {
+                index
+                    .files
+                    .retain(|_, f| !f.chunks.iter().any(|c| orphaned.contains(c)));
+            }
+            tracing::warn!(
+                n = refusal.n,
+                capture = %refusal.capture_id,
+                class = ?refusal.class,
+                reason = %refusal.reason,
+                limit = ?refusal.limit,
+                used = ?refusal.used,
+                requested = ?refusal.requested,
+                continuing_from = ?self.previous.as_ref().map(|p| p.manifest.n),
+                "refused capture dropped; chain continues from its parent"
+            );
+        }
+        self.bulk_work = None;
+        self.persist()?;
+        Ok(())
+    }
+
     /// Take a snap and stage it; a bulk build stops at the next chunk boundary whenever
     /// `preempt` returns `true` and reports [`SnapOutcome::Preempted`], keeping what it read so
     /// far for the next call. Small-class snaps are never preempted.
@@ -700,6 +777,7 @@ impl CaptureEngine {
         req: SnapRequest,
         preempt: &dyn Fn() -> bool,
     ) -> Result<SnapOutcome, EngineError> {
+        self.apply_refusals()?;
         if req.class == Class::Bulk && self.previous.is_none() {
             // A bulk capture copies the small sections from its predecessor; make one first.
             self.snap(SnapRequest {
@@ -711,6 +789,8 @@ impl CaptureEngine {
         let mut stats = SnapStats::default();
         let mut uploads: Vec<Upload> = Vec::new();
         let objects = self.staging.objects_dir();
+        // The tips as of `previous`, before this snap's pack moves them on.
+        let tips_before = self.last_tips.clone();
 
         let sections = match req.class {
             Class::Small => {
@@ -832,6 +912,12 @@ impl CaptureEngine {
         // the shipper from claiming that capture until its replacement is in the queue.
         let staging = Arc::clone(&self.staging);
         let coalesce_guard = staging.coalesce_guard();
+        // Nothing queued: this capture becomes the oldest queued one, so its parent is the
+        // chain head a refusal would send the engine back to.
+        if self.staging.pending()?.is_empty() {
+            self.base = self.previous.clone();
+            self.base_tips = tips_before;
+        }
         let coalesce = if req.kind == CaptureKind::Auto {
             self.staging.coalescible()?
         } else {

@@ -41,6 +41,22 @@
 //! object is retried under a fresh `upload_id`) is the registrar's to expire: a bucket lifecycle
 //! rule for incomplete multipart uploads, no `upload.abort` call in v1.
 //!
+//! # Byte-quota refusals
+//!
+//! A session has a byte budget. The registrar prices a key once and refuses a call that would
+//! take the session past the budget: `upload.urls` answers 413 before minting anything, and
+//! `capture.register` backstops keys that were never sized with 409 of the same body. Both are
+//! [`RegistrarError::QuotaRefused`] — terminal for that capture, never retried (the shipper drops
+//! the queue entry and its staged bytes, and stops re-snapping that class).
+//!
+//! ```json
+//! ← 413 {"reason":"byte-quota","limit":8589934592,"used":8570000000,"requested":775000000}
+//! ← 409 {"reason":"byte-quota","limit":8589934592,"used":8570000000,"requested":775000000}
+//! ```
+//!
+//! So a whole batch can be priced before a URL is minted, `upload.urls` carries `sizes` for
+//! **every** key it asks for, not only the ones that would go up as multipart.
+//!
 //! # `platform` on `plan.get`
 //!
 //! The request names the executor's `<os>-<arch>-<libc>` (the key the bulk class stamps on its
@@ -127,7 +143,8 @@ pub struct UploadUrlsRequest {
     pub epoch: u64,
     /// Keys under the caller's epoch prefix.
     pub keys: Vec<String>,
-    /// Sizes of the keys the caller would upload as multipart (a subset of `keys`).
+    /// Size of each key the caller can size (any key, not only multipart candidates): the
+    /// registrar prices the batch from these before it mints anything.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub sizes: BTreeMap<String, u64>,
 }
@@ -287,12 +304,30 @@ pub enum RegistrarError {
         /// Key.
         key: String,
     },
+    /// The bytes are over the session's quota: 413 on `upload.urls` (before a URL is minted) or
+    /// 409 `byte-quota` on `capture.register`. Terminal for the capture that asked.
+    #[error("refused ({reason}): limit {}, used {}, requested {}", opt(.limit), opt(.used), opt(.requested))]
+    QuotaRefused {
+        /// The registrar's reason code (`byte-quota`).
+        reason: String,
+        /// The session's budget in bytes, when the answer names it.
+        limit: Option<u64>,
+        /// Bytes priced against the session so far.
+        used: Option<u64>,
+        /// Bytes this call asked for.
+        requested: Option<u64>,
+    },
     /// Transport failure (retryable).
     #[error("transport: {0}")]
     Transport(String),
     /// Unexpected answer.
     #[error("protocol: {0}")]
     Protocol(String),
+}
+
+/// A number the registrar may or may not have named.
+pub(crate) fn opt(v: &Option<u64>) -> String {
+    v.map_or_else(|| "?".to_owned(), |n| n.to_string())
 }
 
 impl RegistrarError {
@@ -364,6 +399,10 @@ struct PendingUpload {
 #[derive(Debug, Default)]
 struct InMemoryState {
     live_epoch: u64,
+    /// Bytes priced per key (a key is priced once, as Mend prices it).
+    priced: BTreeMap<String, u64>,
+    /// Every size the caller declared on `upload.urls`, for tests of what the wire carried.
+    sizes_seen: BTreeMap<String, u64>,
     chain: Vec<HeadInfo>,
     lease_alive: bool,
     summaries: Vec<ChangeSummaryRequest>,
@@ -382,6 +421,16 @@ pub struct InMemoryRegistrar {
     url_base: Option<String>,
     multipart: Option<MultipartPolicy>,
     completer: Option<Arc<dyn MultipartCompleter>>,
+    /// Bytes this session may hold, and where a register-time price comes from.
+    quota: Mutex<Option<ByteQuota>>,
+}
+
+/// The in-memory registrar's byte budget: keys are priced from the `sizes` of `upload.urls`, and
+/// a key a register names that was never sized is priced from `store` (the bucket's report, which
+/// is what Mend's backstop does).
+struct ByteQuota {
+    limit: u64,
+    store: Option<Arc<dyn crate::sink::BlobSink>>,
 }
 
 impl std::fmt::Debug for InMemoryRegistrar {
@@ -401,8 +450,11 @@ impl InMemoryRegistrar {
     pub fn new(worktree_id: &str, epoch: u64, url_base: Option<String>) -> Self {
         Self {
             worktree_id: Mutex::new(worktree_id.to_owned()),
+            quota: Mutex::new(None),
             state: Mutex::new(InMemoryState {
                 live_epoch: epoch,
+                priced: BTreeMap::new(),
+                sizes_seen: BTreeMap::new(),
                 chain: Vec::new(),
                 lease_alive: true,
                 summaries: Vec::new(),
@@ -429,6 +481,85 @@ impl InMemoryRegistrar {
         self.multipart = Some(policy);
         self.completer = completer;
         self
+    }
+
+    /// Refuse past `limit` bytes. Keys are priced once, from the `sizes` of `upload.urls`
+    /// (refused there, before a URL is minted) and — for a key a register names that was never
+    /// sized — from `store`, standing in for the bucket's report (refused at the register).
+    #[must_use]
+    pub fn with_byte_quota(
+        self,
+        limit: u64,
+        store: Option<Arc<dyn crate::sink::BlobSink>>,
+    ) -> Self {
+        self.set_byte_quota(Some(limit), store);
+        self
+    }
+
+    /// Change (or lift) the byte budget.
+    pub fn set_byte_quota(
+        &self,
+        limit: Option<u64>,
+        store: Option<Arc<dyn crate::sink::BlobSink>>,
+    ) {
+        *self
+            .quota
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            limit.map(|limit| ByteQuota { limit, store });
+    }
+
+    /// Bytes priced against the session so far.
+    #[must_use]
+    pub fn used_bytes(&self) -> u64 {
+        self.lock().priced.values().sum()
+    }
+
+    /// Every size an `upload.urls` call declared, by key.
+    #[must_use]
+    pub fn sizes_seen(&self) -> BTreeMap<String, u64> {
+        self.lock().sizes_seen.clone()
+    }
+
+    /// Price `keys` (each at most once) and refuse the lot when the budget cannot take them.
+    fn price(
+        &self,
+        state: &mut InMemoryState,
+        keys: impl IntoIterator<Item = (String, u64)>,
+    ) -> Result<(), RegistrarError> {
+        let new: Vec<(String, u64)> = keys
+            .into_iter()
+            .filter(|(k, _)| !state.priced.contains_key(k))
+            .collect();
+        let guard = self
+            .quota
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(quota) = guard.as_ref() {
+            let used: u64 = state.priced.values().sum();
+            let requested: u64 = new.iter().map(|(_, b)| *b).sum();
+            if used.saturating_add(requested) > quota.limit {
+                return Err(RegistrarError::QuotaRefused {
+                    reason: "byte-quota".to_owned(),
+                    limit: Some(quota.limit),
+                    used: Some(used),
+                    requested: Some(requested),
+                });
+            }
+        }
+        drop(guard);
+        state.priced.extend(new);
+        Ok(())
+    }
+
+    /// The size a register-time price uses for `key`: what the store holds, when it is there.
+    fn stored_size(&self, key: &str) -> Option<u64> {
+        let guard = self
+            .quota
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let store = guard.as_ref()?.store.as_ref()?;
+        store.get(key).ok().map(|b| b.len() as u64)
     }
 
     /// Pretend `key` already holds an object: the next complete of it answers `exists`.
@@ -534,6 +665,26 @@ impl InMemoryRegistrar {
     }
 }
 
+/// Every store key a register names: git packs (and their indexes), the workspace and bulk tree
+/// roots and packs, and the manifest itself.
+fn manifest_keys(req: &RegisterRequest) -> Vec<String> {
+    let s = &req.manifest.sections;
+    let mut keys: Vec<String> = s
+        .git
+        .packs
+        .iter()
+        .flat_map(|k| [k.clone(), format!("{k}.idx")])
+        .collect();
+    keys.push(s.workspace.root.clone());
+    keys.extend(s.workspace.packs.iter().cloned());
+    if let Some(bulk) = s.bulk.section() {
+        keys.push(bulk.root.clone());
+        keys.extend(bulk.packs.iter().cloned());
+    }
+    keys.push(req.manifest_key.clone());
+    keys
+}
+
 impl Registrar for InMemoryRegistrar {
     fn plan_get(&self, req: &PlanGetRequest) -> Result<PlanGetResponse, RegistrarError> {
         let state = self.lock();
@@ -592,7 +743,16 @@ impl Registrar for InMemoryRegistrar {
             return Err(RegistrarError::LeaseLost);
         }
         state.url_requests += 1;
+        state.sizes_seen.extend(req.sizes.clone());
         let prefix = format!("captures/{}/{}/", req.worktree_id, req.epoch);
+        // Priced before anything is minted: a refused batch leaves no URL behind.
+        let sized: Vec<(String, u64)> = req
+            .keys
+            .iter()
+            .filter(|k| k.starts_with(&prefix))
+            .filter_map(|k| req.sizes.get(k).map(|b| (k.clone(), *b)))
+            .collect();
+        self.price(&mut state, sized)?;
         let mut urls = BTreeMap::new();
         let mut multipart = BTreeMap::new();
         for k in req.keys.iter().filter(|k| k.starts_with(&prefix)) {
@@ -693,6 +853,14 @@ impl Registrar for InMemoryRegistrar {
     fn capture_register(&self, req: &RegisterRequest) -> Result<RegisterResponse, RegistrarError> {
         let mut state = self.lock();
         Self::check_epoch(&state, req.epoch)?;
+        // The backstop: keys this capture names that no `upload.urls` call ever sized are priced
+        // here, from what the store holds.
+        let unsized_keys: Vec<(String, u64)> = manifest_keys(req)
+            .into_iter()
+            .filter(|k| !state.priced.contains_key(k))
+            .filter_map(|k| self.stored_size(&k).map(|b| (k, b)))
+            .collect();
+        self.price(&mut state, unsized_keys)?;
         let head = state.chain.last();
         // Lost ack: the chain is already at n with this id.
         if let Some(h) = head
@@ -778,6 +946,40 @@ struct ConflictBody {
     head_capture_id: Option<String>,
     #[serde(default)]
     key: Option<String>,
+    #[serde(default)]
+    limit: Option<u64>,
+    #[serde(default)]
+    used: Option<u64>,
+    #[serde(default)]
+    requested: Option<u64>,
+}
+
+impl ConflictBody {
+    fn empty() -> Self {
+        Self {
+            reason: String::new(),
+            live_epoch: None,
+            head_n: None,
+            head_capture_id: None,
+            key: None,
+            limit: None,
+            used: None,
+            requested: None,
+        }
+    }
+
+    fn quota_refused(self) -> RegistrarError {
+        RegistrarError::QuotaRefused {
+            reason: if self.reason.is_empty() {
+                "byte-quota".to_owned()
+            } else {
+                self.reason
+            },
+            limit: self.limit,
+            used: self.used,
+            requested: self.requested,
+        }
+    }
 }
 
 impl HttpRegistrar {
@@ -821,17 +1023,15 @@ impl HttpRegistrar {
                 serde_json::from_slice(&bytes).map_err(|e| RegistrarError::Protocol(e.to_string()))
             }
             409 => {
-                let c: ConflictBody = serde_json::from_slice(&bytes).unwrap_or(ConflictBody {
-                    reason: String::new(),
-                    live_epoch: None,
-                    head_n: None,
-                    head_capture_id: None,
-                    key: None,
-                });
+                let c: ConflictBody =
+                    serde_json::from_slice(&bytes).unwrap_or_else(|_| ConflictBody::empty());
                 if let Some(live) = c.live_epoch.filter(|l| *l != epoch) {
                     Err(RegistrarError::Fenced { epoch, live })
                 } else if c.reason == "stale-epoch" {
                     Err(RegistrarError::Fenced { epoch, live: 0 })
+                } else if c.reason == "byte-quota" {
+                    // The bytes, not the chain: no parent to fix, nothing a retry can change.
+                    Err(c.quota_refused())
                 } else if name == "change.summary" {
                     Err(RegistrarError::SummaryRefused(c.reason))
                 } else if name == "upload.complete" {
@@ -852,6 +1052,9 @@ impl HttpRegistrar {
                     })
                 }
             }
+            413 => Err(serde_json::from_slice::<ConflictBody>(&bytes)
+                .unwrap_or_else(|_| ConflictBody::empty())
+                .quota_refused()),
             404 if name == "lease.heartbeat" => Err(RegistrarError::LeaseLost),
             s if s >= 500 || s == 429 || s == 408 => {
                 Err(RegistrarError::Transport(format!("{name}: http {s}")))
@@ -946,14 +1149,17 @@ impl<R: Registrar + ?Sized> RegistrarMinter<R> {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = get_urls;
     }
 
-    /// Pre-mint PUT URLs for a batch of keys (one channel call).
-    pub fn prefetch_put(&self, keys: &[String]) -> Result<(), RegistrarError> {
+    /// Pre-mint PUT URLs for a batch of `(key, bytes)` (one channel call). Every key travels
+    /// with its size, so the registrar can price the whole batch before it mints anything.
+    pub fn prefetch_put(&self, keys: &[(String, u64)]) -> Result<(), RegistrarError> {
         let (worktree_id, epoch) = self.identity();
-        let resp = self.registrar.upload_urls(&UploadUrlsRequest::new(
+        let mut req = UploadUrlsRequest::new(
             &worktree_id,
             epoch,
-            keys.to_vec(),
-        ))?;
+            keys.iter().map(|(k, _)| k.clone()).collect(),
+        );
+        req.sizes = keys.iter().cloned().collect();
+        let resp = self.registrar.upload_urls(&req)?;
         self.put_cache
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -963,11 +1169,11 @@ impl<R: Registrar + ?Sized> RegistrarMinter<R> {
 }
 
 impl<R: Registrar + ?Sized> crate::sink::UrlMinter for RegistrarMinter<R> {
-    fn prefetch_put(&self, keys: &[String]) -> Result<(), String> {
-        Self::prefetch_put(self, keys).map_err(|e| e.to_string())
+    fn prefetch_put(&self, keys: &[(String, u64)]) -> Result<(), crate::sink::SinkError> {
+        Self::prefetch_put(self, keys).map_err(|e| mint_error(&keys_label(keys), e))
     }
 
-    fn put_url(&self, key: &str) -> Result<String, String> {
+    fn put_url(&self, key: &str) -> Result<String, crate::sink::SinkError> {
         if let Some(u) = self
             .put_cache
             .lock()
@@ -976,32 +1182,43 @@ impl<R: Registrar + ?Sized> crate::sink::UrlMinter for RegistrarMinter<R> {
         {
             return Ok(u);
         }
-        self.prefetch_put(&[key.to_owned()])
-            .map_err(|e| e.to_string())?;
+        // Size unknown here (this is the fallback for a key no batch minted): the registrar's
+        // register-time backstop prices it.
+        Self::prefetch_put(self, &[(key.to_owned(), 0)]).map_err(|e| mint_error(key, e))?;
         self.put_cache
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(key)
-            .ok_or_else(|| format!("no PUT url minted for {key}"))
+            .ok_or_else(|| crate::sink::SinkError::NoUrl {
+                key: key.to_owned(),
+                reason: "no PUT url minted".to_owned(),
+            })
     }
 
-    fn get_url(&self, key: &str) -> Result<String, String> {
+    fn get_url(&self, key: &str) -> Result<String, crate::sink::SinkError> {
         self.get_urls
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(key)
             .cloned()
-            .ok_or_else(|| format!("no GET url in plan for {key}"))
+            .ok_or_else(|| crate::sink::SinkError::NoUrl {
+                key: key.to_owned(),
+                reason: "no GET url in plan".to_owned(),
+            })
     }
 
-    fn multipart_urls(&self, key: &str, size: u64) -> Result<Option<MultipartUrls>, String> {
+    fn multipart_urls(
+        &self,
+        key: &str,
+        size: u64,
+    ) -> Result<Option<MultipartUrls>, crate::sink::SinkError> {
         let (worktree_id, epoch) = self.identity();
         let mut req = UploadUrlsRequest::new(&worktree_id, epoch, vec![key.to_owned()]);
         req.sizes.insert(key.to_owned(), size);
         let mut resp = self
             .registrar
             .upload_urls(&req)
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| mint_error(key, e))?;
         let multipart = resp.multipart.remove(key);
         // A registrar that answered with a plain PUT URL (below its threshold, or no multipart
         // support) has minted it now; keep it for the single-PUT fallback.
@@ -1045,6 +1262,35 @@ impl<R: Registrar + ?Sized> crate::sink::UrlMinter for RegistrarMinter<R> {
                 reason: e.to_string(),
             }),
         }
+    }
+}
+
+/// A quota refusal stays itself on the way to the sink (terminal, with its numbers); anything
+/// else is "no url for this key".
+fn mint_error(key: &str, error: RegistrarError) -> crate::sink::SinkError {
+    match error {
+        RegistrarError::QuotaRefused {
+            reason,
+            limit,
+            used,
+            requested,
+        } => crate::sink::SinkError::QuotaRefused {
+            reason,
+            limit,
+            used,
+            requested,
+        },
+        other => crate::sink::SinkError::NoUrl {
+            key: key.to_owned(),
+            reason: other.to_string(),
+        },
+    }
+}
+
+fn keys_label(keys: &[(String, u64)]) -> String {
+    match keys.first() {
+        Some((first, _)) => format!("{} keys from {first}", keys.len()),
+        None => "no keys".to_owned(),
     }
 }
 
@@ -1225,6 +1471,55 @@ mod tests {
         let back: PlanGetRequest =
             serde_json::from_str(r#"{"worktree_id":null,"epoch":2}"#).unwrap();
         assert_eq!(back.platform, None);
+    }
+
+    /// Every key of a prefetch batch travels with its size (not only multipart candidates), so
+    /// the registrar can price the batch before it mints; a batch past the budget is refused
+    /// whole, with the numbers, and nothing is minted.
+    #[test]
+    fn prefetch_sizes_every_key_and_a_batch_past_the_budget_is_refused() {
+        use crate::sink::UrlMinter;
+
+        let r = Arc::new(InMemoryRegistrar::new("wt", 1, Some("http://x".into())));
+        let keys: Vec<(String, u64)> = (0..3)
+            .map(|i| (format!("captures/wt/1/trees/{i}"), 100 + i))
+            .collect();
+        let minter = RegistrarMinter::new(
+            Arc::clone(&r) as Arc<dyn Registrar>,
+            "wt",
+            1,
+            BTreeMap::new(),
+        );
+        UrlMinter::prefetch_put(&minter, &keys).unwrap();
+        assert_eq!(
+            r.sizes_seen(),
+            keys.iter().cloned().collect::<BTreeMap<_, _>>(),
+            "every key in the batch was sized"
+        );
+        assert_eq!(
+            minter.put_url(&keys[0].0).unwrap(),
+            format!("http://x/{}", keys[0].0)
+        );
+        assert_eq!(r.used_bytes(), 303);
+
+        // 303 bytes are priced; 100 more is one too many, and a priced key costs nothing again.
+        r.set_byte_quota(Some(402), None);
+        let more = [("captures/wt/1/trees/new".to_owned(), 100)];
+        let err = UrlMinter::prefetch_put(&minter, &more).unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                crate::sink::SinkError::QuotaRefused { reason, limit, used, requested }
+                    if reason == "byte-quota"
+                        && *limit == Some(402)
+                        && *used == Some(303)
+                        && *requested == Some(100)
+            ),
+            "{err}"
+        );
+        assert!(!err.is_retryable());
+        assert_eq!(r.used_bytes(), 303, "a refused batch prices nothing");
+        UrlMinter::prefetch_put(&minter, &keys).expect("priced keys cost nothing again");
     }
 
     fn parts(n: u32) -> Vec<CompletedPart> {

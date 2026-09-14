@@ -10,7 +10,8 @@
 //! after the small snap. Forced snaps (turn boundaries, checkpoints, flushes) go through the same
 //! gate. A class that cannot be watched — budget not met, `IN_Q_OVERFLOW`, no backend — polls:
 //! it is snapped at its maximum interval unconditionally (the engine's stat walk stages nothing
-//! when unchanged).
+//! when unchanged). A class the registrar refused for the session's byte quota
+//! ([`Shipper::is_refused`]) is not snapped at all until the next epoch or `capture.replan`.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
@@ -389,7 +390,13 @@ impl Shared {
             let now = Instant::now();
             match due {
                 Some((at, trigger)) if at <= now => {
-                    if !self.allowed() || self.shipper.is_fenced() {
+                    // A bulk class the registrar refused for the session's byte quota takes no
+                    // further snap: the bytes would be refused again. The next epoch or a
+                    // `capture.replan` lifts it.
+                    if !self.allowed()
+                        || self.shipper.is_fenced()
+                        || self.shipper.is_refused(Class::Bulk)
+                    {
                         let mut st = self.state();
                         st.bulk.clear();
                         st.bulk.last_snap = now;

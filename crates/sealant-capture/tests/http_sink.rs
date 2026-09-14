@@ -13,10 +13,10 @@ use common::serve;
 struct Minter(String);
 
 impl UrlMinter for Minter {
-    fn put_url(&self, key: &str) -> Result<String, String> {
+    fn put_url(&self, key: &str) -> Result<String, SinkError> {
         Ok(format!("{}/{key}?sig=put", self.0))
     }
-    fn get_url(&self, key: &str) -> Result<String, String> {
+    fn get_url(&self, key: &str) -> Result<String, SinkError> {
         Ok(format!("{}/{key}?sig=get", self.0))
     }
 }

@@ -899,6 +899,17 @@ pub struct CaptureStaged {
     pub unchanged: bool,
 }
 
+/// What a capture snapped (ADR-0015): the small class is git, `.git` bookkeeping and the harness
+/// home; the bulk class is dependencies and build outputs.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum CaptureClass {
+    /// Git pack, `.git` bookkeeping, harness home.
+    Small,
+    /// Dependencies and build outputs.
+    Bulk,
+}
+
 /// Result of `capture.status` and `capture.flush`.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -927,6 +938,11 @@ pub struct CaptureStatusReport {
     /// Wall-clock time of the last snap, Unix milliseconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_snap_unix_ms: Option<u64>,
+    /// Classes the registrar refused for the session's byte quota: the capture was dropped with
+    /// its staged bytes, and nothing of that class is snapped or shipped again until the next
+    /// epoch or `capture.replan`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub refused: Vec<CaptureClass>,
 }
 
 /// Result of `capture.replan`: the identity the executor now acts under and what the delta

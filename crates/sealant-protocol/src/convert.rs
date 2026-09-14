@@ -9,8 +9,8 @@ use crate::ids::{
 };
 use crate::wire;
 use crate::{
-    ArtifactRef, AttachMode, AttachSessionArgs, Base64Bytes, Capabilities, CaptureKind,
-    CaptureMethod, CaptureMode, CapturePolicy, CaptureReplanned, CaptureStaged,
+    ArtifactRef, AttachMode, AttachSessionArgs, Base64Bytes, Capabilities, CaptureClass,
+    CaptureKind, CaptureMethod, CaptureMode, CapturePolicy, CaptureReplanned, CaptureStaged,
     CaptureStatusReport, ClientMessage, Command, CommandResult, Confidence, ControlError,
     ControlErrorCode, ControlRequest, ControlResponse, Encoding, EnvVar, EventEnvelope,
     EventPayload, ExecAccepted, ExecArgs, ExecutionStartArgs, ExitReason, Feature, FeatureMatrix,
@@ -128,6 +128,12 @@ enum_pair!(
     CaptureKind,
     wire::CaptureKind,
     [Auto, Turn, Checkpoint, Suspend, Final]
+);
+enum_pair!(
+    capture_class,
+    CaptureClass,
+    wire::CaptureClass,
+    [Small, Bulk]
 );
 enum_pair!(
     feature,
@@ -1364,6 +1370,11 @@ impl From<CommandResult> for wire::command_result::Result {
                 fenced: c.fenced,
                 paused: c.paused,
                 last_snap_unix_ms: c.last_snap_unix_ms,
+                refused: c
+                    .refused
+                    .into_iter()
+                    .map(enum_i32::<_, wire::CaptureClass>)
+                    .collect(),
             }),
             CommandResult::LeaseEpoch(l) => W::LeaseEpoch(wire::LeaseEpochReport {
                 epoch: l.epoch,
@@ -1465,6 +1476,11 @@ impl TryFrom<wire::command_result::Result> for CommandResult {
                 fenced: c.fenced,
                 paused: c.paused,
                 last_snap_unix_ms: c.last_snap_unix_ms,
+                refused: c
+                    .refused
+                    .into_iter()
+                    .map(capture_class)
+                    .collect::<Result<_, _>>()?,
             }),
             W::LeaseEpoch(l) => CommandResult::LeaseEpoch(LeaseEpochReport {
                 epoch: l.epoch,
@@ -1976,6 +1992,7 @@ mod tests {
                 fenced: false,
                 paused: true,
                 last_snap_unix_ms: None,
+                refused: vec![CaptureClass::Bulk],
             }),
             CommandResult::LeaseEpoch(LeaseEpochReport {
                 epoch: 2,

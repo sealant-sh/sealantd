@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use crate::cpu::thread_cpu;
 use crate::engine::Class;
 use crate::manifest::CaptureKind;
-use crate::registrar::{RegisterRequest, Registrar, RegistrarError};
+use crate::registrar::{RegisterRequest, Registrar, RegistrarError, opt};
 use crate::sink::{BlobSink, BlobSource, SinkError};
 
 /// Default shipper CPU budget: half of one core.
@@ -86,6 +86,31 @@ pub struct QueueEntry {
     pub register: RegisterRequest,
 }
 
+/// A capture the registrar refused for the session's byte quota. The shipper dropped it and
+/// every queued capture that descends from it; the engine reads this at its next snap, continues
+/// the chain from the refused capture's parent, and forgets the chunks whose packs went with it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefusedCapture {
+    /// Chain position the refused capture held.
+    pub n: u64,
+    /// Its capture id.
+    pub capture_id: String,
+    /// Its parent (the chain head the executor continues from).
+    pub parent: Option<String>,
+    /// The class that was refused, when the entry names one.
+    pub class: Option<Class>,
+    /// The registrar's reason code (`byte-quota`).
+    pub reason: String,
+    /// The session's budget in bytes, when the answer names it.
+    pub limit: Option<u64>,
+    /// Bytes priced against the session so far.
+    pub used: Option<u64>,
+    /// Bytes the refused call asked for.
+    pub requested: Option<u64>,
+    /// Every object the dropped captures staged.
+    pub uploads: Vec<Upload>,
+}
+
 /// Shipping errors.
 #[derive(Debug, thiserror::Error)]
 pub enum ShipError {
@@ -95,6 +120,19 @@ pub enum ShipError {
     /// The chain moved under us (another writer with our epoch, or a lost coalesce).
     #[error("chain conflict: {0}")]
     Conflict(RegistrarError),
+    /// The registrar refused this capture's bytes for the session's byte quota. Terminal: the
+    /// entry and its staged bytes are dropped and the class stops.
+    #[error("refused ({reason}): limit {}, used {}, requested {}", opt(.limit), opt(.used), opt(.requested))]
+    QuotaRefused {
+        /// The registrar's reason code (`byte-quota`).
+        reason: String,
+        /// The session's budget in bytes, when the answer names it.
+        limit: Option<u64>,
+        /// Bytes priced against the session so far.
+        used: Option<u64>,
+        /// Bytes the refused call asked for.
+        requested: Option<u64>,
+    },
     /// Upload failed after retries.
     #[error("upload {key}: {source}")]
     Upload {
@@ -136,6 +174,8 @@ pub struct Staging {
     /// it claims an entry: a pending `auto` capture is never coalesced away under a shipper that
     /// has started on it, and never claimed once replaced.
     coalesce: Mutex<()>,
+    /// Captures the registrar refused, for the engine to read at its next snap.
+    refusals: Mutex<Vec<RefusedCapture>>,
 }
 
 impl Staging {
@@ -151,6 +191,7 @@ impl Staging {
             identity: Mutex::new((worktree_id.to_owned(), epoch)),
             in_flight: Mutex::new(None),
             coalesce: Mutex::new(()),
+            refusals: Mutex::new(Vec::new()),
         };
         fs::create_dir_all(staging.marker_dir())?;
         Ok(staging)
@@ -353,6 +394,41 @@ impl Staging {
         }
     }
 
+    /// Drop `entry` because the registrar refused it for good, with every queued capture after
+    /// it (they name it as their parent and can never register) and all their staged bytes.
+    /// The refusal is kept for the engine, which continues the chain from `entry`'s parent.
+    pub fn drop_refused(&self, entry: &QueueEntry, refusal: RefusedCapture) -> io::Result<usize> {
+        let _g = self.coalesce_guard();
+        let mut refusal = refusal;
+        let mut dropped = 0;
+        for queued in self.pending()? {
+            if queued.n < entry.n {
+                continue;
+            }
+            fs::remove_file(self.queue_path(queued.n)).ok();
+            refusal.uploads.extend(queued.uploads.iter().cloned());
+            dropped += 1;
+        }
+        let uploads = refusal.uploads.clone();
+        self.refusals
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(refusal);
+        self.discard_unreferenced(&uploads)?;
+        Ok(dropped)
+    }
+
+    /// Take the refusals recorded since the last call (the engine applies them).
+    #[must_use]
+    pub fn take_refusals(&self) -> Vec<RefusedCapture> {
+        std::mem::take(
+            &mut *self
+                .refusals
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+
     /// Remove an entry and every object file no remaining entry references.
     pub fn ack(&self, entry: &QueueEntry) -> io::Result<()> {
         fs::remove_file(self.queue_path(entry.n)).or_else(|e| {
@@ -476,6 +552,11 @@ pub struct ShipStatus {
     pub fenced: AtomicBool,
     /// Failed attempts (uploads and registers).
     pub failures: AtomicU64,
+    /// The small class was refused for the session's byte quota.
+    pub refused_small: AtomicBool,
+    /// The bulk class was refused for the session's byte quota; no bulk snap runs until the
+    /// next epoch or `capture.replan`.
+    pub refused_bulk: AtomicBool,
 }
 
 impl ShipStatus {
@@ -490,6 +571,17 @@ impl ShipStatus {
             head_n: Some(self.head_n.load(Ordering::Relaxed)).filter(|n| *n != u64::MAX),
             fenced: self.fenced.load(Ordering::Relaxed),
             failures: self.failures.load(Ordering::Relaxed),
+            refused_small: self.refused_small.load(Ordering::Relaxed),
+            refused_bulk: self.refused_bulk.load(Ordering::Relaxed),
+        }
+    }
+
+    /// The flag for `class`.
+    #[must_use]
+    pub fn refused_flag(&self, class: Class) -> &AtomicBool {
+        match class {
+            Class::Small => &self.refused_small,
+            Class::Bulk => &self.refused_bulk,
         }
     }
 }
@@ -511,6 +603,10 @@ pub struct ShipSnapshot {
     pub fenced: bool,
     /// Failed attempts.
     pub failures: u64,
+    /// The small class was refused for the byte quota.
+    pub refused_small: bool,
+    /// The bulk class was refused for the byte quota.
+    pub refused_bulk: bool,
 }
 
 /// Retry policy for one pass.
@@ -602,10 +698,20 @@ impl Shipper {
         self.status.fenced.load(Ordering::Relaxed)
     }
 
-    /// Lift the fence after a re-plan gave this executor a fresh identity: what was fenced was
-    /// the previous epoch. `head_n` is the plan's head, or none for an empty chain.
+    /// Whether `class` was refused for the session's byte quota (no snap, no ship until the
+    /// next epoch or a re-plan).
+    #[must_use]
+    pub fn is_refused(&self, class: Class) -> bool {
+        self.status.refused_flag(class).load(Ordering::Relaxed)
+    }
+
+    /// Lift the fence and the byte-quota refusals after a re-plan gave this executor a fresh
+    /// identity: what was fenced (and what was refused) belonged to the previous epoch. `head_n`
+    /// is the plan's head, or none for an empty chain.
     pub fn reset_after_replan(&self, head_n: Option<u64>) {
         self.status.fenced.store(false, Ordering::Relaxed);
+        self.status.refused_small.store(false, Ordering::Relaxed);
+        self.status.refused_bulk.store(false, Ordering::Relaxed);
         self.status
             .head_n
             .store(head_n.unwrap_or(u64::MAX), Ordering::Relaxed);
@@ -675,6 +781,19 @@ impl Shipper {
                         tracing::warn!(key = %u.key, attempt, error = %e, "upload failed; retrying");
                         last = Some(e);
                     }
+                    Err(SinkError::QuotaRefused {
+                        reason,
+                        limit,
+                        used,
+                        requested,
+                    }) => {
+                        return Err(ShipError::QuotaRefused {
+                            reason,
+                            limit,
+                            used,
+                            requested,
+                        });
+                    }
                     Err(e) => {
                         self.status.failures.fetch_add(1, Ordering::Relaxed);
                         return Err(ShipError::Upload {
@@ -717,10 +836,29 @@ impl Shipper {
                 start += 1;
                 continue;
             }
-            let keys: Vec<String> = uploads[start..end].iter().map(|u| u.key.clone()).collect();
-            if let Err(error) = self.sink.prefetch_put(&keys) {
+            let keys: Vec<(String, u64)> = uploads[start..end]
+                .iter()
+                .map(|u| (u.key.clone(), u.bytes))
+                .collect();
+            match self.sink.prefetch_put(&keys) {
+                Ok(()) => {}
+                // The registrar priced the batch and refused it: nothing was minted, and no
+                // later attempt at these bytes can pass.
+                Err(SinkError::QuotaRefused {
+                    reason,
+                    limit,
+                    used,
+                    requested,
+                }) => {
+                    return Err(ShipError::QuotaRefused {
+                        reason,
+                        limit,
+                        used,
+                        requested,
+                    });
+                }
                 // Each PUT mints its own then, and reports what stands in the way.
-                tracing::warn!(keys = keys.len(), %error, "batch URL mint failed");
+                Err(error) => tracing::warn!(keys = keys.len(), %error, "batch URL mint failed"),
             }
             for u in &uploads[start..end] {
                 self.upload_one(u, cycle)?;
@@ -748,6 +886,19 @@ impl Shipper {
                     return Err(ShipError::Fenced(e));
                 }
                 Err(e @ RegistrarError::WrongParent { .. }) => return Err(ShipError::Conflict(e)),
+                Err(RegistrarError::QuotaRefused {
+                    reason,
+                    limit,
+                    used,
+                    requested,
+                }) => {
+                    return Err(ShipError::QuotaRefused {
+                        reason,
+                        limit,
+                        used,
+                        requested,
+                    });
+                }
                 Err(e) if e.is_retryable() => {
                     self.status.failures.fetch_add(1, Ordering::Relaxed);
                     tracing::warn!(n = entry.n, attempt, error = %e, "register failed; retrying");
@@ -797,12 +948,72 @@ impl Shipper {
                 Ok(()) => {
                     self.staging.ack(&entry)?;
                     shipped += 1;
+                    if let Some(class) = entry.class {
+                        self.status
+                            .refused_flag(class)
+                            .store(false, Ordering::Relaxed);
+                    }
                     tracing::info!(n = entry.n, capture = %entry.capture_id, kind = ?entry.kind, "capture registered");
+                }
+                Err(ShipError::QuotaRefused {
+                    reason,
+                    limit,
+                    used,
+                    requested,
+                }) => {
+                    self.refuse(&entry, &reason, limit, used, requested)?;
+                    return Ok(shipped);
                 }
                 Err(e) => return Err(e),
             }
         }
         Ok(shipped)
+    }
+
+    /// The registrar refused `entry` for the session's byte quota: drop it, its staged bytes and
+    /// every queued capture that descends from it, and stop the class. The engine picks the
+    /// refusal up at its next snap and continues the chain from the refused capture's parent; a
+    /// refused bulk class takes no further snap until the next epoch or `capture.replan`, while
+    /// the small class keeps going (its batches are small enough to fit what is left).
+    fn refuse(
+        &self,
+        entry: &QueueEntry,
+        reason: &str,
+        limit: Option<u64>,
+        used: Option<u64>,
+        requested: Option<u64>,
+    ) -> Result<(), ShipError> {
+        let dropped = self.staging.drop_refused(
+            entry,
+            RefusedCapture {
+                n: entry.n,
+                capture_id: entry.capture_id.clone(),
+                parent: entry.register.parent.clone(),
+                class: entry.class,
+                reason: reason.to_owned(),
+                limit,
+                used,
+                requested,
+                uploads: entry.uploads.clone(),
+            },
+        )?;
+        if let Some(class) = entry.class {
+            self.status
+                .refused_flag(class)
+                .store(true, Ordering::Relaxed);
+        }
+        tracing::warn!(
+            n = entry.n,
+            capture = %entry.capture_id,
+            class = ?entry.class,
+            reason,
+            limit,
+            used,
+            requested,
+            dropped,
+            "capture refused; dropped with its staged bytes"
+        );
+        Ok(())
     }
 
     /// Ship until the queue is empty or an error is not retryable, bounded by `deadline`.

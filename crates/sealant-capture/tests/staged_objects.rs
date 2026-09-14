@@ -241,24 +241,24 @@ struct Recording {
 }
 
 impl UrlMinter for Recording {
-    fn put_url(&self, key: &str) -> Result<String, String> {
+    fn put_url(&self, key: &str) -> Result<String, SinkError> {
         self.puts.fetch_add(1, Ordering::SeqCst);
         self.inner.put_url(key)
     }
 
-    fn prefetch_put(&self, keys: &[String]) -> Result<(), String> {
+    fn prefetch_put(&self, keys: &[(String, u64)]) -> Result<(), SinkError> {
         self.prefetches.fetch_add(1, Ordering::SeqCst);
         self.prefetched_keys
             .fetch_add(keys.len() as u64, Ordering::SeqCst);
         self.inner.prefetch_put(keys)
     }
 
-    fn get_url(&self, key: &str) -> Result<String, String> {
+    fn get_url(&self, key: &str) -> Result<String, SinkError> {
         self.gets.fetch_add(1, Ordering::SeqCst);
         self.inner.get_url(key)
     }
 
-    fn multipart_urls(&self, key: &str, size: u64) -> Result<Option<MultipartUrls>, String> {
+    fn multipart_urls(&self, key: &str, size: u64) -> Result<Option<MultipartUrls>, SinkError> {
         self.inner.multipart_urls(key, size)
     }
 
