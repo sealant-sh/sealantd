@@ -4,10 +4,8 @@
 //! other tests sharing a process.
 #![cfg(target_os = "linux")]
 
-use std::sync::Arc;
 use std::time::Duration;
 
-use sealant_process::ProcessRegistry;
 use sealant_process::platform;
 
 #[tokio::test]
@@ -16,8 +14,7 @@ async fn subreaper_reaps_adopted_orphan() {
         platform::set_child_subreaper(),
         "subreaper should be settable on Linux"
     );
-    let registry = Arc::new(ProcessRegistry::new());
-    platform::spawn_orphan_reaper(registry.clone());
+    platform::spawn_orphan_reaper();
 
     // sh backgrounds a brief sleep, prints its pid, and exits — orphaning the sleep, which
     // reparents to us (the subreaper). The sleep is NOT a Tokio child, so only our reaper can reap

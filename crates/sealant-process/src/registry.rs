@@ -1,6 +1,6 @@
 //! The managed-process registry.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU8, Ordering};
 
@@ -141,10 +141,6 @@ impl ProcessEntry {
 #[derive(Debug, Default)]
 pub struct ProcessRegistry {
     inner: Mutex<HashMap<ProcessId, std::sync::Arc<ProcessEntry>>>,
-    /// OS pids of children some Tokio task owns and will `wait()` itself — the orphan reaper
-    /// must never reap these. Its mutex doubles as the spawn↔reap critical section
-    /// (see [`Self::owned_pids`]).
-    owned: Mutex<HashSet<i32>>,
 }
 
 impl ProcessRegistry {
@@ -204,20 +200,5 @@ impl ProcessRegistry {
             .filter(|e| e.is_live())
             .cloned()
             .collect()
-    }
-
-    /// Lock the owned-pid set — the spawn↔reap critical section.
-    ///
-    /// A spawn path that will `wait()` its child itself must hold this guard from just before
-    /// `spawn()` until the new pid is inserted; the orphan reaper holds it for a whole sweep.
-    /// This closes the race where a child exits before its ownership is recorded and the reaper
-    /// misreads it as an adopted orphan, stealing the exit status from the owner's `wait()`.
-    pub fn owned_pids(&self) -> std::sync::MutexGuard<'_, HashSet<i32>> {
-        self.owned.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
-    /// Drop ownership of an OS pid once its owner has reaped it (idempotent).
-    pub fn release_pid(&self, pid: i32) {
-        self.owned_pids().remove(&pid);
     }
 }

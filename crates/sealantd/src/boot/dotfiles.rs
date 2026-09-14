@@ -8,6 +8,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use sealant_process::CommandGateExt;
 use serde::Deserialize;
 
 use crate::boot::config::{
@@ -196,7 +197,7 @@ fn clone_dotfiles(
         command.env("GIT_TERMINAL_PROMPT", "0");
     }
     let status = command
-        .status()
+        .status_gated()
         .map_err(|e| BootError::Dotfiles(format!("could not spawn git: {e}")))?;
     if !status.success() {
         return Err(BootError::Dotfiles(format!(
@@ -372,8 +373,10 @@ fn run_bootstrap(checkout: &Path, command: &str) -> Result<(), BootError> {
 }
 
 fn run_checked(command: &mut Command, label: &str) -> Result<(), BootError> {
+    // Gated: the orphan reaper is already sweeping by the time dotfiles are applied, and an
+    // ungated child it reaps first fails this `status()` with ECHILD (see `sealant_process::spawn`).
     let status = command
-        .status()
+        .status_gated()
         .map_err(|e| BootError::Dotfiles(format!("{label}: could not spawn: {e}")))?;
     if !status.success() {
         return Err(BootError::Dotfiles(format!("{label} exited with {status}")));

@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 use sealant_protocol::{
     ChannelId, ControlError, ControlErrorCode, ServerMessage, StreamEnd, StreamFrame, StreamPayload,
@@ -22,7 +22,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tokio::sync::mpsc;
 
-use crate::registry::ProcessRegistry;
+use crate::spawn::spawn_tokio;
 
 /// Read-buffer size for the stdout→gateway pump.
 const READ_BUF: usize = 64 * 1024;
@@ -54,9 +54,9 @@ pub fn resolve_sftp_server() -> Option<PathBuf> {
 struct SftpEntry {
     stdout_to_gateway: tokio::task::JoinHandle<()>,
     stdin_from_gateway: tokio::task::JoinHandle<()>,
+    /// Holds the child's spawn-gate guard: aborting it drops the guard, handing the pid back to
+    /// the orphan reaper (the `kill_on_drop` child is then reaped by Tokio's background queue).
     waiter: tokio::task::JoinHandle<()>,
-    /// OS pid of the bridged `sftp-server`, held in the registry's owned-pid set while live.
-    pid: i32,
 }
 
 impl SftpEntry {
@@ -69,21 +69,18 @@ impl SftpEntry {
 
 /// Registry of live SFTP bridges, keyed by channel id. Connection-scoped teardown drops the inbound
 /// sinks; [`SftpRuntime::close`] aborts a single bridge (and `kill_on_drop` reaps the child).
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct SftpRuntime {
     inner: Mutex<HashMap<ChannelId, SftpEntry>>,
-    /// The shared process registry — sftp children register as owned pids so the orphan reaper
-    /// never steals their exit status from the waiter.
-    registry: Arc<ProcessRegistry>,
 }
 
 impl SftpRuntime {
-    /// An empty SFTP runtime registering its children as owned pids in `registry`.
+    /// An empty SFTP runtime. Its children spawn through the process-wide spawn gate, so the
+    /// orphan reaper never steals their exit status from the waiter.
     #[must_use]
-    pub fn new(registry: Arc<ProcessRegistry>) -> Self {
+    pub fn new() -> Self {
         Self {
             inner: Mutex::new(HashMap::new()),
-            registry,
         }
     }
 
@@ -121,21 +118,18 @@ impl SftpRuntime {
         command.stdout(Stdio::piped());
         command.stderr(Stdio::null());
         command.kill_on_drop(true);
-        // Spawn under the reap gate so the orphan reaper can never peek this child before its
-        // pid is recorded as owned (see `ProcessRegistry::owned_pids`).
-        let mut owned = self.registry.owned_pids();
-        let mut child = command.spawn().map_err(|e| {
+        // Spawn under the reap gate so the orphan reaper can never peek this child before its pid
+        // is registered as one we spawned (see `crate::spawn`).
+        let (mut child, spawned_pid) = spawn_tokio(&mut command).map_err(|e| {
             ControlError::process_start_failed(format!("{}: {e}", binary.display()))
         })?;
-        let pid = child.id().map_or(-1, |p| p as i32);
-        owned.insert(pid);
-        drop(owned);
 
         let (mut stdin, mut stdout) = match (child.stdin.take(), child.stdout.take()) {
             (Some(stdin), Some(stdout)) => (stdin, stdout),
             _ => {
-                // The kill_on_drop child never got a waiter; give its pid back to the reaper.
-                self.registry.release_pid(pid);
+                // The kill_on_drop child never got a waiter; dropping the guard gives its pid
+                // back to the reaper.
+                drop(spawned_pid);
                 return Err(ControlError::process_start_failed(
                     "sftp stdio missing".to_owned(),
                 ));
@@ -182,10 +176,10 @@ impl SftpRuntime {
         // Reap the child and emit a final End{exit_code} on the channel.
         let waiter_channel = channel_id.clone();
         let waiter_out = out_tx;
-        let waiter_registry = self.registry.clone();
         let waiter = tokio::spawn(async move {
             let status = child.wait().await;
-            waiter_registry.release_pid(pid);
+            // Reaped: hand the pid straight back to the orphan reaper.
+            drop(spawned_pid);
             let exit_code = status.ok().and_then(|s| s.code());
             let end = StreamFrame::end(
                 waiter_channel,
@@ -205,7 +199,6 @@ impl SftpRuntime {
                 stdout_to_gateway,
                 stdin_from_gateway,
                 waiter,
-                pid,
             },
         );
         Ok(inbound_tx)
@@ -219,10 +212,9 @@ impl SftpRuntime {
             .unwrap_or_else(|e| e.into_inner())
             .remove(channel_id)
         {
+            // Aborting the waiter drops the spawn-gate guard it holds, so the pid goes back to
+            // the orphan reaper; the kill_on_drop child is reaped by Tokio's background queue.
             entry.abort();
-            // The aborted waiter can no longer release the pid; do it here (idempotent). The
-            // kill_on_drop child is reaped by Tokio's background queue, not by us.
-            self.registry.release_pid(entry.pid);
         }
     }
 
@@ -255,7 +247,7 @@ mod tests {
         // and the End frame is exercised by integration tests instead.
         if SftpRuntime::available() {
             let (out_tx, mut rx) = mpsc::channel::<ServerMessage>(8);
-            let rt = SftpRuntime::new(Arc::new(ProcessRegistry::new()));
+            let rt = SftpRuntime::new();
             let channel = ChannelId::new("chan_sftp");
             let inbound = rt
                 .open(channel.clone(), Path::new("/tmp"), out_tx)
@@ -284,7 +276,7 @@ mod tests {
             return;
         }
         let (out_tx, _rx) = mpsc::channel::<ServerMessage>(8);
-        let rt = SftpRuntime::new(Arc::new(ProcessRegistry::new()));
+        let rt = SftpRuntime::new();
         let err = rt
             .open(ChannelId::new("chan_sftp"), Path::new("/tmp"), out_tx)
             .expect_err("should be unavailable");
@@ -300,7 +292,7 @@ mod tests {
             return;
         }
         let (out_tx, mut rx) = mpsc::channel::<ServerMessage>(64);
-        let rt = SftpRuntime::new(Arc::new(ProcessRegistry::new()));
+        let rt = SftpRuntime::new();
         let channel = ChannelId::new("chan_sftp_init");
         let inbound = rt
             .open(channel.clone(), Path::new("/tmp"), out_tx)

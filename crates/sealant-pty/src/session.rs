@@ -340,20 +340,25 @@ impl SessionRuntime {
 
         // Spawn the leader in the requested shape. Both shapes yield a child to wait on, an input
         // handle for `write_input`, and an output source for the single capture reader.
-        let (child, pid, io, outputs, method) = match args.mode {
+        let (child, pid, spawned_pid, io, outputs, method) = match args.mode {
             SessionMode::Pty => {
-                let PtyChild { master, child, pid } =
-                    pty::spawn(&shell, &args.args, &cwd, &env, args.cols, args.rows, &term)
-                        .map_err(|e| {
-                            ControlError::new(
-                                sealant_protocol::ControlErrorCode::PtyAllocationFailed,
-                                format!("{shell}: {e}"),
-                            )
-                        })?;
+                let PtyChild {
+                    master,
+                    child,
+                    pid,
+                    spawned,
+                } = pty::spawn(&shell, &args.args, &cwd, &env, args.cols, args.rows, &term)
+                    .map_err(|e| {
+                        ControlError::new(
+                            sealant_protocol::ControlErrorCode::PtyAllocationFailed,
+                            format!("{shell}: {e}"),
+                        )
+                    })?;
                 let master = Arc::new(master);
                 (
                     child,
                     pid,
+                    spawned,
                     LeaderIo::Pty {
                         master: Arc::downgrade(&master),
                     },
@@ -368,6 +373,7 @@ impl SessionRuntime {
                     stderr,
                     child,
                     pid,
+                    spawned,
                 } = pipe::spawn(&shell, &args.args, &cwd, &env).map_err(|e| {
                     ControlError::new(
                         sealant_protocol::ControlErrorCode::ProcessStartFailed,
@@ -377,6 +383,7 @@ impl SessionRuntime {
                 (
                     child,
                     pid,
+                    spawned,
                     LeaderIo::Pipe {
                         stdin: tokio::sync::Mutex::new(Some(stdin)),
                     },
@@ -502,6 +509,8 @@ impl SessionRuntime {
         tokio::spawn(async move {
             let start = Instant::now();
             let status_result = child.wait().await;
+            // Reaped: hand the pid back to the orphan reaper before anything slower runs.
+            drop(spawned_pid);
             let _ = leader_exited_tx.send(());
             let _ = capture.await;
             let (exit_code, signal, reason) = classify(&status_result);

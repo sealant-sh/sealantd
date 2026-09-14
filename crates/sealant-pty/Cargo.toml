@@ -11,6 +11,7 @@ workspace = true
 
 [dependencies]
 sealant-protocol = { workspace = true }
+sealant-process = { workspace = true }
 sealant-runtime-core = { workspace = true }
 sealant-telemetry = { workspace = true }
 tokio = { workspace = true }

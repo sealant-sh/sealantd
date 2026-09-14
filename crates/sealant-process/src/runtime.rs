@@ -193,16 +193,12 @@ impl ProcessRuntime {
         command.process_group(0);
         command.kill_on_drop(true);
 
-        // Spawn under the reap gate: the pid must be owned before the orphan reaper can peek at
-        // it, or a fast-exiting child gets misread as an adopted orphan and its status stolen.
-        let mut owned = self.registry.owned_pids();
-        let mut child = command
-            .spawn()
+        // Spawn under the reap gate: the pid must be registered before the orphan reaper can peek
+        // at it, or a fast-exiting child gets misread as an adopted orphan and its status stolen.
+        let (mut child, spawned_pid) = crate::spawn::spawn_tokio(&mut command)
             .map_err(|e| ControlError::process_start_failed(format!("{}: {e}", args.executable)))?;
 
-        let pid = child.id().map_or(-1, |p| p as i32);
-        owned.insert(pid);
-        drop(owned);
+        let pid = spawned_pid.pid();
         // process_group(0) makes the child a group leader, so pgid == pid.
         let pgid = pid;
         let process_id = self.idgen.process_id();
@@ -295,6 +291,9 @@ impl ProcessRuntime {
         tokio::spawn(async move {
             let start = Instant::now();
             let outcome = run_to_exit(child, pgid, timeout, grace).await;
+            // Reaped: hand the pid back to the orphan reaper before anything slower runs, so a
+            // reused pid can never be mistaken for a child of ours.
+            drop(spawned_pid);
             // Drain captured output before publishing the exit, so all io.chunks precede it.
             if let Some(handle) = stdout_handle {
                 let _ = handle.await;
@@ -331,7 +330,6 @@ impl ProcessRuntime {
                 }),
             );
             waiter_registry.remove(&waiter_proc);
-            waiter_registry.release_pid(pid);
             waiter_status.dec_processes();
         });
 

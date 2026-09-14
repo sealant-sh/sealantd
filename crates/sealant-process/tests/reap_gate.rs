@@ -44,7 +44,7 @@ async fn reaper_never_steals_fast_exiting_owned_children() {
         extra_env: Arc::new(std::sync::Mutex::new(Vec::new())),
         redactor: Arc::new(Redactor::default()),
     };
-    platform::spawn_orphan_reaper(runtime.registry.clone());
+    platform::spawn_orphan_reaper();
 
     for round in 0..50 {
         let mut rx = runtime.bus.subscribe();
