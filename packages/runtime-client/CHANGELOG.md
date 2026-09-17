@@ -1,5 +1,49 @@
 # @sealant/runtime-client
 
+## 0.16.0
+
+### Minor Changes
+
+- d0a53fb: Content beside the worktree in a capture-source workspace (daemon-only; the packages ride the
+  release train). `plan.get` may now answer `sources`: per source a name, an absolute path, the
+  object key of a gzipped tar whose GET URL rides `get_urls`, the archive's `sha256`, its `bytes`
+  and `read_only`. The boot fetches each one, verifies the digest, and extracts it at that path
+  before the control socket binds.
+
+  A capture-source workspace mounts nothing from the host — the executor materialises the worktree's
+  head capture on its own disk — so a control plane had no way to put a directory beside the
+  repository. This is how Mend's organization folders and reference repositories reach one. Three
+  rules: a path inside the worktree (or one the worktree sits under) fails the boot, because content
+  there would be listed by the next capture and shipped into the store as the session's own work; a
+  source is a copy and never travels back, with `read_only` additionally taking the writable bit off
+  the tree; and the archive's sha256 is the content stamp, so a re-materialize re-extracts only what
+  changed. One source failing costs that directory and not the session — a fetch, digest or
+  extraction failure is logged and skipped, extraction runs in the staging scratch directory and is
+  renamed into place, and an archive past 64 MiB is skipped.
+
+  `capture.replan` lays down the sources of the worktree it is assigned, because a standby executor
+  boots under a placeholder worktree and only then learns whose session it is. A registrar that
+  answers no `sources` is unchanged in every respect.
+
+### Patch Changes
+
+- 47e1c8e: Every PUT URL is minted for the length the PUT then sends (daemon-only; the packages ride the
+  release train). `UrlMinter::put_url` takes the object's size, so the single-key fallback mint — the
+  path for a key no batch minted — declares that object's real byte count instead of the `0` it sent
+  before, and the git pack index's upload is sized from `fs::metadata` with the error surfaced rather
+  than swallowed into a `0`. `upload.urls` already carried `sizes` for every key of a batch; these
+  were the two places a key could still travel with a size that was not its length.
+
+  Before this, a registrar that binds an upload signature to an exact content length — Mend's upload
+  length binding, `MEND_CAPTURE_REQUIRE_SIZES` — would mint a URL signed for zero bytes and the
+  store would refuse the body, or the declared size would simply be wrong. Both PUT paths already
+  sent `Content-Length`; now the length in the signature and the length on the wire are the same
+  number by construction.
+
+- Updated dependencies [47e1c8e]
+- Updated dependencies [d0a53fb]
+  - @sealant/runtime-protocol@0.16.0
+
 ## 0.15.2
 
 ### Patch Changes
