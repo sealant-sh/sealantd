@@ -821,10 +821,12 @@ impl CaptureEngine {
                         file: p.sha256.clone(),
                         bytes: p.bytes,
                     });
+                    // The index's length is declared like every other object's, so an I/O
+                    // error here fails the snap instead of sizing the upload zero.
                     uploads.push(Upload {
                         key: self.prefix.pack_idx(&p.sha256),
                         file: format!("{}.idx", p.sha256),
-                        bytes: fs::metadata(&p.idx_path).map(|m| m.len()).unwrap_or(0),
+                        bytes: fs::metadata(&p.idx_path)?.len(),
                     });
                     git_packs.push(key);
                 }

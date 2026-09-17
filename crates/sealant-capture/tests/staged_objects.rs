@@ -241,9 +241,9 @@ struct Recording {
 }
 
 impl UrlMinter for Recording {
-    fn put_url(&self, key: &str) -> Result<String, SinkError> {
+    fn put_url(&self, key: &str, size: u64) -> Result<String, SinkError> {
         self.puts.fetch_add(1, Ordering::SeqCst);
-        self.inner.put_url(key)
+        self.inner.put_url(key, size)
     }
 
     fn prefetch_put(&self, keys: &[(String, u64)]) -> Result<(), SinkError> {

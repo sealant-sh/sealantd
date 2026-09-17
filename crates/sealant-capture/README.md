@@ -94,14 +94,16 @@ the materializer treats `"pending"` as nothing to restore and nothing to sweep.
 
 ### `sizes` on every `upload.urls`, and byte-quota refusals
 
-`upload.urls` carries `sizes` for **every** key of the batch, not only the keys the executor
-would upload as multipart (`RegistrarMinter::prefetch_put`), so the registrar can price a whole
-batch before it mints anything. The one key that still travels unsized is the single-key fallback
-mint (`put_url` on a cache miss), which the register-time backstop prices.
+`upload.urls` carries `sizes` for **every** key it asks for — the batch
+(`RegistrarMinter::prefetch_put`), the multipart candidate, and the single-key fallback mint
+(`put_url` on a cache miss, which declares that object's own length) — so the registrar can price
+a whole batch before it mints anything, and a registrar that binds a signature to the exact
+content length gets a URL the PUT can use. `UrlMinter::put_url` therefore takes the object's size,
+and both PUT paths send that length as `Content-Length`.
 
 The registrar prices a key once and refuses what would take the session past its byte budget:
 413 on `upload.urls`, before a URL is minted, and 409 `byte-quota` on `capture.register` as the
-backstop for keys it was never sent a size for. Both bodies carry the numbers.
+backstop for a registrar that priced a key some other way. Both bodies carry the numbers.
 
 ```json
 → {"worktree_id":"wt","epoch":3,"keys":["captures/wt/3/trees/<sha>", …],
