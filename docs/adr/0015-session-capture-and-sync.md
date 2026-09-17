@@ -228,6 +228,11 @@ TTL; changing one changes the other.
   GET URLs for materialize), `upload.urls` (PUT URLs for a key list), `capture.register` (the CAS;
   409 on a stale epoch or a wrong parent), `change.summary` (after a `checkpoint` register returns;
   accepted only against the chain head), `lease.heartbeat` (zero rows = lost, pause).
+  `plan.get` may also name `sources`: gzipped tars the control plane wants beside the worktree
+  (Mend's folders and reference repositories), each with an absolute path outside the worktree and
+  the archive's sha256 as its content stamp. A capture-source workspace has no host mounts, so
+  this is the only way that content reaches it; the boot lays it down and nothing there is ever
+  captured back.
 - `Materializer`: `materialize(manifest, class, root)` — packs into `.git/objects/pack`, refs into
   `packed-refs`, chunks reassembled into files, hardlink groups linked, mode and mtime restored.
 
