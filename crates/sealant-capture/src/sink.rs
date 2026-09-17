@@ -314,8 +314,10 @@ impl BlobSink for LocalDir {
 /// a cache) and completes multipart uploads through the registrar. The crate never sees
 /// credentials, only URLs.
 pub trait UrlMinter: Send + Sync {
-    /// A PUT URL for `key`.
-    fn put_url(&self, key: &str) -> Result<String, SinkError>;
+    /// A PUT URL for `key`, whose object is `size` bytes. The size is not a hint: a registrar
+    /// may bind the signature to that exact content length, so it is the length the PUT then
+    /// sends, and never a guess or a zero stand-in.
+    fn put_url(&self, key: &str, size: u64) -> Result<String, SinkError>;
     /// Mint PUT URLs for `keys` (each `(key, bytes)`) ahead of their [`UrlMinter::put_url`]
     /// calls, in one channel call carrying every size. The default mints nothing (every
     /// `put_url` then mints its own).
@@ -350,8 +352,8 @@ pub trait UrlMinter: Send + Sync {
 /// A shared minter is a minter: the daemon keeps the handle a re-plan resets while the sink
 /// owns a clone.
 impl<M: UrlMinter + ?Sized> UrlMinter for Arc<M> {
-    fn put_url(&self, key: &str) -> Result<String, SinkError> {
-        (**self).put_url(key)
+    fn put_url(&self, key: &str, size: u64) -> Result<String, SinkError> {
+        (**self).put_url(key, size)
     }
 
     fn prefetch_put(&self, keys: &[(String, u64)]) -> Result<(), SinkError> {
@@ -414,12 +416,8 @@ impl PresignedHttp {
         self
     }
 
-    fn url(&self, key: &str, put: bool) -> Result<String, SinkError> {
-        if put {
-            self.minter.put_url(key)
-        } else {
-            self.minter.get_url(key)
-        }
+    fn url(&self, key: &str) -> Result<String, SinkError> {
+        self.minter.get_url(key)
     }
 }
 
@@ -586,8 +584,9 @@ impl BlobSink for PresignedHttp {
     }
 
     fn put_if_absent(&self, key: &str, source: BlobSource<'_>) -> Result<PutOutcome, SinkError> {
-        let url = self.url(key, true)?;
+        // The length before the URL: it is what the mint declares and what the PUT sends.
         let len = source.len()?;
+        let url = self.minter.put_url(key, len)?;
         let req = self
             .agent
             .put(&url)
@@ -727,7 +726,7 @@ impl BlobSink for PresignedHttp {
     }
 
     fn get(&self, key: &str) -> Result<Vec<u8>, SinkError> {
-        let url = self.url(key, false)?;
+        let url = self.url(key)?;
         let mut resp = self
             .agent
             .get(&url)
@@ -751,7 +750,7 @@ impl BlobSink for PresignedHttp {
 
     fn exists(&self, key: &str) -> Result<bool, SinkError> {
         // A presigned GET URL signs the method, so probe with a one-byte ranged GET, not HEAD.
-        let url = self.url(key, false)?;
+        let url = self.url(key)?;
         let resp = self
             .agent
             .get(&url)

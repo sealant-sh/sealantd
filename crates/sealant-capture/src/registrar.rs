@@ -55,7 +55,10 @@
 //! ```
 //!
 //! So a whole batch can be priced before a URL is minted, `upload.urls` carries `sizes` for
-//! **every** key it asks for, not only the ones that would go up as multipart.
+//! **every** key it asks for, not only the ones that would go up as multipart. A single-key
+//! fallback mint declares that object's length too ([`crate::sink::UrlMinter::put_url`] takes
+//! it): a registrar may bind the signature to the exact content length — Mend's upload length
+//! binding — and a stand-in size would mint a URL the PUT cannot use.
 //!
 //! # `platform` on `plan.get`
 //!
@@ -1173,7 +1176,7 @@ impl<R: Registrar + ?Sized> crate::sink::UrlMinter for RegistrarMinter<R> {
         Self::prefetch_put(self, keys).map_err(|e| mint_error(&keys_label(keys), e))
     }
 
-    fn put_url(&self, key: &str) -> Result<String, crate::sink::SinkError> {
+    fn put_url(&self, key: &str, size: u64) -> Result<String, crate::sink::SinkError> {
         if let Some(u) = self
             .put_cache
             .lock()
@@ -1182,9 +1185,10 @@ impl<R: Registrar + ?Sized> crate::sink::UrlMinter for RegistrarMinter<R> {
         {
             return Ok(u);
         }
-        // Size unknown here (this is the fallback for a key no batch minted): the registrar's
-        // register-time backstop prices it.
-        Self::prefetch_put(self, &[(key.to_owned(), 0)]).map_err(|e| mint_error(key, e))?;
+        // The fallback for a key no batch minted, and it declares that key's real length: a
+        // registrar may sign the URL for exactly those bytes (Mend's upload length binding), so
+        // a stand-in size would mint a URL the PUT cannot use.
+        Self::prefetch_put(self, &[(key.to_owned(), size)]).map_err(|e| mint_error(key, e))?;
         self.put_cache
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1497,13 +1501,24 @@ mod tests {
             "every key in the batch was sized"
         );
         assert_eq!(
-            minter.put_url(&keys[0].0).unwrap(),
+            minter.put_url(&keys[0].0, keys[0].1).unwrap(),
             format!("http://x/{}", keys[0].0)
         );
         assert_eq!(r.used_bytes(), 303);
 
-        // 303 bytes are priced; 100 more is one too many, and a priced key costs nothing again.
-        r.set_byte_quota(Some(402), None);
+        // A key no batch minted falls back to a one-key call, and that call declares the
+        // object's real length — never a zero stand-in, which a registrar that binds the
+        // signature to the content length would mint an unusable URL for.
+        let missed = "captures/wt/1/trees/missed".to_owned();
+        assert_eq!(
+            minter.put_url(&missed, 64).unwrap(),
+            format!("http://x/{missed}")
+        );
+        assert_eq!(r.sizes_seen().get(&missed).copied(), Some(64));
+        assert_eq!(r.used_bytes(), 367);
+
+        // 367 bytes are priced; 100 more is one too many, and a priced key costs nothing again.
+        r.set_byte_quota(Some(466), None);
         let more = [("captures/wt/1/trees/new".to_owned(), 100)];
         let err = UrlMinter::prefetch_put(&minter, &more).unwrap_err();
         assert!(
@@ -1511,14 +1526,14 @@ mod tests {
                 &err,
                 crate::sink::SinkError::QuotaRefused { reason, limit, used, requested }
                     if reason == "byte-quota"
-                        && *limit == Some(402)
-                        && *used == Some(303)
+                        && *limit == Some(466)
+                        && *used == Some(367)
                         && *requested == Some(100)
             ),
             "{err}"
         );
         assert!(!err.is_retryable());
-        assert_eq!(r.used_bytes(), 303, "a refused batch prices nothing");
+        assert_eq!(r.used_bytes(), 367, "a refused batch prices nothing");
         UrlMinter::prefetch_put(&minter, &keys).expect("priced keys cost nothing again");
     }
 

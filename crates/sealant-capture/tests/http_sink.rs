@@ -2,6 +2,7 @@
 
 mod common;
 
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use sealant_capture::sink::{
@@ -10,24 +11,37 @@ use sealant_capture::sink::{
 
 use common::serve;
 
-struct Minter(String);
+/// Records the length each PUT URL was minted for, the way a registrar that binds the
+/// signature to the content length sees it.
+struct Minter {
+    base: String,
+    sized: Mutex<Vec<(String, u64)>>,
+}
+
+impl Minter {
+    fn new(base: String) -> Self {
+        Self {
+            base,
+            sized: Mutex::new(Vec::new()),
+        }
+    }
+}
 
 impl UrlMinter for Minter {
-    fn put_url(&self, key: &str) -> Result<String, SinkError> {
-        Ok(format!("{}/{key}?sig=put", self.0))
+    fn put_url(&self, key: &str, size: u64) -> Result<String, SinkError> {
+        self.sized.lock().unwrap().push((key.to_owned(), size));
+        Ok(format!("{}/{key}?sig=put", self.base))
     }
     fn get_url(&self, key: &str) -> Result<String, SinkError> {
-        Ok(format!("{}/{key}?sig=get", self.0))
+        Ok(format!("{}/{key}?sig=get", self.base))
     }
 }
 
 #[test]
 fn presigned_http_put_get_exists() {
     let server = serve();
-    let sink = PresignedHttp::new(
-        Box::new(Minter(server.base.clone())),
-        Duration::from_secs(5),
-    );
+    let minter = Arc::new(Minter::new(server.base.clone()));
+    let sink = PresignedHttp::new(Box::new(Arc::clone(&minter)), Duration::from_secs(5));
     let key = "captures/wt/1/packs/abc";
     assert!(!sink.exists(key).unwrap());
     assert!(matches!(sink.get(key), Err(SinkError::NotFound(_))));
@@ -53,4 +67,13 @@ fn presigned_http_put_get_exists() {
     );
     assert_eq!(sink.get("k/big").unwrap(), big);
     assert_eq!(server.objects.lock().unwrap().len(), 2);
+    // Every PUT URL was minted for the exact byte count the PUT then sent.
+    assert_eq!(
+        *minter.sized.lock().unwrap(),
+        vec![
+            (key.to_owned(), 5),
+            (key.to_owned(), 5),
+            ("k/big".to_owned(), 3_000_000),
+        ]
+    );
 }
