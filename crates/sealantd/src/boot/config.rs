@@ -40,6 +40,11 @@ const CONSUMED_KEYS: &[&str] = &[
     "SEALANT_CAPTURE_WORKTREE_ID",
     "SEALANT_CAPTURE_HARNESS_HOME",
     "SEALANT_CAPTURE_INOTIFY_RAISE",
+    "SEALANT_CAPTURE_ALLOW_PLAINTEXT",
+    "SEALANT_CAPTURE_CA_PEM",
+    "SEALANT_CAPTURE_CA_FILE",
+    "SEALANT_CAPTURE_OBJECT_CA_PEM",
+    "SEALANT_CAPTURE_OBJECT_CA_FILE",
     "SEALANT_WORKSPACE_MOUNT_HOST_PATH",
     "SEALANT_MOUNT_ALLOWED_STORE_ROOTS",
     "SEALANT_WORKSPACE_REPO_URL",
@@ -207,6 +212,22 @@ pub struct CaptureSourceConfig {
     /// `SEALANT_CAPTURE_INOTIFY_RAISE`: try to raise `fs.inotify.max_user_watches` when the
     /// watch budget does not fit (never fails boot; a refusal is logged and the class polls).
     pub raise_inotify_limit: bool,
+    /// `SEALANT_CAPTURE_ALLOW_PLAINTEXT`: the launcher states that the network between this
+    /// executor and the channel is private, so plain HTTP beyond loopback is dialled. Unset, the
+    /// channel and every object URL must be HTTPS with a verified certificate, and boot refuses
+    /// anything else rather than falling back.
+    pub allow_plaintext: bool,
+    /// `SEALANT_CAPTURE_CA_PEM`: a PEM bundle the session channel's certificate must chain to,
+    /// in place of the public roots (a channel behind a private CA).
+    pub ca_pem: Option<String>,
+    /// `SEALANT_CAPTURE_CA_FILE`: the same bundle as a file in the executor image. The inline
+    /// bundle wins when both are set.
+    pub ca_file: Option<PathBuf>,
+    /// `SEALANT_CAPTURE_OBJECT_CA_PEM`: a PEM bundle presigned object URLs must chain to, in
+    /// place of the public roots (an object store behind a private CA).
+    pub object_ca_pem: Option<String>,
+    /// `SEALANT_CAPTURE_OBJECT_CA_FILE`: the same bundle as a file; the inline bundle wins.
+    pub object_ca_file: Option<PathBuf>,
 }
 
 /// How the workspace working directory is provisioned.
@@ -711,6 +732,23 @@ impl BootConfig {
                     raise_inotify_limit: env
                         .get("SEALANT_CAPTURE_INOTIFY_RAISE")
                         .is_some_and(|v| matches!(v.trim(), "1" | "true" | "yes")),
+                    allow_plaintext: env
+                        .get("SEALANT_CAPTURE_ALLOW_PLAINTEXT")
+                        .is_some_and(|v| matches!(v.trim(), "1" | "true" | "yes")),
+                    ca_pem: env
+                        .get("SEALANT_CAPTURE_CA_PEM")
+                        .filter(|s| !s.trim().is_empty()),
+                    ca_file: env
+                        .get("SEALANT_CAPTURE_CA_FILE")
+                        .filter(|s| !s.trim().is_empty())
+                        .map(PathBuf::from),
+                    object_ca_pem: env
+                        .get("SEALANT_CAPTURE_OBJECT_CA_PEM")
+                        .filter(|s| !s.trim().is_empty()),
+                    object_ca_file: env
+                        .get("SEALANT_CAPTURE_OBJECT_CA_FILE")
+                        .filter(|s| !s.trim().is_empty())
+                        .map(PathBuf::from),
                 }))
             }
             Some(other) => Err(BootError::config(format!(
@@ -1655,6 +1693,49 @@ mod tests {
             &cfg.source,
             WorkspaceSource::Capture(c) if c.worktree_id.as_deref() == Some("wt-1")
         ));
+    }
+
+    #[test]
+    fn capture_transport_is_strict_unless_the_launcher_says_otherwise() {
+        let mut pairs: Vec<(&str, &str)> = base_pairs()
+            .into_iter()
+            .filter(|(k, _)| *k != "SEALANT_WORKSPACE_REPO_URL")
+            .collect();
+        pairs.extend_from_slice(&[
+            ("SEALANT_WORKSPACE_SOURCE", "capture"),
+            ("SEALANT_CAPTURE_ENDPOINT", "http://mend-api:3106/channel"),
+        ]);
+        let cfg = BootConfig::load(&MapEnv::from_pairs(&pairs)).expect("valid");
+        assert!(matches!(
+            &cfg.source,
+            WorkspaceSource::Capture(c)
+                if !c.allow_plaintext && c.ca_pem.is_none() && c.ca_file.is_none()
+        ));
+
+        pairs.extend_from_slice(&[
+            ("SEALANT_CAPTURE_ALLOW_PLAINTEXT", "true"),
+            ("SEALANT_CAPTURE_CA_PEM", "-----BEGIN CERTIFICATE-----"),
+            ("SEALANT_CAPTURE_CA_FILE", "/etc/sealant/channel-ca.pem"),
+            (
+                "SEALANT_CAPTURE_OBJECT_CA_FILE",
+                "/etc/sealant/object-ca.pem",
+            ),
+        ]);
+        let cfg = BootConfig::load(&MapEnv::from_pairs(&pairs)).expect("valid");
+        assert!(matches!(
+            &cfg.source,
+            WorkspaceSource::Capture(c)
+                if c.allow_plaintext
+                    && c.ca_pem.is_some()
+                    && c.ca_file.as_deref() == Some(Path::new("/etc/sealant/channel-ca.pem"))
+                    && c.object_ca_file.as_deref() == Some(Path::new("/etc/sealant/object-ca.pem"))
+        ));
+        // None of it reaches the harness environment.
+        assert!(
+            !cfg.passthrough_env
+                .iter()
+                .any(|(k, _)| k.starts_with("SEALANT_CAPTURE_"))
+        );
     }
 
     #[test]
