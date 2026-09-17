@@ -43,6 +43,31 @@ the two trees compare identical (bytes, modes, mtimes, links), and the head over
 nothing. This is what lets a standby executor pre-materialize the project base and apply the
 claimed worktree's head over it (`capture.replan`).
 
+## Sources beside the worktree
+
+A capture-source workspace mounts nothing from the host, so content the control plane wants
+beside the repository — Mend's organization folders and reference repositories — travels on the
+plan. `plan.get` answers `sources`: per source a `name`, an absolute `path`, the object `key` of
+a gzipped tar (its GET URL rides `get_urls`), the archive's `sha256`, its `bytes`, and
+`read_only`. `crates/sealantd/src/boot/sources.rs` lays each one down at boot, before the control
+socket binds.
+
+- **Outside the worktree.** A path inside the working directory, or one the working directory
+  sits under, fails the boot: content there would be listed by the next capture and shipped into
+  the store as the session's own work. Paths must be absolute, under the workspace root, and free
+  of `..`.
+- **A copy, never a mount.** Nothing laid down here travels back — it sits outside every capture
+  root. `read_only` additionally takes the writable bit off the tree, which is what a host bind
+  mount would have done.
+- **Stamped by content.** The archive's sha256 is the integrity check and the stamp
+  (`<staging>/sources.json`), so a re-materialize re-extracts only what changed.
+- **Re-planned with the worktree.** `capture.replan` lays down the sources of the worktree it is
+  assigned: a standby executor boots under a placeholder, so the boot's plan named none of them.
+- One source failing costs that directory, not the session: a fetch, digest or extraction failure
+  is logged and skipped. Extraction runs in the staging scratch directory and is renamed into
+  place, so a failure never leaves half a tree. An archive past 64 MiB is skipped; a byte budget
+  belongs to the control plane that published it.
+
 ## Re-plan (`capture.replan`)
 
 A standby executor boots on the project base under a placeholder worktree id and epoch (Mend's

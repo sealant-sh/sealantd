@@ -17,7 +17,8 @@ use sealant_protocol::{
     LeaseEpochReport, ProcessId, Signal,
 };
 
-use crate::boot::capture::{CaptureBoot, SharedMinter};
+use crate::boot::capture::{CaptureBoot, SharedMinter, SourceLayout};
+use crate::boot::sources;
 use crate::runtime::Runtime;
 
 /// The error a capture command gets on a workspace without a capture store.
@@ -52,6 +53,8 @@ pub struct CaptureRuntime {
     minter: Option<SharedMinter>,
     /// The worktree and lease epoch this executor acts under; a re-plan moves them.
     identity: Mutex<(String, u64)>,
+    /// Where content the plan names beside the worktree lands.
+    layout: SourceLayout,
     grace: Duration,
     paused: AtomicBool,
     last_snap_unix_ms: AtomicU64,
@@ -83,6 +86,7 @@ impl CaptureRuntime {
             sink: boot.sink,
             minter: boot.minter,
             identity: Mutex::new((boot.worktree_id, boot.epoch)),
+            layout: boot.layout,
             grace: Duration::from_millis(grace_ms),
             paused: AtomicBool::new(false),
             last_snap_unix_ms: AtomicU64::new(0),
@@ -319,6 +323,10 @@ impl CaptureRuntime {
             engine
                 .rebase(&plan.worktree_id, plan.epoch, previous)
                 .map_err(|e| internal(&format!("capture engine rebase: {e}")))?;
+            // A standby executor boots under a placeholder worktree, so the sources of the
+            // session it is assigned arrive with this plan, not the boot's.
+            sources::apply(self.sink.as_ref(), &plan.sources, &self.layout)
+                .map_err(|e| internal(&format!("capture sources: {e}")))?;
             self.runner.shipper().reset_after_replan(head_n);
             *self.identity.lock().unwrap_or_else(|e| e.into_inner()) =
                 (plan.worktree_id.clone(), plan.epoch);
@@ -392,13 +400,15 @@ mod tests {
     use std::process::Command as Proc;
     use std::time::Instant;
 
-    use sealant_capture::registrar::HeadInfo;
+    use sealant_capture::registrar::{HeadInfo, PlanSource};
+    use sealant_capture::sink::BlobSource;
     use sealant_capture::{
         BlobSink, CaptureConfig, CaptureEngine, CaptureKind as EngineKind, Class,
         InMemoryRegistrar, LocalDir, SnapRequest,
     };
     use sealant_protocol::{Command, CommandResult, ControlRequest, RequestId, ResponseOutcome};
     use sealant_runtime_core::{RuntimeConfig, new_runtime_id};
+    use sha2::{Digest, Sha256};
 
     use super::*;
     use crate::boot::capture::boot_from;
@@ -436,6 +446,11 @@ mod tests {
                 minter: None,
                 worktree_id: "wt-hooks".to_owned(),
                 epoch: 1,
+                layout: SourceLayout {
+                    workspace_root: base.to_path_buf(),
+                    working_directory: root.clone(),
+                    staging_dir: root.join(".sealantd/capture"),
+                },
             },
             registrar,
         )
@@ -621,6 +636,7 @@ mod tests {
                 raise_inotify_limit: false,
             },
             &ws,
+            tmp.path(),
         )
         .unwrap();
         assert_eq!((boot.worktree_id.as_str(), boot.epoch), ("standby-1", 7));
@@ -657,6 +673,40 @@ mod tests {
         shipper.ship_pending().unwrap();
         let head = registrar.head().unwrap();
         assert_eq!(head.n, 3);
+
+        // The session's own content beside the worktree arrives with the plan that assigns the
+        // worktree: a standby booted under the placeholder, so the boot's plan had none.
+        let tree = tmp.path().join("publish");
+        std::fs::create_dir_all(&tree).unwrap();
+        std::fs::write(tree.join("NOTES.md"), "team docs\n").unwrap();
+        let archive = tmp.path().join("docs.tar.gz");
+        assert!(
+            Proc::new("tar")
+                .args([
+                    "-czf".as_ref(),
+                    archive.as_os_str(),
+                    "-C".as_ref(),
+                    tree.as_os_str(),
+                    ".".as_ref()
+                ])
+                .output()
+                .expect("tar -czf")
+                .status
+                .success()
+        );
+        let bytes = std::fs::read(&archive).unwrap();
+        let sha256 = format!("{:x}", Sha256::digest(&bytes));
+        let key = format!("projects/p/sources/{sha256}");
+        sink.put_if_absent(&key, BlobSource::Bytes(&bytes)).unwrap();
+        let docs = tmp.path().join("home/docs");
+        registrar.set_sources(vec![PlanSource {
+            name: "docs".to_owned(),
+            path: docs.display().to_string(),
+            key,
+            sha256,
+            bytes: bytes.len() as u64,
+            read_only: true,
+        }]);
 
         // Claim: the plan now names wt-real at epoch 1 with head n=3.
         let resp = runtime
@@ -697,6 +747,11 @@ mod tests {
         );
         assert!(ws.join("node_modules/pkg/extra.js").exists());
         assert!(!ws.join("node_modules/pkg/m0.js").exists());
+        assert_eq!(
+            std::fs::read_to_string(docs.join("NOTES.md")).unwrap(),
+            "team docs\n",
+            "the assigned worktree's sources land on the re-plan"
+        );
         let lease = capture.lease_epoch();
         assert_eq!(
             (lease.worktree_id.as_str(), lease.epoch, lease.fenced),

@@ -17,6 +17,7 @@ mod dotfiles;
 mod error;
 mod git;
 mod mount;
+pub(crate) mod sources;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -156,6 +157,7 @@ fn prepare(
                 source,
                 token,
                 &config.workspace.working_directory,
+                &config.workspace.workspace_root,
             )?);
         }
     }

@@ -2,7 +2,7 @@
 //! materialize the chain head onto local disk, and hand back an engine seeded to continue the
 //! chain under this session's lease epoch.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -16,6 +16,7 @@ use sealant_capture::{
 
 use crate::boot::config::CaptureSourceConfig;
 use crate::boot::error::BootError;
+use crate::boot::sources;
 
 /// The secret-environment key carrying the session token.
 pub const TOKEN_KEY: &str = "SEALANT_CAPTURE_TOKEN";
@@ -43,6 +44,21 @@ pub struct CaptureBoot {
     pub worktree_id: String,
     /// Lease epoch this session holds.
     pub epoch: u64,
+    /// Where content the plan names beside the worktree may land, and where its stamps live: a
+    /// re-plan lays down the sources of the worktree it is assigned (a standby executor boots
+    /// under a placeholder and only then learns whose session it is).
+    pub layout: SourceLayout,
+}
+
+/// The paths `sources` are resolved against.
+#[derive(Debug, Clone)]
+pub struct SourceLayout {
+    /// `SEALANT_WORKSPACE_ROOT`: every source lands under it.
+    pub workspace_root: PathBuf,
+    /// The worktree; no source may land inside it.
+    pub working_directory: PathBuf,
+    /// Capture staging, which holds the content stamps and the extraction scratch space.
+    pub staging_dir: PathBuf,
 }
 
 impl std::fmt::Debug for CaptureBoot {
@@ -63,10 +79,11 @@ pub fn materialize(
     source: &CaptureSourceConfig,
     token: &str,
     working_directory: &Path,
+    workspace_root: &Path,
 ) -> Result<CaptureBoot, BootError> {
     let registrar: Arc<dyn Registrar> =
         Arc::new(HttpRegistrar::new(&source.endpoint, token, CHANNEL_TIMEOUT));
-    boot_from(registrar, None, source, working_directory)
+    boot_from(registrar, None, source, working_directory, workspace_root)
 }
 
 /// [`materialize`] over any registrar. `sink` is the object store to read the head from; `None`
@@ -80,6 +97,7 @@ pub(crate) fn boot_from(
     sink: Option<Arc<dyn BlobSink>>,
     source: &CaptureSourceConfig,
     working_directory: &Path,
+    workspace_root: &Path,
 ) -> Result<CaptureBoot, BootError> {
     let plan = registrar
         .plan_get(&PlanGetRequest::booting(source.worktree_id.clone()))
@@ -123,6 +141,11 @@ pub(crate) fn boot_from(
     let mut config = CaptureConfig::new(&worktree_id, epoch, working_directory);
     config.harness_home = source.harness_home.clone();
     config.watch.raise_limit = source.raise_inotify_limit;
+    let layout = SourceLayout {
+        workspace_root: workspace_root.to_path_buf(),
+        working_directory: working_directory.to_path_buf(),
+        staging_dir: config.staging_dir(),
+    };
 
     let previous = match &plan.head {
         Some(head) => {
@@ -166,6 +189,10 @@ pub(crate) fn boot_from(
         }
     };
 
+    // Content beside the worktree (Mend's folders and reference repositories): outside the
+    // worktree, so it is laid down after the head and never enters a capture.
+    sources::apply(sink.as_ref(), &plan.sources, &layout)?;
+
     let seeded = previous.is_some();
     let mut engine = CaptureEngine::open(config, previous)
         .map_err(|error| BootError::config(format!("capture engine: {error}")))?;
@@ -181,6 +208,7 @@ pub(crate) fn boot_from(
         minter,
         worktree_id,
         epoch,
+        layout,
     })
 }
 
@@ -190,9 +218,13 @@ mod tests {
     use std::process::Command as Proc;
 
     use sealant_capture::engine::default_platform;
+    use sealant_capture::registrar::PlanSource;
+    use sealant_capture::sink::BlobSource;
     use sealant_capture::{
         CaptureKind, Class, InMemoryRegistrar, LocalDir, SnapRequest, sink::BlobSink,
     };
+    use sha2::{Digest, Sha256};
+    use std::os::unix::fs::PermissionsExt;
 
     use super::*;
 
@@ -266,7 +298,14 @@ mod tests {
 
         let same = tmp.path().join("same");
         let dyn_sink: Arc<dyn BlobSink> = sink.clone();
-        let boot = boot_from(registrar.clone(), Some(dyn_sink.clone()), &source(), &same).unwrap();
+        let boot = boot_from(
+            registrar.clone(),
+            Some(dyn_sink.clone()),
+            &source(),
+            &same,
+            tmp.path(),
+        )
+        .unwrap();
         assert_eq!(boot.worktree_id, "wt-boot");
         assert!(same.join("lib.rs").exists());
         assert!(same.join("node_modules/pkg/index.js").exists());
@@ -284,12 +323,165 @@ mod tests {
         // Re-stamp the head's bulk section for another platform: the double answers pending.
         registrar.set_bulk_platform("linux-riscv64-musl");
         let other = tmp.path().join("other");
-        let boot = boot_from(registrar.clone(), Some(dyn_sink), &source(), &other).unwrap();
+        let boot = boot_from(
+            registrar.clone(),
+            Some(dyn_sink),
+            &source(),
+            &other,
+            tmp.path(),
+        )
+        .unwrap();
         assert!(other.join("lib.rs").exists());
         assert!(!other.join("node_modules").exists(), "bulk left pending");
         assert_eq!(
             boot.engine.previous().unwrap().manifest.sections.bulk,
             BulkState::pending()
+        );
+    }
+
+    /// A gzipped tar at `key` in `sink`, and the `PlanSource` that names it at `path`.
+    fn publish_source(
+        sink: &LocalDir,
+        base: &Path,
+        name: &str,
+        path: &str,
+        body: &str,
+        read_only: bool,
+    ) -> PlanSource {
+        let tree = base.join(format!("publish-{name}"));
+        std::fs::create_dir_all(&tree).unwrap();
+        std::fs::write(tree.join("NOTES.md"), body).unwrap();
+        let archive = base.join(format!("{name}.tar.gz"));
+        let out = Proc::new("tar")
+            .arg("-czf")
+            .arg(&archive)
+            .arg("-C")
+            .arg(&tree)
+            .arg(".")
+            .output()
+            .expect("tar -czf");
+        assert!(out.status.success(), "tar -czf");
+        let bytes = std::fs::read(&archive).unwrap();
+        let sha256 = format!("{:x}", Sha256::digest(&bytes));
+        let key = format!("projects/p/sources/{sha256}");
+        sink.put_if_absent(&key, BlobSource::Bytes(&bytes)).unwrap();
+        PlanSource {
+            name: name.to_owned(),
+            path: path.to_owned(),
+            key,
+            sha256,
+            bytes: bytes.len() as u64,
+            read_only,
+        }
+    }
+
+    /// Content the plan names beside the worktree lands outside it, is left alone when the
+    /// stamp says the copy is current, and a `read_only` source is not writable. Mend's folders
+    /// and reference repositories reach a capture-source workspace this way, which mounts
+    /// nothing from the host (Mend PLATFORM-FEEDBACK, 2026-09-17).
+    #[test]
+    fn plan_sources_land_beside_the_worktree_and_are_stamped_by_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let registrar = Arc::new(InMemoryRegistrar::new("wt-boot", 1, None));
+        let sink = capture_source(tmp.path(), &registrar);
+        let root = tmp.path().join("ws");
+        let repo = root.join("repo");
+
+        let docs = publish_source(
+            &sink,
+            tmp.path(),
+            "docs",
+            &root.join("home/docs").display().to_string(),
+            "first\n",
+            true,
+        );
+        let refs = publish_source(
+            &sink,
+            tmp.path(),
+            "api",
+            &root.join("ref/api").display().to_string(),
+            "reference\n",
+            false,
+        );
+        registrar.set_sources(vec![docs.clone(), refs.clone()]);
+
+        let dyn_sink: Arc<dyn BlobSink> = sink.clone();
+        boot_from(
+            registrar.clone(),
+            Some(dyn_sink.clone()),
+            &source(),
+            &repo,
+            &root,
+        )
+        .unwrap();
+        assert!(repo.join("lib.rs").exists(), "the worktree materialized");
+        let laid_down = root.join("home/docs/NOTES.md");
+        assert_eq!(std::fs::read_to_string(&laid_down).unwrap(), "first\n");
+        assert_eq!(
+            std::fs::read_to_string(root.join("ref/api/NOTES.md")).unwrap(),
+            "reference\n"
+        );
+        // Outside the worktree, so no capture of this session ever lists it.
+        assert!(!laid_down.starts_with(&repo));
+        // read_only takes the writable bit off; the writable source keeps it.
+        assert_eq!(
+            std::fs::metadata(&laid_down).unwrap().permissions().mode() & 0o222,
+            0
+        );
+        assert_ne!(
+            std::fs::metadata(root.join("ref/api/NOTES.md"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o222,
+            0
+        );
+
+        // The stamp is the archive digest: an unchanged source is not extracted again, which a
+        // file written beside it survives to prove.
+        std::fs::write(root.join("ref/api/LOCAL.md"), "kept\n").unwrap();
+        boot_from(
+            registrar.clone(),
+            Some(dyn_sink.clone()),
+            &source(),
+            &repo,
+            &root,
+        )
+        .unwrap();
+        assert!(root.join("ref/api/LOCAL.md").exists(), "not re-extracted");
+
+        // New bytes, new digest: the copy is replaced, and what was beside it is gone.
+        let docs_v2 = publish_source(
+            &sink,
+            tmp.path(),
+            "docs",
+            &root.join("home/docs").display().to_string(),
+            "second\n",
+            true,
+        );
+        assert_ne!(docs_v2.sha256, docs.sha256);
+        registrar.set_sources(vec![docs_v2, refs.clone()]);
+        boot_from(
+            registrar.clone(),
+            Some(dyn_sink.clone()),
+            &source(),
+            &repo,
+            &root,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&laid_down).unwrap(), "second\n");
+
+        // A path inside the worktree would be captured back into the store as the session's
+        // own work: that is a control-plane bug, and it fails the boot.
+        let inside = PlanSource {
+            path: repo.join("vendor").display().to_string(),
+            ..refs
+        };
+        registrar.set_sources(vec![inside]);
+        let error = boot_from(registrar, Some(dyn_sink), &source(), &repo, &root).unwrap_err();
+        assert!(
+            format!("{error}").contains("outside the worktree"),
+            "{error}"
         );
     }
 }

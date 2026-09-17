@@ -69,6 +69,21 @@
 //! leaves the plan unchanged when the field is absent (an older executor) or the platforms
 //! match. The materializer treats `"pending"` as "nothing to restore, nothing to sweep".
 //!
+//! # Sources beside the worktree
+//!
+//! A capture-source workspace mounts nothing from the host, so content the control plane wants
+//! beside the repository — Mend's organization folders and reference repositories — travels on
+//! the plan as `sources`: a gzipped tar per source, at a key whose GET URL rides `get_urls`,
+//! with the archive's `sha256` as both the integrity check and the stamp that says whether the
+//! copy on disk is already current. Paths are absolute, inside the workspace and outside the
+//! worktree, so nothing laid down here is ever captured back.
+//!
+//! ```json
+//! ← {…,"sources":[{"name":"docs","path":"/workspace/home/docs",
+//!    "key":"projects/p/sources/<sha256>","sha256":"<sha256>","bytes":40960,
+//!    "read_only":true}]}
+//! ```
+//!
 //! ```json
 //! → {"worktree_id":"wt","epoch":0,"platform":"linux-x86_64-gnu"}
 //! ← {"worktree_id":"wt","epoch":3,"head":{"n":7,"capture_id":"…","manifest_key":"…",
@@ -135,6 +150,38 @@ pub struct PlanGetResponse {
     /// Key → presigned GET URL (empty when the sink is a directory).
     #[serde(default)]
     pub get_urls: BTreeMap<String, String>,
+    /// Read-only content to lay down beside the worktree, outside it: the control plane's
+    /// folders and reference repositories, which a capture-source workspace cannot reach as a
+    /// host mount. Absent from an older registrar's answer, which means "nothing beside the
+    /// worktree".
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sources: Vec<PlanSource>,
+}
+
+/// One archive the plan names to lay down beside the worktree. The bytes are a gzipped tar at
+/// `key`, fetched through the same presigned GET URLs as the head's objects, and `sha256` is
+/// both the integrity check and the stamp that decides whether the copy on disk is current.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanSource {
+    /// A short name for logs and errors; never a path component.
+    pub name: String,
+    /// Absolute path inside the workspace, outside the worktree: content under the worktree
+    /// would be captured back into the store.
+    pub path: String,
+    /// Object key of the gzipped tar; its GET URL rides `get_urls`.
+    pub key: String,
+    /// sha256 of the archive bytes, lowercase hex.
+    pub sha256: String,
+    /// Archive length in bytes.
+    pub bytes: u64,
+    /// Take the writable bit off the extracted copy. Either way nothing here travels back: a
+    /// source is a copy, and it sits outside every capture root.
+    #[serde(default = "default_read_only")]
+    pub read_only: bool,
+}
+
+fn default_read_only() -> bool {
+    true
 }
 
 /// `upload.urls`.
@@ -415,6 +462,8 @@ struct InMemoryState {
     completed: BTreeSet<String>,
     completes: u64,
     next_upload: u64,
+    /// Content the plan names beside the worktree.
+    sources: Vec<PlanSource>,
 }
 
 /// In-memory registrar: one worktree, one chain, a live epoch, a lease flag.
@@ -463,6 +512,7 @@ impl InMemoryRegistrar {
                 summaries: Vec::new(),
                 url_requests: 0,
                 uploads: BTreeMap::new(),
+                sources: Vec::new(),
                 completed: BTreeSet::new(),
                 completes: 0,
                 next_upload: 0,
@@ -611,6 +661,11 @@ impl InMemoryRegistrar {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = worktree_id.to_owned();
     }
 
+    /// What `plan.get` answers as content beside the worktree.
+    pub fn set_sources(&self, sources: Vec<PlanSource>) {
+        self.lock().sources = sources;
+    }
+
     /// Re-stamp the head's bulk section as captured for `platform` (tests of the `plan.get`
     /// platform rule); a head without a bulk section is left alone.
     pub fn set_bulk_platform(&self, platform: &str) {
@@ -731,11 +786,18 @@ impl Registrar for InMemoryRegistrar {
                 get_urls.insert(k.clone(), self.url(&k));
             }
         }
+        let sources = state.sources.clone();
+        if self.url_base.is_some() {
+            for source in &sources {
+                get_urls.insert(source.key.clone(), self.url(&source.key));
+            }
+        }
         Ok(PlanGetResponse {
             worktree_id,
             epoch: state.live_epoch,
             head,
             get_urls,
+            sources,
         })
     }
 
