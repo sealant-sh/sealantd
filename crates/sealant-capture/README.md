@@ -204,6 +204,22 @@ not), one complete with retry on transport loss, size check from the registrar's
 ranged GET where a GET URL exists. `LocalDir` writes the parts concatenated. `InMemoryRegistrar`
 implements Create/Complete with a pluggable completer for tests (`tests/ship_multipart.rs`).
 
+## Transport (`transport.rs`)
+
+`ChannelTransport` is the one policy both outbound HTTP paths share (ADR-0015 §"Transport").
+`HttpRegistrar::new` checks the endpoint against it and fails instead of constructing;
+`PresignedHttp::with_transport` wraps the minter so every URL it answers is checked before a byte
+is sent (`SinkError::NoUrl`, naming the host only). HTTPS with verified certificates; plain HTTP
+to loopback, or anywhere under `SEALANT_CAPTURE_ALLOW_PLAINTEXT`; `SEALANT_CAPTURE_CA_PEM` /
+`SEALANT_CAPTURE_CA_FILE` replace the channel's roots and `SEALANT_CAPTURE_OBJECT_CA_PEM` /
+`_FILE` the object store's; redirects are never followed and proxy variables are not honoured.
+`tests/channel_tls.rs` runs the channel against a real TLS listener with a throwaway PKI: the
+named CA is accepted, an unknown issuer and a wrong name are refused with no request arriving,
+and a 307 to a plain-HTTP host is reported, not followed.
+
+A launcher that reaches the channel over plain HTTP on a private network (Docker and in-cluster
+Mend installs today) must now say so, or boot refuses.
+
 ## Deviations from ADR-0015 pending amendment
 
 - §"Capture format", CDC packs: "≤ 64 MiB, one PUT, never multipart" → packs stay ≤ 64 MiB but

@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use crate::cpu::thread_cpu;
 use crate::registrar::{CompletedPart, MultipartUrls, opt};
+use crate::transport::ChannelTransport;
 
 /// Bytes to store: in memory or a file on disk (streamed).
 #[derive(Debug, Clone, Copy)]
@@ -378,6 +379,62 @@ impl<M: UrlMinter + ?Sized> UrlMinter for Arc<M> {
     }
 }
 
+/// A minter whose every URL has passed the session's [`ChannelTransport`] before the sink sees
+/// it: the registrar chooses where bytes go, and the transport policy decides whether that is a
+/// place this executor dials.
+struct CheckedMinter {
+    inner: Box<dyn UrlMinter>,
+    transport: ChannelTransport,
+}
+
+impl CheckedMinter {
+    fn checked(&self, key: &str, url: String) -> Result<String, SinkError> {
+        match self.transport.check("a presigned object URL", &url) {
+            Ok(()) => Ok(url),
+            Err(refusal) => Err(SinkError::NoUrl {
+                key: key.to_owned(),
+                reason: refusal.to_string(),
+            }),
+        }
+    }
+}
+
+impl UrlMinter for CheckedMinter {
+    fn put_url(&self, key: &str, size: u64) -> Result<String, SinkError> {
+        let url = self.inner.put_url(key, size)?;
+        self.checked(key, url)
+    }
+
+    fn prefetch_put(&self, keys: &[(String, u64)]) -> Result<(), SinkError> {
+        self.inner.prefetch_put(keys)
+    }
+
+    fn get_url(&self, key: &str) -> Result<String, SinkError> {
+        let url = self.inner.get_url(key)?;
+        self.checked(key, url)
+    }
+
+    fn multipart_urls(&self, key: &str, size: u64) -> Result<Option<MultipartUrls>, SinkError> {
+        let Some(mut plan) = self.inner.multipart_urls(key, size)? else {
+            return Ok(None);
+        };
+        plan.part_urls = std::mem::take(&mut plan.part_urls)
+            .into_iter()
+            .map(|url| self.checked(key, url))
+            .collect::<Result<_, _>>()?;
+        Ok(Some(plan))
+    }
+
+    fn complete_multipart(
+        &self,
+        key: &str,
+        upload_id: &str,
+        parts: &[CompletedPart],
+    ) -> Result<Completed, SinkError> {
+        self.inner.complete_multipart(key, upload_id, parts)
+    }
+}
+
 /// Presigned-URL HTTP sink (S3, R2, Garage, or a test server).
 pub struct PresignedHttp {
     agent: ureq::Agent,
@@ -394,16 +451,28 @@ impl std::fmt::Debug for PresignedHttp {
 }
 
 impl PresignedHttp {
-    /// Build with a minter and a per-request timeout.
+    /// Build with a minter and a per-request timeout, under the strict transport: HTTPS with
+    /// verified certificates, plain HTTP to loopback only.
     #[must_use]
     pub fn new(minter: Box<dyn UrlMinter>, timeout: Duration) -> Self {
-        let config = ureq::Agent::config_builder()
-            .http_status_as_error(false)
-            .timeout_global(Some(timeout))
-            .build();
+        Self::with_transport(minter, timeout, &ChannelTransport::verified())
+    }
+
+    /// Build under the session's transport policy. Every URL the minter answers is checked
+    /// against it before a byte is sent, certificates are always verified, and no redirect is
+    /// followed (a 3xx answers as an unexpected status).
+    #[must_use]
+    pub fn with_transport(
+        minter: Box<dyn UrlMinter>,
+        timeout: Duration,
+        transport: &ChannelTransport,
+    ) -> Self {
         Self {
-            agent: ureq::Agent::new_with_config(config),
-            minter,
+            agent: transport.object_agent(timeout),
+            minter: Box::new(CheckedMinter {
+                inner: minter,
+                transport: transport.clone(),
+            }),
             part_retry: PartRetry::default(),
             helper_cpu_micros: AtomicU64::new(0),
         }

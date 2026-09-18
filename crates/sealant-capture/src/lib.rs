@@ -23,6 +23,7 @@ pub mod registrar;
 pub mod roots;
 pub mod ship;
 pub mod sink;
+pub mod transport;
 pub mod tree;
 pub mod watch;
 
@@ -38,4 +39,5 @@ pub use materialize::{
 pub use registrar::{HttpRegistrar, InMemoryRegistrar, Registrar, RegistrarError};
 pub use ship::{MultipartConfig, RefusedCapture, ShipSnapshot, ShipWorker, Shipper, Staging};
 pub use sink::{BlobSink, LocalDir, PresignedHttp, UrlMinter};
+pub use transport::{ChannelTransport, TransportError};
 pub use watch::{ChangeSignal, Mode as WatchMode, WatchPolicy};

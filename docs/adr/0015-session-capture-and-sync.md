@@ -216,6 +216,39 @@ sha256 at read, and the reason pickup falls back to the newest verifying capture
 grace period of 30 min (15 min TTL + 5 min materialize budget, rounded up) is derived from this
 TTL; changing one changes the other.
 
+### Transport
+
+The session token and every presigned URL are bearer credentials, and the channel's answers decide
+where a session's bytes go. The executor therefore dials both over HTTPS with a verified
+certificate and does not fall back. A channel endpoint the policy does not dial refuses boot,
+before the token leaves the process; an object URL it does not dial is refused when the registrar
+answers it, before a byte is sent to it.
+
+- Plain HTTP is dialled to the executor's own loopback, and otherwise only when the launcher sets
+  `SEALANT_CAPTURE_ALLOW_PLAINTEXT=true`. That setting is a statement that the network between the
+  executor and the channel is private (a VPC, a Docker network, a cluster network), made by
+  whoever launches the executor. It covers the channel and the object URLs together, because an
+  install with a plain-HTTP channel usually has a plain-HTTP object store beside it.
+- `SEALANT_CAPTURE_CA_PEM` (inline) or `SEALANT_CAPTURE_CA_FILE` (a path in the executor image)
+  names the roots the channel's certificate must chain to, **in place of** the bundled public
+  roots: a channel behind a private CA, which nothing a public CA signs can stand in for.
+  `SEALANT_CAPTURE_OBJECT_CA_PEM` / `SEALANT_CAPTURE_OBJECT_CA_FILE` do the same for object URLs
+  (a private object store), so a private install is not pushed onto the plaintext exception. Each
+  path trusts its own bundle, or the public roots when none is named.
+- Certificate and host name verification cannot be turned off. The plaintext exception does not
+  relax it.
+- No redirect is followed, on the channel or on an object URL. A 3xx is an answer: a protocol
+  error on the channel, an unexpected status on an object. A redirect would otherwise carry a
+  request to a host or a scheme the policy never checked.
+- A refusal names the host, never the path or query, since a presigned URL is a credential.
+- Proxy variables in the daemon's environment (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`) are not
+  honoured on either path. A plain-HTTP request allowed because it names loopback would otherwise
+  be handed, token and all, to whatever the variable names.
+
+Not covered: client certificates on the channel, a bundle that adds to the public roots instead of
+replacing them, and reaching the channel or the object store through a mandatory egress proxy.
+Each is later work if a deployment needs it.
+
 ### Ports and crate layout
 
 `sealant-capture` replaces the `SnapEngine`/`Receiver` pair of the first version with four ports:
@@ -432,7 +465,9 @@ reviewer may overturn without touching the rest.
    with the same epoch; never kill.
 9. Epoch travels as a field of every Registrar request, not in the token.
 10. sealantd's names for the channel material: `SEALANT_CAPTURE_ENDPOINT` and secret
-    `SEALANT_CAPTURE_TOKEN`; `SEALANT_WORKSPACE_SOURCE=capture` selects the source.
+    `SEALANT_CAPTURE_TOKEN`; `SEALANT_WORKSPACE_SOURCE=capture` selects the source. Transport:
+    `SEALANT_CAPTURE_ALLOW_PLAINTEXT`, `SEALANT_CAPTURE_CA_PEM` / `_FILE`,
+    `SEALANT_CAPTURE_OBJECT_CA_PEM` / `_FILE` (§"Transport").
 11. Staging lives at `<workspace root>/.sealantd/capture/` — the same filesystem as the tree, so
     hardlink staging works — and is excluded from captures; it uses the `Spool` discipline of
     ADR-0007 (append → replay → ack, segment rotation, disk bound), not its record format.

@@ -97,6 +97,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::manifest::{BulkState, Manifest};
+use crate::transport::{ChannelTransport, TransportError};
 
 /// `plan.get`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1048,18 +1049,26 @@ impl ConflictBody {
 }
 
 impl HttpRegistrar {
-    /// `endpoint` is `SEALANT_CAPTURE_ENDPOINT`, `token` is `SEALANT_CAPTURE_TOKEN`.
-    #[must_use]
-    pub fn new(endpoint: &str, token: &str, timeout: Duration) -> Self {
-        let config = ureq::Agent::config_builder()
-            .http_status_as_error(false)
-            .timeout_global(Some(timeout))
-            .build();
-        Self {
-            agent: ureq::Agent::new_with_config(config),
-            endpoint: endpoint.trim_end_matches('/').to_owned(),
+    /// `endpoint` is `SEALANT_CAPTURE_ENDPOINT`, `token` is `SEALANT_CAPTURE_TOKEN`. The
+    /// endpoint is checked against `transport` here, before the token is ever sent: plain HTTP
+    /// beyond loopback is refused unless the launcher allowed it, certificates are always
+    /// verified, and no redirect is followed (a 3xx answers as a protocol error).
+    ///
+    /// # Errors
+    /// [`TransportError`] when the endpoint is not one `transport` dials.
+    pub fn new(
+        endpoint: &str,
+        token: &str,
+        timeout: Duration,
+        transport: &ChannelTransport,
+    ) -> Result<Self, TransportError> {
+        let endpoint = endpoint.trim().trim_end_matches('/');
+        transport.check("the session channel (SEALANT_CAPTURE_ENDPOINT)", endpoint)?;
+        Ok(Self {
+            agent: transport.channel_agent(timeout),
+            endpoint: endpoint.to_owned(),
             token: token.to_owned(),
-        }
+        })
     }
 
     fn call<Req: Serialize, Resp: for<'de> Deserialize<'de>>(

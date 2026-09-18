@@ -27,3 +27,7 @@ nix = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# A throwaway PKI and a TLS listener for the channel transport tests.
+rcgen = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }

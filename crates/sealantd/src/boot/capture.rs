@@ -10,8 +10,8 @@ use sealant_capture::gitpack::GitRepo;
 use sealant_capture::manifest::BulkState;
 use sealant_capture::registrar::{PlanGetRequest, RegistrarMinter};
 use sealant_capture::{
-    BlobSink, CaptureConfig, CaptureEngine, HttpRegistrar, MaterializeClass, MaterializeTargets,
-    Materializer, PresignedHttp, Registrar,
+    BlobSink, CaptureConfig, CaptureEngine, ChannelTransport, HttpRegistrar, MaterializeClass,
+    MaterializeTargets, Materializer, PresignedHttp, Registrar,
 };
 
 use crate::boot::config::CaptureSourceConfig;
@@ -81,9 +81,50 @@ pub fn materialize(
     working_directory: &Path,
     workspace_root: &Path,
 ) -> Result<CaptureBoot, BootError> {
-    let registrar: Arc<dyn Registrar> =
-        Arc::new(HttpRegistrar::new(&source.endpoint, token, CHANNEL_TIMEOUT));
+    // Refused here, before the token leaves the process: plain HTTP beyond loopback without the
+    // launcher's explicit exception, a scheme that is not http(s), or an unreadable CA bundle.
+    let transport = transport_of(source)?;
+    if transport.plaintext_allowed() {
+        tracing::warn!(
+            "SEALANT_CAPTURE_ALLOW_PLAINTEXT is set: the session channel and object URLs may be \
+             dialled over plain HTTP; the network between this executor and them must be private"
+        );
+    }
+    let registrar: Arc<dyn Registrar> = Arc::new(
+        HttpRegistrar::new(&source.endpoint, token, CHANNEL_TIMEOUT, &transport)
+            .map_err(|refusal| BootError::config(refusal.to_string()))?,
+    );
     boot_from(registrar, None, source, working_directory, workspace_root)
+}
+
+/// The session's transport policy, from the capture source's environment.
+///
+/// # Errors
+/// [`BootError::Config`] when a CA bundle cannot be read or holds no certificate.
+pub(crate) fn transport_of(source: &CaptureSourceConfig) -> Result<ChannelTransport, BootError> {
+    let bundle = |pem: &Option<String>, file: &Option<PathBuf>, name: &str| match (pem, file) {
+        (Some(pem), _) => Ok(Some(pem.clone())),
+        (None, Some(path)) => std::fs::read_to_string(path)
+            .map(Some)
+            .map_err(|error| BootError::config(format!("{name} {}: {error}", path.display()))),
+        (None, None) => Ok(None),
+    };
+    let mut transport = ChannelTransport::verified().allow_plaintext(source.allow_plaintext);
+    if let Some(pem) = bundle(&source.ca_pem, &source.ca_file, "SEALANT_CAPTURE_CA_FILE")? {
+        transport = transport
+            .with_channel_ca_pem(&pem)
+            .map_err(|error| BootError::config(error.to_string()))?;
+    }
+    if let Some(pem) = bundle(
+        &source.object_ca_pem,
+        &source.object_ca_file,
+        "SEALANT_CAPTURE_OBJECT_CA_FILE",
+    )? {
+        transport = transport
+            .with_object_ca_pem(&pem)
+            .map_err(|error| BootError::config(format!("object store: {error}")))?;
+    }
+    Ok(transport)
 }
 
 /// [`materialize`] over any registrar. `sink` is the object store to read the head from; `None`
@@ -133,7 +174,13 @@ pub(crate) fn boot_from(
                 epoch,
                 plan.get_urls.clone(),
             ));
-            let sink = PresignedHttp::new(Box::new(minter.clone()), OBJECT_TIMEOUT);
+            let sink = PresignedHttp::with_transport(
+                Box::new(minter.clone()),
+                OBJECT_TIMEOUT,
+                // Built again rather than threaded through every `boot_from` caller: two small
+                // reads of the same bundles, once per boot.
+                &transport_of(source)?,
+            );
             (Arc::new(sink), Some(minter))
         }
     };
@@ -274,12 +321,45 @@ mod tests {
         sink
     }
 
+    #[test]
+    fn a_plain_http_channel_beyond_loopback_refuses_boot_before_dialling() {
+        let mut plain = source();
+        plain.endpoint = "http://mend-api:3106/channel".to_owned();
+        let tmp = tempfile::tempdir().unwrap();
+        let refusal = materialize(&plain, "session-token", &tmp.path().join("ws"), tmp.path())
+            .expect_err("refused");
+        let text = refusal.to_string();
+        assert!(text.contains("plain http to mend-api"), "{text}");
+        assert!(text.contains("SEALANT_CAPTURE_ALLOW_PLAINTEXT"), "{text}");
+        assert!(!text.contains("session-token"), "{text}");
+    }
+
+    #[test]
+    fn an_unreadable_or_empty_ca_bundle_refuses_boot() {
+        let mut missing = source();
+        missing.ca_file = Some(PathBuf::from("/nonexistent/channel-ca.pem"));
+        assert!(
+            transport_of(&missing)
+                .unwrap_err()
+                .to_string()
+                .contains("SEALANT_CAPTURE_CA_FILE")
+        );
+        let mut empty = source();
+        empty.ca_pem = Some("not a certificate".to_owned());
+        assert!(transport_of(&empty).is_err());
+    }
+
     fn source() -> CaptureSourceConfig {
         CaptureSourceConfig {
             endpoint: "http://unused".to_owned(),
             worktree_id: None,
             harness_home: None,
             raise_inotify_limit: false,
+            allow_plaintext: false,
+            ca_pem: None,
+            ca_file: None,
+            object_ca_pem: None,
+            object_ca_file: None,
         }
     }
 
