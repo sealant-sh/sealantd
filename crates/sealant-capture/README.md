@@ -68,6 +68,23 @@ socket binds.
   place, so a failure never leaves half a tree. An archive past 64 MiB is skipped; a byte budget
   belongs to the control plane that published it.
 
+## Remotes of the worktree
+
+The executor builds the worktree's repository itself: `git init`, then the head's packs. Remotes
+are configuration of the control plane's own copy and never travel in a capture, so that
+repository has none, and a harness that runs `git push origin` finds no `origin`. `plan.get`
+answers `remotes`: per remote a `name` and a `url`. `crates/sealantd/src/boot/remotes.rs` sets
+each one after the head is materialized, at boot and again at `capture.replan`, where a standby
+learns which worktree it serves.
+
+- **Name and URL only.** How a remote is authenticated stays the control plane's business; Mend
+  points git's ssh at a transport that signs on its own machine.
+- **Set, never pruned.** A missing remote is added and one that points elsewhere is updated. A
+  remote the session added itself is left alone.
+- A name or URL that could read as an option fails the boot: that is a control-plane bug. A git
+  failure is logged and skipped, and the harness runs without that remote. URLs are never logged,
+  since one may carry a credential.
+
 ## Re-plan (`capture.replan`)
 
 A standby executor boots on the project base under a placeholder worktree id and epoch (Mend's

@@ -17,6 +17,7 @@ mod dotfiles;
 mod error;
 mod git;
 mod mount;
+pub(crate) mod remotes;
 pub(crate) mod sources;
 
 use std::path::{Path, PathBuf};

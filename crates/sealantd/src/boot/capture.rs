@@ -16,6 +16,7 @@ use sealant_capture::{
 
 use crate::boot::config::CaptureSourceConfig;
 use crate::boot::error::BootError;
+use crate::boot::remotes;
 use crate::boot::sources;
 
 /// The secret-environment key carrying the session token.
@@ -239,6 +240,9 @@ pub(crate) fn boot_from(
     // Content beside the worktree (Mend's folders and reference repositories): outside the
     // worktree, so it is laid down after the head and never enters a capture.
     sources::apply(sink.as_ref(), &plan.sources, &layout)?;
+
+    // The repository above was built here, so it has no remotes until the plan names them.
+    remotes::apply(working_directory, &plan.remotes)?;
 
     let seeded = previous.is_some();
     let mut engine = CaptureEngine::open(config, previous)
