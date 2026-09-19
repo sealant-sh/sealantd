@@ -18,6 +18,7 @@ use sealant_protocol::{
 };
 
 use crate::boot::capture::{CaptureBoot, SharedMinter, SourceLayout};
+use crate::boot::remotes;
 use crate::boot::sources;
 use crate::runtime::Runtime;
 
@@ -327,6 +328,10 @@ impl CaptureRuntime {
             // session it is assigned arrive with this plan, not the boot's.
             sources::apply(self.sink.as_ref(), &plan.sources, &self.layout)
                 .map_err(|e| internal(&format!("capture sources: {e}")))?;
+            // Likewise its remotes: the placeholder has none, and the repository here was built
+            // by this executor, never cloned.
+            remotes::apply(&self.layout.working_directory, &plan.remotes)
+                .map_err(|e| internal(&format!("capture remotes: {e}")))?;
             self.runner.shipper().reset_after_replan(head_n);
             *self.identity.lock().unwrap_or_else(|e| e.into_inner()) =
                 (plan.worktree_id.clone(), plan.epoch);
@@ -400,7 +405,7 @@ mod tests {
     use std::process::Command as Proc;
     use std::time::Instant;
 
-    use sealant_capture::registrar::{HeadInfo, PlanSource};
+    use sealant_capture::registrar::{HeadInfo, PlanRemote, PlanSource};
     use sealant_capture::sink::BlobSource;
     use sealant_capture::{
         BlobSink, CaptureConfig, CaptureEngine, CaptureKind as EngineKind, Class,
@@ -712,6 +717,10 @@ mod tests {
             bytes: bytes.len() as u64,
             read_only: true,
         }]);
+        registrar.set_remotes(vec![PlanRemote {
+            name: "origin".to_owned(),
+            url: "git@example.invalid:acme/api.git".to_owned(),
+        }]);
 
         // Claim: the plan now names wt-real at epoch 1 with head n=3.
         let resp = runtime
@@ -756,6 +765,17 @@ mod tests {
             std::fs::read_to_string(docs.join("NOTES.md")).unwrap(),
             "team docs\n",
             "the assigned worktree's sources land on the re-plan"
+        );
+        let origin = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&ws)
+            .args(["remote", "get-url", "origin"])
+            .output()
+            .expect("git remote get-url");
+        assert_eq!(
+            String::from_utf8_lossy(&origin.stdout).trim(),
+            "git@example.invalid:acme/api.git",
+            "the assigned worktree's remotes are set on the re-plan"
         );
         let lease = capture.lease_epoch();
         assert_eq!(

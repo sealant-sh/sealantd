@@ -266,6 +266,9 @@ Each is later work if a deployment needs it.
   the archive's sha256 as its content stamp. A capture-source workspace has no host mounts, so
   this is the only way that content reaches it; the boot lays it down and nothing there is ever
   captured back.
+  `plan.get` may name `remotes` as well: a name and a URL each. The executor builds the worktree's
+  repository itself, so it has no remotes until the plan names them; they are set after the head
+  is materialized, at boot and at a re-plan, and nothing about authentication travels.
 - `Materializer`: `materialize(manifest, class, root)` — packs into `.git/objects/pack`, refs into
   `packed-refs`, chunks reassembled into files, hardlink groups linked, mode and mtime restored.
 

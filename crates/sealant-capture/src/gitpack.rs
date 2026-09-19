@@ -37,6 +37,17 @@ pub enum GitError {
     Io(#[from] io::Error),
 }
 
+/// What [`GitRepo::set_remote`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteChange {
+    /// The remote did not exist.
+    Added,
+    /// The remote pointed somewhere else.
+    Updated,
+    /// The remote already had this URL.
+    Unchanged,
+}
+
 /// A repository and its directories.
 #[derive(Debug, Clone)]
 pub struct GitRepo {
@@ -165,6 +176,24 @@ impl GitRepo {
             let _ = pipe.write_all(stdin);
         }
         check(args, child.wait_with_output()?)
+    }
+
+    /// Make `name` a remote with `url`, and say what that took. The caller validates both: they
+    /// reach git as plain arguments.
+    pub fn set_remote(&self, name: &str, url: &str) -> Result<RemoteChange, GitError> {
+        let key = format!("remote.{name}.url");
+        let current = git_command(&self.root)
+            .args(["config", "--local", "--get", &key])
+            .output_gated()?;
+        if !current.status.success() {
+            self.run(&["remote", "add", name, url])?;
+            return Ok(RemoteChange::Added);
+        }
+        if stdout_string(&current).trim_end_matches('\n') == url {
+            return Ok(RemoteChange::Unchanged);
+        }
+        self.run(&["remote", "set-url", name, url])?;
+        Ok(RemoteChange::Updated)
     }
 
     /// Ref name → sha for every ref (including `refs/stash`).

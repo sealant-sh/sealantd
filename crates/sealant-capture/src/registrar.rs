@@ -84,6 +84,19 @@
 //!    "read_only":true}]}
 //! ```
 //!
+//! # Remotes of the worktree
+//!
+//! The executor builds the worktree's repository itself (`git init`, then the head's packs), so
+//! it has no remotes: the ones the control plane's own copy carries never travel in a capture.
+//! A harness that runs `git push origin` would find no `origin`. The plan therefore names the
+//! remotes the repository should have, and the executor sets each one after it materializes the
+//! head. Only the name and the URL travel; how the remote is authenticated stays the control
+//! plane's business (Mend routes git's ssh through the session channel).
+//!
+//! ```json
+//! ← {…,"remotes":[{"name":"origin","url":"git@github.com:acme/api.git"}]}
+//! ```
+//!
 //! ```json
 //! → {"worktree_id":"wt","epoch":0,"platform":"linux-x86_64-gnu"}
 //! ← {"worktree_id":"wt","epoch":3,"head":{"n":7,"capture_id":"…","manifest_key":"…",
@@ -157,6 +170,21 @@ pub struct PlanGetResponse {
     /// worktree".
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sources: Vec<PlanSource>,
+    /// Remotes the worktree's repository should have. The executor builds that repository
+    /// itself, so without these it has none. Absent from an older registrar's answer, which
+    /// means "leave the repository's remotes alone".
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub remotes: Vec<PlanRemote>,
+}
+
+/// One remote of the worktree's repository: what `git remote add <name> <url>` takes. Nothing
+/// about authentication travels here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanRemote {
+    /// The remote's name, e.g. `origin`.
+    pub name: String,
+    /// The URL git dials, in any form git accepts (`https://…`, `ssh://…`, `git@host:path`).
+    pub url: String,
 }
 
 /// One archive the plan names to lay down beside the worktree. The bytes are a gzipped tar at
@@ -465,6 +493,8 @@ struct InMemoryState {
     next_upload: u64,
     /// Content the plan names beside the worktree.
     sources: Vec<PlanSource>,
+    /// Remotes the plan names for the worktree's repository.
+    remotes: Vec<PlanRemote>,
 }
 
 /// In-memory registrar: one worktree, one chain, a live epoch, a lease flag.
@@ -514,6 +544,7 @@ impl InMemoryRegistrar {
                 url_requests: 0,
                 uploads: BTreeMap::new(),
                 sources: Vec::new(),
+                remotes: Vec::new(),
                 completed: BTreeSet::new(),
                 completes: 0,
                 next_upload: 0,
@@ -667,6 +698,11 @@ impl InMemoryRegistrar {
         self.lock().sources = sources;
     }
 
+    /// What `plan.get` answers as the remotes of the worktree's repository.
+    pub fn set_remotes(&self, remotes: Vec<PlanRemote>) {
+        self.lock().remotes = remotes;
+    }
+
     /// Re-stamp the head's bulk section as captured for `platform` (tests of the `plan.get`
     /// platform rule); a head without a bulk section is left alone.
     pub fn set_bulk_platform(&self, platform: &str) {
@@ -799,6 +835,7 @@ impl Registrar for InMemoryRegistrar {
             head,
             get_urls,
             sources,
+            remotes: state.remotes.clone(),
         })
     }
 
