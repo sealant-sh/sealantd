@@ -11,6 +11,7 @@ use sealant_protocol::{
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::UnixListener;
 use tokio::sync::{Mutex, broadcast, mpsc, watch};
+use tokio::task::JoinSet;
 
 use crate::frame::{FrameError, read_frame, write_frame};
 use crate::service::{ChannelRegistry, CloserRegistry, ConnHandle, ControlService};
@@ -255,7 +256,16 @@ fn prepare_socket_path(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// How long live connections get to unwind after shutdown before they are aborted.
+const CONNECTION_DRAIN: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Bind the Unix control socket (mode `0600`) and serve connections until shutdown is signalled.
+///
+/// Returning is what lets the daemon exit, so this does not return while a connection still has
+/// a reply queued: every live connection observes the same shutdown signal, flushes its writer
+/// and ends, and those tasks are joined here (aborted after a short grace). Without the join, the
+/// reply to the very command that asked for the shutdown raced the process exit, and the client
+/// saw its connection close with the request still pending.
 ///
 /// # Errors
 /// Returns an I/O error if the socket cannot be prepared or bound.
@@ -270,6 +280,7 @@ pub async fn serve_unix<S: ControlService>(
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     let self_uid = crate::peer::self_uid();
     tracing::info!(socket = %path.display(), "control socket listening");
+    let mut connections = JoinSet::new();
 
     loop {
         tokio::select! {
@@ -278,6 +289,8 @@ pub async fn serve_unix<S: ControlService>(
                     break;
                 }
             }
+            // Reap finished connection tasks so the set does not grow without bound.
+            Some(_) = connections.join_next(), if !connections.is_empty() => {}
             accepted = listener.accept() => {
                 match accepted {
                     Ok((stream, _addr)) => {
@@ -291,7 +304,7 @@ pub async fn serve_unix<S: ControlService>(
                         let service = service.clone();
                         let shutdown = shutdown.clone();
                         let (read_half, write_half) = stream.into_split();
-                        tokio::spawn(async move {
+                        connections.spawn(async move {
                             handle_connection(service, read_half, write_half, shutdown).await;
                         });
                     }
@@ -301,7 +314,23 @@ pub async fn serve_unix<S: ControlService>(
         }
     }
 
+    // Stop accepting first, then drain: connections unwind on the signal they already hold.
+    drop(listener);
     let _ = std::fs::remove_file(path);
+    let grace = tokio::time::sleep(CONNECTION_DRAIN);
+    tokio::pin!(grace);
+    loop {
+        tokio::select! {
+            () = &mut grace => break,
+            next = connections.join_next() => {
+                if next.is_none() {
+                    break;
+                }
+            }
+        }
+    }
+    connections.abort_all();
+    while connections.join_next().await.is_some() {}
     tracing::info!("control socket closed");
     Ok(())
 }
@@ -418,6 +447,91 @@ mod tests {
 
         drop(client);
         let _ = conn.await;
+    }
+
+    /// A service that asks for shutdown from inside the request it is answering, as
+    /// `runtime.gracefulShutdown` does.
+    struct ShutdownService {
+        events: broadcast::Sender<EventEnvelope>,
+        stop: watch::Sender<bool>,
+    }
+
+    impl ControlService for ShutdownService {
+        async fn handle_on_connection(
+            &self,
+            request: ControlRequest,
+            _conn: &ConnHandle,
+        ) -> ControlResponse {
+            let _ = self.stop.send(true);
+            // The rest of the daemon's shutdown runs on other workers and is quick on an idle
+            // runtime. Holding the reply back makes that teardown win every time, not sometimes.
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            ControlResponse::ok_with(request.request_id, CommandResult::Accepted)
+        }
+        fn subscribe_events(&self) -> broadcast::Receiver<EventEnvelope> {
+            self.events.subscribe()
+        }
+        fn max_frame_bytes(&self) -> u32 {
+            64 * 1024
+        }
+    }
+
+    /// The daemon exits when `serve_unix` returns, which drops every task still running. The
+    /// server runs on a runtime of its own here and that runtime is dropped the moment
+    /// `serve_unix` returns, as a process exit would: the reply to the request that asked for the
+    /// shutdown must already be on the wire.
+    #[test]
+    fn the_reply_to_a_shutdown_request_is_sent_before_serve_unix_returns() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("control.sock");
+        let (stop, stopped) = watch::channel(false);
+        let (events, _) = broadcast::channel(16);
+        let service = Arc::new(ShutdownService { events, stop });
+
+        let server_path = path.clone();
+        let server = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            let uid = crate::peer::self_uid();
+            let served = runtime.block_on(serve_unix(service, &server_path, vec![uid], stopped));
+            drop(runtime);
+            served
+        });
+
+        let client = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        client.block_on(async {
+            let mut stream = loop {
+                match tokio::net::UnixStream::connect(&path).await {
+                    Ok(stream) => break stream,
+                    Err(_) => tokio::time::sleep(std::time::Duration::from_millis(5)).await,
+                }
+            };
+            let request = ControlRequest::new(
+                RequestId::new("req_stop"),
+                Command::RuntimeGracefulShutdown { grace_millis: None },
+            );
+            let body = sealant_protocol::encode_client(&ClientMessage::Request(request));
+            write_frame(&mut stream, &body, 64 * 1024)
+                .await
+                .expect("write");
+            let reply = read_frame(&mut stream, 64 * 1024)
+                .await
+                .expect("read")
+                .expect("the reply must arrive before the connection closes");
+            match sealant_protocol::decode_server(&reply).expect("decode") {
+                ServerMessage::Response(response) => {
+                    assert_eq!(response.request_id, RequestId::new("req_stop"));
+                    assert!(response.is_ok());
+                }
+                other => panic!("expected the shutdown reply, got {other:?}"),
+            }
+        });
+        server.join().expect("server thread").expect("serve_unix");
     }
 
     #[tokio::test]
