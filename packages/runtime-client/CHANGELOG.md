@@ -20,6 +20,12 @@
 
 ### Patch Changes
 
+- The reply to `runtime.gracefulShutdown` is sent before the daemon exits (daemon-only; the
+  packages ride the release train). The Unix control frontend spawned each connection and never
+  joined it, so once shutdown was requested the process could exit while that connection still had
+  the reply queued, and a client saw `connection closed` with its request pending. `serve_unix`
+  now stops accepting, lets live connections flush and end on the shutdown signal they already
+  hold, and joins them (aborting after two seconds), as the WebSocket frontend already did.
 - Updated dependencies [86eaf1f]
   - @sealant/runtime-protocol@0.18.0
 
