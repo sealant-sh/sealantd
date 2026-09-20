@@ -22,8 +22,9 @@ RUN set -eux; \
       *) echo "unsupported arch $(uname -m)" >&2; exit 1 ;; \
     esac; \
     rustup target add "$target"; \
-    cargo build --release --bin sealantd --target "$target"; \
-    cp "target/$target/release/sealantd" /sealantd
+    cargo build --release --bin sealantd --bin sealantctl --target "$target"; \
+    cp "target/$target/release/sealantd" /sealantd; \
+    cp "target/$target/release/sealantctl" /sealantctl
 
 # Static socat, shipped beside sealantd. The workspace control socket is bridged to the host over
 # a `docker exec` relay that needs socat in the workspace image; vendoring a fully static musl
@@ -45,6 +46,14 @@ RUN set -eux; \
 # Minimal runtime: static binaries on scratch (no shell, no libc, no attack surface).
 FROM scratch AS runtime
 COPY --from=builder /sealantd /usr/local/bin/sealantd
+# The control socket's client, shipped beside the daemon for the same reason as socat: an image
+# builder can `COPY --from` it into any base. A Lambda MicroVM's in-VM agent runs
+# `sealantctl capture flush` in the platform's suspend and terminate hooks, where no control plane
+# is connected to ask the daemon for it.
+COPY --from=builder /sealantctl /usr/local/bin/sealantctl
+# Exec form, since scratch has no shell: a client that is missing or not static fails the release
+# here, not the first MicroVM that is stopped.
+RUN ["/usr/local/bin/sealantctl", "--version"]
 COPY --from=socat-builder /socat /usr/local/bin/socat
 # Default socket lives in the workspace's runtime dir; override via flags.
 ENTRYPOINT ["/usr/local/bin/sealantd"]
