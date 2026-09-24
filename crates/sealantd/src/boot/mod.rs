@@ -213,29 +213,67 @@ fn prepare_workspace(config: &BootConfig) -> Result<(), BootError> {
     Ok(())
 }
 
+/// The glibc dynamic loader a binary built for one architecture names as its interpreter
+/// (`PT_INTERP`), and that loader's file name inside a nix glibc store path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GlibcLoader {
+    canonical: &'static str,
+    file_name: &'static str,
+}
+
+/// The loader for `arch` (a [`std::env::consts::ARCH`] value), or `None` for an architecture no
+/// workspace image is built for.
+fn glibc_loader_for(arch: &str) -> Option<GlibcLoader> {
+    match arch {
+        "x86_64" => Some(GlibcLoader {
+            canonical: "/lib64/ld-linux-x86-64.so.2",
+            file_name: "ld-linux-x86-64.so.2",
+        }),
+        "aarch64" => Some(GlibcLoader {
+            canonical: "/lib/ld-linux-aarch64.so.1",
+            file_name: "ld-linux-aarch64.so.1",
+        }),
+        _ => None,
+    }
+}
+
 /// Step 4: on Nix bases the dynamic loader may not be at the canonical path; symlink it from the
-/// nix store so binaries expecting `/lib64/ld-linux-x86-64.so.2` work. Best-effort.
+/// nix store so binaries expecting the running architecture's loader (`/lib64/ld-linux-x86-64.so.2`
+/// or `/lib/ld-linux-aarch64.so.1`) work. Best-effort.
 fn glibc_loader_shim() {
-    let canonical = Path::new("/lib64/ld-linux-x86-64.so.2");
+    let Some(loader) = glibc_loader_for(std::env::consts::ARCH) else {
+        tracing::warn!(
+            arch = std::env::consts::ARCH,
+            "nix base: no known glibc loader for this architecture; skipping shim"
+        );
+        return;
+    };
+    let canonical = Path::new(loader.canonical);
     if canonical.exists() {
         return;
     }
-    let Some(loader) = find_nix_loader() else {
-        tracing::warn!("nix base: no glibc loader found under /nix/store; skipping shim");
+    let Some(found) = find_nix_loader(Path::new("/nix/store"), loader.file_name) else {
+        tracing::warn!(
+            loader = loader.file_name,
+            "nix base: no glibc loader found under /nix/store; skipping shim"
+        );
         return;
     };
     if let Some(parent) = canonical.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    match std::os::unix::fs::symlink(&loader, canonical) {
-        Ok(()) => tracing::info!(loader = %loader.display(), "linked glibc loader shim"),
+    match std::os::unix::fs::symlink(&found, canonical) {
+        Ok(()) => tracing::info!(
+            loader = %found.display(),
+            canonical = loader.canonical,
+            "linked glibc loader shim"
+        ),
         Err(error) => tracing::warn!(%error, "failed to link glibc loader shim"),
     }
 }
 
-/// Glob `/nix/store/*-glibc-*/lib/ld-linux-x86-64.so.2` and return the first hit.
-fn find_nix_loader() -> Option<PathBuf> {
-    let store = Path::new("/nix/store");
+/// Glob `<store>/*-glibc-*/lib/<file_name>` and return the first hit.
+fn find_nix_loader(store: &Path, file_name: &str) -> Option<PathBuf> {
     let entries = std::fs::read_dir(store).ok()?;
     for entry in entries.flatten() {
         let name = entry.file_name();
@@ -243,7 +281,7 @@ fn find_nix_loader() -> Option<PathBuf> {
         if !name.contains("-glibc-") {
             continue;
         }
-        let candidate = entry.path().join("lib/ld-linux-x86-64.so.2");
+        let candidate = entry.path().join("lib").join(file_name);
         if candidate.exists() {
             return Some(candidate);
         }
@@ -699,6 +737,71 @@ mod tests {
 
     fn lookup<'a>(env: &'a [EnvVar], key: &str) -> Option<&'a str> {
         env.iter().find(|v| v.key == key).map(|v| v.value.as_str())
+    }
+
+    #[test]
+    fn the_glibc_loader_is_chosen_by_architecture() {
+        assert_eq!(
+            glibc_loader_for("x86_64"),
+            Some(GlibcLoader {
+                canonical: "/lib64/ld-linux-x86-64.so.2",
+                file_name: "ld-linux-x86-64.so.2",
+            })
+        );
+        assert_eq!(
+            glibc_loader_for("aarch64"),
+            Some(GlibcLoader {
+                canonical: "/lib/ld-linux-aarch64.so.1",
+                file_name: "ld-linux-aarch64.so.1",
+            })
+        );
+        assert_eq!(glibc_loader_for("riscv64"), None);
+    }
+
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn the_running_architecture_has_a_glibc_loader() {
+        let loader = glibc_loader_for(std::env::consts::ARCH).expect("a loader for this arch");
+        let expected = if cfg!(target_arch = "aarch64") {
+            "ld-linux-aarch64.so.1"
+        } else {
+            "ld-linux-x86-64.so.2"
+        };
+        assert_eq!(loader.file_name, expected);
+    }
+
+    #[test]
+    fn find_nix_loader_finds_the_requested_loader_in_a_glibc_store_path() {
+        let store = tempfile::tempdir().expect("store");
+        for (dir, file) in [
+            ("aaa-glibc-2.40-66", "ld-linux-x86-64.so.2"),
+            ("bbb-glibc-2.40-66", "ld-linux-aarch64.so.1"),
+            ("ccc-musl-1.2.5", "ld-linux-aarch64.so.1"),
+        ] {
+            let lib = store.path().join(dir).join("lib");
+            std::fs::create_dir_all(&lib).expect("mkdir");
+            std::fs::write(lib.join(file), b"").expect("write");
+        }
+        assert_eq!(
+            find_nix_loader(store.path(), "ld-linux-aarch64.so.1"),
+            Some(
+                store
+                    .path()
+                    .join("bbb-glibc-2.40-66/lib/ld-linux-aarch64.so.1")
+            )
+        );
+        assert_eq!(
+            find_nix_loader(store.path(), "ld-linux-x86-64.so.2"),
+            Some(
+                store
+                    .path()
+                    .join("aaa-glibc-2.40-66/lib/ld-linux-x86-64.so.2")
+            )
+        );
+        assert_eq!(
+            find_nix_loader(store.path(), "ld-linux-riscv64-lp64d.so.1"),
+            None
+        );
     }
 
     #[test]
