@@ -552,9 +552,13 @@ fn apply_stow(checkout: &Path, target_dir: &Path, home: &Home) -> Result<(), Boo
             "stow: top-level files are not packages; not applied"
         );
     }
+    // `--no-folding`: without it stow links a whole directory the home does not have yet
+    // (`~/.config` → the per-boot staging tree), so anything written there later lands in
+    // staging, and a later archive or the next boot's apply can remove it.
     for package in &top.packages {
         let mut command = Command::new("stow");
         home.identify(&mut command)
+            .arg("--no-folding")
             .arg("-d")
             .arg(checkout)
             .arg("-t")
@@ -1148,6 +1152,14 @@ mod tests {
         assert!(zshrc.symlink_metadata().expect("meta").is_symlink());
         assert_eq!(fx.read_home(".zshrc"), "export FROM_STOW=1\n");
         assert_eq!(fx.read_home(".config/nvim/init.lua"), "-- stowed\n");
+        // Linked file by file, never by folding a directory into the staging tree.
+        for dir in [".config", ".config/nvim"] {
+            let meta = fx.home_path(dir).symlink_metadata().expect("meta");
+            assert!(
+                meta.is_dir() && !meta.is_symlink(),
+                "{dir} was folded into a link"
+            );
+        }
         assert!(!fx.home_path("README.md").exists());
         assert!(!fx.home_path(".gitignore").exists());
         assert_eq!(fx.read_home(".tmux.conf"), "set -g mouse on\n");
