@@ -587,8 +587,10 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<(), BootError> {
 /// Copy one entry the way `cp -a` would: a directory recursively, a symlink as the same symlink
 /// (so a dangling or absolute link from the repository neither fails the apply nor is followed
 /// out of the tree), a file as its bytes and mode. A file or symlink already at the destination
-/// is replaced rather than written through, so a later archive never edits the tree an earlier
-/// one's symlink points into.
+/// of a file or symlink is replaced rather than written through, so a later archive never edits
+/// the file an earlier one's link points at. A directory is merged into whatever directory is at
+/// its destination, including one reached through a symlink: a directory stow folded into an
+/// earlier archive's staging tree receives the later archive's files there.
 fn copy_entry(from: &Path, to: &Path) -> Result<(), BootError> {
     let file_type = std::fs::symlink_metadata(from)
         .map_err(|e| BootError::io_path("stat", from, e))?
@@ -1172,8 +1174,9 @@ mod tests {
         assert!(linked.symlink_metadata().expect("linked").is_symlink());
         assert!(!linked.exists(), "the link still dangles");
 
-        // GNU stow (2.4) refuses a package holding an absolute symlink ("source is an absolute
-        // symlink"), so the apply, and with it boot, fails instead of linking part of the package.
+        // GNU stow (2.3.1 on Ubuntu 24.04, 2.4 on nixpkgs) refuses a package holding an absolute
+        // symlink ("source is an absolute symlink"), so the apply, and with it boot, fails
+        // instead of linking part of the package.
         let absolute = fx.source("absolute");
         write_tree(&absolute, &[("tmux/.tmux.conf", "set -g mouse on\n")]);
         std::os::unix::fs::symlink("/nonexistent/sealant/target", absolute.join("tmux/.abs"))
