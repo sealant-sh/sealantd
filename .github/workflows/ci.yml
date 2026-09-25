@@ -33,8 +33,32 @@ jobs:
       - uses: Swatinem/rust-cache@v2 # cache ~/.cargo + target so deps aren't recompiled each run
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      # The dotfiles tests apply real trees with stow and chezmoi; with the tools required they
+      # fail instead of skipping when either is missing.
+      - run: scripts/ci-install-dotfiles-tools.sh
       # ubuntu-latest is Linux, so this also runs the Linux-only tests (inotify, peer-cred, reaper).
       - run: cargo test --workspace
+        env:
+          SEALANTD_REQUIRE_DOTFILES_TOOLS: "1"
+
+  # The released daemon runs on arm64 too (Graviton MicroVMs), so the same tests run natively
+  # there. fmt is architecture-independent and stays on the job above.
+  rust-arm64:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: scripts/ci-install-dotfiles-tools.sh
+      - run: cargo test --workspace
+        env:
+          SEALANTD_REQUIRE_DOTFILES_TOOLS: "1"
 
   node:
     runs-on: blacksmith-4vcpu-ubuntu-2404

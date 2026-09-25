@@ -413,10 +413,12 @@ fn a_due_small_snap_is_not_delayed_by_a_bulk_build() {
         "one chunk (≤ 4 MiB) plus a pack finish plus a small snap: {latency:?}"
     );
 
-    // The bulk build resumes and completes.
+    // The bulk build resumes and completes. Its wall time is 30 MB of hashing at a 5 % duty
+    // cycle, which is slower on some runners (arm64 CI took over 60 s); what this test holds is
+    // the turn snap's latency above, so this bound only has to catch a build that never ends.
     let done = Instant::now();
     while runner.snapshot().bulk_snaps < 1 {
-        assert!(done.elapsed() < Duration::from_secs(60), "bulk completes");
+        assert!(done.elapsed() < Duration::from_secs(180), "bulk completes");
         std::thread::sleep(Duration::from_millis(50));
     }
     let bulk_wall = bulk_start.elapsed();
