@@ -53,10 +53,14 @@ pub enum Incomplete {
     /// Shipping kept failing until the deadline.
     #[error("shipping failed: {0}")]
     ShipFailed(String),
+    /// A final snap met work it could not read (it would have been left out of the capture).
+    #[error("unreadable work: {0}")]
+    Unreadable(String),
 }
 
 impl Incomplete {
-    /// The reason code: `snapshot-failed`, `fenced`, `conflict`, `deadline` or `ship-failed`.
+    /// The reason code: `snapshot-failed`, `fenced`, `conflict`, `deadline`, `ship-failed` or
+    /// `unreadable`.
     #[must_use]
     pub fn reason(&self) -> &'static str {
         match self {
@@ -65,6 +69,15 @@ impl Incomplete {
             Self::Conflict(_) => "conflict",
             Self::Deadline { .. } => "deadline",
             Self::ShipFailed(_) => "ship-failed",
+            Self::Unreadable(_) => "unreadable",
+        }
+    }
+
+    fn from_snap(class: Class, error: &EngineError) -> Self {
+        // SEAM(fix/capture-read-fidelity 2607672): `if error.unreadable().is_some() { return Self::Unreadable(error.to_string()); }`
+        Self::SnapshotFailed {
+            class,
+            error: error.to_string(),
         }
     }
 
@@ -372,7 +385,13 @@ impl Shared {
             }
             let outcome = self.engine().snap_preemptible(
                 SnapRequest {
-                    kind: CaptureKind::Auto,
+                    // A final flush's forced snap is a `final` one, as its small snap is: the
+                    // engine holds a final capture to stricter rules than a scheduled one.
+                    kind: if forced {
+                        CaptureKind::Final
+                    } else {
+                        CaptureKind::Auto
+                    },
                     class: Class::Bulk,
                     seq,
                 },
@@ -725,19 +744,13 @@ impl CadenceRunner {
         let mut incomplete = None;
         if let Err(error) = self.snap(CaptureKind::Final) {
             tracing::error!(%error, "final small-class snap failed");
-            incomplete = Some(Incomplete::SnapshotFailed {
-                class: Class::Small,
-                error: error.to_string(),
-            });
+            incomplete = Some(Incomplete::from_snap(Class::Small, &error));
         }
         if self.shared.capture_bulk
             && let Err(error) = self.shared.bulk_snap(true)
         {
             tracing::error!(%error, "final bulk-class snap failed");
-            incomplete.get_or_insert(Incomplete::SnapshotFailed {
-                class: Class::Bulk,
-                error: error.to_string(),
-            });
+            incomplete.get_or_insert(Incomplete::from_snap(Class::Bulk, &error));
         }
         let shipped = match self.shared.shipper.flush_final(left()) {
             Ok(shipped) => shipped,

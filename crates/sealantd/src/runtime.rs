@@ -155,9 +155,20 @@ pub struct Runtime {
     /// runtime in it would take every other's processes, so a unit test's runtime starts with
     /// a mark nobody holds.
     sweep_mark: Mutex<Option<String>>,
+    /// The last quiesce's outcome (`None`: none ran; `Some(None)`: every writer stopped). A
+    /// final flush asked again after one that stopped every writer does not quiesce again:
+    /// admission is closed, and nothing is left to stop.
+    quiesced: Mutex<Option<Option<&'static str>>>,
+    /// Quiesces run (test observability).
+    quiesces: std::sync::atomic::AtomicU64,
     features: Mutex<HashMap<Feature, bool>>,
     pidfd_supported: bool,
-    subreaper: bool,
+    /// `PR_SET_CHILD_SUBREAPER` took effect: an orphan of anything sealantd started stays its
+    /// descendant, which the final capture's sweep relies on outside a PID namespace of its own.
+    subreaper: AtomicBool,
+    /// The workspace's own Docker daemon, whose containers the final capture stops
+    /// ([`crate::docker`]). Set by boot; none by default.
+    workspace_docker: Mutex<Option<crate::docker::DockerEndpoint>>,
 }
 
 impl Runtime {
@@ -242,10 +253,13 @@ impl Runtime {
             shutdown,
             admission_closed: AtomicBool::new(false),
             final_lock: tokio::sync::Mutex::new(()),
+            quiesced: Mutex::new(None),
+            quiesces: std::sync::atomic::AtomicU64::new(0),
             sweep_mark: Mutex::new(cfg!(test).then(|| format!("unit-test-{}", new_unit_mark()))),
             features,
             pidfd_supported,
-            subreaper,
+            subreaper: AtomicBool::new(subreaper),
+            workspace_docker: Mutex::new(None),
         })
     }
 
@@ -281,9 +295,12 @@ impl Runtime {
     /// The report's `complete` is true only when all of that happened; every failure is
     /// `complete: false` with its reason, logged at error, and the staging directory stays as
     /// it is. `deadline_ms` bounds the whole of it (the grace included); none: until complete,
-    /// or until it never can be (a fence, a conflict, a failed snap). Serialized: a second
-    /// final flush waits for the first, then runs again (nothing is left to terminate). `None`
-    /// without a capture engine.
+    /// or until it never can be (a fence, a conflict, a failed snap). A flush that returned at
+    /// its deadline does not end the daemon: admission stays closed, the writers stay stopped,
+    /// the ship worker keeps uploading, and `capture.status` turns `complete` once it is done.
+    /// Idempotent: serialized, and a final flush asked again after one that stopped every
+    /// writer does not stop them again, and snaps only what changed (nothing, as a rule) before
+    /// it ships what is left. `None` without a capture engine.
     pub async fn final_flush(
         &self,
         deadline_ms: Option<u64>,
@@ -295,21 +312,27 @@ impl Runtime {
         let deadline = deadline_ms.map(Duration::from_millis);
         let grace = Duration::from_millis(grace_ms.unwrap_or_else(|| self.shutdown.grace_ms()));
         let grace = deadline.map_or(grace, |d| grace.min(d));
-        let remaining = self.quiesce(grace).await;
-        let left = deadline.map(|d| d.saturating_sub(start.elapsed()));
-        let flushing = Arc::clone(&capture);
-        let report = match tokio::task::spawn_blocking(move || {
-            flushing.flush_final(left, remaining)
-        })
-        .await
-        {
-            Ok(report) => report,
-            Err(error) => {
-                tracing::error!(%error, "final capture flush task failed");
-                capture.record_final_incomplete("internal");
-                capture.status()
+        let previous = *self.quiesced.lock().unwrap_or_else(|e| e.into_inner());
+        let quiesced = match previous {
+            // Every writer stopped the last time, and admission has been closed since.
+            Some(None) => None,
+            _ => {
+                let quiesced = self.quiesce(grace).await;
+                *self.quiesced.lock().unwrap_or_else(|e| e.into_inner()) = Some(quiesced);
+                quiesced
             }
         };
+        let left = deadline.map(|d| d.saturating_sub(start.elapsed()));
+        let flushing = Arc::clone(&capture);
+        let report =
+            match tokio::task::spawn_blocking(move || flushing.flush_final(left, quiesced)).await {
+                Ok(report) => report,
+                Err(error) => {
+                    tracing::error!(%error, "final capture flush task failed");
+                    capture.record_final_incomplete("internal");
+                    capture.status()
+                }
+            };
         if report.complete {
             tracing::info!(
                 head_n = ?report.head_n,
@@ -343,9 +366,12 @@ impl Runtime {
     /// process group and `SIGHUP` to every session, `SIGKILL` after `grace`, and awaited; then
     /// at the same time every process outside those groups ([`crate::sweep`]: the PID namespace
     /// when sealantd is its PID 1, else sealantd's descendants) the same way.
-    /// Returns how many are still alive after that.
-    async fn quiesce(&self, grace: Duration) -> usize {
+    /// Every container of the workspace's own Docker daemon is stopped at the same time. Returns
+    /// why the capture that follows cannot be complete (`processes-remain`,
+    /// `sweep-unavailable`), or `None`.
+    async fn quiesce(&self, grace: Duration) -> Option<&'static str> {
         self.admission_closed.store(true, Ordering::SeqCst);
+        self.quiesces.fetch_add(1, Ordering::Relaxed);
         let sftp = self.sftp.close_all();
         let (signal, grace) = if self.shutdown.is_hard() {
             (Signal::Kill, Duration::ZERO)
@@ -378,20 +404,50 @@ impl Runtime {
                 .is_none_or(|m| crate::sweep::has_env_entry(pid, SWEEP_MARK_ENV, m))
         };
         let sweeper = crate::sweep::Sweeper::this_process();
+        let docker = self
+            .workspace_docker
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         let started = Instant::now();
-        let ((), (), (swept, sweep_left)) = tokio::join!(
+        // And every container of the workspace's own Docker daemon: a container can bind-mount
+        // the worktree, and its processes are neither in sealantd's groups nor its descendants.
+        let stop_containers = async {
+            match &docker {
+                None => Ok(None),
+                Some(endpoint) => crate::docker::stop_all(endpoint, grace).await.map(Some),
+            }
+        };
+        let ((), (), (swept, sweep_left), containers) = tokio::join!(
             self.sessions.terminate_all(grace),
             self.processes.terminate_all(signal, grace),
             sweeper.sweep(grace, self.shutdown.is_hard(), &admit),
+            stop_containers,
         );
         let managed_left = self.processes.registry.running().len() + self.sessions.registry.len();
-        let remaining = managed_left + sweep_left;
+        let (containers_stopped, containers_left) = match &containers {
+            Ok(None) => (0, 0),
+            Ok(Some(stopped)) => (stopped.containers, stopped.running),
+            Err(error) => {
+                // Known to exist and not reached: nobody knows what still runs there.
+                tracing::error!(
+                    endpoint = %docker.as_ref().map(ToString::to_string).unwrap_or_default(),
+                    %error,
+                    "the workspace's Docker daemon could not be reached; its containers may \
+                     still be writing"
+                );
+                (0, 1)
+            }
+        };
+        let remaining = managed_left + sweep_left + containers_left;
+        let sweep_unavailable = self.sweep_unavailable();
         tracing::info!(
             processes = running.len(),
             sessions,
             sftp,
             swept,
             sweep_scope = ?sweeper.scope,
+            containers = containers_stopped,
             remaining,
             took_ms = started.elapsed().as_millis() as u64,
             "admission closed; every writer terminated for the final capture"
@@ -399,10 +455,50 @@ impl Runtime {
         if remaining > 0 {
             tracing::error!(
                 remaining,
-                "processes outlived SIGKILL; the final capture cannot be complete"
+                "processes or containers outlived SIGKILL; the final capture cannot be complete"
             );
+            return Some("processes-remain");
         }
-        remaining
+        if sweep_unavailable {
+            tracing::error!(
+                "this daemon is not a child subreaper: an orphan may have left its descendants \
+                 unseen; the final capture cannot be complete"
+            );
+            return Some("sweep-unavailable");
+        }
+        None
+    }
+
+    /// Whether the final capture's sweep cannot guarantee it sees every writer: outside a PID
+    /// namespace of its own it takes sealantd's descendants, and without
+    /// `PR_SET_CHILD_SUBREAPER` an orphan is re-parented away from sealantd, out of sight.
+    /// Every final flush on such a daemon is incomplete (`sweep-unavailable`).
+    #[must_use]
+    pub fn sweep_unavailable(&self) -> bool {
+        crate::sweep::Scope::detect() == crate::sweep::Scope::Descendants
+            && !self.subreaper.load(Ordering::Relaxed)
+    }
+
+    /// How many times a final flush stopped the writers (test observability).
+    #[doc(hidden)]
+    #[must_use]
+    pub fn quiesce_count(&self) -> u64 {
+        self.quiesces.load(Ordering::Relaxed)
+    }
+
+    /// Test hook: behave as if `PR_SET_CHILD_SUBREAPER` had (not) taken effect.
+    #[doc(hidden)]
+    pub fn set_subreaper_for_test(&self, subreaper: bool) {
+        self.subreaper.store(subreaper, Ordering::Relaxed);
+    }
+
+    /// The workspace's own Docker daemon, whose containers every final capture stops
+    /// ([`crate::docker::workspace_endpoint`]).
+    pub fn set_workspace_docker(&self, endpoint: Option<crate::docker::DockerEndpoint>) {
+        *self
+            .workspace_docker
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = endpoint;
     }
 
     /// Narrow the final flush's sweep to processes whose environment holds
@@ -689,7 +785,7 @@ impl Runtime {
                 network: self.network.capability_mode(),
                 privileged: false,
                 pidfd: self.pidfd_supported,
-                subreaper: self.subreaper,
+                subreaper: self.subreaper.load(Ordering::Relaxed),
                 pipe_sessions: true,
             },
             limits: self.config.limits,

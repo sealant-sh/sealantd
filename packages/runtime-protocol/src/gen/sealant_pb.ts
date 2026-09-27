@@ -2416,8 +2416,11 @@ export type CaptureStatusReport = Message<"sealant.v1.CaptureStatusReport"> & {
   complete: boolean;
 
   /**
-   * Why `complete` is false: `not-final` (no final flush has run), `processes-remain` (a managed
-   * process outlived SIGKILL), `snapshot-failed` (a final snap of either class failed),
+   * Why `complete` is false: `not-final` (no final flush has run), `processes-remain` (a process
+   * or a container of the workspace's Docker daemon outlived SIGKILL, or that daemon could not
+   * be reached), `sweep-unavailable` (the daemon cannot see every writer: not a child subreaper
+   * and not PID 1 of its PID namespace), `snapshot-failed` (a final snap of either class failed),
+   * `unreadable` (a final snap met work it could not read),
    * `fenced`, `conflict` (the chain moved under this executor), `deadline` (`deadline_ms`
    * passed with captures pending), `ship-failed` (shipping kept failing until the deadline),
    * `pending` (a capture was staged after the final flush), `internal` (the flush's task

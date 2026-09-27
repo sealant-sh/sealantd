@@ -501,38 +501,79 @@ async fn boot_serve(
         if runtime.install_capture(capture_runtime.clone()) {
             capture_runtime.start(runtime.clone(), harness_process_id.clone());
         }
+        // What the final capture stops besides the processes sealantd started.
+        match &config.workspace_docker {
+            Some(endpoint) => tracing::info!(
+                %endpoint,
+                "the final capture stops every container of the workspace's Docker daemon"
+            ),
+            None => tracing::info!("no workspace Docker daemon; no container to stop at the end"),
+        }
+        runtime.set_workspace_docker(config.workspace_docker.clone());
+        if runtime.sweep_unavailable() {
+            tracing::error!(
+                "PR_SET_CHILD_SUBREAPER did not take effect and sealantd is not PID 1 of its PID \
+                 namespace: the final capture cannot see an orphaned writer, and every final \
+                 flush will answer complete: false (sweep-unavailable)"
+            );
+        }
     }
 
     // Step 16: supervise — wait for the harness exit OR a shutdown signal.
-    let exit_code = tokio::select! {
-        status = await_exit_on(&mut harness_events, &harness_process_id) => {
-            if runtime.admission_is_closed() {
-                // A final capture flush (SIGTERM, SIGINT, gracefulShutdown, capture.flush
-                // final) terminated it: the stop that was asked for, as when the shutdown
-                // request wins this race.
-                tracing::info!("harness terminated for the final capture; shutting down");
-                ExitCode::SUCCESS
-            } else {
-                tracing::info!("harness exited; shutting down");
-                exit_code_from_status(status)
-            }
-        }
-        () = runtime.shutdown().wait() => {
-            tracing::info!("shutdown requested; terminating harness");
-            ExitCode::SUCCESS
-        }
+    enum Woke {
+        Harness(ExitStatus),
+        Shutdown,
+        ControlEnded,
+    }
+    let woke = tokio::select! {
+        status = await_exit_on(&mut harness_events, &harness_process_id) => Woke::Harness(status),
+        () = runtime.shutdown().wait() => Woke::Shutdown,
         join = &mut control_handle => {
             if let Err(error) = join {
                 tracing::warn!(%error, "control server task ended unexpectedly");
             }
-            ExitCode::FAILURE
+            Woke::ControlEnded
         }
     };
+    let exit_code = match woke {
+        Woke::Harness(_) if runtime.admission_is_closed() => {
+            // A final capture flush terminated it. Its own stop follows when the flush came
+            // from SIGTERM, SIGINT or gracefulShutdown. When it came from `capture.flush`, the
+            // control plane decides when this executor ends: it polls `capture.status`, or asks
+            // for the flush again, until `complete` — the daemon stays up meanwhile, admission
+            // closed and the ship worker uploading, and never exits on its own.
+            tracing::info!("harness terminated by a final capture flush; waiting for the stop");
+            if control_handle.is_finished() {
+                ExitCode::FAILURE
+            } else {
+                tokio::select! {
+                    () = runtime.shutdown().wait() => ExitCode::SUCCESS,
+                    join = &mut control_handle => {
+                        if let Err(error) = join {
+                            tracing::warn!(%error, "control server task ended unexpectedly");
+                        }
+                        ExitCode::FAILURE
+                    }
+                }
+            }
+        }
+        Woke::Harness(status) => {
+            tracing::info!("harness exited; shutting down");
+            exit_code_from_status(status)
+        }
+        Woke::Shutdown => {
+            tracing::info!("shutdown requested; terminating harness");
+            ExitCode::SUCCESS
+        }
+        Woke::ControlEnded => ExitCode::FAILURE,
+    };
 
-    // Step 16b: the final capture — admission closed, every managed process terminated and
-    // awaited (the harness is gone; its lifecycle siblings, sessions and execs may not be), then
-    // both classes snapped and everything registered. It waits for a final flush already
-    // running (the signal listener's, a control command's) and runs once more after it.
+    // Step 16b: the final capture — admission closed, every writer terminated and awaited (the
+    // harness is gone; its lifecycle siblings, sessions, execs, escaped processes and the
+    // workspace's containers may not be), then both classes snapped and everything registered,
+    // with no deadline. It waits for a final flush already running (the signal listener's, a
+    // control command's); after one that stopped every writer it neither stops them again nor
+    // re-snaps an unchanged disk, and ships what is left. Exit 75 applies to this path only.
     runtime.final_flush(None, None).await;
     // A daemon whose final capture is incomplete never exits 0: what is on this disk is not
     // all in the store, and whoever tears the workspace down must know.

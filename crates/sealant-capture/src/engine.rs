@@ -1282,8 +1282,13 @@ impl CaptureEngine {
             None => self.previous.as_ref(),
         };
 
-        // Nothing changed: an `auto` snap stages nothing rather than growing the chain.
-        if req.kind == CaptureKind::Auto
+        // Nothing changed: an `auto` snap stages nothing rather than growing the chain, and nor
+        // does a final flush's bulk snap (its small snap is the capture that marks the end), or
+        // a final snap over a final capture (the same final flush asked again).
+        if (req.kind == CaptureKind::Auto
+            || (req.kind == CaptureKind::Final
+                && (req.class == Class::Bulk
+                    || follows.is_some_and(|p| p.manifest.kind == CaptureKind::Final))))
             && let Some(prev) = follows
             && prev.manifest.sections == sections
         {

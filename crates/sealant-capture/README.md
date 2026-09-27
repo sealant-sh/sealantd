@@ -276,8 +276,18 @@ restore, byte for byte, so the user never notices the compute changed.
      sealantd, which as the child subreaper inherits every orphan of what it started — the
      VM's agent and its `sealantctl` are never touched. sealantd, its threads, its own helpers
      (its own process group: the capture engine's `git`), kernel threads and zombies are left
-     alone;
-  3. the small class and, forced, the bulk class are snapped (`CadenceRunner::flush_final`) —
+     alone. A daemon that is not PID 1 of its namespace and did not become a child subreaper
+     cannot see an orphan, so every final flush it runs is incomplete (`sweep-unavailable`,
+     logged at boot). And every running container of the workspace's own Docker daemon is
+     stopped (`POST /containers/{id}/stop?t=<grace>`, `crates/sealantd/src/docker.rs`) until
+     the daemon reports none running: a container can bind-mount the worktree. The daemon is
+     `SEALANT_WORKSPACE_DOCKER_HOST`, else a `DOCKER_HOST` Core reserves for the workspace's
+     own daemon — `unix:///run/docker/docker.sock` (Docker in the MicroVM, the Kubernetes dind
+     sidecar) or `tcp://docker:2375` (the Docker adapter's dind sidecar); any other
+     `DOCKER_HOST` (a host daemon) is never touched. A container left running, or a daemon
+     named and not reached, is `processes-remain`;
+  3. the small class and, forced, the bulk class are snapped (`CadenceRunner::flush_final`),
+     both as `final` snaps —
      whatever the bulk clocks say; a scheduled bulk build in progress yields to it at its next
      chunk boundary and the forced snap resumes its progress, re-reading only files whose size,
      mtime or inode moved;
@@ -295,9 +305,19 @@ restore, byte for byte, so the user never notices the compute changed.
   `pending_bulk`, `pending_bytes`, `refused`). Without a deadline — the daemon's own paths
   never give one — a transport failure is retried with backoff, a held capture is waited for, a
   lost lease is waited out, and only the process ending (or a fence, a conflict, a failed snap)
-  stops it. One final flush runs at a time; a second waits, then runs again. A daemon whose
-  final flush is not complete exits with 75 (`EX_TEMPFAIL`), never 0, logs `FINAL CAPTURE
-  INCOMPLETE` at error, and leaves the staging directory as it is.
+  stops it.
+
+  A flush that returned at its `deadline_ms` ends nothing: the daemon stays up, admission stays
+  closed, the writers stay stopped, the ship worker keeps uploading, and `capture.status` turns
+  `complete` once it has (`incomplete_reason` stays `deadline` or `ship-failed` meanwhile). The
+  harness a `capture.flush` terminated does not end the daemon either: boot waits for the stop
+  (SIGTERM, SIGINT, `runtime.gracefulShutdown`) the control plane sends when it decides. One
+  final flush runs at a time, and one asked again is idempotent: after a flush that stopped
+  every writer it does not stop them again, a final snap over a final capture of an unchanged
+  disk stages nothing, and it ships what is left. Only the daemon's own way out (SIGTERM,
+  SIGINT, `runtime.gracefulShutdown`, the harness exiting on its own), whose final flush has no
+  deadline, exits with 75 (`EX_TEMPFAIL`) when it ends incomplete — never 0 — after logging
+  `FINAL CAPTURE INCOMPLETE` at error, and leaves the staging directory as it is.
 - **A deadline is the caller's.** The daemon used to clamp every flush's deadline to its
   shutdown grace (10 s, never configured at boot), so a caller that allowed 30 minutes for a
   dependency tree got 10 s. A flush now runs for exactly the `deadline_ms` it was given. A
@@ -347,7 +367,10 @@ that runs past the 10 s it was once clamped to, the grace bounding a suspend flu
 deadline, a writer's `SIGTERM` handler landing in the head of a final flush and of
 `runtime.gracefulShutdown`, and the fenced and cut-short final flushes answering incomplete;
 `crates/sealantd/tests/final_sweep.rs` a `setsid`'d, double-forked writer stopped before the
-last snap, its `SIGTERM` handler's file in the head;
+last snap, its `SIGTERM` handler's file in the head; `crates/sealantd/src/capture.rs` also the
+containers of a fake Docker daemon stopped (and a stuck one, or no daemon, incomplete), a
+daemon without a subreaper incomplete, and a flush past its deadline completing in the
+background and answering `complete` when asked again without a second quiesce;
 `crates/sealantd/src/boot/capture.rs` another platform's dependency tree carried through an
 executor's captures and restored on its own platform byte for byte.
 
@@ -401,8 +424,10 @@ terminated and awaited, the small and the bulk class snapped after that, everyth
 — and while that still holds (nothing staged since, the lease not fenced). It is the only answer
 a control plane may read as saved: `pending == 0` alone is not (a failed snap leaves nothing
 pending). `incomplete_reason` says why not: `not-final`, `processes-remain`, `snapshot-failed`,
-`fenced`, `conflict`, `deadline`, `ship-failed`, `pending` (staged after the final flush) or
-`internal`; absent when `complete`. An older daemon's report decodes with `complete: false`.
+`fenced`, `conflict`, `deadline`, `ship-failed`, `pending` (staged after the final flush),
+`sweep-unavailable`, `unreadable` or `internal`; absent when `complete`. After a flush that
+returned at its deadline (`deadline`, `ship-failed`), `complete` turns true once the worker has
+shipped the rest: poll `capture.status`, or send the final flush again. An older daemon's report decodes with `complete: false`.
 
 ```json
 ← {"pending":0,"pendingBulk":0,"pendingBytes":0,"complete":true}
