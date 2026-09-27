@@ -293,9 +293,12 @@ impl Runtime {
     ///
     /// 1. admission closes for good — no new process, exec, session, SFTP bridge, execution,
     ///    bind or re-plan;
-    /// 2. every managed process and session is terminated (a process the fence paused is
-    ///    continued, then `SIGTERM`; `SIGKILL` after `grace_ms`, the shutdown grace when
-    ///    absent; a hard shutdown kills at once) and awaited, and SFTP bridges are closed;
+    /// 2. every writer is terminated and awaited (the quiesce): SFTP bridges are
+    ///    closed; the containers of the workspace's own Docker daemon are stopped first, while
+    ///    the processes that may stream their output still run; then every managed process and
+    ///    session (a process the fence paused is continued, then `SIGTERM`; `SIGKILL` after
+    ///    `grace_ms`, the shutdown grace when absent; a hard shutdown kills at once) and every
+    ///    process the sweep finds; then the containers again;
     /// 3. the small AND the bulk class are snapped — both must succeed;
     /// 4. everything ships until nothing is pending.
     ///

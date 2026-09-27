@@ -150,7 +150,7 @@ impl Sweeper {
     /// The live processes of `procs` the sweep stops, `admit` narrowing them further. `peers`
     /// are the pids at the far end of live control connections: each is spared with its
     /// ancestors (short of PID 1) when that chain does not pass through sealantd
-    /// ([`Sweeper::spared`]).
+    /// (`Sweeper::spared`).
     #[must_use]
     pub fn select(
         &self,
