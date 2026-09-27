@@ -3,10 +3,10 @@
 //! In Docker, Core reaches sealantd through `docker exec … socat - UNIX-CONNECT:<control
 //! socket>`. sealantd is PID 1 of the container's PID namespace there, so the sweep takes every
 //! process in the namespace — the `socat` carrying the `capture.flush {kind: final}` included:
-//! it was sent `SIGTERM` while the flush ran, and the reply was lost ("connection closed" on
-//! every stop; the saved state was seen only on the next poll). The sweep now spares the
-//! process at the far end of each live control connection (`SO_PEERCRED`) and its ancestors,
-//! unless sealantd started it.
+//! nothing can tell a relay from a writer (an external client, or its parent, could write the
+//! workspace too), so none is spared. The reply to that request is lost with it; the outcome is
+//! not. `capture.status` reads it, and the final flush asked again answers `complete` at once,
+//! without stopping anything twice (review 2026-09-28 #18).
 //!
 //! Its own test binary: the relay must be orphaned before this process becomes a child
 //! subreaper (`Runtime::new`), so it is not sealantd's descendant — as `docker exec`'s `socat`
@@ -164,7 +164,7 @@ fn orphan(script: &str, args: &[&Path], env: &[(&str, String)], pid_file: &Path)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_final_flush_spares_the_relay_carrying_its_reply() {
+async fn a_final_flush_sweeps_the_relay_and_the_final_flush_asked_again_answers_complete() {
     let tmp = tempfile::tempdir().unwrap();
     let base = tmp.path();
     let mark = format!("control-peer-{}", std::process::id());
@@ -252,34 +252,80 @@ async fn a_final_flush_spares_the_relay_carrying_its_reply() {
     )
     .await
     .unwrap();
-    let report = loop {
-        let frame = tokio::time::timeout(Duration::from_secs(60), read_frame(&mut front, 16 << 20))
-            .await
-            .expect("an answer within a minute")
-            .expect("a frame");
-        let Some(body) = frame else {
-            panic!("the connection carrying the final flush closed before its reply");
-        };
-        if let ServerMessage::Response(response) = decode_server(&body).unwrap() {
-            match response.outcome {
-                ResponseOutcome::Ok {
-                    result: Some(CommandResult::CaptureStatus(report)),
-                } => break report,
-                other => panic!("capture.flush: {other:?}"),
+    // The relay is swept like every other process: the connection closes before the reply.
+    let closed = tokio::time::timeout(Duration::from_secs(60), async {
+        while let Ok(Some(body)) = read_frame(&mut front, 16 << 20).await {
+            if let ServerMessage::Response(response) = decode_server(&body).unwrap() {
+                panic!("the relay was spared and carried the reply: {response:?}");
             }
         }
-    };
-    assert!(report.complete, "{report:?}");
-    assert!(alive(relay), "the relay carrying the reply was spared");
+    })
+    .await;
     assert!(
-        !alive(bystander),
-        "the sweep ran over the namespace: the bystander is stopped"
+        closed.is_ok(),
+        "the relay's connection closed within a minute"
     );
-    assert_eq!(runtime.health_report().active_processes, 0);
-    drop(front);
     let start = Instant::now();
     while alive(relay) && start.elapsed() < Duration::from_secs(10) {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    assert!(!alive(relay), "the relay ends once its connection closes");
+    assert!(!alive(relay), "the relay carrying the request was swept");
+    assert!(
+        !alive(bystander),
+        "the sweep ran over the namespace: the bystander is stopped"
+    );
+
+    // Core, on "connection closed" during a final flush, asks again: the outcome is kept.
+    let ask = |id: &'static str, command: Command| {
+        let socket = control_sock.clone();
+        async move {
+            let mut stream = tokio::net::UnixStream::connect(&socket).await.unwrap();
+            let request = ControlRequest::new(RequestId::new(id), command);
+            write_frame(
+                &mut stream,
+                &encode_client(&ClientMessage::Request(request)),
+                16 << 20,
+            )
+            .await
+            .unwrap();
+            loop {
+                let frame = tokio::time::timeout(
+                    Duration::from_secs(60),
+                    read_frame(&mut stream, 16 << 20),
+                )
+                .await
+                .expect("an answer within a minute")
+                .expect("a frame")
+                .expect("the direct connection answers");
+                if let ServerMessage::Response(response) = decode_server(&frame).unwrap() {
+                    match response.outcome {
+                        ResponseOutcome::Ok {
+                            result: Some(CommandResult::CaptureStatus(report)),
+                        } => break report,
+                        other => panic!("{id}: {other:?}"),
+                    }
+                }
+            }
+        }
+    };
+    let quiesces = runtime.quiesce_count();
+    let again = ask(
+        "final-again",
+        Command::CaptureFlush {
+            kind: CaptureFlushKind::Final,
+            deadline_ms: None,
+            grace_ms: Some(2_000),
+        },
+    )
+    .await;
+    assert!(again.complete, "{again:?}");
+    assert_eq!(
+        runtime.quiesce_count(),
+        quiesces,
+        "the final flush asked again does not stop the writers twice"
+    );
+    let status = ask("status", Command::CaptureStatus).await;
+    assert!(status.complete, "{status:?}");
+    assert_eq!(status.head_n, again.head_n, "the same outcome, read twice");
+    assert_eq!(runtime.health_report().active_processes, 0);
 }

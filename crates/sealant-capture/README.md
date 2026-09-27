@@ -405,15 +405,18 @@ restore, byte for byte, so the user never notices the compute changed.
      the namespace, `docker exec`'d ones included; otherwise (a Lambda MicroVM, where Core's
      agent is PID 1 and starts `sealantd boot`; `sealantd serve`), every descendant of
      sealantd, which as the child subreaper inherits every orphan of what it started — the
-     VM's agent and its `sealantctl` are never touched. sealantd, its threads, its own helpers
-     (its own process group: the capture engine's `git`), kernel threads and zombies are left
-     alone, and so is the process at the far end of a live control-socket connection
-     (`SO_PEERCRED`) with its ancestors short of PID 1, while that connection is open — when
-     its ancestry leaves the namespace or reaches PID 1 without passing through sealantd: in
-     Docker, Core reaches the socket through `docker exec … socat - UNIX-CONNECT:…`, and
-     stopping that `socat` lost the final flush's own reply ("connection closed" on every
-     stop). A process sealantd started or adopted is swept whatever connection it holds. A
-     daemon that is not PID 1 of its namespace and did not become a child subreaper
+     VM's agent and its `sealantctl` are never touched. sealantd, its threads, kernel threads
+     and zombies are left alone, and so are its own helpers: the pids sealantd spawned itself
+     and has not reaped (the spawn gate, `sealant_process::spawn`) that stayed in its own
+     process group — the capture engine's `git` — with their children still in that group. A
+     process that joined sealantd's process group, or that sealantd only adopted, is swept.
+     Nothing else is spared, the far end of a control connection included: in Docker, Core
+     reaches the socket through `docker exec … socat - UNIX-CONNECT:…`, and that `socat` is
+     swept with the rest (nothing tells a relay from a writer). The reply to the request that
+     ended the executor may be lost with it ("connection closed"); the outcome is not:
+     `capture.status` reads it, and a final flush asked again answers it at once without
+     stopping anything twice. Core, on "connection closed" during a final flush, reads
+     `capture.status` or asks the final flush again. A daemon that is not PID 1 of its namespace and did not become a child subreaper
      cannot see an orphan, so every final flush it runs is incomplete (`sweep-unavailable`,
      logged at boot). And every running container of the workspace's own Docker daemon is
      stopped (`POST /containers/{id}/stop?t=<grace>`, `crates/sealantd/src/docker.rs`) until
@@ -541,13 +544,15 @@ the refusals; `tests/restage_crash.rs` the restage; `crates/sealantd/src/capture
 that runs past the 10 s it was once clamped to, the grace bounding a suspend flush without a
 deadline, a writer's `SIGTERM` handler landing in the head of a final flush and of
 `runtime.gracefulShutdown`, and the fenced and cut-short final flushes answering incomplete;
-`crates/sealantd/tests/final_sweep.rs` a `setsid`'d, double-forked writer stopped before the
-last snap, its `SIGTERM` handler's file in the head;
+`crates/sealantd/tests/final_sweep.rs` a `setsid`'d, double-forked writer and a writer that
+joined sealantd's process group stopped before the last snap, their `SIGTERM` handlers' files
+in the head;
 `tests/flush_modes.rs` a preempted scheduled bulk build not resuming after the final flush;
 `crates/sealantd/src/capture.rs` no scheduled snap after a final flush, and a bulk capture
 being built after it reported incomplete;
 `crates/sealantd/tests/final_sweep_control_peer.rs` the relay carrying a final flush over a
-real control socket spared (its reply arrives) while a bystander in the same scope is stopped; `crates/sealantd/src/capture.rs` also the
+real control socket swept with a bystander in the same scope, and the final flush asked again
+answering `complete` (and `capture.status` the same) without a second quiesce; `crates/sealantd/src/capture.rs` also the
 containers of a fake Docker daemon stopped (and a stuck one, or no daemon, incomplete), stopped
 before the process streaming their output into the worktree (its last line in the head) and a
 container a process started on its way out stopped after the processes, a
