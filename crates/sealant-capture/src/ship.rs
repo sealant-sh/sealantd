@@ -828,6 +828,29 @@ impl Staging {
         }
         Ok(total)
     }
+
+    /// Bytes staged on this disk that no queued entry lists and no upload took: the packs a
+    /// bulk build in progress has written so far (they join a capture when the build ends). What
+    /// a drain must still count while the build runs.
+    pub fn unqueued_bytes(&self, queued: &[QueueEntry]) -> io::Result<u64> {
+        let listed: HashSet<&str> = queued
+            .iter()
+            .flat_map(|e| e.uploads.iter().map(|u| u.file.as_str()))
+            .collect();
+        let mut total = 0;
+        for d in fs::read_dir(self.objects_dir())? {
+            let d = d?;
+            let name = d.file_name();
+            let name = name.to_string_lossy();
+            if d.file_type()?.is_file()
+                && !listed.contains(name.as_ref())
+                && !self.is_uploaded(&name)
+            {
+                total += d.metadata()?.len();
+            }
+        }
+        Ok(total)
+    }
 }
 
 /// A CPU-time duty cycle (amendment decision 12): after each unit of work, if this thread's CPU

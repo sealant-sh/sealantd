@@ -1024,6 +1024,11 @@ pub struct CaptureStatusReport {
     /// The refused capture waits to be rebuilt from disk; nothing behind it registers first.
     #[serde(default)]
     pub repairing: bool,
+    /// A bulk build is in progress (reading, or paused mid-way for a small capture): its
+    /// capture is not queued yet, so `pending` and `pending_bulk` do not count it, but
+    /// `pending_bytes` counts what it has staged so far. A drain is not done while this is true.
+    #[serde(default)]
+    pub bulk_building: bool,
 }
 
 /// Result of `capture.replan`: the identity the executor now acts under and what the delta

@@ -49,6 +49,17 @@ the two trees compare identical (bytes, modes, mtimes, links — tracked files' 
 worktree metadata overlay), and the head over itself writes and changes nothing. This is what lets a standby executor pre-materialize the project base and apply the
 claimed worktree's head over it (`capture.replan`).
 
+**The next capture is incremental too.** A restored executor learns where the head's chunks are:
+at open (and at a re-plan) the engine maps the chunks of every workspace and bulk pack the
+registered head names that the materializer left in the pack cache (and, writing dir packs, the
+dir objects of its dir packs), and keeps the chunk locations of earlier epochs that point into
+packs the head names. The materialized files' stat is in the class indexes already, so the next
+capture reads and packs only what changed and names the head's packs for the rest, across
+epochs, on its chain. Before, a new epoch forgot every earlier epoch's chunk locations: the
+first bulk capture after a resume read and uploaded the whole dependency tree again (Docker end
+to end: 119,414 files and 1.4 GB for one new 300 MB file; `tests/resume_incremental.rs`: 300
+files read and packed again, now 0, and a new file costs one read).
+
 ## Worktree metadata and refs (`worktree_meta.rs`, `materialize.rs`, `gitpack.rs`)
 
 A git tree carries a file's bytes and whether it is executable. A checkout writes every file
@@ -668,9 +679,12 @@ shipped the rest: poll `capture.status`, or send the final flush again. An older
 ### `pending_bytes` on `capture.status` / `capture.flush`
 
 `uint64` field 14 of `CaptureStatusReport`: bytes staged on the executor's disk that no upload
-has taken yet, over every pending capture, each object counted once. `0` from an older daemon.
-A caller that has to decide whether a workspace can go reads `pending == 0` (and
-`pending_bytes` for how far off that is).
+has taken yet, over every pending capture, each object counted once, plus — while a bulk build
+is in progress (`bulk_building`, `bool` field 25) — the packs that build has staged so far,
+which no capture lists until it ends. `0` from an older daemon. A caller that has to decide
+whether a workspace can go reads `complete` after a final flush; a drain loop reads
+`pending == 0 && !bulk_building && pending_bytes == 0` (the Docker end to end read
+`pending 0 / pending_bulk 0` with 463 MB staged by a build in progress).
 
 ### `other_bulk` in a manifest
 
@@ -778,7 +792,16 @@ conflict. Nothing new on the wire; the reading changed.
 ### `platform` on `plan.get`
 
 The request carries the executor's `<os>-<arch>-<libc>` (the same key the bulk class stamps on
-its captures, `engine::default_platform`). A registrar answers the head's bulk section as
+its captures, `engine::default_platform`). `<libc>` is the workspace userland's, not the
+daemon's build: `musl` when the musl dynamic loader (`/lib/ld-musl-<arch>.so.1`) is there or
+`ldd --version` names musl, `gnu` otherwise on Linux, `system` on any other OS — the answer
+Mend's probe (`uname -s; uname -m; ldd --version`) gives for the same workspace. The key used
+to come from the build (`cfg!(target_env)`), and the release daemon is a static musl binary: it
+said `linux-x86_64-musl` in every glibc workspace, so every resume took the head's dependency
+tree for another platform's and installed it again (Docker end to end, 2026-09-27: 177 files
+rewritten, 988 MB captured again). A bulk section an older daemon stamped `-musl` in a glibc
+workspace is answered `"pending"` once more (one install), kept in `other_bulk` as every other
+platform's section is, and the next bulk capture fills `bulk` under `-gnu`. A registrar answers the head's bulk section as
 `"pending"` when it was captured for another platform and `other_bulk` carries none for this
 one (see "`other_bulk` in a manifest"), and omits its packs from `get_urls`:
 the executor never restores a dependency tree built elsewhere, the control plane runs the
@@ -898,6 +921,15 @@ A launcher that reaches the channel over plain HTTP on a private network (Docker
 Mend installs today) must now say so, or boot refuses.
 
 ## Deviations from ADR-0015 pending amendment
+
+- §"Capture format", Keys: "a new epoch never skips an upload because a prior epoch holds the
+  bytes" → a new epoch reuses chunk locations only in packs the registered head it continues
+  names (packs from earlier epochs on its chain, which the ADR already lets a manifest
+  reference); anything else an earlier epoch staged is still never trusted. A pack the store
+  lost after all is refused at register and rebuilt (see "A refused register is fixed, never
+  dropped").
+- §"Capture format", bulk `platform`: `<libc>` is the workspace userland's, detected at run
+  time, not the daemon build's.
 
 - §"Snap rules", Excluded always: `*.lock`, `gc.pid`, `objects/tmp_*` and `objects/incoming-*`
   are excluded only inside a git directory; SQLite `-shm` and pid files are captured; `.git/lfs`

@@ -665,6 +665,10 @@ message CaptureStatusReport {
   optional uint64 register_refusals = 23;
   // The refused capture waits to be rebuilt from disk; nothing behind it registers first.
   bool repairing = 24;
+  // A bulk build is in progress (reading the dependency trees, or paused mid-way for a small
+  // capture): its capture is not queued yet, so `pending` and `pending_bulk` do not count it, but
+  // `pending_bytes` counts what it has staged so far. A drain is not done while this is true.
+  bool bulk_building = 25;
 }
 message LeaseEpochReport { uint64 epoch = 1; string worktree_id = 2; bool fenced = 3; }
 message CaptureReplanned {

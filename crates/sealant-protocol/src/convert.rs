@@ -1422,6 +1422,7 @@ impl From<CommandResult> for wire::command_result::Result {
                     register_missing: c.register_missing,
                     register_refusals: c.register_refusals,
                     repairing: c.repairing,
+                    bulk_building: c.bulk_building,
                 }))
             }
             CommandResult::LeaseEpoch(l) => W::LeaseEpoch(wire::LeaseEpochReport {
@@ -1541,6 +1542,7 @@ impl TryFrom<wire::command_result::Result> for CommandResult {
                 register_missing: c.register_missing,
                 register_refusals: c.register_refusals,
                 repairing: c.repairing,
+                bulk_building: c.bulk_building,
             })),
             W::LeaseEpoch(l) => CommandResult::LeaseEpoch(LeaseEpochReport {
                 epoch: l.epoch,
@@ -2132,6 +2134,7 @@ mod tests {
                 register_missing: vec!["captures/wt/2/packs/abc".to_owned()],
                 register_refusals: Some(2),
                 repairing: true,
+                bulk_building: true,
             })),
             CommandResult::CaptureStatus(Box::new(CaptureStatusReport {
                 epoch: 2,
@@ -2158,6 +2161,7 @@ mod tests {
                 register_missing: vec![],
                 register_refusals: Some(0),
                 repairing: false,
+                bulk_building: false,
             })),
             CommandResult::LeaseEpoch(LeaseEpochReport {
                 epoch: 2,

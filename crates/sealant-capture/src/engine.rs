@@ -17,14 +17,15 @@ use crate::index::{
 };
 use crate::keys::KeyPrefix;
 use crate::manifest::{
-    BulkSection, BulkState, CaptureKind, DirFormat, EncodedManifest, GitSection, Manifest,
-    Sections, WORKTREE_META_FORMAT, WORKTREE_TREE_REF, WorkspaceSection, WorktreeMeta, rfc3339_now,
+    BulkSection, BulkState, CaptureKind, DirFormat, EncodedManifest, FORMAT_DIR_PACKS, GitSection,
+    Manifest, Sections, WORKTREE_META_FORMAT, WORKTREE_TREE_REF, WorkspaceSection, WorktreeMeta,
+    rfc3339_now,
 };
 use crate::materialize::{
     DiskState, MaterializeClass, MaterializeError, MaterializeReport, MaterializeTargets,
     Materializer,
 };
-use crate::pack::{MAX_PACK_BYTES, PackBuilder, PackError};
+use crate::pack::{MAX_PACK_BYTES, PackBuilder, PackError, PackReader};
 use crate::registrar::RegisterRequest;
 use crate::registrar::Registrar;
 use crate::roots::ClassRoots;
@@ -67,15 +68,57 @@ impl Default for Cadence {
     }
 }
 
-/// `<os>-<arch>-<libc>` of this build.
+/// `<os>-<arch>-<libc>` of the workspace this daemon captures, the key its bulk class stamps on
+/// its captures and names on `plan.get`: the C library of the userland the dependency tree was
+/// built for, never this build's own. sealantd ships as a static musl binary into glibc
+/// workspaces, and keying by the build said `linux-x86_64-musl` everywhere: Mend's probe of the
+/// same workspace says `-gnu`, so every resume took the head's dependency tree for another
+/// platform's, left it `"pending"` and installed it again (observed: 177 files rewritten, 988 MB
+/// captured again). Detected once per process ([`platform_of`] over `/`).
 #[must_use]
 pub fn default_platform() -> String {
-    let libc = if cfg!(target_env = "musl") {
+    static PLATFORM: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    PLATFORM
+        .get_or_init(|| platform_of(Path::new("/"), ldd_version))
+        .clone()
+}
+
+/// `<os>-<arch>-<libc>` of the userland under `root`, in the form Mend's platform probe gives
+/// (`uname -s`, `uname -m`, `ldd --version`): `musl` when the musl dynamic loader
+/// (`lib/ld-musl-<arch>.so.1`) is there or `ldd --version` (`ldd`, asked only then) names
+/// musl; `gnu` otherwise on Linux; `system` on any other OS.
+pub fn platform_of(root: &Path, ldd: impl FnOnce() -> Option<String>) -> String {
+    let os = std::env::consts::OS;
+    let libc = if os != "linux" {
+        "system"
+    } else if musl_loader(root) || ldd().is_some_and(|out| out.to_lowercase().contains("musl")) {
         "musl"
     } else {
         "gnu"
     };
-    format!("{}-{}-{libc}", std::env::consts::OS, std::env::consts::ARCH)
+    format!("{os}-{}-{libc}", std::env::consts::ARCH)
+}
+
+fn musl_loader(root: &Path) -> bool {
+    fs::read_dir(root.join("lib")).is_ok_and(|dir| {
+        dir.filter_map(Result::ok).any(|e| {
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            name.starts_with("ld-musl-") && name.ends_with(".so.1")
+        })
+    })
+}
+
+/// What `ldd --version` prints, both streams (musl's `ldd` prints its banner on stderr).
+fn ldd_version() -> Option<String> {
+    let out = std::process::Command::new("ldd")
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+    text.push_str(&String::from_utf8_lossy(&out.stderr));
+    Some(text)
 }
 
 /// Engine configuration.
@@ -379,6 +422,29 @@ struct RepairTarget {
     followers: Vec<QueueEntry>,
 }
 
+/// The chunked-section keys a registered head names: its workspace and bulk packs and dir
+/// packs (across epochs, on its chain).
+fn chain_keys(head: &EncodedManifest) -> HashSet<String> {
+    let s = &head.manifest.sections;
+    let mut keys: HashSet<String> = s
+        .workspace
+        .packs
+        .iter()
+        .chain(&s.workspace.dir_packs)
+        .cloned()
+        .collect();
+    if let Some(bulk) = s.bulk.section() {
+        keys.extend(bulk.packs.iter().chain(&bulk.dir_packs).cloned());
+    }
+    keys
+}
+
+/// A pack the materializer cached (`<cache>/<sha256>`), opened, when it is there and whole.
+fn cached_pack(cache: &Path, key: &str) -> Option<PackReader> {
+    let sha = crate::keys::key_digest(key)?;
+    PackReader::open(&cache.join(sha)).ok()
+}
+
 /// The staged file a store key was uploaded from (its ack marker's name).
 fn file_of_key(key: &str) -> Option<String> {
     let (dir, last) = key.rsplit_once('/')?;
@@ -642,17 +708,20 @@ impl CaptureEngine {
             last_tips.clear();
         }
         let prefix = config.prefix();
-        // Chunk locations from another epoch are never reused (ADR-0015: a new epoch never skips
-        // an upload because a prior epoch holds the bytes).
+        // Chunk locations from another epoch are reused only where the registered head this
+        // engine continues names their packs (ADR-0015: a manifest may reference packs from
+        // earlier epochs on its chain); anything else an earlier epoch staged may never have
+        // reached the store.
         let base = format!("{}/", prefix.base());
+        let chain = previous.as_ref().map(chain_keys).unwrap_or_default();
         let chunks = ChunkMap {
             packs: chunks
                 .packs
                 .into_iter()
-                .filter(|(_, k)| k.starts_with(&base))
+                .filter(|(_, k)| k.starts_with(&base) || chain.contains(k))
                 .collect(),
         };
-        dirs.retain(|k| k.starts_with(&base));
+        dirs.retain(|k| k.starts_with(&base) || chain.contains(k));
         let mut engine = Self {
             config,
             prefix,
@@ -681,8 +750,76 @@ impl CaptureEngine {
                 "captures staged under another epoch dropped; the disk is captured again"
             );
         }
+        engine.seed_from_chain()?;
         engine.resume_queue()?;
         Ok(engine)
+    }
+
+    /// Learn where the registered head's chunks are: every pack its workspace and bulk sections
+    /// name (and, writing dir packs, every dir pack) that the materializer left in the pack cache
+    /// is opened and its chunks mapped to its key. A restored executor then knows the files it
+    /// just wrote are in the store — the materializer recorded their stat in the class indexes —
+    /// and its next capture reads and uploads only what changed. Before, every epoch forgot
+    /// them: the first bulk capture after a resume read and uploaded the whole dependency tree
+    /// again (observed: 119,414 files, 1.4 GB, for one new 300 MB file).
+    fn seed_from_chain(&mut self) -> Result<(), EngineError> {
+        let Some(previous) = &self.previous else {
+            return Ok(());
+        };
+        let sections = &previous.manifest.sections;
+        let cache = self.staging.cache_dir();
+        let mut learned = 0usize;
+        let mut chunked: Vec<&String> = sections.workspace.packs.iter().collect();
+        let bulk = sections.bulk.section();
+        if let Some(bulk) = bulk {
+            chunked.extend(&bulk.packs);
+        }
+        for key in chunked {
+            let Some(reader) = cached_pack(&cache, key) else {
+                continue;
+            };
+            for id in reader.chunk_ids() {
+                if !self.chunks.packs.contains_key(id) {
+                    self.chunks.packs.insert(*id, key.clone());
+                    learned += 1;
+                }
+            }
+        }
+        if self.config.dir_format == DirFormat::Packs {
+            let mut dir_packs: Vec<(Class, &String)> = Vec::new();
+            if sections.workspace.format == FORMAT_DIR_PACKS {
+                dir_packs.extend(
+                    sections
+                        .workspace
+                        .dir_packs
+                        .iter()
+                        .map(|k| (Class::Small, k)),
+                );
+            }
+            if let Some(bulk) = bulk
+                && bulk.format == FORMAT_DIR_PACKS
+            {
+                dir_packs.extend(bulk.dir_packs.iter().map(|k| (Class::Bulk, k)));
+            }
+            for (class, key) in dir_packs {
+                let Some(reader) = cached_pack(&cache, key) else {
+                    continue;
+                };
+                let known = self.dirs.class(class);
+                for id in reader.chunk_ids() {
+                    known.entry(id.to_hex()).or_insert_with(|| key.clone());
+                }
+            }
+        }
+        if learned > 0 {
+            tracing::info!(
+                chunks = learned,
+                head = previous.manifest.n,
+                "chunk locations learned from the restored head"
+            );
+            self.persist()?;
+        }
+        Ok(())
     }
 
     /// Whether this disk continues the chain at `head` on its own: its staging names this
@@ -810,11 +947,16 @@ impl CaptureEngine {
         self.staging.set_identity(worktree_id, epoch)?;
         let dropped = self.staging.discard_foreign()?;
         let base = format!("{}/", self.prefix.base());
-        self.chunks.packs.retain(|_, k| k.starts_with(&base));
-        self.dirs.retain(|k| k.starts_with(&base));
+        let chain = previous.as_ref().map(chain_keys).unwrap_or_default();
+        self.chunks
+            .packs
+            .retain(|_, k| k.starts_with(&base) || chain.contains(k));
+        self.dirs
+            .retain(|k| k.starts_with(&base) || chain.contains(k));
         self.bulk_work = None;
         let seeded = previous.is_some();
         self.previous = previous;
+        self.seed_from_chain()?;
         if seeded {
             self.seed_tips_from_repo()?;
         } else {

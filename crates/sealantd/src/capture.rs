@@ -443,7 +443,16 @@ impl CaptureRuntime {
             .iter()
             .filter(|e| e.class == Some(Class::Bulk))
             .count() as u64;
-        let pending_bytes = staging.pending_bytes(&queued);
+        // A bulk build in progress has staged packs no queued capture lists yet: they are on
+        // this disk only, and a drain that read `pending_bytes` 0 mid-build stopped too early.
+        let cadence = self.runner.snapshot();
+        let bulk_building = cadence.bulk_running || cadence.bulk_in_progress;
+        let pending_bytes = staging.pending_bytes(&queued)
+            + if bulk_building {
+                staging.unqueued_bytes(&queued).unwrap_or(0)
+            } else {
+                0
+            };
         let staged_bytes = staging.staged_bytes().unwrap_or(0);
         let last = self.last_snap_unix_ms.load(Ordering::Relaxed);
         let (worktree_id, epoch) = self.identity();
@@ -494,6 +503,7 @@ impl CaptureRuntime {
                 .unwrap_or_default(),
             register_refusals: Some(ship.register_refusals),
             repairing: ship.repair_pending,
+            bulk_building,
         }
     }
 
@@ -951,6 +961,63 @@ mod tests {
         let status = capture.status();
         assert_eq!((status.unreadable, status.carried), (Some(0), Some(0)));
         assert!(status.unreadable_paths.is_empty());
+    }
+
+    /// A bulk build in progress has staged packs no queued capture lists: `capture.status`
+    /// says a build is running and counts those bytes, so a drain never reads "nothing pending"
+    /// mid-build (Docker end to end: `pending 0 / pending_bulk 0` with 463 MB staged).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn capture_status_reports_a_bulk_build_in_progress() {
+        use std::sync::atomic::AtomicUsize;
+        let tmp = tempfile::tempdir().unwrap();
+        let (boot, _registrar) = boot(tmp.path());
+        let root = boot.layout.working_directory.clone();
+        std::fs::write(root.join(".gitignore"), "node_modules/\n").unwrap();
+        for p in 0..20 {
+            let dir = root.join(format!("node_modules/pkg{p}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            for f in 0..20 {
+                std::fs::write(
+                    dir.join(format!("m{f}.js")),
+                    format!("module.exports = [{p}, {f}];\n").repeat(200),
+                )
+                .unwrap();
+            }
+        }
+        let capture = CaptureRuntime::new(boot);
+        capture.snap(CaptureKind::Turn).unwrap();
+        capture.runner().shipper().ship_pending().unwrap();
+        let idle = capture.status();
+        assert!(!idle.bulk_building, "{idle:?}");
+        assert_eq!((idle.pending, idle.pending_bytes), (0, 0));
+
+        // A bulk build that yields part-way (a small capture wanted the engine).
+        let calls = AtomicUsize::new(0);
+        let outcome = capture.runner().with_engine_mut(|engine| {
+            engine.snap_preemptible(
+                SnapRequest {
+                    kind: EngineKind::Auto,
+                    class: Class::Bulk,
+                    seq: 99,
+                },
+                &|| calls.fetch_add(1, Ordering::SeqCst) > 100,
+            )
+        });
+        assert!(
+            matches!(outcome, Ok(sealant_capture::SnapOutcome::Preempted)),
+            "{outcome:?}"
+        );
+        let status = capture.status();
+        assert!(status.bulk_building, "{status:?}");
+        assert_eq!(
+            (status.pending, status.pending_bulk),
+            (0, 0),
+            "not queued yet"
+        );
+        assert!(
+            status.pending_bytes > 0,
+            "what the build staged is counted: {status:?}"
+        );
     }
 
     /// A path no capture has read yet that cannot be read now has nothing to carry: an automatic
