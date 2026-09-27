@@ -612,9 +612,11 @@ pub struct CaptureEngine {
     /// content). Empty after a restart, when such a path's metadata is left out and the path is
     /// reported unreadable all the same.
     last_meta: Option<worktree_meta::MetaDocument>,
-    /// The last small snap found tracked files with names outside the worktree (hardlinks
-    /// another class carries): its overlay names the bulk class's names as the bulk index had
-    /// them, so a bulk capture staged after it can change what the next small snap records.
+    /// The last small snap found files with names outside their class — a tracked file's inode
+    /// another class names, or a workspace-class file whose inode has names the workspace
+    /// class does not hold (hardlinks into the bulk class): its overlay names the bulk class's
+    /// names as the bulk index had them, so a bulk capture staged after it can change what the
+    /// next small snap records.
     shared_outside: bool,
     /// A refused capture being rebuilt in its place ([`CaptureEngine::repair`]): the next
     /// snap takes its `n` and parent and folds the captures staged after it into itself.
@@ -1182,6 +1184,72 @@ impl CaptureEngine {
         shared.sort();
         shared.dedup();
         shared
+    }
+
+    /// Inodes the workspace class (`listing`, this snap's) and the bulk class (its index, each
+    /// name checked on disk) both name, none of them tracked: the tracked inodes in `outside`
+    /// are [`Self::shared_links`]' (and a tracked inode none of whose names is outside the
+    /// overlay has no name in either class). Each group lists every name the two classes carry
+    /// of the inode, sorted, workspace names first. Also whether any workspace-class file has
+    /// names the workspace class does not hold: then what this records depends on the bulk
+    /// index (see [`Self::small_depends_on_bulk`]).
+    fn cross_links(
+        &self,
+        outside: &[worktree_meta::OutsideLinks],
+        listing: &Listing,
+    ) -> (Vec<Vec<worktree_meta::LinkMember>>, bool) {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::MetadataExt;
+        let tracked: HashSet<(u64, u64)> = outside.iter().map(|o| (o.dev, o.ino)).collect();
+        let member = |class, v: &str| worktree_meta::LinkMember {
+            class,
+            member: v.to_owned(),
+            raw_member: worktree_meta::raw_of(v),
+        };
+        // (dev, ino) → (link count, the workspace class's names).
+        let mut inodes: HashMap<(u64, u64), (u64, Vec<worktree_meta::LinkMember>)> = HashMap::new();
+        for (v, src) in &listing.entries {
+            let key = (src.meta.dev(), src.meta.ino());
+            if src.meta.is_file() && src.meta.nlink() > 1 && !tracked.contains(&key) {
+                let slot = inodes.entry(key).or_insert((src.meta.nlink(), Vec::new()));
+                slot.1.push(member(worktree_meta::LinkClass::Workspace, v));
+            }
+        }
+        inodes.retain(|_, (nlink, names)| *nlink > names.len() as u64);
+        if inodes.is_empty() {
+            return (Vec::new(), false);
+        }
+        let mut bulk: HashMap<(u64, u64), Vec<worktree_meta::LinkMember>> = HashMap::new();
+        for (v, known) in &self.bulk_index.files {
+            let key = (known.stat.dev, known.stat.ino);
+            if !inodes.contains_key(&key) {
+                continue;
+            }
+            // The index is the last bulk snap's; the inode must still be this one.
+            let abs = self
+                .config
+                .root
+                .join(std::ffi::OsStr::from_bytes(&worktree_meta::bytes_of(v)));
+            let on_disk = crate::longpath::symlink_metadata(&abs)
+                .is_ok_and(|m| m.is_file() && (m.dev(), m.ino()) == key);
+            if on_disk {
+                bulk.entry(key)
+                    .or_default()
+                    .push(member(worktree_meta::LinkClass::Bulk, v));
+            }
+        }
+        let mut groups: Vec<Vec<worktree_meta::LinkMember>> = bulk
+            .into_iter()
+            .filter_map(|(key, bulk_names)| {
+                let (_, mut names) = inodes.remove(&key)?;
+                names.extend(bulk_names);
+                names.sort();
+                names.dedup();
+                Some(names)
+            })
+            .collect();
+        groups.sort();
+        (groups, true)
     }
 
     /// The bulk class listing: every bulk directory under the root.
@@ -1890,8 +1958,11 @@ impl CaptureEngine {
                             })
                             .collect();
                         git_unreadable = merge_unreadable(git_unreadable, meta_unreadable);
-                        self.shared_outside = !captured.outside.is_empty();
+                        let (cross_links, ws_outside) =
+                            self.cross_links(&captured.outside, &listing);
+                        self.shared_outside = !captured.outside.is_empty() || ws_outside;
                         let mut doc = captured.doc;
+                        doc.cross_links = cross_links;
                         // A tracked file under a bulk directory is the overlay's own name.
                         let own: HashSet<&str> =
                             doc.entries.iter().map(|e| e.path.as_str()).collect();
@@ -2295,8 +2366,9 @@ impl CaptureEngine {
     }
 
     /// Whether the last small snap's worktree metadata overlay depends on the bulk index: it
-    /// found tracked files with names another class carries, and records the bulk class's
-    /// names of them as the last bulk snap indexed them. A final flush whose bulk snap staged a
+    /// found tracked files with names another class carries, or workspace-class files with
+    /// names the workspace class does not hold, and records the bulk class's names of them as
+    /// the last bulk snap indexed them. A final flush whose bulk snap staged a
     /// capture snaps the small class again then, so the chain's last capture records them as
     /// they are (Docker end to end, round 3: the flush after the one that reported `complete`
     /// registered a final capture whose only difference was these links).

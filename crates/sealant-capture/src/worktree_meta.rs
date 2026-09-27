@@ -9,7 +9,10 @@
 //! - mtimes in nanoseconds of files, symlinks and directories;
 //! - directories git does not track (empty ones, and ones holding only empty ones);
 //! - hardlink groups among the worktree tree's files, and the names another class carries of a
-//!   tracked file's inode (`shared`: an ignored file or a bulk file hardlinked to a tracked one).
+//!   tracked file's inode (`shared`: an ignored file or a bulk file hardlinked to a tracked one);
+//! - inodes the workspace and bulk classes share with no tracked name (`cross_links`: an
+//!   ignored file hardlinked into `node_modules`). Each class carries its own names of such an
+//!   inode (and links them among themselves); only this overlay says they are one file.
 //!
 //! [`capture`] reads it from disk after the worktree tree is written; [`apply`] brings a disk
 //! the git class checked out to it — after every other class, since restoring an ignored file
@@ -154,8 +157,30 @@ pub struct SharedLink {
     pub raw_member: Option<String>,
 }
 
+/// One name of an untracked inode, as the class that carries it names it.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct LinkMember {
+    /// The class carrying the name.
+    pub class: LinkClass,
+    /// The name, as that class names it (a key): the workspace class's virtual path
+    /// (`tree/…`, `.git/…`, `harness/…`), the bulk class's root-relative path.
+    pub member: String,
+    /// The member's bytes, hex, when `member` is an escaped key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_member: Option<String>,
+}
+
+impl LinkMember {
+    /// The member's bytes.
+    fn bytes(&self) -> Result<Vec<u8>, MetaError> {
+        bytes_of_pair(&self.member, self.raw_member.as_deref())
+    }
+}
+
 /// The overlay document: entries sorted by path, hardlink groups sorted (each group's members
-/// sorted, the first being the one the others link to), shared links sorted. Encodes
+/// sorted, the first being the one the others link to), shared links sorted, cross-class
+/// groups sorted (each group's members sorted, the first being the one the others link to).
+/// Encodes
 /// deterministically, so an unchanged working tree encodes to the same bytes.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MetaDocument {
@@ -169,6 +194,12 @@ pub struct MetaDocument {
     /// Names other classes carry of a tracked file's inode.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub shared: Vec<SharedLink>,
+    /// Inodes named in both the workspace and the bulk class and by no tracked file: each group
+    /// every name those classes carry of one inode, two or more. Absent when empty, so a
+    /// document without one encodes exactly as before (a reader that predates the field
+    /// restores each name as its own class captured it, as it always did).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cross_links: Vec<Vec<LinkMember>>,
 }
 
 impl MetaDocument {
@@ -213,6 +244,23 @@ impl MetaDocument {
             let member = bytes_of_pair(&link.member, link.raw_member.as_deref())?;
             if !is_file(&link.path) || member.is_empty() || !is_plain_relative(&member) {
                 return Err(MetaError::BadDocument(format!("shared link {link:?}")));
+            }
+        }
+        for group in &doc.cross_links {
+            let mut seen = BTreeSet::new();
+            for m in group {
+                let member = m.bytes()?;
+                if member.is_empty()
+                    || !is_plain_relative(&member)
+                    || !seen.insert((m.class, member))
+                {
+                    return Err(MetaError::BadDocument(format!("cross-class link {m:?}")));
+                }
+            }
+            if seen.len() < 2 {
+                return Err(MetaError::BadDocument(format!(
+                    "cross-class link group {group:?} names fewer than two members"
+                )));
             }
         }
         Ok(doc)
@@ -479,7 +527,8 @@ pub struct OutsideLinks {
 /// What [`capture`] read.
 #[derive(Debug, Clone)]
 pub struct Captured {
-    /// The document (without `shared`, which the caller fills from the other classes).
+    /// The document (without `shared` and `cross_links`, which the caller fills from the other
+    /// classes).
     pub doc: MetaDocument,
     /// Tracked files whose inode has names the overlay does not hold.
     pub outside: Vec<OutsideLinks>,
@@ -603,6 +652,7 @@ pub fn capture(
             entries: entries.into_values().collect(),
             hardlinks,
             shared: Vec::new(),
+            cross_links: Vec::new(),
         },
         outside,
         unreadable,
@@ -618,8 +668,9 @@ pub fn capture(
 pub struct Applied {
     /// Paths it changed: directories created or removed, links made, modes and mtimes set.
     pub changed: u64,
-    /// Other classes' names it linked to a tracked file (the class's index must learn their new
-    /// inode): class, member key, metadata after the link.
+    /// Other classes' names whose inode it linked (the class's index must learn their new
+    /// inode, or its new ctime: a link moves the ctime of every name of the inode): class,
+    /// member key, metadata after every link.
     pub relinked: Vec<(LinkClass, String, Metadata)>,
 }
 
@@ -762,6 +813,51 @@ pub fn apply(
         relink(&canonical, &abs).map_err(io_err(&member))?;
         relinked.push((link.class, link.member.clone(), abs, member));
         applied.changed += 1;
+    }
+    // Inodes the workspace and bulk classes share with no tracked name: every member on the
+    // first member's inode, under the same rule as a shared link (a name that is missing, not
+    // a file, or holds other bytes than the first is left as its own class restored it). When
+    // anything was linked, every name of the group is restated: the link moved the inode's
+    // ctime, which each class's index holds.
+    for group in &doc.cross_links {
+        let mut named: Vec<(&LinkMember, PathBuf, Vec<u8>)> = Vec::new();
+        for m in group {
+            let bytes = m.bytes()?;
+            let Some(abs) = resolve(m.class, &bytes) else {
+                continue;
+            };
+            match longpath::symlink_metadata(&abs) {
+                Ok(meta) if meta.is_file() => named.push((m, abs, bytes)),
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(io_err(&bytes)(e)),
+            }
+        }
+        let Some(((head, canonical, first), rest)) = named.split_first() else {
+            continue;
+        };
+        let target = longpath::symlink_metadata(canonical).map_err(io_err(first))?;
+        let mut linked = false;
+        let mut on_inode = vec![0];
+        for (i, (m, abs, bytes)) in rest.iter().enumerate() {
+            let meta = longpath::symlink_metadata(abs).map_err(io_err(bytes))?;
+            if (meta.dev(), meta.ino()) != (target.dev(), target.ino()) {
+                if !same_bytes(canonical, abs).map_err(io_err(bytes))? {
+                    tracing::debug!(canonical = %head.member, member = %m.member, "cross-class hardlink: contents differ; left unlinked");
+                    continue;
+                }
+                relink(canonical, abs).map_err(io_err(bytes))?;
+                applied.changed += 1;
+                linked = true;
+            }
+            on_inode.push(i + 1);
+        }
+        if linked {
+            for i in on_inode {
+                let (m, abs, bytes) = &named[i];
+                relinked.push((m.class, m.member.clone(), abs.clone(), bytes.clone()));
+            }
+        }
     }
     // Files and symlinks, then directories deepest first.
     let mut dirs: Vec<&(Vec<u8>, &MetaEntry)> = Vec::new();
@@ -1004,5 +1100,45 @@ mod tests {
         assert!(MetaDocument::decode(&lying.encode()).is_err());
         let dots = key_of(b"a/\xff/../..").into_owned();
         assert!(MetaDocument::decode(&doc(1, &dots)).is_err());
+    }
+
+    /// `cross_links` decode: two or more distinct plain members; a document without the field
+    /// encodes as before.
+    #[test]
+    fn cross_links_decode_under_their_own_rules() {
+        let m = |class, member: &str| LinkMember {
+            class,
+            member: member.to_owned(),
+            raw_member: raw_of(member),
+        };
+        assert!(
+            !String::from_utf8(MetaDocument::default().encode())
+                .unwrap()
+                .contains("cross_links")
+        );
+        let with = |group: Vec<LinkMember>| MetaDocument {
+            format: 1,
+            cross_links: vec![group],
+            ..MetaDocument::default()
+        };
+        let good = with(vec![
+            m(LinkClass::Workspace, "tree/ignored/x"),
+            m(LinkClass::Bulk, &key_of(b"node_modules/caf\xe9")),
+        ]);
+        assert_eq!(MetaDocument::decode(&good.encode()).unwrap(), good);
+        for bad in [
+            vec![m(LinkClass::Workspace, "tree/x")],
+            vec![m(LinkClass::Bulk, "a"), m(LinkClass::Bulk, "a")],
+            vec![
+                m(LinkClass::Workspace, "tree/x"),
+                m(LinkClass::Bulk, "../x"),
+            ],
+            vec![m(LinkClass::Workspace, "tree/x"), m(LinkClass::Bulk, "")],
+        ] {
+            assert!(
+                MetaDocument::decode(&with(bad.clone()).encode()).is_err(),
+                "{bad:?}"
+            );
+        }
     }
 }

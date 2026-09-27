@@ -107,6 +107,19 @@ and empty directories and every tracked mtime were lost.
   Relinking (remove the name, link it) moves its directory's mtime, and that directory's class
   set it already — `node_modules` itself, a pnpm `file:` package's directories (the Docker end
   to end found 31 wrong): the directory gets back the mtime it had before the relink.
+- **Hardlinks between untracked names of two classes.** An inode no tracked file names, named
+  by the workspace class (an ignored file, `tree/…`) and by the bulk class (a file under
+  `node_modules/`), is recorded in the document's `cross_links`: every name the two classes carry
+  of it, found from this snap's workspace listing (a file whose link count exceeds the names the
+  workspace class holds) and the bulk class's index (each name checked on disk). Each class
+  still links its own names among themselves; a restore then links every group member to the
+  group's first member under the rule a `shared` name follows (only a name on disk holding
+  exactly the first member's bytes), gives relinked directories their mtimes back, and restates
+  every member in its class's index (a link moves the inode's ctime), so a head over itself
+  writes nothing. Found by review 2 (2026-09-28, #10): `ignored/x` hardlinked to
+  `node_modules/pkg/x` came back as two files after a complete final flush. A small snap that
+  finds such a file depends on the bulk index, so a final flush whose bulk snap staged a capture
+  snaps the small class again, as it does for a tracked file's shared names.
 - **A path it cannot read is not gone.** A tracked path whose metadata cannot be read (a
   directory above it that cannot be searched; git carries its content from the previous capture,
   see "What a snap reads") keeps the previous document's entry in an automatic snap and counts as
@@ -182,9 +195,13 @@ is captured and restored by a delta and a fresh materialize; links a tracked fil
 and a bulk name and checks all three come back as one inode, and apart but byte-exact when the
 bulk section is older. `tests/delta.rs` compares the mtimes of the whole working tree.
 
-Not covered: hardlinks between two names of other classes (an ignored file and a bulk file: each
-class restores its own names), and a directory whose restored mode forbids the owner to write (a
-later delta that writes into it fails, loudly).
+`tests/restore_metadata.rs` also final-flushes an ignored file hardlinked into `node_modules` and
+an inode with two ignored names and one bulk name (plus a bulk-only pair across `node_modules/`
+and `dist/`), and checks one inode per group, every mtime, and a write through one name showing
+through the other.
+
+Not covered: a directory whose restored mode forbids the owner to write (a later delta that
+writes into it fails, loudly).
 
 ## Sources beside the worktree
 
@@ -772,8 +789,8 @@ snap did, whenever: `snaps`), `fenced`, `conflict`, `deadline`, `ship-failed`, `
 `sweep-unavailable`, `unreadable` or `internal`; absent when `complete`.
 
 Once `complete` is said, nothing more is captured. The final flush ends the chain as the disk
-is: when its bulk snap staged a capture and the small snap found tracked files with names in
-the bulk class (a pnpm `file:` package hardlinked into `node_modules`: the overlay records those
+is: when its bulk snap staged a capture and the small snap found tracked or ignored files with
+names in the bulk class (a pnpm `file:` package hardlinked into `node_modules`: the overlay records those
 links from the bulk index, empty until the first bulk snap), the small class is snapped again
 inside the same flush; and when the newest capture is not a final one (the final small snap was
 staged ahead of a scheduled bulk capture still uploading, and the final bulk snap found that
@@ -887,7 +904,9 @@ for byte as before.
               {"path":"to-secret","kind":"symlink","mtime":1600000007123456838}],
    "hardlinks":[["link.txt","src/twin.txt"]],
    "shared":[{"path":"shared.txt","class":"bulk","member":"node_modules/pkg/shared.txt"},
-             {"path":"shared.txt","class":"workspace","member":"tree/copy.log"}]}
+             {"path":"shared.txt","class":"workspace","member":"tree/copy.log"}],
+   "cross_links":[[{"class":"workspace","member":"tree/ignored/x"},
+                   {"class":"bulk","member":"node_modules/pkg/x"}]]}
   ```
 
   (`\u{10ffe9}` stands for that character, which JSON carries as UTF-8.) `entries` are sorted
@@ -902,12 +921,18 @@ for byte as before.
   `shared` (absent when empty) lists names another class carries of a tracked file's inode:
   `path` is the tracked file's key, `class` is `workspace` (then `member` is that class's
   virtual path, `tree/…`, `.git/…` or `harness/…`) or `bulk` (then `member` is root-relative),
-  and `raw_member` carries an escaped member's bytes.
+  and `raw_member` carries an escaped member's bytes. `cross_links` (absent when empty; added
+  2026-09-28 within format `1`, so an older reader ignores it and restores each name as its own
+  class captured it, as before) lists inodes no tracked file names that the workspace and bulk
+  classes both name: each group is two or more distinct `{class, member, raw_member?}` (as in
+  `shared`, members plain relative and not empty), sorted, workspace names first; the first is
+  the one the others link to.
 - Applying it (sealantd's `worktree_meta::apply`, after the worktree tree is checked out and every
   other class restored): create each `dir` that is missing; every other path must exist with its
   kind; remove the empty directories in scope that no entry names; link each group's members to
   its first path; link each `shared` member that holds exactly the tracked file's bytes to it
-  (leave it otherwise); set files' and symlinks' mode and mtime (a symlink's own, never
+  (leave it otherwise); link each `cross_links` member on disk that holds exactly the bytes of
+  its group's first member on disk to it (leave it otherwise); set files' and symlinks' mode and mtime (a symlink's own, never
   followed), then directories' deepest first. A reader that only lists or reads a class's files (Mend's
   `listCaptureDir`, `statCaptureEntry`, `readCaptureFile`, `materialize` of the workspace or bulk
   class) is unaffected: the overlay describes the git class's working tree, not a chunked class.
