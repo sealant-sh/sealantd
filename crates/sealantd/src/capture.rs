@@ -135,9 +135,23 @@ impl CaptureRuntime {
         self.start_with(runtime, Some(harness));
     }
 
-    /// [`Self::start`] with no harness to pause on a fence (a recovery boot runs none).
+    /// [`Self::start`] with no harness to pause on a fence: a recovery boot runs none, and a boot
+    /// starts the engine this way before any user code runs, attaching the harness once it is
+    /// launched ([`Self::attach_harness`]).
     pub fn start_without_harness(self: &Arc<Self>, runtime: Arc<Runtime>) {
         self.start_with(runtime, None);
+    }
+
+    /// The harness this boot launched after the engine started ([`Self::start_without_harness`]
+    /// runs first, before any user code): the process the fence pauses and resumes from now
+    /// on. A fence that paused the engine before the harness existed pauses it at once.
+    pub fn attach_harness(&self, runtime: &Runtime, harness: ProcessId) {
+        *self.harness.lock().unwrap_or_else(|e| e.into_inner()) = Some(harness.clone());
+        if self.paused.load(Ordering::Relaxed)
+            && let Err(error) = runtime.signal_process(&harness, Signal::Stop)
+        {
+            tracing::warn!(%error, "could not pause the harness");
+        }
     }
 
     fn start_with(self: &Arc<Self>, runtime: Arc<Runtime>, harness: Option<ProcessId>) {

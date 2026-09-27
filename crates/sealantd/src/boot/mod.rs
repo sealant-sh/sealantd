@@ -369,7 +369,10 @@ fn harness_child_env(config: &BootConfig, secret_env: &[(String, String)]) -> Ve
 }
 
 /// Steps 9–18: build the runtime, enter Tokio, run the control server and supervise the harness.
-fn run_supervised(
+/// [`run_boot`] calls it after its own preparation; public for tests that prepare a capture
+/// workspace in-process (a registrar double) and run the rest of the boot as it is.
+#[doc(hidden)]
+pub fn run_supervised(
     config: BootConfig,
     secret_env: Vec<(String, String)>,
     capture_boot: Option<capture::CaptureBoot>,
@@ -434,6 +437,14 @@ async fn boot_serve(
         runtime.close_admission();
     }
 
+    // Step 11c: the capture engine starts now, on the disk as materialized — before dotfiles,
+    // lifecycle steps, the harness or anything else a user wrote runs (cross-repo decision 8):
+    // setup can write for hours, and without a running engine an unannounced crash lost all of
+    // it, beyond any capture cadence (review 2026-09-28 #9). It needs no control socket. From
+    // here on every exit runs its final flush ([`final_capture`]). The harness is attached for
+    // the fence once it is launched.
+    let capture_runtime = capture_boot.map(|boot| start_capture(&runtime, &config, boot));
+
     // Step 12: runtime dotfiles, synchronously, BEFORE the control socket binds. The launching
     // adapter and the gateway treat the socket as the readiness signal, and everything they inject
     // after readiness (credential files into $HOME) must never race a dotfiles apply that writes
@@ -443,7 +454,8 @@ async fn boot_serve(
     {
         tracing::error!(%error, "dotfiles apply failed");
         eprintln!("sealantd boot: {error}");
-        return shutdown_before_control(&runtime, ExitCode::FAILURE).await;
+        let code = final_capture(&runtime, ExitCode::FAILURE).await;
+        return shutdown_before_control(&runtime, code).await;
     }
     // Caller-provided archives apply after the repo so local selections override its files.
     if let Some(dir) = config
@@ -454,7 +466,8 @@ async fn boot_serve(
     {
         tracing::error!(%error, "dotfiles archive apply failed");
         eprintln!("sealantd boot: {error}");
-        return shutdown_before_control(&runtime, ExitCode::FAILURE).await;
+        let code = final_capture(&runtime, ExitCode::FAILURE).await;
+        return shutdown_before_control(&runtime, code).await;
     }
 
     // Step 13: control server in-process on the same runtime/bus/registry. The optional WSS
@@ -466,7 +479,8 @@ async fn boot_serve(
             Err(error) => {
                 tracing::error!(%error, "wss frontend failed to start");
                 eprintln!("sealantd boot: wss frontend failed to start: {error}");
-                return shutdown_before_control(&runtime, ExitCode::FAILURE).await;
+                let code = final_capture(&runtime, ExitCode::FAILURE).await;
+                return shutdown_before_control(&runtime, code).await;
             }
         },
     };
@@ -483,7 +497,7 @@ async fn boot_serve(
     );
 
     if config.recovery {
-        return recover(runtime, config, capture_boot, serve_tx, control_handle).await;
+        return recover(runtime, capture_runtime, serve_tx, control_handle).await;
     }
 
     // Print the harness banner (E8) now that prep is done.
@@ -499,6 +513,7 @@ async fn boot_serve(
     for step in steps {
         if let Err(code) = run_lifecycle_step(&runtime, &config, step).await {
             tracing::error!(run = %step.run, "lifecycle step failed; aborting boot");
+            let code = final_capture(&runtime, code).await;
             return shutdown_with(&runtime, &serve_tx, control_handle, code).await;
         }
     }
@@ -511,33 +526,14 @@ async fn boot_serve(
         Err(error) => {
             tracing::error!(%error, "failed to launch harness");
             eprintln!("sealantd boot: {error}");
-            return shutdown_with(&runtime, &serve_tx, control_handle, ExitCode::FAILURE).await;
+            let code = final_capture(&runtime, ExitCode::FAILURE).await;
+            return shutdown_with(&runtime, &serve_tx, control_handle, code).await;
         }
     };
 
-    // Step 15b: the capture engine runs beside the harness: cadence snaps, heartbeats, and the
-    // fence that pauses the harness process group (ADR-0015).
-    if let Some(boot) = capture_boot {
-        let capture_runtime = crate::capture::CaptureRuntime::new(boot);
-        if runtime.install_capture(capture_runtime.clone()) {
-            capture_runtime.start(runtime.clone(), harness_process_id.clone());
-        }
-        // What the final capture stops besides the processes sealantd started.
-        match &config.workspace_docker {
-            Some(endpoint) => tracing::info!(
-                %endpoint,
-                "the final capture stops every container of the workspace's Docker daemon"
-            ),
-            None => tracing::info!("no workspace Docker daemon; no container to stop at the end"),
-        }
-        runtime.set_workspace_docker(config.workspace_docker.clone());
-        if runtime.sweep_unavailable() {
-            tracing::error!(
-                "PR_SET_CHILD_SUBREAPER did not take effect and sealantd is not PID 1 of its PID \
-                 namespace: the final capture cannot see an orphaned writer, and every final \
-                 flush will answer complete: false (sweep-unavailable)"
-            );
-        }
+    // Step 15b: the fence pauses the harness from now on (the engine runs since step 11c).
+    if let Some(capture) = &capture_runtime {
+        capture.attach_harness(&runtime, harness_process_id.clone());
     }
 
     // Step 16: supervise — wait for the harness exit OR a shutdown signal.
@@ -595,18 +591,7 @@ async fn boot_serve(
     // with no deadline. It waits for a final flush already running (the signal listener's, a
     // control command's); after one that stopped every writer it neither stops them again nor
     // re-snaps an unchanged disk, and ships what is left. Exit 75 applies to this path only.
-    runtime.final_flush(None, None).await;
-    // A daemon whose final capture is incomplete never exits 0: what is on this disk is not
-    // all in the store, and whoever tears the workspace down must know.
-    let exit_code = if runtime.capture_incomplete() {
-        tracing::error!(
-            code = crate::runtime::EXIT_CAPTURE_INCOMPLETE,
-            "final capture incomplete; exiting with EX_TEMPFAIL and keeping the staging directory"
-        );
-        ExitCode::from(crate::runtime::EXIT_CAPTURE_INCOMPLETE)
-    } else {
-        exit_code
-    };
+    let exit_code = final_capture(&runtime, exit_code).await;
 
     // Steps 17–18.
     shutdown_with(&runtime, &serve_tx, control_handle, exit_code).await
@@ -619,12 +604,11 @@ async fn boot_serve(
 /// complete, else 75.
 async fn recover(
     runtime: Arc<Runtime>,
-    config: BootConfig,
-    capture_boot: Option<capture::CaptureBoot>,
+    capture_runtime: Option<Arc<crate::capture::CaptureRuntime>>,
     serve_tx: watch::Sender<bool>,
     mut control_handle: tokio::task::JoinHandle<std::io::Result<()>>,
 ) -> ExitCode {
-    let Some(boot) = capture_boot else {
+    if capture_runtime.is_none() {
         tracing::error!("recovery boot without a capture engine");
         return shutdown_with(
             &runtime,
@@ -633,12 +617,7 @@ async fn recover(
             ExitCode::from(crate::runtime::EXIT_CAPTURE_INCOMPLETE),
         )
         .await;
-    };
-    let capture_runtime = crate::capture::CaptureRuntime::new(boot);
-    if runtime.install_capture(capture_runtime.clone()) {
-        capture_runtime.start_without_harness(runtime.clone());
     }
-    runtime.set_workspace_docker(config.workspace_docker.clone());
     tracing::warn!(
         "recovery boot: shipping this disk's staged captures; no lifecycle step or harness runs \
          and nothing is admitted — waiting for the final flush and the stop"
@@ -652,18 +631,62 @@ async fn recover(
             ExitCode::FAILURE
         }
     };
-    runtime.final_flush(None, None).await;
-    let exit_code = if runtime.capture_incomplete() {
+    let exit_code = final_capture(&runtime, exit_code).await;
+    shutdown_with(&runtime, &serve_tx, control_handle, exit_code).await
+}
+
+/// Step 11c: install the capture engine and start it with no harness (the fence gets the
+/// harness once it is launched), and name what its final flush stops besides the processes
+/// sealantd started.
+fn start_capture(
+    runtime: &Arc<Runtime>,
+    config: &BootConfig,
+    boot: capture::CaptureBoot,
+) -> Arc<crate::capture::CaptureRuntime> {
+    let capture_runtime = crate::capture::CaptureRuntime::new(boot);
+    if runtime.install_capture(capture_runtime.clone()) {
+        capture_runtime.start_without_harness(runtime.clone());
+    }
+    match &config.workspace_docker {
+        Some(endpoint) => tracing::info!(
+            %endpoint,
+            "the final capture stops every container of the workspace's Docker daemon"
+        ),
+        None => tracing::info!("no workspace Docker daemon; no container to stop at the end"),
+    }
+    runtime.set_workspace_docker(config.workspace_docker.clone());
+    if runtime.sweep_unavailable() {
+        tracing::error!(
+            "PR_SET_CHILD_SUBREAPER did not take effect and sealantd is not PID 1 of its PID \
+             namespace: the final capture cannot see an orphaned writer, and every final \
+             flush will answer complete: false (sweep-unavailable)"
+        );
+    }
+    tracing::info!("capture engine started before any user code");
+    capture_runtime
+}
+
+/// Every exit after the capture engine started runs its final flush: admission closed, every
+/// writer terminated and awaited, then both classes snapped and everything registered, with no
+/// deadline. It waits for a final flush already running (the signal listener's, a control
+/// command's); after one that stopped every writer it neither stops them again nor re-snaps an
+/// unchanged disk, and ships what is left. A daemon whose final capture is incomplete never
+/// exits with `code`: it exits 75 ([`crate::runtime::EXIT_CAPTURE_INCOMPLETE`]), because what
+/// is on this disk is not all in the store and whoever tears the workspace down must know. No
+/// capture engine: `code` as it is.
+async fn final_capture(runtime: &Arc<Runtime>, code: ExitCode) -> ExitCode {
+    if runtime.final_flush(None, None).await.is_none() {
+        return code;
+    }
+    if runtime.capture_incomplete() {
         tracing::error!(
             code = crate::runtime::EXIT_CAPTURE_INCOMPLETE,
-            "recovery: final capture incomplete; exiting with EX_TEMPFAIL and keeping the \
-             staging directory"
+            "final capture incomplete; exiting with EX_TEMPFAIL and keeping the staging directory"
         );
         ExitCode::from(crate::runtime::EXIT_CAPTURE_INCOMPLETE)
     } else {
-        exit_code
-    };
-    shutdown_with(&runtime, &serve_tx, control_handle, exit_code).await
+        code
+    }
 }
 
 /// Run one lifecycle step as a managed process and await its exit. `Err(code)` on non-zero exit.
