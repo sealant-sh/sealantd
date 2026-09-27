@@ -425,16 +425,24 @@ enum CaptureFlushKind {
   // A small-class snap; returns once every capture ahead of a bulk capture still uploading is
   // registered (what a change or a diff needs). The bulk capture keeps uploading.
   CAPTURE_FLUSH_KIND_SUSPEND = 1;
-  // The executor is going away: a small-class AND a bulk-class snap, then ship until nothing is
-  // pending (bulk included), the lease is fenced, the chain conflicts, or `deadline_ms` passes.
+  // The executor is ending. In order: the daemon stops admitting new processes, execs, sessions
+  // and SFTP bridges (for good); terminates every managed process and session (SIGTERM, then
+  // SIGKILL after `grace_ms`) and waits for them; snaps the small AND the bulk class (both must
+  // succeed); then ships until nothing is pending, bulk included. The answer's `complete` says
+  // whether all of that happened; anything else (a snap failed, the lease is fenced, the chain
+  // conflicts, `deadline_ms` passed, a process survived SIGKILL) leaves it false with a reason.
   CAPTURE_FLUSH_KIND_FINAL = 2;
 }
 message CaptureFlushArgs {
   CaptureFlushKind kind = 1;
   // How long the flush may take, milliseconds. Honoured as given (never clamped to the shutdown
   // grace). Absent: a suspend flush is bounded by the daemon's shutdown grace, as before; a final
-  // flush has no deadline and returns only when nothing is pending, or on a fence or a conflict.
+  // flush has no deadline and returns when it is complete, or when it can never be (a fence, a
+  // conflict, a failed snap).
   optional uint64 deadline_ms = 2;
+  // Final only: how long managed processes get after SIGTERM before SIGKILL, milliseconds.
+  // Absent: the daemon's shutdown grace. Counted inside `deadline_ms`.
+  optional uint64 grace_ms = 3;
 }
 // What a capture snapped: the small class (git, `.git` bookkeeping, harness home) or the bulk
 // class (dependencies, build outputs).
@@ -620,6 +628,18 @@ message CaptureStatusReport {
   // object two captures share is counted once). What is lost if the disk goes now; 0 once
   // everything is up (captures can still wait to register).
   uint64 pending_bytes = 14;
+  // True only when a final capture.flush ran to the end on this executor: admission closed,
+  // every managed process terminated and awaited, the small and the bulk class snapped after
+  // that, and everything registered (`pending` 0, not fenced). The only answer a control plane
+  // may read as "saved"; `pending == 0` alone is not. False from an older daemon.
+  bool complete = 15;
+  // Why `complete` is false: `not-final` (no final flush has run), `processes-remain` (a managed
+  // process outlived SIGKILL), `snapshot-failed` (a final snap of either class failed),
+  // `fenced`, `conflict` (the chain moved under this executor), `deadline` (`deadline_ms`
+  // passed with captures pending), `ship-failed` (shipping kept failing until the deadline),
+  // `pending` (a capture was staged after the final flush), `internal` (the flush's task
+  // failed). Absent when `complete`.
+  optional string incomplete_reason = 16;
 }
 message LeaseEpochReport { uint64 epoch = 1; string worktree_id = 2; bool fenced = 3; }
 message CaptureReplanned {

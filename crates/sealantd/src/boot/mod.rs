@@ -506,8 +506,16 @@ async fn boot_serve(
     // Step 16: supervise — wait for the harness exit OR a shutdown signal.
     let exit_code = tokio::select! {
         status = await_exit_on(&mut harness_events, &harness_process_id) => {
-            tracing::info!("harness exited; shutting down");
-            exit_code_from_status(status)
+            if runtime.admission_is_closed() {
+                // A final capture flush (SIGTERM, SIGINT, gracefulShutdown, capture.flush
+                // final) terminated it: the stop that was asked for, as when the shutdown
+                // request wins this race.
+                tracing::info!("harness terminated for the final capture; shutting down");
+                ExitCode::SUCCESS
+            } else {
+                tracing::info!("harness exited; shutting down");
+                exit_code_from_status(status)
+            }
         }
         () = runtime.shutdown().wait() => {
             tracing::info!("shutdown requested; terminating harness");
@@ -521,11 +529,22 @@ async fn boot_serve(
         }
     };
 
-    // Step 16b: the final capture (a no-op when the signal listener or a gracefulShutdown command
-    // already flushed).
-    runtime
-        .flush_captures(sealant_protocol::CaptureFlushKind::Final)
-        .await;
+    // Step 16b: the final capture — admission closed, every managed process terminated and
+    // awaited (the harness is gone; its lifecycle siblings, sessions and execs may not be), then
+    // both classes snapped and everything registered. It waits for a final flush already
+    // running (the signal listener's, a control command's) and runs once more after it.
+    runtime.final_flush(None, None).await;
+    // A daemon whose final capture is incomplete never exits 0: what is on this disk is not
+    // all in the store, and whoever tears the workspace down must know.
+    let exit_code = if runtime.capture_incomplete() {
+        tracing::error!(
+            code = crate::runtime::EXIT_CAPTURE_INCOMPLETE,
+            "final capture incomplete; exiting with EX_TEMPFAIL and keeping the staging directory"
+        );
+        ExitCode::from(crate::runtime::EXIT_CAPTURE_INCOMPLETE)
+    } else {
+        exit_code
+    };
 
     // Steps 17–18.
     shutdown_with(&runtime, &serve_tx, control_handle, exit_code).await

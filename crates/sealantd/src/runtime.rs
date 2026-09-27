@@ -3,7 +3,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use sealant_control::{ConnHandle, ControlService};
 use sealant_eventlog::{FsyncPolicy, Spool, SpoolConfig};
@@ -27,6 +28,10 @@ use crate::shutdown::ShutdownSignal;
 
 /// Daemon build version.
 pub const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// The exit code of a daemon whose final capture flush did not complete (`EX_TEMPFAIL`): what
+/// is on this disk is not all registered, and the staging directory is left as it is.
+pub const EXIT_CAPTURE_INCOMPLETE: u8 = 75;
 
 /// Collect the values captured I/O must redact (plan §18): the values of secret-looking env vars
 /// plus every launcher-provided secret literal, whatever its name.
@@ -128,6 +133,12 @@ pub struct Runtime {
     capture: std::sync::OnceLock<Arc<crate::capture::CaptureRuntime>>,
     extra_env: Arc<Mutex<Vec<(String, String)>>>,
     shutdown: Arc<ShutdownSignal>,
+    /// A final capture flush began: the executor is ending, and no new process, exec, session
+    /// or SFTP bridge is admitted, ever again.
+    admission_closed: AtomicBool,
+    /// One final capture flush at a time (the signal listener's, a control command's, and the
+    /// boot supervisor's after the harness exits can overlap).
+    final_lock: tokio::sync::Mutex<()>,
     features: Mutex<HashMap<Feature, bool>>,
     pidfd_supported: bool,
     subreaper: bool,
@@ -213,6 +224,8 @@ impl Runtime {
             capture: std::sync::OnceLock::new(),
             extra_env,
             shutdown,
+            admission_closed: AtomicBool::new(false),
+            final_lock: tokio::sync::Mutex::new(()),
             features,
             pidfd_supported,
             subreaper,
@@ -236,46 +249,142 @@ impl Runtime {
         self.capture.get().cloned()
     }
 
-    /// Flush captures on the daemon's own way out (SIGTERM, SIGINT, `runtime.gracefulShutdown`,
-    /// the harness exiting): a `final` flush snaps both classes and returns only once everything
-    /// staged is registered, or the lease is fenced, or the chain conflicts — no deadline, since
-    /// the disk goes with the daemon and the process ending is what stops it. A no-op without a
-    /// capture engine; errors are logged, never fatal.
-    pub async fn flush_captures(&self, kind: sealant_protocol::CaptureFlushKind) {
-        let Some(capture) = self.capture() else {
-            return;
-        };
-        let deadline = self.flush_deadline(kind, None);
-        match tokio::task::spawn_blocking(move || capture.flush(kind, deadline)).await {
-            Ok(Ok(report)) => {
-                tracing::info!(
-                    head_n = ?report.head_n,
-                    pending = report.pending,
-                    pending_bulk = report.pending_bulk,
-                    pending_bytes = report.pending_bytes,
-                    "captures flushed"
-                );
+    /// The final capture flush: this executor is ending. In this order, because a writer that
+    /// runs past the last snap loses what it writes (an agent writing during the upload, or
+    /// from its SIGTERM handler, after the snap that was meant to be the last):
+    ///
+    /// 1. admission closes for good — no new process, exec, session, SFTP bridge, execution,
+    ///    bind or re-plan;
+    /// 2. every managed process and session is terminated (a process the fence paused is
+    ///    continued, then `SIGTERM`; `SIGKILL` after `grace_ms`, the shutdown grace when
+    ///    absent; a hard shutdown kills at once) and awaited, and SFTP bridges are closed;
+    /// 3. the small AND the bulk class are snapped — both must succeed;
+    /// 4. everything ships until nothing is pending.
+    ///
+    /// The report's `complete` is true only when all of that happened; every failure is
+    /// `complete: false` with its reason, logged at error, and the staging directory stays as
+    /// it is. `deadline_ms` bounds the whole of it (the grace included); none: until complete,
+    /// or until it never can be (a fence, a conflict, a failed snap). Serialized: a second
+    /// final flush waits for the first, then runs again (nothing is left to terminate). `None`
+    /// without a capture engine.
+    pub async fn final_flush(
+        &self,
+        deadline_ms: Option<u64>,
+        grace_ms: Option<u64>,
+    ) -> Option<sealant_protocol::CaptureStatusReport> {
+        let capture = self.capture()?;
+        let _one = self.final_lock.lock().await;
+        let start = Instant::now();
+        let deadline = deadline_ms.map(Duration::from_millis);
+        let grace = Duration::from_millis(grace_ms.unwrap_or_else(|| self.shutdown.grace_ms()));
+        let grace = deadline.map_or(grace, |d| grace.min(d));
+        let remaining = self.quiesce(grace).await;
+        let left = deadline.map(|d| d.saturating_sub(start.elapsed()));
+        let flushing = Arc::clone(&capture);
+        let report = match tokio::task::spawn_blocking(move || {
+            flushing.flush_final(left, remaining)
+        })
+        .await
+        {
+            Ok(report) => report,
+            Err(error) => {
+                tracing::error!(%error, "final capture flush task failed");
+                capture.record_final_incomplete("internal");
+                capture.status()
             }
-            Ok(Err(error)) => tracing::warn!(%error, "capture flush failed"),
-            Err(error) => tracing::warn!(%error, "capture flush task failed"),
+        };
+        if report.complete {
+            tracing::info!(
+                head_n = ?report.head_n,
+                took_ms = start.elapsed().as_millis() as u64,
+                "final capture complete: everything on this disk is registered"
+            );
+        } else {
+            tracing::error!(
+                reason = report.incomplete_reason.as_deref().unwrap_or("unknown"),
+                pending = report.pending,
+                pending_bulk = report.pending_bulk,
+                pending_bytes = report.pending_bytes,
+                fenced = report.fenced,
+                "FINAL CAPTURE INCOMPLETE: work product is on this disk only; the staging \
+                 directory is kept"
+            );
         }
+        Some(report)
     }
 
-    /// The deadline a `capture.flush` of `kind` runs under: the caller's, as given; without one,
-    /// a suspend flush is bounded by the shutdown grace (as it always was) and a final flush by
-    /// nothing.
-    fn flush_deadline(
-        &self,
-        kind: sealant_protocol::CaptureFlushKind,
-        deadline_ms: Option<u64>,
-    ) -> Option<Duration> {
-        match (deadline_ms, kind) {
-            (Some(ms), _) => Some(Duration::from_millis(ms)),
-            (None, sealant_protocol::CaptureFlushKind::Suspend) => {
-                Some(Duration::from_millis(self.shutdown.grace_ms()))
-            }
-            (None, sealant_protocol::CaptureFlushKind::Final) => None,
+    /// Whether this is a capture-store workspace whose captures are not known complete: no
+    /// final flush completed, or something was staged after it. The daemon then exits with
+    /// [`EXIT_CAPTURE_INCOMPLETE`], never 0.
+    #[must_use]
+    pub fn capture_incomplete(&self) -> bool {
+        self.capture().is_some_and(|c| !c.status().complete)
+    }
+
+    /// Close admission and stop every writer this daemon manages: SFTP bridges closed, paused
+    /// processes continued, then `SIGTERM` (or `SIGKILL` on a hard shutdown) to every managed
+    /// process group and `SIGHUP` to every session, `SIGKILL` after `grace`, and awaited.
+    /// Returns how many managed processes and sessions are still alive after that.
+    async fn quiesce(&self, grace: Duration) -> usize {
+        self.admission_closed.store(true, Ordering::SeqCst);
+        let sftp = self.sftp.close_all();
+        let (signal, grace) = if self.shutdown.is_hard() {
+            (Signal::Kill, Duration::ZERO)
+        } else {
+            (Signal::Term, grace)
+        };
+        let running: Vec<_> = self
+            .processes
+            .list(None)
+            .into_iter()
+            .filter(|p| !matches!(p.state, ProcessState::Exited | ProcessState::Signaled))
+            .collect();
+        // A process group the capture fence stopped (`SIGSTOP`) would not act on `SIGTERM`
+        // until the `SIGKILL`: continue it first.
+        for process in &running {
+            let _ = self.processes.signal(&process.process_id, Signal::Cont);
         }
+        let sessions = self.sessions.registry.len();
+        let started = Instant::now();
+        tokio::join!(
+            self.sessions.terminate_all(grace),
+            self.processes.terminate_all(signal, grace),
+        );
+        let remaining = self.processes.registry.running().len() + self.sessions.registry.len();
+        tracing::info!(
+            processes = running.len(),
+            sessions,
+            sftp,
+            remaining,
+            took_ms = started.elapsed().as_millis() as u64,
+            "admission closed; managed processes terminated for the final capture"
+        );
+        if remaining > 0 {
+            tracing::error!(
+                remaining,
+                "managed processes outlived SIGKILL; the final capture cannot be complete"
+            );
+        }
+        remaining
+    }
+
+    /// The error for new work once a final capture flush closed admission.
+    fn admission_closed_error() -> ControlError {
+        ControlError::runtime_shutting_down(
+            "the executor is ending: a final capture flush closed admission".to_owned(),
+        )
+    }
+
+    /// Whether a final capture flush closed admission (the executor is ending).
+    #[must_use]
+    pub fn admission_is_closed(&self) -> bool {
+        self.admission_closed.load(Ordering::SeqCst)
+    }
+
+    /// The deadline a suspend `capture.flush` runs under: the caller's, as given; without one,
+    /// the shutdown grace (as it always was).
+    fn suspend_deadline(&self, deadline_ms: Option<u64>) -> Duration {
+        Duration::from_millis(deadline_ms.unwrap_or_else(|| self.shutdown.grace_ms()))
     }
 
     /// Deliver a signal to a managed process's group (the capture fence pauses the harness).
@@ -319,6 +428,9 @@ impl Runtime {
         &self,
         args: sealant_protocol::ExecArgs,
     ) -> Result<sealant_protocol::ExecAccepted, ControlError> {
+        if self.admission_is_closed() {
+            return Err(Self::admission_closed_error());
+        }
         self.processes.exec(args, None)
     }
 
@@ -437,7 +549,8 @@ impl Runtime {
         );
     }
 
-    /// Begin shutdown: announce, then terminate the managed process tree.
+    /// Begin shutdown: announce, then terminate the managed process tree (already gone when a
+    /// final capture flush ran: it terminates the tree before its snaps).
     pub async fn begin_shutdown(&self) {
         self.transition(
             RuntimeState::ShuttingDown,
@@ -574,6 +687,21 @@ impl Runtime {
             }
         }
 
+        // A final capture flush began: this executor admits no new writer (nor a re-plan or a
+        // bind, which would change what the last capture is taken of).
+        if self.admission_is_closed()
+            && matches!(
+                &request.command,
+                Command::Exec(_)
+                    | Command::OpenSession(_)
+                    | Command::ExecutionStart(_)
+                    | Command::BindMount { .. }
+                    | Command::CaptureReplan
+            )
+        {
+            return ControlResponse::error(rid, Self::admission_closed_error());
+        }
+
         match request.command {
             Command::RuntimeHealth => {
                 ControlResponse::ok_with(rid, CommandResult::Health(self.health_report()))
@@ -585,8 +713,8 @@ impl Runtime {
                 ControlResponse::ok_with(rid, CommandResult::Metrics(self.metrics()))
             }
             Command::RuntimeGracefulShutdown { grace_millis } => {
-                self.flush_captures(sealant_protocol::CaptureFlushKind::Final)
-                    .await;
+                // Writers stop, then the final capture, then the shutdown.
+                self.final_flush(None, grace_millis).await;
                 self.shutdown.request_graceful(grace_millis);
                 ControlResponse::ok_with(
                     rid,
@@ -736,11 +864,25 @@ impl Runtime {
                     }
                 }
             },
-            Command::CaptureFlush { kind, deadline_ms } => match self.capture() {
+            Command::CaptureFlush {
+                kind: sealant_protocol::CaptureFlushKind::Final,
+                deadline_ms,
+                grace_ms,
+            } => match self.final_flush(deadline_ms, grace_ms).await {
+                // Answered whatever happened: `complete` and `incomplete_reason` say what.
+                Some(report) => ControlResponse::ok_with(rid, CommandResult::CaptureStatus(report)),
+                None => ControlResponse::error(rid, crate::capture::not_enabled()),
+            },
+            Command::CaptureFlush {
+                kind: sealant_protocol::CaptureFlushKind::Suspend,
+                deadline_ms,
+                grace_ms: _,
+            } => match self.capture() {
                 None => ControlResponse::error(rid, crate::capture::not_enabled()),
                 Some(capture) => {
-                    let deadline = self.flush_deadline(kind, deadline_ms);
-                    match tokio::task::spawn_blocking(move || capture.flush(kind, deadline)).await {
+                    let deadline = self.suspend_deadline(deadline_ms);
+                    match tokio::task::spawn_blocking(move || capture.flush_suspend(deadline)).await
+                    {
                         Ok(Ok(report)) => {
                             ControlResponse::ok_with(rid, CommandResult::CaptureStatus(report))
                         }
@@ -836,6 +978,12 @@ impl Runtime {
                 rid,
                 ControlError::runtime_shutting_down("runtime is shutting down".to_owned()),
             );
+        }
+        // An exec-attach spawns a writer, and so does an `sftp-server`.
+        if self.admission_is_closed()
+            && matches!(&request.command, Command::Exec(_) | Command::OpenSftp(_))
+        {
+            return ControlResponse::error(rid, Self::admission_closed_error());
         }
 
         match request.command {

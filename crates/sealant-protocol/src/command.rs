@@ -472,11 +472,12 @@ pub enum Command {
     },
     /// A forced capture, then ship and register what `kind` waits for (the platform's suspend
     /// and terminate hooks call this). `suspend`: a small-class snap; returns once every capture
-    /// ahead of a bulk capture still uploading is registered. `final`: a small-class and a
-    /// bulk-class snap; returns once nothing is pending (bulk included), on a fence or a chain
-    /// conflict, or at `deadline_ms`. `deadline_ms` is honoured as given, never clamped to the
-    /// shutdown grace; absent, a suspend flush is bounded by the shutdown grace and a final
-    /// flush by nothing.
+    /// ahead of a bulk capture still uploading is registered. `final`: the executor is ending —
+    /// admission of new processes closes for good, every managed process and session is
+    /// terminated (`SIGTERM`, `SIGKILL` after `grace_ms`) and awaited, then the small and the
+    /// bulk class are snapped and everything ships; the report's `complete` says whether all of
+    /// it happened. `deadline_ms` is honoured as given, never clamped to the shutdown grace;
+    /// absent, a suspend flush is bounded by the shutdown grace and a final flush by nothing.
     #[serde(rename = "capture.flush")]
     CaptureFlush {
         /// What the flush waits for.
@@ -485,6 +486,10 @@ pub enum Command {
         /// How long it may take, milliseconds.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         deadline_ms: Option<u64>,
+        /// Final only: how long managed processes get after `SIGTERM` before `SIGKILL`,
+        /// milliseconds; absent, the shutdown grace.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        grace_ms: Option<u64>,
     },
     /// Report the capture engine's state.
     #[serde(rename = "capture.status")]
@@ -508,8 +513,8 @@ pub enum CaptureFlushKind {
     /// the bulk capture keeps uploading. What a client that sends no kind gets.
     #[default]
     Suspend,
-    /// The executor is going away: both classes are snapped and everything ships, bulk
-    /// included.
+    /// The executor is ending: admission closes, managed processes are terminated and awaited,
+    /// then both classes are snapped and everything ships, bulk included.
     Final,
 }
 
@@ -979,6 +984,16 @@ pub struct CaptureStatusReport {
     /// object two captures share counts once): what would be lost if the disk went now.
     #[serde(default)]
     pub pending_bytes: u64,
+    /// A final `capture.flush` ran to the end on this executor: admission closed, every managed
+    /// process terminated and awaited, the small and the bulk class snapped after that, and
+    /// everything registered (`pending` 0, not fenced). The only answer that means "saved";
+    /// `pending == 0` alone does not. `false` from an older daemon.
+    #[serde(default)]
+    pub complete: bool,
+    /// Why `complete` is false: `not-final`, `processes-remain`, `snapshot-failed`, `fenced`,
+    /// `conflict`, `deadline`, `ship-failed`, `pending` or `internal`. Absent when `complete`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incomplete_reason: Option<String>,
 }
 
 /// Result of `capture.replan`: the identity the executor now acts under and what the delta

@@ -27,7 +27,7 @@ pub mod transport;
 pub mod tree;
 pub mod watch;
 
-pub use cadence::{CadenceRunner, CadenceSnapshot};
+pub use cadence::{CadenceRunner, CadenceSnapshot, FinalFlush, Incomplete};
 pub use engine::{
     Cadence, CaptureConfig, CaptureEngine, Class, EngineError, SnapOutcome, SnapRequest, SnapStats,
     StagedCapture,

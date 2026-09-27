@@ -76,12 +76,15 @@ enum CaptureCmd {
         kind: String,
     },
     /// A forced capture, then ship and register it (the suspend and terminate hooks). Without
-    /// `--final`: returns once everything ahead of a bulk upload is registered. With it: snaps
-    /// the bulk class too and returns once nothing is pending, bulk included (or at
-    /// `--deadline`, or on a fence). Prints the report: `pending`, `pendingBulk`,
-    /// `pendingBytes`, `refused`.
+    /// `--final`: returns once everything ahead of a bulk upload is registered. With it: the
+    /// executor is ending — the daemon admits no new process, terminates every managed one
+    /// (SIGTERM, SIGKILL after `--grace`) and waits for them, snaps the small and the bulk
+    /// class, and ships until nothing is pending (or `--deadline`, or a fence). Prints the
+    /// report: `complete` (true only when all of that happened), `incompleteReason`,
+    /// `pending`, `pendingBulk`, `pendingBytes`, `refused`.
     Flush {
-        /// Snap and ship everything, dependency trees included: the executor is going away.
+        /// The executor is ending: stop its processes, then snap and ship everything,
+        /// dependency trees included.
         #[arg(long = "final")]
         final_: bool,
         /// How long the flush may take: `500ms`, `90s`, `15m`, `2h` (a bare number is
@@ -89,6 +92,10 @@ enum CaptureCmd {
         /// a suspend flush is bounded by the daemon's shutdown grace.
         #[arg(long, value_parser = parse_duration_ms)]
         deadline: Option<u64>,
+        /// Final only: how long managed processes get after SIGTERM before SIGKILL (same
+        /// units). Without it, the daemon's shutdown grace.
+        #[arg(long, value_parser = parse_duration_ms, requires = "final_")]
+        grace: Option<u64>,
     },
     /// Report the capture engine's state.
     Status,
@@ -171,7 +178,11 @@ async fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             },
-            CaptureCmd::Flush { final_, deadline } => (
+            CaptureCmd::Flush {
+                final_,
+                deadline,
+                grace,
+            } => (
                 Command::CaptureFlush {
                     kind: if final_ {
                         CaptureFlushKind::Final
@@ -179,6 +190,7 @@ async fn main() -> ExitCode {
                         CaptureFlushKind::Suspend
                     },
                     deadline_ms: deadline,
+                    grace_ms: grace,
                 },
                 false,
             ),
@@ -278,15 +290,38 @@ mod tests {
             let cli = Cli::try_parse_from(args).expect("parse");
             match cli.command {
                 Cmd::Capture {
-                    action: CaptureCmd::Flush { final_, deadline },
-                } => (final_, deadline),
+                    action:
+                        CaptureCmd::Flush {
+                            final_,
+                            deadline,
+                            grace,
+                        },
+                } => (final_, deadline, grace),
                 other => panic!("{other:?}"),
             }
         };
-        assert_eq!(flush(&["sealantctl", "capture", "flush"]), (false, None));
+        assert_eq!(
+            flush(&["sealantctl", "capture", "flush"]),
+            (false, None, None)
+        );
         assert_eq!(
             flush(&["sealantctl", "capture", "flush", "--final"]),
-            (true, None)
+            (true, None, None)
+        );
+        assert_eq!(
+            flush(&[
+                "sealantctl",
+                "capture",
+                "flush",
+                "--final",
+                "--grace",
+                "30s"
+            ]),
+            (true, None, Some(30_000))
+        );
+        assert!(
+            Cli::try_parse_from(["sealantctl", "capture", "flush", "--grace", "30s"]).is_err(),
+            "a grace belongs to a final flush"
         );
         assert_eq!(
             flush(&[
@@ -297,7 +332,7 @@ mod tests {
                 "--deadline",
                 "15m"
             ]),
-            (true, Some(900_000))
+            (true, Some(900_000), None)
         );
     }
 }

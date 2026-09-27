@@ -242,7 +242,8 @@ fn a_final_flush_preempts_a_scheduled_bulk_build() {
 }
 
 /// A final flush given a deadline returns at it — the rest stays staged and is reported, never
-/// dropped — and a final flush without one then finishes the job.
+/// dropped, and the flush is not complete (it answered `Ok` before, like a finished one) — and
+/// a final flush without one then finishes the job.
 #[test]
 fn a_final_flush_with_a_deadline_returns_at_it_and_keeps_the_rest_staged() {
     let fx = fixture(60);
@@ -253,10 +254,10 @@ fn a_final_flush_with_a_deadline_returns_at_it_and_keeps_the_rest_staged() {
     });
     let runner = runner(slow_config(&fx.root), slow.clone(), &fx);
     let start = Instant::now();
-    runner
-        .flush(CaptureKind::Final, Some(Duration::from_millis(300)))
-        .unwrap();
+    let flushed = runner.flush(CaptureKind::Final, Some(Duration::from_millis(300)));
     let took = start.elapsed();
+    let error = flushed.expect_err("a flush cut short by its deadline is not complete");
+    assert!(error.to_string().contains("deadline"), "{error}");
     assert!(
         took < Duration::from_secs(2),
         "returned at its deadline: {took:?}"
@@ -423,4 +424,78 @@ fn a_lost_lease_pauses_shipping_and_a_final_flush_waits_it_out() {
         chain.last().unwrap().manifest.sections.bulk,
         BulkState::Ready(_)
     ));
+}
+
+/// Review finding #11: a final flush whose forced bulk snap failed logged it and went on; older
+/// captures drained and the flush answered success, while the dependency tree as it was then
+/// was on the disk only. Now a failed final snap of either class makes the flush incomplete
+/// (`snapshot-failed`), and what could be staged still ships.
+///
+/// The bulk snap is made to fail where it writes: the pack it produces has a name fixed by its
+/// bytes, so the same tree snapped elsewhere names it, and a directory in its place makes the
+/// rename fail.
+#[test]
+fn a_failed_final_bulk_snap_is_not_a_complete_flush() {
+    // The same tree, snapped elsewhere: the packs a bulk snap of it writes.
+    let probe = fixture(20);
+    let runner_probe = runner(
+        CaptureConfig::new("wt", 1, &probe.root),
+        probe.store.clone(),
+        &probe,
+    );
+    runner_probe.flush(CaptureKind::Final, None).unwrap();
+    let BulkState::Ready(bulk) = probe.registrar.head().unwrap().manifest.sections.bulk else {
+        panic!("the probe snapped the bulk class");
+    };
+    runner_probe.stop();
+
+    let fx = fixture(20);
+    let config = CaptureConfig::new("wt", 1, &fx.root);
+    let objects = config.staging_dir().join("objects");
+    for key in &bulk.packs {
+        let sha = key.rsplit('/').next().unwrap();
+        fs::create_dir_all(objects.join(sha).join("taken")).unwrap();
+    }
+    let runner = runner(config, fx.store.clone(), &fx);
+    let flushed = runner.flush(CaptureKind::Final, None);
+    let error = flushed.expect_err("a failed final bulk snap is not a complete flush");
+    assert!(error.to_string().contains("snap failed"), "{error}");
+    let reported = runner.flush_final(None);
+    assert_eq!(
+        reported.incomplete.as_ref().map(|i| i.reason()),
+        Some("snapshot-failed"),
+        "{reported:?}"
+    );
+    // The small class still shipped: the edit-level work is in the store.
+    assert!(runner.staging().pending().unwrap().is_empty());
+    assert!(matches!(
+        fx.registrar.head().unwrap().manifest.sections.bulk,
+        BulkState::Pending(_)
+    ));
+}
+
+/// Review finding #11: once the shipper had been fenced, a pass answered "done" and the next
+/// final flush succeeded with the capture still staged. A final flush on a fenced lease is now
+/// an error every time, and the capture stays staged.
+#[test]
+fn a_final_flush_after_a_fence_is_not_a_success() {
+    let fx = fixture(3);
+    let engine = CaptureEngine::open(CaptureConfig::new("wt", 1, &fx.root), None).unwrap();
+    let sink: Arc<dyn BlobSink> = fx.store.clone();
+    let registrar: Arc<dyn Registrar> = fx.registrar.clone();
+    let shipper = Arc::new(engine.shipper(sink, registrar));
+    let runner = CadenceRunner::new(engine, shipper.clone());
+    runner.snap(CaptureKind::Turn).unwrap();
+    fx.registrar.set_live_epoch(2);
+    assert!(shipper.ship_pending().is_err(), "the fence is found");
+    assert!(shipper.is_fenced());
+
+    let flushed = runner.flush(CaptureKind::Final, None);
+    let error = flushed.expect_err("a fenced final flush is not a success");
+    assert!(error.to_string().contains("fenced"), "{error}");
+    assert!(
+        !runner.staging().pending().unwrap().is_empty(),
+        "still staged"
+    );
+    assert!(fx.registrar.chain().is_empty());
 }

@@ -1025,12 +1025,15 @@ impl From<Command> for wire::command::Command {
             Command::CaptureNow { kind } => W::CaptureNow(wire::CaptureNowArgs {
                 kind: enum_i32::<_, wire::CaptureKind>(kind),
             }),
-            Command::CaptureFlush { kind, deadline_ms } => {
-                W::CaptureFlush(wire::CaptureFlushArgs {
-                    kind: enum_i32::<_, wire::CaptureFlushKind>(kind),
-                    deadline_ms,
-                })
-            }
+            Command::CaptureFlush {
+                kind,
+                deadline_ms,
+                grace_ms,
+            } => W::CaptureFlush(wire::CaptureFlushArgs {
+                kind: enum_i32::<_, wire::CaptureFlushKind>(kind),
+                deadline_ms,
+                grace_ms,
+            }),
             Command::CaptureStatus => W::CaptureStatus(wire::Empty {}),
             Command::LeaseEpoch => W::LeaseEpoch(wire::Empty {}),
             Command::CaptureReplan => W::CaptureReplan(wire::Empty {}),
@@ -1117,6 +1120,7 @@ impl TryFrom<wire::command::Command> for Command {
             W::CaptureFlush(a) => Command::CaptureFlush {
                 kind: capture_flush_kind(a.kind)?,
                 deadline_ms: a.deadline_ms,
+                grace_ms: a.grace_ms,
             },
             W::CaptureStatus(_) => Command::CaptureStatus,
             W::LeaseEpoch(_) => Command::LeaseEpoch,
@@ -1407,6 +1411,8 @@ impl From<CommandResult> for wire::command_result::Result {
                     .collect(),
                 pending_bulk: c.pending_bulk,
                 pending_bytes: c.pending_bytes,
+                complete: c.complete,
+                incomplete_reason: c.incomplete_reason,
             }),
             CommandResult::LeaseEpoch(l) => W::LeaseEpoch(wire::LeaseEpochReport {
                 epoch: l.epoch,
@@ -1515,6 +1521,8 @@ impl TryFrom<wire::command_result::Result> for CommandResult {
                     .collect::<Result<_, _>>()?,
                 pending_bulk: c.pending_bulk,
                 pending_bytes: c.pending_bytes,
+                complete: c.complete,
+                incomplete_reason: c.incomplete_reason,
             }),
             W::LeaseEpoch(l) => CommandResult::LeaseEpoch(LeaseEpochReport {
                 epoch: l.epoch,
@@ -2019,13 +2027,37 @@ mod tests {
             Command::CaptureFlush {
                 kind: CaptureFlushKind::Suspend,
                 deadline_ms: None,
+                grace_ms: None,
             }
         );
         let unknown = wire::CaptureFlushArgs {
             kind: 7,
             deadline_ms: None,
+            grace_ms: None,
         };
         assert!(capture_flush_kind(unknown.kind).is_err());
+    }
+
+    /// A status report from a daemon that predates `complete` decodes as not complete, with no
+    /// reason: a control plane reading it never takes it for saved.
+    #[test]
+    fn a_status_report_without_complete_is_not_complete() {
+        let old = wire::ResponseOutcome {
+            outcome: Some(wire::response_outcome::Outcome::Ok(wire::CommandResult {
+                result: Some(wire::command_result::Result::CaptureStatus(
+                    wire::CaptureStatusReport::default(),
+                )),
+            })),
+        };
+        let Ok(ResponseOutcome::Ok {
+            result: Some(CommandResult::CaptureStatus(report)),
+        }) = ResponseOutcome::try_from(old)
+        else {
+            panic!("decode");
+        };
+        assert_eq!(report.pending, 0);
+        assert!(!report.complete);
+        assert_eq!(report.incomplete_reason, None);
     }
 
     #[test]
@@ -2037,10 +2069,12 @@ mod tests {
             Command::CaptureFlush {
                 kind: CaptureFlushKind::Suspend,
                 deadline_ms: None,
+                grace_ms: None,
             },
             Command::CaptureFlush {
                 kind: CaptureFlushKind::Final,
                 deadline_ms: Some(90_000),
+                grace_ms: Some(5_000),
             },
             Command::CaptureStatus,
             Command::LeaseEpoch,
@@ -2072,6 +2106,26 @@ mod tests {
                 refused: vec![CaptureClass::Bulk],
                 pending_bulk: 1,
                 pending_bytes: 812_000_000,
+                complete: false,
+                incomplete_reason: Some("deadline".to_owned()),
+            }),
+            CommandResult::CaptureStatus(CaptureStatusReport {
+                epoch: 2,
+                worktree_id: "wt".to_owned(),
+                head_n: Some(9),
+                pending: 0,
+                staged_bytes: 0,
+                uploaded_objects: 40,
+                uploaded_bytes: 5_000,
+                registered: 9,
+                fenced: false,
+                paused: false,
+                last_snap_unix_ms: Some(1),
+                refused: vec![],
+                pending_bulk: 0,
+                pending_bytes: 0,
+                complete: true,
+                incomplete_reason: None,
             }),
             CommandResult::LeaseEpoch(LeaseEpochReport {
                 epoch: 2,

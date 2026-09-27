@@ -218,6 +218,22 @@ impl SftpRuntime {
         }
     }
 
+    /// Close every bridge (the executor is ending: an `sftp-server` writes files). Returns how
+    /// many were open.
+    pub fn close_all(&self) -> usize {
+        let entries: Vec<SftpEntry> = self
+            .inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain()
+            .map(|(_, entry)| entry)
+            .collect();
+        for entry in &entries {
+            entry.abort();
+        }
+        entries.len()
+    }
+
     /// Number of live bridges.
     #[must_use]
     pub fn len(&self) -> usize {

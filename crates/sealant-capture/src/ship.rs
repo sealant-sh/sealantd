@@ -175,6 +175,19 @@ pub enum ShipError {
         /// Bytes the refused call asked for.
         requested: Option<u64>,
     },
+    /// The lease was fenced before (or while) this flush ran: nothing staged can register any
+    /// more. `pending` captures are still staged on this disk.
+    #[error("fenced: the lease is fenced; {pending} captures cannot register")]
+    AlreadyFenced {
+        /// Captures still staged.
+        pending: usize,
+    },
+    /// The caller's deadline passed with captures still staged.
+    #[error("deadline passed with {pending} captures pending")]
+    Deadline {
+        /// Captures still staged.
+        pending: usize,
+    },
     /// Upload failed after retries.
     #[error("upload {key}: {source}")]
     Upload {
@@ -204,6 +217,35 @@ pub enum ShipError {
     },
 }
 
+/// The file (beside `queue/`) that makes a restage one step: see [`Staging::restage`].
+const RESTAGE_JOURNAL: &str = "restage.json";
+
+/// Queue writes that land together or not at all ([`Staging::restage`]).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Restage {
+    /// Entries written, in this order (a queue file per entry, over whatever held its `n`).
+    pub write: Vec<QueueEntry>,
+    /// Entries they supersede: the queue file of one whose `n` no written entry takes is
+    /// removed, and object files no queued entry lists any more are swept.
+    pub superseded: Vec<QueueEntry>,
+}
+
+/// Write `bytes` to `path` and flush them to the disk.
+fn write_synced(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    use std::io::Write;
+    let mut file = fs::File::create(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()
+}
+
+/// Flush a directory's entries (a rename, a removal) to the disk. Best effort: some
+/// filesystems refuse to open a directory for it.
+fn sync_dir(dir: &Path) {
+    if let Ok(d) = fs::File::open(dir) {
+        let _ = d.sync_all();
+    }
+}
+
 /// The staging area.
 #[derive(Debug)]
 pub struct Staging {
@@ -220,6 +262,10 @@ pub struct Staging {
     /// uploading a bulk capture's objects checks it between objects, so a capture staged ahead
     /// of that bulk capture ships first.
     generation: AtomicU64,
+    /// Test hook: a restage fails as a crash would after this many of its steps (0: never).
+    crash_at: AtomicU64,
+    /// Restage steps taken since the hook was set.
+    steps: AtomicU64,
 }
 
 impl Staging {
@@ -236,9 +282,129 @@ impl Staging {
             in_flight: Mutex::new(None),
             coalesce: Mutex::new(()),
             generation: AtomicU64::new(0),
+            crash_at: AtomicU64::new(0),
+            steps: AtomicU64::new(0),
         };
         fs::create_dir_all(staging.marker_dir())?;
+        // A restage the process did not finish (it died between two of its renames) is
+        // finished before anything reads the queue.
+        if let Some(journal) = staging.recover()? {
+            tracing::warn!(
+                written = ?journal.write.iter().map(|e| e.n).collect::<Vec<_>>(),
+                "an interrupted restage was finished from its journal"
+            );
+        }
         Ok(staging)
+    }
+
+    /// Stage several queue changes as one step: a small capture staged ahead of a queued bulk
+    /// capture writes the bulk capture again at `n + 1` (its parent the small capture) and the
+    /// small capture in the bulk capture's old slot. A process that died between those two
+    /// renames left a queue whose bulk capture named a parent no entry held — it could never
+    /// register, and nothing behind it could either. Now the whole change is written first as a
+    /// journal (`restage.json`, synced, then renamed into place: the commit point), then
+    /// applied; a restage the process did not finish is finished by [`Staging::recover`], which
+    /// [`Staging::open`] runs, so a crash anywhere leaves either the queue as it was or the
+    /// queue as the restage makes it. Every object file an entry lists must be on disk before
+    /// this is called. Call under [`Staging::coalesce_guard`].
+    pub fn restage(&self, write: &[QueueEntry], superseded: &[QueueEntry]) -> io::Result<()> {
+        let journal = Restage {
+            write: write.to_vec(),
+            superseded: superseded.to_vec(),
+        };
+        let path = self.dir.join(RESTAGE_JOURNAL);
+        let tmp = path.with_extension("tmp");
+        write_synced(&tmp, &serde_json::to_vec(&journal)?)?;
+        self.step()?;
+        fs::rename(&tmp, &path)?;
+        sync_dir(&self.dir);
+        self.step()?;
+        self.apply_restage(&journal)
+    }
+
+    /// Finish a restage the journal holds, if one does (a process died before it was done).
+    /// Idempotent: each step writes or removes what the journal names. Returns the journal it
+    /// finished.
+    ///
+    /// # Errors
+    /// I/O, or a journal that does not parse (it is written whole before it is renamed into
+    /// place, so that is corruption, and the queue is left as it is for a person to look at).
+    pub fn recover(&self) -> io::Result<Option<Restage>> {
+        let path = self.dir.join(RESTAGE_JOURNAL);
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let journal: Restage = serde_json::from_slice(&bytes).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{}: {e}", path.display()),
+            )
+        })?;
+        self.apply_restage(&journal)?;
+        Ok(Some(journal))
+    }
+
+    /// Whether a restage is committed and not applied yet: the queue may be half-way, so
+    /// nothing ships until it is finished.
+    #[must_use]
+    pub fn restage_pending(&self) -> bool {
+        self.dir.join(RESTAGE_JOURNAL).exists()
+    }
+
+    fn apply_restage(&self, journal: &Restage) -> io::Result<()> {
+        for entry in &journal.write {
+            let path = self.queue_path(entry.n);
+            let tmp = path.with_extension("tmp");
+            write_synced(&tmp, &serde_json::to_vec(entry)?)?;
+            fs::rename(tmp, path)?;
+            self.step()?;
+        }
+        let written: HashSet<u64> = journal.write.iter().map(|e| e.n).collect();
+        for old in &journal.superseded {
+            if !written.contains(&old.n) {
+                match fs::remove_file(self.queue_path(old.n)) {
+                    Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+                    _ => {}
+                }
+                self.step()?;
+            }
+        }
+        sync_dir(&self.dir.join("queue"));
+        self.bump();
+        for old in &journal.superseded {
+            self.sweep(old)?;
+        }
+        self.step()?;
+        match fs::remove_file(self.dir.join(RESTAGE_JOURNAL)) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+            _ => {}
+        }
+        sync_dir(&self.dir);
+        Ok(())
+    }
+
+    /// One restage step; from the step the test hook names on, every step fails, as nothing
+    /// runs any more in a process that died there.
+    fn step(&self) -> io::Result<()> {
+        let at = self.crash_at.load(Ordering::SeqCst);
+        let n = self.steps.fetch_add(1, Ordering::SeqCst) + 1;
+        if at != 0 && n >= at {
+            return Err(io::Error::other(format!(
+                "injected crash after restage step {at}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Test hook: restages fail, as a process dying there would, after `step` of their steps
+    /// (1: the journal is written but not committed; 2: committed; then one per queue file
+    /// written or removed; then the sweep), and every step after it fails too. 0 turns it off.
+    #[doc(hidden)]
+    pub fn crash_restage_after(&self, step: u64) {
+        self.steps.store(0, Ordering::SeqCst);
+        self.crash_at.store(step, Ordering::SeqCst);
     }
 
     /// The worktree and epoch entries are staged under.
@@ -1307,6 +1473,11 @@ impl Shipper {
         if self.lease_retry_at().is_some() {
             return Ok(pass);
         }
+        // A restage is half-way (its journal is committed, the engine finishes it at its next
+        // snap): the queue may name a parent no entry holds yet. Nothing ships meanwhile.
+        if self.staging.restage_pending() {
+            return Ok(pass);
+        }
         let past = |deadline: Option<Instant>| deadline.is_some_and(|d| Instant::now() >= d);
         let mut cycle = DutyCycle::new(self.cpu_fraction);
         loop {
@@ -1492,13 +1663,20 @@ impl Shipper {
     }
 
     /// Ship and register everything pending, bulk captures included: the executor is going away
-    /// (`final`), and what is staged on its disk goes with it unless it is in the store. Returns
-    /// once the queue is empty, at `deadline` when the caller gave one (a pass stops between
-    /// objects when it passes; whatever is left stays staged and is reported), or early when
-    /// nothing can ever register — the lease is fenced, or the chain moved under this executor.
-    /// A transport failure is retried with backoff, a capture held for the byte quota is asked
+    /// (`final`), and what is staged on its disk goes with it unless it is in the store. `Ok`
+    /// only once the queue is empty and the lease is not fenced; anything short of that is an
+    /// error that says why, never a success with work still staged: a fence
+    /// ([`ShipError::Fenced`], or [`ShipError::AlreadyFenced`] when the lease was fenced before
+    /// this pass — an already-fenced shipper used to answer "done" and the flush succeeded with
+    /// captures still staged), a chain conflict, the caller's `deadline`
+    /// ([`ShipError::Deadline`]; a pass stops between objects when it passes), or the error
+    /// shipping kept failing with when the deadline came. What is left stays staged. A
+    /// transport failure is retried with backoff, a capture held for the byte quota is asked
     /// for again when its backoff runs out, and a lease-lost answer pauses and asks again — for
     /// as long as the process lives when there is no deadline.
+    ///
+    /// # Errors
+    /// See above.
     pub fn flush_final(&self, deadline: Option<Duration>) -> Result<usize, ShipError> {
         let until = deadline.map(|d| Instant::now() + d);
         let past = || until.is_some_and(|u| Instant::now() >= u);
@@ -1507,14 +1685,26 @@ impl Shipper {
                 u.saturating_duration_since(Instant::now())
             })
         };
+        let pending = || {
+            self.staging
+                .pending()
+                .map(|p| p.len())
+                .unwrap_or(usize::MAX)
+        };
         let mut total = 0;
         let mut failures = 0u32;
         loop {
             match self.pass(Scope::All, until, true) {
                 Ok(pass) => {
                     total += pass.shipped;
-                    if pass.done || past() {
+                    if self.is_fenced() {
+                        return Err(ShipError::AlreadyFenced { pending: pending() });
+                    }
+                    if pass.done {
                         return Ok(total);
+                    }
+                    if past() {
+                        return Err(ShipError::Deadline { pending: pending() });
                     }
                     if pass.shipped > 0 {
                         failures = 0;
@@ -1528,9 +1718,10 @@ impl Shipper {
                 Err(e @ (ShipError::Fenced(_) | ShipError::Conflict(_))) => return Err(e),
                 Err(error) => {
                     if past() {
-                        // The caller's deadline: what is left stays staged and is reported.
+                        // The caller's deadline, with shipping failing: what is left stays
+                        // staged, and the failure is the answer.
                         tracing::warn!(%error, "final flush: deadline reached while shipping failed");
-                        return Ok(total);
+                        return Err(error);
                     }
                     failures += 1;
                     let wait = self.backoff(failures.min(10));
