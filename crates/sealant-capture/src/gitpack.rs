@@ -206,6 +206,18 @@ impl GitRepo {
             .collect())
     }
 
+    /// Symbolic refs other than `HEAD` (`refs/remotes/origin/HEAD` → `refs/remotes/origin/main`):
+    /// ref name → the ref it points at. [`Self::refs`] lists them too, by the sha they resolve to.
+    pub fn symrefs(&self) -> Result<BTreeMap<String, String>, GitError> {
+        let out = self.run(&["for-each-ref", "--format=%(refname) %(symref)"])?;
+        Ok(stdout_string(&out)
+            .lines()
+            .filter_map(|l| l.split_once(' '))
+            .filter(|(_, target)| !target.is_empty())
+            .map(|(r, t)| (r.to_owned(), t.to_owned()))
+            .collect())
+    }
+
     /// `HEAD` as a ref name (symbolic) or a sha (detached).
     pub fn head(&self) -> Result<String, GitError> {
         let out = git_command(&self.root)
@@ -651,6 +663,8 @@ fn unreadable_in_add(root: &Path, stderr: &str) -> Vec<(String, String)> {
 pub struct Closure {
     /// Refs plus the two pseudo-refs.
     pub refs: BTreeMap<String, String>,
+    /// Symbolic refs other than `HEAD`: name → the ref it points at.
+    pub symrefs: BTreeMap<String, String>,
     /// `HEAD`.
     pub head: String,
     /// Every positive tip: ref values, `HEAD`, reflog entries, index and worktree trees (or the
@@ -684,6 +698,7 @@ pub fn read_closure_carrying(
     carry_from: Option<&str>,
 ) -> Result<Closure, GitError> {
     let mut refs = repo.refs()?;
+    let symrefs = repo.symrefs()?;
     let head = repo.head()?;
     let mut tips: Vec<String> = refs.values().cloned().collect();
     if !head.starts_with("refs/") {
@@ -709,6 +724,7 @@ pub fn read_closure_carrying(
     tips.dedup();
     Ok(Closure {
         refs,
+        symrefs,
         head,
         tips,
         gitlinks,
@@ -955,15 +971,28 @@ pub fn install_pack(
     Ok(true)
 }
 
-/// Make the repository's refs exactly `refs` (the pseudo-refs skipped): `packed-refs` is
-/// written from them and every loose ref is removed, whether the manifest names it or not, so
-/// a branch, tag, remote-tracking ref or stash the disk held beyond the manifest does not
-/// survive a materialize. Directories under `refs/` a loose ref leaves empty go too, except
-/// `refs/heads` and `refs/tags`, which git expects.
-pub fn write_packed_refs(repo: &GitRepo, refs: &BTreeMap<String, String>) -> Result<(), GitError> {
+/// Make the repository's refs exactly `refs` (the pseudo-refs skipped) with `symrefs`
+/// symbolic: `packed-refs` is written from the direct ones and every loose ref is removed,
+/// whether the manifest names it or not, so a branch, tag, remote-tracking ref or stash the
+/// disk held beyond the manifest does not survive a materialize; then each symbolic ref is
+/// written loose (`packed-refs` cannot hold one) as `ref: <target>`. Directories under `refs/`
+/// a loose ref leaves empty go too, except `refs/heads` and `refs/tags`, which git expects.
+pub fn write_packed_refs(
+    repo: &GitRepo,
+    refs: &BTreeMap<String, String>,
+    symrefs: &BTreeMap<String, String>,
+) -> Result<(), GitError> {
+    for (name, target) in symrefs {
+        if !is_safe_ref_name(name) || !is_safe_ref_name(target) {
+            return Err(GitError::Command {
+                args: "symbolic-ref".to_owned(),
+                stderr: format!("refusing symbolic ref {name:?} -> {target:?}"),
+            });
+        }
+    }
     let mut text = String::from("# pack-refs with: peeled fully-peeled sorted \n");
     for (name, sha) in refs {
-        if name.starts_with(PSEUDO_REF_PREFIX) {
+        if name.starts_with(PSEUDO_REF_PREFIX) || symrefs.contains_key(name) {
             continue;
         }
         text.push_str(sha);
@@ -980,7 +1009,27 @@ pub fn write_packed_refs(repo: &GitRepo, refs: &BTreeMap<String, String>) -> Res
     for dir in [&repo.common_dir, &repo.git_dir] {
         remove_loose_refs(&dir.join("refs"), 0)?;
     }
+    for (name, target) in symrefs {
+        let path = repo.common_dir.join(name);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(path, format!("ref: {target}\n"))?;
+    }
     Ok(())
+}
+
+/// A ref name that is safe to write as a path under the git dir: `refs/…`, components that
+/// are not empty, `.`/`..`-led, or `.lock`, and no control or special characters.
+fn is_safe_ref_name(name: &str) -> bool {
+    name.starts_with("refs/")
+        && name
+            .split('/')
+            .all(|c| !c.is_empty() && !c.starts_with('.') && !c.ends_with(".lock"))
+        && !name.contains("..")
+        && !name
+            .chars()
+            .any(|c| c.is_control() || matches!(c, ' ' | '~' | '^' | ':' | '?' | '*' | '[' | '\\'))
 }
 
 /// Remove every file under `dir` (a `refs/` directory) and the directories that empties, but
@@ -1228,7 +1277,7 @@ mod tests {
         let fresh = GitRepo::init(&dir.path().join("fresh")).unwrap();
         let bytes = fs::read(&pack.path).unwrap();
         install_pack(&fresh, &pack.sha256, &bytes, None).unwrap();
-        write_packed_refs(&fresh, &r.closure.refs).unwrap();
+        write_packed_refs(&fresh, &r.closure.refs, &r.closure.symrefs).unwrap();
         write_head(&fresh, &r.closure.head).unwrap();
         checkout_tree(&fresh, &r.closure.refs[WORKTREE_TREE_REF], &scratch).unwrap();
         read_tree_into_index(&fresh, &r.closure.refs[INDEX_TREE_REF]).unwrap();

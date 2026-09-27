@@ -17,9 +17,16 @@ of reporting a partial restore, when a path cannot be brought to it. A manifest 
 restores as before, and a manifest with it encodes the field only when present. The shape is in
 `crates/sealant-capture/README.md`, "`worktree_meta` in a manifest".
 
+Names that are not UTF-8 are kept byte for byte in the document, written as the same escaped keys
+dir objects use for names with the bytes in hex beside them. A tracked file hardlinked to an
+ignored file or to a file under a bulk directory comes back as one inode when every name holds
+the same bytes, and as separate byte-exact files when the bulk capture is older.
+
 A rematerialize removed only the loose refs the manifest named, so a branch, a remote-tracking
 ref or a stash the disk held beyond the manifest survived it. Every loose ref is now removed and
-`packed-refs` holds exactly the manifest's refs.
+`packed-refs` holds exactly the manifest's refs. Symbolic refs other than `HEAD`
+(`refs/remotes/origin/HEAD`) came back as plain refs; the git section now carries them in an
+additive `symrefs` map (name → target, absent when empty) and a restore writes them symbolic.
 
 Chunked-class symlinks get their own mtime back, and a directory mode or mtime, a hardlink or a
 hardlink canonical outside the class roots that cannot be restored fails the materialize instead

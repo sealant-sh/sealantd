@@ -1891,6 +1891,7 @@ mod tests {
                             refs: std::collections::BTreeMap::new(),
                             head: "HEAD".into(),
                             fsck: crate::manifest::FsckStatus::Unverified,
+                            symrefs: std::collections::BTreeMap::new(),
                         },
                         workspace: crate::manifest::WorkspaceSection::objects(
                             String::new(),

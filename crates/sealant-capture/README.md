@@ -66,6 +66,29 @@ and empty directories and every tracked mtime were lost.
   harness home, bulk directories, nested repositories and every directory git ignores — those
   are the chunked classes', which carry their own metadata. The document is deterministic, so an
   unchanged tree is still an unchanged capture, and a change of mode or mtime alone is a capture.
+- **Hardlinks across classes.** A tracked file whose inode has names outside the overlay — an
+  ignored file (workspace class) or a file under a bulk directory — is matched against this
+  snap's workspace listing and the bulk class's index (each bulk name checked on disk), and each
+  such name is recorded in the document's `shared`. A restore links the name to the tracked file
+  only when it holds exactly the tracked file's bytes: its class restored it from its own
+  capture, which can be older (a bulk section captured before the shared inode was rewritten),
+  and linking would then replace one content with the other. Left unlinked, each name holds
+  exactly what its class captured, and the next bulk capture brings them together again. The
+  relinked name's new inode goes into its class's index, so a head over itself writes nothing.
+- **Names that are not UTF-8** are kept byte for byte: a path is written as a *key*, the
+  encoding dir objects use for names (bytes as UTF-8 when they are UTF-8 and hold no character of
+  `U+10FF80..=U+10FFFF`; otherwise each such byte becomes `U+10FF00 + byte`, a bijection), and an
+  escaped key also carries its bytes, hex, in `raw_path` (`raw_member` for a shared name).
+- **Cost.** `examples/overlay_cost.rs` (release build, read-only) times the overlay of a small
+  snap — `git ls-tree`, an lstat per path, the directory walk with its `git ls-files` of ignored
+  directories, the encode and the chunking. On the Mend repository (1,349 tracked files, ≈ 22k
+  directories under `node_modules`, which the walk never enters): 1,549 entries, p50 6.6–7.9 ms,
+  p90 8.5–15 ms, a 157 KB document (17.5 KB compressed). On a synthetic repository of 100,000
+  tracked files in 10,100 directories: 110,101 entries, p50 279–349 ms (a `git add -A` +
+  `write-tree` of the same repository takes ≈ 140 ms), a 9.1 MB document in 13 chunks; one
+  changed mtime uploads one new chunk, 49 KB compressed. Both are under the budget set for it
+  (50 ms and 500 ms p50), so the overlay is read whole each snap; making it follow the watcher's
+  dirty set is the next step if a repository needs it.
 - **Applied last.** The materializer applies it after every class (restoring an ignored file or a
   bulk directory moves the mtime of the directory it lands in): it creates the directories the
   document names, removes the empty directories in its scope the document does not name, links
@@ -90,20 +113,24 @@ and empty directories and every tracked mtime were lost.
   loose ref is removed, named by the manifest or not (only the ones it named went before), so a
   branch, tag, remote-tracking ref or stash the disk held beyond the manifest does not survive a
   materialize; `HEAD` is written as before.
+- **Symbolic refs stay symbolic.** `refs/remotes/origin/HEAD` → `refs/remotes/origin/main` used
+  to come back as a plain ref to the sha it resolved to. The git section now carries
+  `symrefs` (name → target) beside `refs`; a restore writes each as a loose `ref: <target>` (a
+  packed ref cannot be symbolic) after the loose refs are cleared, and leaves it out of
+  `packed-refs`. A name or target that is not a plain `refs/…` name fails the materialize.
 
 `tests/restore_metadata.rs` writes a worktree with all of it (modes, ns mtimes of files,
-directories, symlinks and the root, empty directories, a hardlink pair, loose and packed refs, an
-annotated tag, a stash), captures it, materializes it fresh and compares everything; drifts the
+directories, symlinks and the root, empty directories, a hardlink pair, names that are not UTF-8,
+loose and packed refs, a symbolic ref, an annotated tag, a stash), captures it, materializes it fresh and compares everything; drifts the
 restored disk (extra loose and packed refs, `HEAD` moved, modes and mtimes off, a broken hardlink,
 a stray empty directory) and materializes the head over it; changes metadata alone and checks it
-is captured and restored by a delta and a fresh materialize. `tests/delta.rs` compares the mtimes
-of the whole working tree.
+is captured and restored by a delta and a fresh materialize; links a tracked file to an ignored
+and a bulk name and checks all three come back as one inode, and apart but byte-exact when the
+bulk section is older. `tests/delta.rs` compares the mtimes of the whole working tree.
 
-Not covered: a hardlink between a tracked file and a file of another class (each class restores
-its own names), symbolic refs other than `HEAD` (a ref's value is its resolved sha, as before),
-names that are not UTF-8 (skipped with a warning, as dir objects convert them), and a
-directory whose restored mode forbids the owner to write (a later delta that writes into it
-fails, loudly).
+Not covered: hardlinks between two names of other classes (an ignored file and a bulk file: each
+class restores its own names), and a directory whose restored mode forbids the owner to write (a
+later delta that writes into it fails, loudly).
 
 ## Sources beside the worktree
 
@@ -635,24 +662,48 @@ for byte as before.
   ```json
   {"format":1,
    "entries":[{"path":"","kind":"dir","mode":488,"mtime":1599999000999999999},
+              {"path":"caf\u{10ffe9}.txt","raw_path":"636166e92e747874","kind":"file","mode":384,"mtime":1600000000000000777},
               {"path":"empty","kind":"dir","mode":448,"mtime":1599827199999999986},
               {"path":"run.sh","kind":"file","mode":488,"mtime":1600000001123456796},
               {"path":"to-secret","kind":"symlink","mtime":1600000007123456838}],
-   "hardlinks":[["link.txt","src/twin.txt"]]}
+   "hardlinks":[["link.txt","src/twin.txt"]],
+   "shared":[{"path":"shared.txt","class":"bulk","member":"node_modules/pkg/shared.txt"},
+             {"path":"shared.txt","class":"workspace","member":"tree/copy.log"}]}
   ```
 
-  `entries` are sorted by `path` (worktree-relative, `/`-separated, `""` the root; no `.`, `..`
-  or empty component); `kind` is `file`, `symlink` or `dir`; `mode` is `st_mode & 0o7777`
-  (absent for a symlink); `mtime` is nanoseconds since the epoch. `hardlinks` (absent when empty)
-  lists groups of two or more `file` paths sharing one inode, each sorted, the first being the
-  one the others link to.
+  (`\u{10ffe9}` stands for that character, which JSON carries as UTF-8.) `entries` are sorted
+  by `path` (worktree-relative, `/`-separated, `""` the root; no `.`, `..` or empty component).
+  A path is a key: the bytes as UTF-8 when they are UTF-8 and hold no character of
+  `U+10FF80..=U+10FFFF`, otherwise each byte of an invalid sequence (and of such a character)
+  becomes `U+10FF00 + byte` — the encoding dir objects use for names — and an escaped key also
+  carries its bytes, hex, in `raw_path`, which a reader takes over `path`. `kind` is `file`,
+  `symlink` or `dir`; `mode` is `st_mode & 0o7777` (absent for a symlink); `mtime` is
+  nanoseconds since the epoch. `hardlinks` (absent when empty) lists groups of two or more
+  `file` keys sharing one inode, each sorted, the first being the one the others link to.
+  `shared` (absent when empty) lists names another class carries of a tracked file's inode:
+  `path` is the tracked file's key, `class` is `workspace` (then `member` is that class's
+  virtual path, `tree/…`, `.git/…` or `harness/…`) or `bulk` (then `member` is root-relative),
+  and `raw_member` carries an escaped member's bytes.
 - Applying it (sealantd's `worktree_meta::apply`, after the worktree tree is checked out and every
   other class restored): create each `dir` that is missing; every other path must exist with its
   kind; remove the empty directories in scope that no entry names; link each group's members to
-  its first path; set files' and symlinks' mode and mtime (a symlink's own, never followed), then
-  directories' deepest first. A reader that only lists or reads a class's files (Mend's
+  its first path; link each `shared` member that holds exactly the tracked file's bytes to it
+  (leave it otherwise); set files' and symlinks' mode and mtime (a symlink's own, never
+  followed), then directories' deepest first. A reader that only lists or reads a class's files (Mend's
   `listCaptureDir`, `statCaptureEntry`, `readCaptureFile`, `materialize` of the workspace or bulk
   class) is unaffected: the overlay describes the git class's working tree, not a chunked class.
+
+### `symrefs` in a manifest
+
+`sections.git.symrefs`: symbolic refs other than `HEAD`, name → the ref it points at. Each is
+also in `refs`, by the sha it resolved to at capture, so a reader that knows only `refs` reads
+what it always did. Absent when empty, so a manifest without one encodes exactly as before.
+
+```json
+"git":{"packs":[…],"refs":{"refs/heads/main":"<sha>","refs/remotes/origin/HEAD":"<sha>",…},
+       "head":"refs/heads/main","fsck":"verified",
+       "symrefs":{"refs/remotes/origin/HEAD":"refs/remotes/origin/main"}}
+```
 
 ### `lease-lost` on the session channel
 
@@ -799,7 +850,8 @@ Mend installs today) must now say so, or boot refuses.
   again, never dropped.
 - §"Manifest": sections gain `other_bulk`, the bulk sections captured on other platforms, keyed
   by platform and carried from capture to capture (see "`other_bulk` in a manifest").
-- §"Manifest": the workspace section gains `worktree_meta`, the worktree metadata overlay, and
+- §"Manifest": the git section gains `symrefs`; the workspace section gains `worktree_meta`,
+  the worktree metadata overlay, and
   §"Materialize" applies it after every class and reconciles the ref set to the manifest's
   (see "Worktree metadata and refs").
 - §"Executor hooks": `capture.flush` takes `kind` (`suspend` | `final`), `deadline_ms` and

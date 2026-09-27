@@ -6,6 +6,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -51,6 +52,10 @@ fn set_mtime(path: &Path, ns: i64) {
     .unwrap();
 }
 
+fn non_utf8(bytes: &[u8]) -> &Path {
+    Path::new(std::ffi::OsStr::from_bytes(bytes))
+}
+
 fn chmod(path: &Path, mode: u32) {
     fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
 }
@@ -79,12 +84,8 @@ fn snapshot(root: &Path) -> (BTreeMap<String, Entry>, BTreeSet<Vec<String>>) {
         })
     {
         let e = e.unwrap();
-        let rel = e
-            .path()
-            .strip_prefix(root)
-            .unwrap()
-            .to_string_lossy()
-            .to_string();
+        // Exact, bytes and all: a name that is not UTF-8 shows its bytes escaped.
+        let rel = format!("{:?}", e.path().strip_prefix(root).unwrap().as_os_str());
         let meta = fs::symlink_metadata(e.path()).unwrap();
         let mtime = meta.mtime() * 1_000_000_000 + meta.mtime_nsec();
         let entry = if meta.is_symlink() {
@@ -151,7 +152,7 @@ fn refs(root: &Path) -> (String, String, String) {
             root,
             &[
                 "for-each-ref",
-                "--format=%(refname) %(objectname) %(*objectname)",
+                "--format=%(refname) %(objectname) %(*objectname) %(symref)",
             ],
         ),
         git(root, &["symbolic-ref", "HEAD"]),
@@ -186,12 +187,24 @@ impl Fixture {
         fs::write(root.join("link.txt"), "linked twice\n").unwrap();
         fs::hard_link(root.join("link.txt"), root.join("src/twin.txt")).unwrap();
         std::os::unix::fs::symlink("secret.txt", root.join("to-secret")).unwrap();
+        // Names that are not UTF-8: a tracked file, and (below) an untracked empty directory.
+        fs::write(root.join(non_utf8(b"caf\xe9.txt")), "latin-1\n").unwrap();
         git(&root, &["add", "-A"]);
         git(&root, &["commit", "-q", "-m", "one"]);
         git(&root, &["tag", "-a", "v1", "-m", "v1"]);
         git(&root, &["branch", "packed-branch"]);
         git(&root, &["pack-refs", "--all"]);
         git(&root, &["branch", "loose-branch"]);
+        // A symbolic ref besides HEAD, as a clone has.
+        git(&root, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        git(
+            &root,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ],
+        );
         // A stash entry, then the worktree back as committed.
         fs::write(root.join("secret.txt"), "stashed edit\n").unwrap();
         git(&root, &["stash", "push", "-q", "-m", "wip"]);
@@ -203,6 +216,7 @@ impl Fixture {
         std::os::unix::fs::symlink("nowhere", root.join("dangling")).unwrap();
         fs::create_dir_all(root.join("empty/deeper")).unwrap();
         fs::create_dir_all(root.join("hollow/inner")).unwrap();
+        fs::create_dir_all(root.join(non_utf8(b"empty\xff"))).unwrap();
         // Ignored: a file beside tracked ones, a directory with a symlink.
         fs::write(root.join("app.log"), "log\n").unwrap();
         fs::create_dir_all(root.join("ignored")).unwrap();
@@ -227,6 +241,10 @@ impl Fixture {
         chmod(&r.join("link.txt"), 0o660);
         chmod(&r.join("untracked.md"), 0o604);
         chmod(&r.join("newdir/new.txt"), 0o400);
+        chmod(&r.join(non_utf8(b"caf\xe9.txt")), 0o600);
+        set_mtime(&r.join(non_utf8(b"caf\xe9.txt")), T + 777);
+        chmod(&r.join(non_utf8(b"empty\xff")), 0o701);
+        set_mtime(&r.join(non_utf8(b"empty\xff")), T - 777);
         let files = [
             "secret.txt",
             "run.sh",
@@ -329,6 +347,14 @@ fn metadata_and_refs_round_trip_exactly() {
         &restored,
         &["update-ref", "refs/remotes/origin/main", "HEAD"],
     );
+    git(
+        &restored,
+        &[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/heads/main",
+        ],
+    );
     chmod(&restored.join("secret.txt"), 0o644);
     set_mtime(&restored.join("src/lib.rs"), T);
     set_mtime(&restored.join("to-secret"), T);
@@ -421,6 +447,14 @@ fn rematerialize_reconciles_the_complete_ref_set() {
         &restored,
         &["update-ref", "refs/remotes/origin/main", "HEAD"],
     );
+    git(
+        &restored,
+        &[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/heads/main",
+        ],
+    );
     git(&restored, &["update-ref", "refs/stash", "HEAD"]);
     git(
         &restored,
@@ -430,13 +464,42 @@ fn rematerialize_reconciles_the_complete_ref_set() {
     m.materialize(&head.manifest, MaterializeClass::All)
         .unwrap();
     assert_eq!(refs(&restored), refs(&fx.root));
-    let loose: Vec<String> = walkdir::WalkDir::new(restored.join(".git/refs"))
+    // Every direct ref is in packed-refs; the one loose ref left is the symbolic one, which
+    // packed-refs cannot hold.
+    let loose: Vec<(String, String)> = walkdir::WalkDir::new(restored.join(".git/refs"))
         .into_iter()
         .flatten()
         .filter(|e| e.file_type().is_file())
-        .map(|e| e.path().display().to_string())
+        .map(|e| {
+            (
+                e.path()
+                    .strip_prefix(restored.join(".git"))
+                    .unwrap()
+                    .display()
+                    .to_string(),
+                fs::read_to_string(e.path()).unwrap(),
+            )
+        })
         .collect();
-    assert!(loose.is_empty(), "every ref is in packed-refs: {loose:?}");
+    assert_eq!(
+        loose,
+        vec![(
+            "refs/remotes/origin/HEAD".to_owned(),
+            "ref: refs/remotes/origin/main\n".to_owned()
+        )]
+    );
+    assert_eq!(
+        git(&restored, &["symbolic-ref", "refs/remotes/origin/HEAD"]),
+        "refs/remotes/origin/main"
+    );
+    assert_eq!(
+        head.manifest
+            .sections
+            .git
+            .symrefs
+            .get("refs/remotes/origin/HEAD"),
+        Some(&"refs/remotes/origin/main".to_owned())
+    );
 }
 
 /// Capture the fixture once and hand back what the other tests need.
@@ -696,5 +759,126 @@ fn a_stale_bulk_section_never_touches_tracked_files() {
             "generated\n"
         );
         assert_eq!(git(&restored, &["status", "--porcelain"]), "?? build/out.o");
+    }
+}
+
+/// A tracked file hardlinked to an ignored file (workspace class) and to a file under
+/// `node_modules/` (bulk class) comes back as one inode with all three names, byte-exact; the
+/// head over itself writes nothing. When the bulk class captured the shared inode's bytes
+/// before they changed, the names are left apart instead, each holding exactly what its own
+/// class captured.
+#[test]
+fn hardlinks_across_classes_are_kept() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("ws");
+    fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
+    git(&root, &["init", "-q", "-b", "main"]);
+    git(&root, &["config", "user.email", "t@t"]);
+    git(&root, &["config", "user.name", "t"]);
+    fs::write(root.join(".gitignore"), "*.log\nnode_modules/\n").unwrap();
+    fs::write(root.join("shared.txt"), "one inode, three classes\n").unwrap();
+    fs::hard_link(root.join("shared.txt"), root.join("copy.log")).unwrap();
+    fs::hard_link(
+        root.join("shared.txt"),
+        root.join("node_modules/pkg/shared.txt"),
+    )
+    .unwrap();
+    git(&root, &["add", "-A"]);
+    git(&root, &["commit", "-q", "-m", "a"]);
+    let sink = Arc::new(LocalDir::new(&tmp.path().join("store")).unwrap());
+    let registrar = Arc::new(InMemoryRegistrar::new("wt-links", 1, None));
+    let mut engine = CaptureEngine::open(CaptureConfig::new("wt-links", 1, &root), None).unwrap();
+    let bulk = |engine: &mut CaptureEngine, seq| {
+        engine
+            .snap(SnapRequest {
+                kind: CaptureKind::Auto,
+                class: Class::Bulk,
+                seq,
+            })
+            .unwrap();
+    };
+    snap(&mut engine, CaptureKind::Turn, 1);
+    bulk(&mut engine, 2);
+    snap(&mut engine, CaptureKind::Turn, 3);
+    let shipper = engine.shipper(sink.clone(), registrar.clone());
+    shipper.ship_pending().unwrap();
+    let head = registrar.head().unwrap();
+
+    let ino = |p: &Path| fs::metadata(p).unwrap().ino();
+    let names = ["shared.txt", "copy.log", "node_modules/pkg/shared.txt"];
+    let restored = tmp.path().join("restored");
+    let m = Materializer::new(sink.as_ref(), MaterializeTargets::new(&restored, None));
+    m.materialize(&head.manifest, MaterializeClass::All)
+        .unwrap();
+    for n in names {
+        assert_eq!(
+            fs::read_to_string(restored.join(n)).unwrap(),
+            "one inode, three classes\n",
+            "{n}"
+        );
+        assert_eq!(
+            ino(&restored.join(n)),
+            ino(&restored.join("shared.txt")),
+            "{n}"
+        );
+    }
+    assert_eq!(
+        fs::metadata(restored.join("shared.txt")).unwrap().nlink(),
+        3
+    );
+    let again = m
+        .materialize(&head.manifest, MaterializeClass::All)
+        .unwrap();
+    assert_eq!(
+        (again.files, again.hardlinks, again.worktree_meta),
+        (0, 0, 0),
+        "{again:?}"
+    );
+
+    // The shared inode's bytes change after the bulk capture: the bulk section holds the old
+    // bytes, the git and workspace classes the new ones.
+    fs::write(root.join("shared.txt"), "rewritten in place\n").unwrap();
+    assert_eq!(fs::metadata(root.join("shared.txt")).unwrap().nlink(), 3);
+    snap(&mut engine, CaptureKind::Turn, 4);
+    shipper.ship_pending().unwrap();
+    let head = registrar.head().unwrap();
+    let fresh = tmp.path().join("fresh");
+    Materializer::new(sink.as_ref(), MaterializeTargets::new(&fresh, None))
+        .materialize(&head.manifest, MaterializeClass::All)
+        .unwrap();
+    assert_eq!(
+        fs::read_to_string(fresh.join("shared.txt")).unwrap(),
+        "rewritten in place\n"
+    );
+    assert_eq!(
+        fs::read_to_string(fresh.join("copy.log")).unwrap(),
+        "rewritten in place\n"
+    );
+    assert_eq!(ino(&fresh.join("copy.log")), ino(&fresh.join("shared.txt")));
+    assert_eq!(
+        fs::read_to_string(fresh.join("node_modules/pkg/shared.txt")).unwrap(),
+        "one inode, three classes\n",
+        "the bulk name holds what the bulk class captured"
+    );
+    assert_ne!(
+        ino(&fresh.join("node_modules/pkg/shared.txt")),
+        ino(&fresh.join("shared.txt"))
+    );
+    // Once the bulk class captures again, the three names are one inode again.
+    bulk(&mut engine, 5);
+    snap(&mut engine, CaptureKind::Turn, 6);
+    shipper.ship_pending().unwrap();
+    let head = registrar.head().unwrap();
+    let last = tmp.path().join("last");
+    Materializer::new(sink.as_ref(), MaterializeTargets::new(&last, None))
+        .materialize(&head.manifest, MaterializeClass::All)
+        .unwrap();
+    for n in names {
+        assert_eq!(
+            fs::read_to_string(last.join(n)).unwrap(),
+            "rewritten in place\n",
+            "{n}"
+        );
+        assert_eq!(ino(&last.join(n)), ino(&last.join("shared.txt")), "{n}");
     }
 }

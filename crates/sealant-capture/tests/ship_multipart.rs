@@ -55,6 +55,7 @@ fn entry(n: u64, uploads: Vec<Upload>) -> QueueEntry {
                         refs: BTreeMap::new(),
                         head: "HEAD".into(),
                         fsck: FsckStatus::Unverified,
+                        symrefs: Default::default(),
                     },
                     workspace: WorkspaceSection::objects(String::new(), Vec::new()),
                     bulk: BulkState::pending(),

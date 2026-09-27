@@ -944,6 +944,61 @@ impl CaptureEngine {
         }
     }
 
+    /// The names the workspace class (`listing`, this snap's) and the bulk class (its index,
+    /// each name checked on disk) carry of the tracked files in `outside`, whose inodes have
+    /// names the overlay does not hold.
+    fn shared_links(
+        &self,
+        outside: &[worktree_meta::OutsideLinks],
+        listing: &Listing,
+    ) -> Vec<worktree_meta::SharedLink> {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::MetadataExt;
+        if outside.is_empty() {
+            return Vec::new();
+        }
+        let wanted: HashMap<(u64, u64), &str> = outside
+            .iter()
+            .map(|o| ((o.dev, o.ino), o.path.as_str()))
+            .collect();
+        let link = |path: &str, class, member: &str| worktree_meta::SharedLink {
+            path: path.to_owned(),
+            class,
+            member: member.to_owned(),
+            raw_member: None,
+        };
+        let mut shared = Vec::new();
+        for (v, src) in &listing.entries {
+            if src.meta.is_file()
+                && let Some(path) = wanted.get(&(src.meta.dev(), src.meta.ino()))
+            {
+                shared.push(link(path, worktree_meta::LinkClass::Workspace, v));
+            }
+        }
+        for (v, known) in &self.bulk_index.files {
+            let Some(path) = wanted.get(&(known.stat.dev, known.stat.ino)) else {
+                continue;
+            };
+            // The index is the last bulk snap's; the inode must still be this one.
+            let abs = self
+                .config
+                .root
+                .join(std::ffi::OsStr::from_bytes(&worktree_meta::bytes_of(v)));
+            let on_disk = fs::symlink_metadata(abs).is_ok_and(|m| {
+                m.is_file() && (m.dev(), m.ino()) == (known.stat.dev, known.stat.ino)
+            });
+            if on_disk {
+                shared.push(link(path, worktree_meta::LinkClass::Bulk, v));
+            }
+        }
+        for s in &mut shared {
+            s.raw_member = worktree_meta::raw_of(&s.member);
+        }
+        shared.sort();
+        shared.dedup();
+        shared
+    }
+
     /// The bulk class listing: every bulk directory under the root.
     fn bulk_listing(&self) -> Listing {
         self.roots().bulk_listing()
@@ -1445,11 +1500,27 @@ impl CaptureEngine {
                 // What the worktree tree does not carry: modes, mtimes, untracked directories,
                 // hardlink groups.
                 let meta_doc = match git.closure.refs.get(WORKTREE_TREE_REF) {
-                    Some(tree) => Some(worktree_meta::capture(
-                        &repo,
-                        tree,
-                        &self.meta_scope(&git.closure.gitlinks),
-                    )?),
+                    Some(tree) => {
+                        let captured = worktree_meta::capture(
+                            &repo,
+                            tree,
+                            &self.meta_scope(&git.closure.gitlinks),
+                        )?;
+                        let mut doc = captured.doc;
+                        // A tracked file under a bulk directory is the overlay's own name.
+                        let own: HashSet<&str> =
+                            doc.entries.iter().map(|e| e.path.as_str()).collect();
+                        let shared = self
+                            .shared_links(&captured.outside, &listing)
+                            .into_iter()
+                            .filter(|l| {
+                                l.class != worktree_meta::LinkClass::Bulk
+                                    || !own.contains(l.member.as_str())
+                            })
+                            .collect();
+                        doc.shared = shared;
+                        Some(doc)
+                    }
                     None => None,
                 };
                 let meta_bytes = meta_doc.as_ref().map(worktree_meta::MetaDocument::encode);
@@ -1502,6 +1573,7 @@ impl CaptureEngine {
                         refs: git.closure.refs,
                         head: git.closure.head,
                         fsck: git.fsck,
+                        symrefs: git.closure.symrefs,
                     },
                     workspace: WorkspaceSection {
                         root: built.root,

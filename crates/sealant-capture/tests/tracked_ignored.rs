@@ -137,6 +137,7 @@ fn control_plane_base(
                 .collect(),
                 head: "refs/heads/main".into(),
                 fsck: FsckStatus::Verified,
+                symrefs: Default::default(),
             },
             workspace: WorkspaceSection::objects(root_key, vec![]),
             bulk: BulkState::pending(),

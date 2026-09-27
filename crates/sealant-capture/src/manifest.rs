@@ -28,7 +28,8 @@
 //!   `child` are dir object digests, so a dir object's bytes do not depend on where it is
 //!   stored, and a reader resolves a digest through the listed packs' trailing indexes.
 //!
-//! The workspace section can carry `worktree_meta` ([`WorktreeMeta`]): the worktree metadata
+//! The git section can carry `symrefs` (symbolic refs other than `HEAD`, name → target; each is
+//! in `refs` too, by the sha it resolved to). The workspace section can carry `worktree_meta` ([`WorktreeMeta`]): the worktree metadata
 //! overlay (modes, nanosecond mtimes, untracked directories and hardlink groups of the working
 //! tree the worktree pseudo-ref describes), a JSON document chunked into the section's own packs.
 //! Absent in every capture before it, and then restored as git checks the tree out.
@@ -117,6 +118,12 @@ pub struct GitSection {
     pub head: String,
     /// fsck outcome.
     pub fsck: FsckStatus,
+    /// Symbolic refs other than `HEAD` (`refs/remotes/origin/HEAD` → `refs/remotes/origin/main`):
+    /// name → the ref it points at. Each is in `refs` as well, by the sha it resolved to, so a
+    /// reader that knows only `refs` reads what it always did. Absent when empty, so a manifest
+    /// without one encodes exactly as before.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub symrefs: BTreeMap<String, String>,
 }
 
 /// Section format 1: every dir object is its own object at `…/trees/<sha256>`, and `root` and
@@ -526,6 +533,7 @@ mod tests {
                         .collect(),
                     head: "refs/heads/main".into(),
                     fsck: FsckStatus::Verified,
+                    symrefs: BTreeMap::new(),
                 },
                 workspace: WorkspaceSection::objects("captures/wt/1/trees/t", vec![]),
                 bulk: BulkState::pending(),
@@ -698,6 +706,25 @@ mod tests {
                 .worktree_meta,
             None
         );
+    }
+
+    /// `symrefs` is additive: absent when empty (an older manifest's bytes are unchanged),
+    /// written after `fsck` when present, and decoded back.
+    #[test]
+    fn symrefs_are_written_only_when_present() {
+        assert!(!String::from_utf8_lossy(&sample().encode().bytes).contains("symrefs"));
+        let mut m = sample();
+        m.sections.git.symrefs.insert(
+            "refs/remotes/origin/HEAD".into(),
+            "refs/remotes/origin/main".into(),
+        );
+        let e = m.clone().encode();
+        let text = String::from_utf8(e.bytes.clone()).unwrap();
+        assert!(
+            text.contains(r#""fsck":"verified","symrefs":{"refs/remotes/origin/HEAD":"refs/remotes/origin/main"}}"#),
+            "{text}"
+        );
+        assert_eq!(Manifest::decode(&e.bytes).unwrap().manifest, m);
     }
 
     #[test]

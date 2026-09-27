@@ -1557,6 +1557,7 @@ mod tests {
                     refs: BTreeMap::new(),
                     head: "refs/heads/main".into(),
                     fsck: FsckStatus::Verified,
+                    symrefs: BTreeMap::new(),
                 },
                 workspace: WorkspaceSection::objects("r", vec![]),
                 bulk: BulkState::pending(),

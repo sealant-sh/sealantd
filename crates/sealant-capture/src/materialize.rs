@@ -41,8 +41,10 @@
 //! symlink's mtime, a hardlink — fails the materialize.
 
 use std::collections::{BTreeSet, HashMap};
+use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io::{self, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -61,7 +63,7 @@ use crate::pack::{PackError, PackReader};
 use crate::roots::ClassRoots;
 use crate::sink::{BlobSink, SinkError};
 use crate::tree::{DirEntry, DirObject, EntryKind};
-use crate::worktree_meta::{self, MetaDocument, MetaError, MetaScope};
+use crate::worktree_meta::{self, LinkClass, MetaDocument, MetaError, MetaScope};
 
 /// Which classes to materialize.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -591,7 +593,38 @@ impl<'a> Materializer<'a> {
             // wrote into.
             if let Some(doc) = &meta {
                 let scope = self.meta_scope(&repo)?;
-                report.worktree_meta = worktree_meta::apply(&repo, doc, &scope)?;
+                let git_dir = repo.git_dir.clone();
+                let resolve = |class: LinkClass, member: &[u8]| -> Option<PathBuf> {
+                    let member = Path::new(OsStr::from_bytes(member));
+                    match class {
+                        LinkClass::Bulk => Some(self.targets.root.join(member)),
+                        LinkClass::Workspace => {
+                            let mut parts = member.components();
+                            let head = parts.next()?.as_os_str().to_str()?.to_owned();
+                            let rest = parts.as_path();
+                            let base = match head.as_str() {
+                                ".git" => git_dir.clone(),
+                                "tree" => self.targets.root.clone(),
+                                "harness" => self.targets.harness_home.clone()?,
+                                _ => return None,
+                            };
+                            Some(base.join(rest))
+                        }
+                    }
+                };
+                let applied = worktree_meta::apply(&repo, doc, &scope, &resolve)?;
+                report.worktree_meta = applied.changed;
+                // A relinked name has a new inode: the class's index must say so, or the next
+                // delta would take it for changed and write it again.
+                for (class, member, meta) in applied.relinked {
+                    let index = match class {
+                        LinkClass::Workspace => &mut state.workspace,
+                        LinkClass::Bulk => &mut state.bulk,
+                    };
+                    if let Some(known) = index.files.get_mut(&member) {
+                        known.stat = FileStat::of(&meta);
+                    }
+                }
             }
         }
         Ok(report)
@@ -680,7 +713,7 @@ impl<'a> Materializer<'a> {
                 report.git_packs += 1;
             }
         }
-        gitpack::write_packed_refs(&repo, &git.refs)?;
+        gitpack::write_packed_refs(&repo, &git.refs, &git.symrefs)?;
         gitpack::write_head(&repo, &git.head)?;
         if let Some(tree) = git.refs.get(WORKTREE_TREE_REF) {
             let excludes = vec![DAEMON_DIR.to_owned()];
