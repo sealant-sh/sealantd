@@ -225,13 +225,14 @@ pub(crate) fn boot_from(
 
     let mut config = CaptureConfig::new(&worktree_id, epoch, working_directory);
     config.harness_home = source.harness_home.clone();
-    // The executor a completed final flush is sealed under: the one the session token was
-    // issued for, as the plan names it, else the workspace id Core started this daemon as.
-    config.executor = plan.executor.clone().or_else(|| source.executor_id.clone());
+    // The executor a completed final flush is sealed under: the launch the session token was
+    // issued for, as the plan names it (cross-repo decision 5), and nothing else — not the
+    // workspace id this daemon was started as, which names a runtime resource, not a launch.
+    config.executor = plan.executor.clone();
     if config.executor.is_none() {
         tracing::warn!(
-            "no executor identity (plan.get names none and SEALANT_WORKSPACE_ID is unset): a \
-             completed final flush is not sealed on the chain, only reported"
+            "plan.get names no executor: a completed final flush is not sealed on the chain, \
+             only reported"
         );
     }
     // Dir packs only for a registrar that reads them; either format materializes here.
@@ -495,7 +496,6 @@ mod tests {
             ca_file: None,
             object_ca_pem: None,
             object_ca_file: None,
-            executor_id: None,
             recovery: false,
         }
     }
@@ -1152,5 +1152,40 @@ mod tests {
                 .unwrap(),
             "https://example.invalid/upstream.git"
         );
+    }
+
+    /// The seal names the executor `plan.get` answers — the launch the session token was
+    /// issued for — and nothing else (cross-repo decision 5): a plan that names none seals
+    /// nothing, whatever `SEALANT_WORKSPACE_ID` says. Before, the workspace id stood in, and a
+    /// seal could name a runtime resource instead of the launch being stopped.
+    #[test]
+    fn the_seal_names_only_the_executor_the_plan_answers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let registrar = Arc::new(InMemoryRegistrar::new("wt-boot", 1, None));
+        let sink: Arc<dyn BlobSink> = capture_source(tmp.path(), &registrar);
+        // `SEALANT_WORKSPACE_ID` is no longer read for it at all (`CaptureSourceConfig` has no
+        // such field); the plan without an executor seals nothing.
+        let with_workspace_id = source();
+        let boot = boot_from(
+            registrar.clone(),
+            Some(sink.clone()),
+            &with_workspace_id,
+            &tmp.path().join("a"),
+            tmp.path(),
+        )
+        .unwrap();
+        assert_eq!(boot.engine.config().executor, None);
+        drop(boot);
+        let named = Arc::new(InMemoryRegistrar::new("wt-boot", 1, None).with_executor("launch-7"));
+        let sink: Arc<dyn BlobSink> = capture_source(&tmp.path().join("b"), &named);
+        let boot = boot_from(
+            named,
+            Some(sink),
+            &with_workspace_id,
+            &tmp.path().join("b/ws"),
+            tmp.path(),
+        )
+        .unwrap();
+        assert_eq!(boot.engine.config().executor.as_deref(), Some("launch-7"));
     }
 }

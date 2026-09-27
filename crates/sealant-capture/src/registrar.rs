@@ -160,10 +160,11 @@
 //!
 //! A final flush that completes registers one more capture carrying `final_seal: {complete:
 //! true, epoch, executor}` ([`crate::manifest::FinalSeal`]) and reports `complete` only once
-//! that register is acknowledged. `executor` is the executor the session token was issued for:
-//! the plan's `executor` when the registrar names it (it knows which one the token is scoped
-//! to), else `SEALANT_WORKSPACE_ID`. The registrar records the seal on the chain only when it
-//! is complete, names the registering epoch and names that executor.
+//! that register is acknowledged. `executor` is the plan's `executor` — the launch id the
+//! session token was issued for (cross-repo decision 5) — and nothing else: a plan that names
+//! none gets no seal, and a re-plan replaces it (a seal never carries over to another launch).
+//! The registrar records the seal on the chain only when it is complete, names the registering
+//! epoch and names that executor.
 //!
 //! ```json
 //! ← {"worktree_id":"wt","epoch":3,…,"manifest_features":[…],"executor":"<executor id>"}
@@ -313,7 +314,7 @@ pub struct PlanGetResponse {
     pub manifest_features: Vec<String>,
     /// The executor the session token was issued for: what a completed final flush's seal
     /// names ([`crate::manifest::FinalSeal`]). Absent from a registrar that does not say, and
-    /// the executor falls back to `SEALANT_WORKSPACE_ID`.
+    /// then no seal is written.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub executor: Option<String>,
 }

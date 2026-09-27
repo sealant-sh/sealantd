@@ -441,10 +441,10 @@ impl CaptureRuntime {
             engine
                 .rebase(&plan.worktree_id, plan.epoch, previous)
                 .map_err(|e| internal(&format!("capture engine rebase: {e}")))?;
-            // The executor a completed final flush is sealed under, as this plan names it.
-            if let Some(executor) = &plan.executor {
-                engine.set_executor(Some(executor.clone()));
-            }
+            // The executor a completed final flush is sealed under, as this plan names it, and
+            // nothing else: a seal never carries over from the placeholder's plan to another
+            // launch (cross-repo decision 5). A plan that names none seals nothing.
+            engine.set_executor(plan.executor.clone());
             // The registrar of the assigned worktree decides whether dir objects travel in
             // dir packs from the next snap on.
             engine.set_dir_format(DirFormat::for_registrar(plan.manifest_format));
@@ -1312,7 +1312,6 @@ mod tests {
                 ca_file: None,
                 object_ca_pem: None,
                 object_ca_file: None,
-                executor_id: None,
                 recovery: false,
             },
             &ws,

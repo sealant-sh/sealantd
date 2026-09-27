@@ -537,8 +537,8 @@ pub struct FinalSeal {
     pub complete: bool,
     /// The lease epoch the sealing capture registers under.
     pub epoch: u64,
-    /// The executor sealantd was planned as: `plan.get`'s `executor`, else
-    /// `SEALANT_WORKSPACE_ID`.
+    /// The executor sealantd was planned as: `plan.get`'s `executor` (the launch the session
+    /// token was issued for), and nothing else.
     pub executor: String,
 }
 

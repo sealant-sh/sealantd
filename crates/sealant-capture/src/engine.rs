@@ -162,7 +162,7 @@ pub struct CaptureConfig {
     /// trusted by its stat ([`index::RACY_WINDOW`]; see `index` "When a file is re-read").
     pub racy_window: Duration,
     /// The executor this engine captures for, as the session token names it: `plan.get`'s
-    /// `executor`, else `SEALANT_WORKSPACE_ID`. A complete final flush seals the chain under
+    /// `executor` (the launch), and nothing else. A complete final flush seals the chain under
     /// it ([`crate::manifest::FinalSeal`]); `None` seals nothing.
     pub executor: Option<String>,
     /// Name the git section's trees in their own fields (`worktree_tree`, `index_tree`,

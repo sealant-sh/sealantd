@@ -245,9 +245,6 @@ pub struct CaptureSourceConfig {
     pub object_ca_pem: Option<String>,
     /// `SEALANT_CAPTURE_OBJECT_CA_FILE`: the same bundle as a file; the inline bundle wins.
     pub object_ca_file: Option<PathBuf>,
-    /// `SEALANT_WORKSPACE_ID`: the executor a completed final flush is sealed under when
-    /// `plan.get` does not name one (`executor`).
-    pub executor_id: Option<String>,
     /// A recovery boot ([`BootConfig::recovery`]): the disk is resumed as it is, never
     /// materialized over.
     pub recovery: bool,
@@ -836,9 +833,6 @@ impl BootConfig {
                         .get("SEALANT_CAPTURE_OBJECT_CA_FILE")
                         .filter(|s| !s.trim().is_empty())
                         .map(PathBuf::from),
-                    executor_id: env
-                        .get("SEALANT_WORKSPACE_ID")
-                        .filter(|s| !s.trim().is_empty()),
                     recovery: false,
                 }))
             }
@@ -1875,7 +1869,7 @@ mod tests {
         assert!(cfg.recovery);
         assert!(matches!(
             &cfg.source,
-            WorkspaceSource::Capture(c) if c.recovery && c.executor_id.as_deref() == Some("ws-42")
+            WorkspaceSource::Capture(c) if c.recovery
         ));
         assert!(
             !cfg.passthrough_env
