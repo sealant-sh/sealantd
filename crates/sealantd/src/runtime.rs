@@ -559,6 +559,17 @@ impl Runtime {
         )
     }
 
+    /// Whether a final capture flush stopped every writer (admission closed, nothing left
+    /// running): from then on the disk changes only through what sealantd itself does, and the
+    /// capture's scheduled snaps stop — the final flush's forced snaps are the last ones.
+    #[must_use]
+    pub fn writers_stopped(&self) -> bool {
+        matches!(
+            *self.quiesced.lock().unwrap_or_else(|e| e.into_inner()),
+            Some(None)
+        )
+    }
+
     /// Whether a final capture flush closed admission (the executor is ending).
     #[must_use]
     pub fn admission_is_closed(&self) -> bool {

@@ -132,10 +132,14 @@ impl CaptureRuntime {
         *self.harness.lock().unwrap_or_else(|e| e.into_inner()) = Some(harness);
         let cadence = self.runner.with_engine(|e| e.config().cadence);
 
-        // Scheduled snaps stop once the daemon is hard-stopping; forced ones (flush) still run.
+        // Scheduled snaps stop once the daemon is hard-stopping, and once a final flush stopped
+        // every writer: its forced snaps are the last, and a scheduled one after them (a bulk
+        // build resuming after the forced one, the clocks firing on what the watcher saw) only
+        // kept a build running past `complete`. Forced ones (flush, turn) still run.
         let rt = runtime.clone();
-        self.runner
-            .start(Some(Arc::new(move || !rt.shutdown().is_hard())));
+        self.runner.start(Some(Arc::new(move || {
+            !rt.shutdown().is_hard() && !rt.writers_stopped()
+        })));
         // A disk the boot resumed may have changed after its last snap, while no watcher ran:
         // both classes are snapped on their quiet clocks, as after any change.
         if self.resumed {
@@ -457,7 +461,8 @@ impl CaptureRuntime {
         let last = self.last_snap_unix_ms.load(Ordering::Relaxed);
         let (worktree_id, epoch) = self.identity();
         // Complete only after a final flush stopped every writer and snapped both classes, and
-        // only once everything is registered: nothing pending, the lease not fenced.
+        // only once everything is registered: nothing pending or being built, the lease not
+        // fenced.
         let outcome = *self.final_outcome.lock().unwrap_or_else(|e| e.into_inner());
         let incomplete_reason = match outcome {
             FinalOutcome::NotRun => Some("not-final"),
@@ -466,6 +471,8 @@ impl CaptureRuntime {
             FinalOutcome::Snapped { shipping } if pending > 0 => {
                 Some(shipping.unwrap_or("pending"))
             }
+            // A capture being built after the final one: staged, not queued yet.
+            FinalOutcome::Snapped { .. } if bulk_building => Some("pending"),
             FinalOutcome::Snapped { .. } => None,
         };
         let reads = self.reads.current();
@@ -567,6 +574,15 @@ mod tests {
         base: &Path,
         wrap: impl FnOnce(Arc<dyn BlobSink>) -> Arc<dyn BlobSink>,
     ) -> (CaptureBoot, Arc<InMemoryRegistrar>) {
+        boot_tuned(base, wrap, |_| {})
+    }
+
+    /// [`boot_with`], its engine's configuration as `tune` leaves it.
+    fn boot_tuned(
+        base: &Path,
+        wrap: impl FnOnce(Arc<dyn BlobSink>) -> Arc<dyn BlobSink>,
+        tune: impl FnOnce(&mut CaptureConfig),
+    ) -> (CaptureBoot, Arc<InMemoryRegistrar>) {
         let root = base.join("ws");
         std::fs::create_dir_all(root.join("src")).unwrap();
         git(&root, &["init", "-q", "-b", "main"]);
@@ -577,7 +593,9 @@ mod tests {
         git(&root, &["commit", "-q", "-m", "one"]);
         let registrar = Arc::new(InMemoryRegistrar::new("wt-hooks", 1, None));
         let sink = wrap(Arc::new(LocalDir::new(&base.join("store")).unwrap()));
-        let engine = CaptureEngine::open(CaptureConfig::new("wt-hooks", 1, &root), None).unwrap();
+        let mut config = CaptureConfig::new("wt-hooks", 1, &root);
+        tune(&mut config);
+        let engine = CaptureEngine::open(config, None).unwrap();
         let dyn_registrar: Arc<dyn Registrar> = registrar.clone();
         (
             CaptureBoot {
@@ -1799,6 +1817,98 @@ mod tests {
             "the container a process started on its way out is stopped too"
         );
         assert!(docker.running.is_empty());
+    }
+
+    /// Docker end to end, round 2: `bulk_building` was true 0.6–11.4 s after a final flush
+    /// answered `complete: true` — a scheduled bulk build resumed after the forced one, or the
+    /// clocks fired on what the watcher saw after the last snap. Once a final flush stopped
+    /// every writer, nothing snaps on a schedule any more (a forced snap still does), and a
+    /// capture being built or staged after the final one is not complete until it has shipped.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn after_a_final_flush_nothing_snaps_on_a_schedule() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (boot, _registrar) = boot_tuned(
+            tmp.path(),
+            |store| store,
+            |config| {
+                config.cadence.quiet = Duration::from_millis(50);
+                config.cadence.max_interval = Duration::from_millis(200);
+                config.cadence.bulk_quiet = Duration::from_millis(50);
+                config.cadence.bulk_max_interval = Duration::from_millis(200);
+            },
+        );
+        let ws = boot.layout.working_directory.clone();
+        std::fs::write(ws.join(".gitignore"), "node_modules/\n").unwrap();
+        std::fs::create_dir_all(ws.join("node_modules/pkg")).unwrap();
+        for f in 0..50 {
+            std::fs::write(
+                ws.join(format!("node_modules/pkg/m{f}.js")),
+                format!("module.exports = {f};\n").repeat(100),
+            )
+            .unwrap();
+        }
+        let mut config = RuntimeConfig::new(new_runtime_id());
+        config.workspace_root = ws.clone();
+        let runtime = Runtime::new(config, Arc::new(ShutdownSignal::new(3_000)));
+        runtime.mark_healthy();
+        let capture = CaptureRuntime::new(boot);
+        assert!(runtime.install_capture(capture.clone()));
+        let harness = runtime
+            .spawn_managed(sh("exec sleep 3600", &ws))
+            .expect("spawn");
+        capture.start(runtime.clone(), harness.process_id);
+
+        let report = runtime.final_flush(None, Some(3_000)).await.unwrap();
+        assert!(report.complete, "{report:?}");
+        let after_final = capture.runner().snapshot();
+
+        // Something changes after the last snap anyway, in both classes, and the clocks see it.
+        std::fs::write(ws.join("after.txt"), "after the final flush\n").unwrap();
+        std::fs::write(ws.join("node_modules/pkg/late.js"), "late\n").unwrap();
+        for _ in 0..5 {
+            capture
+                .runner()
+                .signal(sealant_capture::ChangeSignal::Changed(Class::Small));
+            capture
+                .runner()
+                .signal(sealant_capture::ChangeSignal::Changed(Class::Bulk));
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let status = capture.status();
+            assert!(!status.bulk_building, "{status:?}");
+            assert!(status.complete, "{status:?}");
+        }
+        let later = capture.runner().snapshot();
+        assert_eq!(
+            (later.small_snaps, later.bulk_snaps),
+            (after_final.small_snaps, after_final.bulk_snaps),
+            "no scheduled snap after the final flush: {later:?}"
+        );
+
+        // A bulk capture being built after the final one is not complete until it is done.
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let outcome = capture.runner().with_engine_mut(|engine| {
+            engine.snap_preemptible(
+                SnapRequest {
+                    kind: EngineKind::Auto,
+                    class: Class::Bulk,
+                    seq: 99,
+                },
+                &|| calls.fetch_add(1, Ordering::SeqCst) > 10,
+            )
+        });
+        assert!(
+            matches!(outcome, Ok(sealant_capture::SnapOutcome::Preempted)),
+            "{outcome:?}"
+        );
+        let building = capture.status();
+        assert!(building.bulk_building, "{building:?}");
+        assert!(!building.complete, "{building:?}");
+        assert_eq!(building.incomplete_reason.as_deref(), Some("pending"));
+
+        // The final flush again: the build is finished, shipped, and the executor complete.
+        let again = runtime.final_flush(None, Some(3_000)).await.unwrap();
+        assert!(again.complete, "{again:?}");
+        assert!(!again.bulk_building, "{again:?}");
     }
 
     /// A container that is still running after its stop, or a daemon that is known and cannot

@@ -385,10 +385,14 @@ impl Shared {
                 }
             }
             // A forced snap runs on a stopped runner (the daemon is shutting down, and this is
-            // the capture that must reach the store); a scheduled one does not.
-            if !forced && self.state().stop {
+            // the capture that must reach the store); a scheduled one does not, nor one that
+            // is no longer allowed (a final flush stopped every writer while it yielded: the
+            // forced snap took its progress, and resuming would only build again after it).
+            if !forced && (self.state().stop || !self.allowed()) {
                 self.counters.bulk_running.store(false, Ordering::SeqCst);
-                return Err(EngineError::Io(std::io::Error::other("runner stopped")));
+                return Err(EngineError::Io(std::io::Error::other(
+                    "scheduled bulk snap stopped: the runner stopped or snaps are not allowed",
+                )));
             }
             let outcome = self.engine().snap_preemptible(
                 SnapRequest {

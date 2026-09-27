@@ -408,6 +408,12 @@ restore, byte for byte, so the user never notices the compute changed.
      cannot read fails the snap (`EngineError::unreadable()`), it never becomes a deletion;
   4. everything ships, bulk included (`Shipper::flush_final`).
 
+  Once a final flush stopped every writer, nothing snaps on a schedule any more: its forced
+  snaps are the last (a turn snap or another final flush still runs). A scheduled bulk build
+  the forced one preempted does not resume after it — the Docker end to end saw
+  `bulk_building` true for 0.6–11.4 s after `complete: true`. A capture staged or being built
+  after the final one turns `complete` false (`pending`) until it has shipped.
+
   The daemon used to snap first and terminate after, so what an agent wrote during the upload,
   or from its `SIGTERM` handler, was on the disk only. The report's `complete` is true only when
   all four steps happened and nothing is pending on an unfenced lease; anything else is
@@ -510,6 +516,9 @@ deadline, a writer's `SIGTERM` handler landing in the head of a final flush and 
 `runtime.gracefulShutdown`, and the fenced and cut-short final flushes answering incomplete;
 `crates/sealantd/tests/final_sweep.rs` a `setsid`'d, double-forked writer stopped before the
 last snap, its `SIGTERM` handler's file in the head;
+`tests/flush_modes.rs` a preempted scheduled bulk build not resuming after the final flush;
+`crates/sealantd/src/capture.rs` no scheduled snap after a final flush, and a bulk capture
+being built after it reported incomplete;
 `crates/sealantd/tests/final_sweep_control_peer.rs` the relay carrying a final flush over a
 real control socket spared (its reply arrives) while a bystander in the same scope is stopped; `crates/sealantd/src/capture.rs` also the
 containers of a fake Docker daemon stopped (and a stuck one, or no daemon, incomplete), stopped
@@ -681,7 +690,8 @@ terminated and awaited, the small and the bulk class snapped after that, everyth
 — and while that still holds (nothing staged since, the lease not fenced). It is the only answer
 a control plane may read as saved: `pending == 0` alone is not (a failed snap leaves nothing
 pending). `incomplete_reason` says why not: `not-final`, `processes-remain`, `snapshot-failed`,
-`fenced`, `conflict`, `deadline`, `ship-failed`, `pending` (staged after the final flush),
+`fenced`, `conflict`, `deadline`, `ship-failed`, `pending` (staged, or a bulk capture being
+built, after the final flush),
 `sweep-unavailable`, `unreadable` or `internal`; absent when `complete`. After a flush that
 returned at its deadline (`deadline`, `ship-failed`), `complete` turns true once the worker has
 shipped the rest: poll `capture.status`, or send the final flush again. An older daemon's report decodes with `complete: false`.
