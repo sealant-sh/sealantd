@@ -455,6 +455,11 @@ impl CaptureRuntime {
     /// Current state.
     #[must_use]
     pub fn status(&self) -> CaptureStatusReport {
+        // The final flush's outcome first, then the queue: a flush sets its outcome once it has
+        // shipped, so the queue read after it is at least as new. Read the other way round, a
+        // queue read while the flush ran met the outcome it set on its way out, and the report
+        // said `pending` between `in-progress` and `complete`.
+        let outcome = *self.final_outcome.lock().unwrap_or_else(|e| e.into_inner());
         let ship = self.runner.shipper().status.snapshot();
         let staging = self.runner.staging();
         let queued = staging.pending().unwrap_or_default();
@@ -499,7 +504,6 @@ impl CaptureRuntime {
         // Complete only after a final flush stopped every writer and snapped both classes, and
         // only once everything is registered: nothing pending or being built, the lease not
         // fenced, no class whose last snap failed.
-        let outcome = *self.final_outcome.lock().unwrap_or_else(|e| e.into_inner());
         let incomplete_reason = match outcome {
             FinalOutcome::NotRun => Some("not-final"),
             FinalOutcome::Running => Some("in-progress"),
