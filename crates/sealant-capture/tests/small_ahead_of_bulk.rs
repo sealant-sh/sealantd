@@ -274,7 +274,7 @@ fn a_small_capture_registers_while_a_bulk_capture_uploads() {
     fs::write(s.root.join("src/lib.rs"), "pub fn f() { edited_twice() }\n").unwrap();
     let t1 = Instant::now();
     runner
-        .flush(CaptureKind::Suspend, Duration::from_secs(20))
+        .flush(CaptureKind::Suspend, Some(Duration::from_secs(20)))
         .unwrap();
     let flushed_in = t1.elapsed();
     eprintln!("flush returned in {flushed_in:?} during the bulk upload");

@@ -58,6 +58,7 @@ fn entry(n: u64, uploads: Vec<Upload>) -> QueueEntry {
                     },
                     workspace: WorkspaceSection::objects(String::new(), Vec::new()),
                     bulk: BulkState::pending(),
+                    other_bulk: Default::default(),
                 },
                 checkpoint: None,
             },

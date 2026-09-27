@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use sealant_capture::engine::Pickup;
 use sealant_capture::gitpack::GitRepo;
-use sealant_capture::manifest::{BulkState, DirFormat};
+use sealant_capture::manifest::{BulkState, DirFormat, Sections};
 use sealant_capture::registrar::{PlanGetRequest, RegistrarMinter};
 use sealant_capture::{
     BlobSink, CaptureConfig, CaptureEngine, ChannelTransport, HttpRegistrar, MaterializeClass,
@@ -54,6 +54,36 @@ pub struct CaptureBoot {
     /// left as it is, and both classes are snapped once the cadence starts, so whatever changed
     /// after the last snap is captured.
     pub resumed: bool,
+}
+
+/// Bring a stored head's sections to what this executor continues the chain from, given the
+/// bulk section the registrar answered for it (`plan.get`'s head). The answered section is the
+/// one restored here when the head holds it and it was captured on `platform`; otherwise the
+/// bulk section is `"pending"` (restore nothing, sweep nothing, the next bulk snap captures the
+/// disk). Either way every bulk section the head holds for another platform is kept in
+/// `other_bulk`: before, a registrar's `"pending"` for another platform's dependency tree
+/// replaced it in the engine's copy of the head, and the next capture dropped it from the chain
+/// for good, so the platform it was built on could never restore it again.
+pub(crate) fn continue_bulk(sections: &mut Sections, answered: &BulkState, platform: &str) {
+    let answered = match answered.section() {
+        Some(section) if section.platform == platform => answered.clone(),
+        Some(section) => {
+            tracing::warn!(
+                answered = %section.platform,
+                platform,
+                "the registrar answered another platform's bulk section; not restored here"
+            );
+            BulkState::pending()
+        }
+        None => BulkState::pending(),
+    };
+    *sections = sections.with_bulk_answer(&answered);
+    if !sections.other_bulk.is_empty() {
+        tracing::info!(
+            platforms = ?sections.other_bulk.keys().collect::<Vec<_>>(),
+            "bulk sections of other platforms carried on the chain"
+        );
+    }
 }
 
 /// The paths `sources` are resolved against.
@@ -239,12 +269,13 @@ pub(crate) fn boot_from(
             let mut manifest = materializer
                 .fetch_manifest(&head.manifest_key, &head.capture_id)
                 .map_err(|error| BootError::config(format!("capture head manifest: {error}")))?;
-            // The stored bytes verify the head; the plan's answer decides the bulk section: a
-            // registrar leaves it `"pending"` when the head's was captured for another platform,
-            // and the engine continues the chain that way until this platform's bulk is snapped.
-            if head.manifest.sections.bulk.section().is_none() {
-                manifest.manifest.sections.bulk = BulkState::pending();
-            }
+            // The stored bytes verify the head; the plan's answer decides the bulk section
+            // restored here, and every other bulk section the head holds is carried on.
+            continue_bulk(
+                &mut manifest.manifest.sections,
+                &head.manifest.sections.bulk,
+                &config.platform,
+            );
             let report = materializer
                 .materialize(&manifest.manifest, MaterializeClass::All)
                 .map_err(|error| {
@@ -330,6 +361,16 @@ mod tests {
     /// A source workspace with a tracked file and a bulk directory, captured (small + bulk)
     /// into `store` and registered as the head of `registrar`.
     fn capture_source(base: &Path, registrar: &Arc<InMemoryRegistrar>) -> Arc<LocalDir> {
+        capture_source_on(base, registrar, &default_platform())
+    }
+
+    /// [`capture_source`] on an executor of `platform` (the key its bulk section is stamped
+    /// with).
+    fn capture_source_on(
+        base: &Path,
+        registrar: &Arc<InMemoryRegistrar>,
+        platform: &str,
+    ) -> Arc<LocalDir> {
         let src = base.join("src");
         std::fs::create_dir_all(src.join("node_modules/pkg")).unwrap();
         git(&src, &["init", "-q", "-b", "main"]);
@@ -345,7 +386,9 @@ mod tests {
         git(&src, &["add", "-A"]);
         git(&src, &["commit", "-q", "-m", "one"]);
         let sink = Arc::new(LocalDir::new(&base.join("store")).unwrap());
-        let mut engine = CaptureEngine::open(CaptureConfig::new("wt-boot", 1, &src), None).unwrap();
+        let mut config = CaptureConfig::new("wt-boot", 1, &src);
+        config.platform = platform.to_owned();
+        let mut engine = CaptureEngine::open(config, None).unwrap();
         for (class, seq) in [(Class::Small, 1), (Class::Bulk, 2)] {
             engine
                 .snap(SnapRequest {
@@ -458,6 +501,119 @@ mod tests {
         assert_eq!(
             boot.engine.previous().unwrap().manifest.sections.bulk,
             BulkState::pending()
+        );
+    }
+
+    /// Every file under `dir` with its bytes, sorted.
+    fn tree(dir: &Path) -> Vec<(String, Vec<u8>)> {
+        let mut out = Vec::new();
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(d) = stack.pop() {
+            for entry in std::fs::read_dir(&d).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else {
+                    let rel = path.strip_prefix(dir).unwrap().display().to_string();
+                    out.push((rel, std::fs::read(&path).unwrap()));
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// Another platform's dependency tree is never dropped from the chain. The head was captured
+    /// on `linux-riscv64-musl`; this executor boots on its own platform, the registrar answers
+    /// the bulk section `"pending"`, and nothing is restored here. The executor keeps the riscv
+    /// section in `other_bulk`, through a small capture and through its own bulk capture (which
+    /// takes `bulk`), so a riscv executor booting on the chain head afterwards is answered that
+    /// section and restores it byte for byte. Before, the first capture here dropped it.
+    #[test]
+    fn another_platforms_bulk_stays_on_the_chain_and_restores_there() {
+        let riscv = "linux-riscv64-musl";
+        let tmp = tempfile::tempdir().unwrap();
+        let registrar = Arc::new(InMemoryRegistrar::new("wt-boot", 1, None));
+        let sink = capture_source_on(tmp.path(), &registrar, riscv);
+        let src_tree = tree(&tmp.path().join("src/node_modules"));
+        let dyn_sink: Arc<dyn BlobSink> = sink.clone();
+
+        // This platform: the riscv tree is not restored, and it is kept.
+        let here = tmp.path().join("here");
+        let mut boot = boot_from(
+            registrar.clone(),
+            Some(dyn_sink.clone()),
+            &source(),
+            &here,
+            tmp.path(),
+        )
+        .unwrap();
+        assert!(!here.join("node_modules").exists(), "not restored here");
+        let previous = &boot.engine.previous().unwrap().manifest.sections;
+        assert_eq!(previous.bulk, BulkState::pending());
+        assert_eq!(previous.other_bulk[riscv].platform, riscv);
+
+        // A small capture, then this platform's own dependency tree.
+        std::fs::write(here.join("lib.rs"), "pub fn f() { here() }\n").unwrap();
+        std::fs::create_dir_all(here.join("node_modules/native")).unwrap();
+        std::fs::write(here.join("node_modules/native/x86.node"), "x86 build\n").unwrap();
+        for (class, seq) in [(Class::Small, 10), (Class::Bulk, 11)] {
+            boot.engine
+                .snap(SnapRequest {
+                    kind: CaptureKind::Auto,
+                    class,
+                    seq,
+                })
+                .unwrap();
+        }
+        let dyn_registrar: Arc<dyn Registrar> = registrar.clone();
+        assert_eq!(
+            boot.engine
+                .shipper(dyn_sink.clone(), dyn_registrar)
+                .ship_pending()
+                .unwrap(),
+            2
+        );
+        let head = registrar.head().unwrap();
+        let sections = &head.manifest.sections;
+        assert_eq!(
+            sections.bulk.section().unwrap().platform,
+            default_platform()
+        );
+        assert_eq!(
+            sections.other_bulk.keys().collect::<Vec<_>>(),
+            [riscv],
+            "the riscv tree rides on the chain"
+        );
+
+        // A riscv executor on the new head: answered its own tree, restored byte for byte, with
+        // the edit made here.
+        let plan = registrar
+            .plan_get(&PlanGetRequest {
+                worktree_id: None,
+                epoch: 0,
+                platform: Some(riscv.to_owned()),
+            })
+            .unwrap();
+        let answered = plan.head.unwrap().manifest.sections.bulk;
+        assert_eq!(answered.section().unwrap().platform, riscv);
+        let there = tmp.path().join("there");
+        let mut restored = Materializer::new(sink.as_ref(), MaterializeTargets::new(&there, None))
+            .fetch_manifest(&head.manifest_key, &head.capture_id)
+            .unwrap();
+        continue_bulk(&mut restored.manifest.sections, &answered, riscv);
+        Materializer::new(sink.as_ref(), MaterializeTargets::new(&there, None))
+            .materialize(&restored.manifest, MaterializeClass::All)
+            .unwrap();
+        assert_eq!(tree(&there.join("node_modules")), src_tree);
+        assert_eq!(
+            std::fs::read_to_string(there.join("lib.rs")).unwrap(),
+            "pub fn f() { here() }\n"
+        );
+        // …and the x86 tree is now the one carried for this platform.
+        assert_eq!(
+            restored.manifest.sections.other_bulk[&default_platform()].platform,
+            default_platform()
         );
     }
 

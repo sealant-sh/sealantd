@@ -51,6 +51,13 @@ pub const PREFETCH_BATCH: usize = 500;
 /// registrar's call quota.
 pub const HOLD_BACKOFF: (Duration, Duration) = (Duration::from_secs(30), Duration::from_secs(600));
 
+/// After the registrar answers that the worktree lease is not live (409 `lease-lost`) the shipper
+/// pauses and asks again after 1 s, doubling per answer in a row up to 30 s. The lease comes back
+/// when the control plane renews or re-grants it; until then nothing can register, and nothing
+/// staged is dropped either.
+pub const LEASE_LOST_BACKOFF: (Duration, Duration) =
+    (Duration::from_secs(1), Duration::from_secs(30));
+
 /// Single-PUT uploads in flight at once. A presigned PUT from a MicroVM to S3 is a round trip of
 /// ≈ 70 ms whatever the object's size (measured on alpha, 2026-09-27: 20,878 objects in 24
 /// minutes one at a time), so the small objects of a capture are latency-bound, not
@@ -150,6 +157,11 @@ pub enum ShipError {
     /// The chain moved under us (another writer with our epoch, or a lost coalesce).
     #[error("chain conflict: {0}")]
     Conflict(RegistrarError),
+    /// The registrar answered that the worktree lease is not live (409 `lease-lost`, or a
+    /// heartbeat that renewed nothing). Not a conflict: the chain is as it was. The shipper
+    /// pauses and asks again after a backoff ([`LEASE_LOST_BACKOFF`]); everything stays staged.
+    #[error("lease lost; shipping paused")]
+    LeaseLost,
     /// The registrar refused this capture's bytes for the session's byte quota. The entry stays
     /// queued with its staged bytes ([`HeldCapture`]) and is asked for again after a backoff.
     #[error("refused ({reason}): limit {}, used {}, requested {}", opt(.limit), opt(.used), opt(.requested))]
@@ -523,6 +535,20 @@ impl Staging {
         Ok(removed)
     }
 
+    /// Bytes `entries` still have to upload: every object they list that is not acked as
+    /// uploaded, an object two entries share counted once. What would be lost if this disk went
+    /// now (the objects themselves stay on disk until their entries register).
+    #[must_use]
+    pub fn pending_bytes(&self, entries: &[QueueEntry]) -> u64 {
+        let mut seen: HashSet<&str> = HashSet::new();
+        entries
+            .iter()
+            .flat_map(|e| &e.uploads)
+            .filter(|u| seen.insert(u.file.as_str()) && !self.is_uploaded(&u.file))
+            .map(|u| u.bytes)
+            .sum()
+    }
+
     /// Bytes of staged objects not yet acked.
     pub fn staged_bytes(&self) -> io::Result<u64> {
         let mut total = 0;
@@ -617,6 +643,10 @@ pub struct ShipStatus {
     /// A bulk capture is held for the byte quota, as `refused_small`. The class keeps snapping
     /// (a newer bulk capture replaces the held one) and nothing is dropped.
     pub refused_bulk: AtomicBool,
+    /// The registrar answered that the worktree lease is not live (409 `lease-lost`): shipping
+    /// is paused and asked again after a backoff. Cleared by the next upload or register that
+    /// goes through.
+    pub lease_lost: AtomicBool,
 }
 
 impl ShipStatus {
@@ -633,6 +663,7 @@ impl ShipStatus {
             failures: self.failures.load(Ordering::Relaxed),
             refused_small: self.refused_small.load(Ordering::Relaxed),
             refused_bulk: self.refused_bulk.load(Ordering::Relaxed),
+            lease_lost: self.lease_lost.load(Ordering::Relaxed),
         }
     }
 
@@ -667,6 +698,8 @@ pub struct ShipSnapshot {
     pub refused_small: bool,
     /// The bulk class was refused for the byte quota.
     pub refused_bulk: bool,
+    /// The registrar answered that the lease is not live; shipping is paused.
+    pub lease_lost: bool,
 }
 
 /// Retry policy for one pass.
@@ -742,6 +775,10 @@ pub struct Shipper {
     held: Mutex<[Option<HeldCapture>; 2]>,
     /// First wait after a byte-quota refusal and its cap; doubles per refusal in a row.
     hold_backoff: (Duration, Duration),
+    /// Lease-lost answers in a row, and when shipping asks again.
+    lease: Mutex<(u32, Option<Instant>)>,
+    /// First wait after a lease-lost answer and its cap; doubles per answer in a row.
+    lease_backoff: (Duration, Duration),
     /// Counters.
     pub status: Arc<ShipStatus>,
 }
@@ -776,6 +813,8 @@ impl Shipper {
             waiting: AtomicUsize::new(0),
             held: Mutex::new([None, None]),
             hold_backoff: HOLD_BACKOFF,
+            lease: Mutex::new((0, None)),
+            lease_backoff: LEASE_LOST_BACKOFF,
             status,
         }
     }
@@ -813,6 +852,46 @@ impl Shipper {
     pub fn with_hold_backoff(mut self, first: Duration, max: Duration) -> Self {
         self.hold_backoff = (first, max);
         self
+    }
+
+    /// The wait after a lease-lost answer (`first`, doubling up to `max`);
+    /// [`LEASE_LOST_BACKOFF`].
+    #[must_use]
+    pub fn with_lease_backoff(mut self, first: Duration, max: Duration) -> Self {
+        self.lease_backoff = (first, max);
+        self
+    }
+
+    /// The registrar answered that the lease is not live: pause shipping until the backoff
+    /// runs out. Nothing is dropped and nothing is a conflict; the harness is paused by the
+    /// heartbeat, not here.
+    fn lease_lost(&self) {
+        let mut lease = lock(&self.lease);
+        lease.0 += 1;
+        let (first, max) = self.lease_backoff;
+        let wait = first.saturating_mul(1u32 << (lease.0 - 1).min(16)).min(max);
+        lease.1 = Some(Instant::now() + wait);
+        let answers = lease.0;
+        drop(lease);
+        self.status.lease_lost.store(true, Ordering::Relaxed);
+        tracing::warn!(
+            answers,
+            retry_in_ms = wait.as_millis() as u64,
+            "the registrar answered lease-lost; shipping paused, everything stays staged"
+        );
+    }
+
+    /// An upload or a register went through: the lease is live again.
+    fn lease_ok(&self) {
+        if self.status.lease_lost.swap(false, Ordering::Relaxed) {
+            *lock(&self.lease) = (0, None);
+            tracing::info!("the lease is live again; shipping resumed");
+        }
+    }
+
+    /// When shipping asks again after a lease-lost answer, while that is still ahead.
+    fn lease_retry_at(&self) -> Option<Instant> {
+        lock(&self.lease).1.filter(|at| Instant::now() < *at)
     }
 
     /// The captures held for the byte quota, per class: queued with their bytes, asked for
@@ -922,8 +1001,10 @@ impl Shipper {
                             }
                         }
                         self.staging.mark_uploaded(&u.file)?;
+                        self.lease_ok();
                         return Ok(());
                     }
+                    Err(SinkError::LeaseLost { .. }) => return Err(ShipError::LeaseLost),
                     Err(e) if e.is_retryable() => {
                         self.status.failures.fetch_add(1, Ordering::Relaxed);
                         tracing::warn!(key = %u.key, attempt, error = %e, "upload failed; retrying");
@@ -1105,6 +1186,7 @@ impl Shipper {
                         requested,
                     });
                 }
+                Err(SinkError::LeaseLost { .. }) => return Err(ShipError::LeaseLost),
                 Err(error) if error.is_retryable() => {
                     self.status.failures.fetch_add(1, Ordering::Relaxed);
                     attempt += 1;
@@ -1133,8 +1215,12 @@ impl Shipper {
                 Ok(resp) => {
                     self.status.registered.fetch_add(1, Ordering::Relaxed);
                     self.status.head_n.store(resp.head_n, Ordering::Relaxed);
+                    self.lease_ok();
                     return Ok(());
                 }
+                // Not live right now: pause and ask again, never a conflict (before, a 409
+                // `lease-lost` read as a wrong parent and ended a final flush).
+                Err(RegistrarError::LeaseLost) => return Err(ShipError::LeaseLost),
                 Err(e @ RegistrarError::Fenced { .. }) => {
                     // A fence on an entry staged under a previous identity is that identity's
                     // (a re-plan raced the shipper), not this executor's.
@@ -1217,6 +1303,10 @@ impl Shipper {
             pass.done = true;
             return Ok(pass);
         }
+        // Paused after a lease-lost answer: nothing can register until the backoff runs out.
+        if self.lease_retry_at().is_some() {
+            return Ok(pass);
+        }
         let past = |deadline: Option<Instant>| deadline.is_some_and(|d| Instant::now() >= d);
         let mut cycle = DutyCycle::new(self.cpu_fraction);
         loop {
@@ -1269,6 +1359,10 @@ impl Shipper {
                         self.hold(entry, &reason, limit, used, requested);
                         return Ok(pass);
                     }
+                    Err(ShipError::LeaseLost) => {
+                        self.lease_lost();
+                        return Ok(pass);
+                    }
                     // The entry was coalesced or re-staged under the upload (a later bulk snap
                     // swept an object it no longer lists): start again from the queue.
                     Err(_) if self.staging.generation() != generation => continue,
@@ -1314,6 +1408,11 @@ impl Shipper {
                 }) => {
                     self.staging.release();
                     self.hold(entry, &reason, limit, used, requested);
+                    return Ok(pass);
+                }
+                Err(ShipError::LeaseLost) => {
+                    self.staging.release();
+                    self.lease_lost();
                     return Ok(pass);
                 }
                 Err(e) => {
@@ -1380,93 +1479,114 @@ impl Shipper {
     /// Ship until the queue is empty or an error is not retryable, bounded by `deadline` (also
     /// inside a pass: a bulk upload stops between objects when it passes).
     pub fn flush(&self, deadline: Duration) -> Result<usize, ShipError> {
-        self.flush_scope(Scope::All, deadline)
+        self.flush_scope(Scope::All, Some(deadline))
     }
 
     /// Register every capture staged ahead of a bulk capture whose objects are still uploading,
-    /// bounded by `deadline`, and return: that is the git pack, the worktree tree and the
-    /// workspace class — what a change or a diff needs. The bulk capture keeps uploading in the
-    /// worker and registers after them; until then the chain head's bulk section is the one
-    /// before it (or `"pending"`).
-    pub fn flush_small(&self, deadline: Duration) -> Result<usize, ShipError> {
+    /// bounded by `deadline` (none: until they are, retrying what fails), and return: that is
+    /// the git pack, the worktree tree and the workspace class — what a change or a diff needs.
+    /// The bulk capture keeps uploading in the worker and registers after them; until then the
+    /// chain head's bulk section is the one before it (or `"pending"`).
+    pub fn flush_small(&self, deadline: Option<Duration>) -> Result<usize, ShipError> {
         self.flush_scope(Scope::AheadOfBulk, deadline)
     }
 
-    /// Ship and register everything pending, bulk captures included, with no deadline: the
-    /// executor is going away (`final`), and what is staged on its disk goes with it unless it
-    /// is in the store. Returns once the queue is empty; stops early only when nothing can ever
-    /// register — the lease is fenced, or the chain moved under this executor. A transport
-    /// failure is retried with backoff and a capture held for the byte quota is asked for again
-    /// when its backoff runs out, for as long as the process lives.
-    pub fn flush_final(&self) -> Result<usize, ShipError> {
+    /// Ship and register everything pending, bulk captures included: the executor is going away
+    /// (`final`), and what is staged on its disk goes with it unless it is in the store. Returns
+    /// once the queue is empty, at `deadline` when the caller gave one (a pass stops between
+    /// objects when it passes; whatever is left stays staged and is reported), or early when
+    /// nothing can ever register — the lease is fenced, or the chain moved under this executor.
+    /// A transport failure is retried with backoff, a capture held for the byte quota is asked
+    /// for again when its backoff runs out, and a lease-lost answer pauses and asks again — for
+    /// as long as the process lives when there is no deadline.
+    pub fn flush_final(&self, deadline: Option<Duration>) -> Result<usize, ShipError> {
+        let until = deadline.map(|d| Instant::now() + d);
+        let past = || until.is_some_and(|u| Instant::now() >= u);
+        let left = || {
+            until.map_or(Duration::MAX, |u| {
+                u.saturating_duration_since(Instant::now())
+            })
+        };
         let mut total = 0;
         let mut failures = 0u32;
         loop {
-            match self.pass(Scope::All, None, true) {
+            match self.pass(Scope::All, until, true) {
                 Ok(pass) => {
                     total += pass.shipped;
-                    if pass.done {
+                    if pass.done || past() {
                         return Ok(total);
                     }
                     if pass.shipped > 0 {
                         failures = 0;
                         continue;
                     }
-                    // Held for the byte quota, or a claim lost to a coalescing snap: wait for
-                    // the backoff (a second at a time, so a snap staged meanwhile ships).
-                    let wait = self
-                        .held()
-                        .iter()
-                        .map(|h| h.retry_at.saturating_duration_since(Instant::now()))
-                        .min()
-                        .unwrap_or(self.retry.backoff)
-                        .clamp(Duration::from_millis(10), Duration::from_secs(1));
-                    thread::sleep(wait);
+                    // Held for the byte quota, paused on a lost lease, or a claim lost to a
+                    // coalescing snap: wait for the nearest backoff (a second at a time, so a
+                    // snap staged meanwhile ships).
+                    thread::sleep(self.idle_wait().min(left()));
                 }
                 Err(e @ (ShipError::Fenced(_) | ShipError::Conflict(_))) => return Err(e),
                 Err(error) => {
+                    if past() {
+                        // The caller's deadline: what is left stays staged and is reported.
+                        tracing::warn!(%error, "final flush: deadline reached while shipping failed");
+                        return Ok(total);
+                    }
                     failures += 1;
                     let wait = self.backoff(failures.min(10));
                     tracing::warn!(%error, failures, "final flush: shipping failed; retrying");
-                    thread::sleep(wait);
+                    thread::sleep(wait.min(left()));
                 }
             }
         }
     }
 
-    fn flush_scope(&self, scope: Scope, deadline: Duration) -> Result<usize, ShipError> {
-        let until = Instant::now() + deadline;
+    /// How long a flush waits when a pass moved nothing: until the nearest held capture or
+    /// lease-lost backoff runs out, a second at most, 10 ms at least.
+    fn idle_wait(&self) -> Duration {
+        let now = Instant::now();
+        self.held()
+            .iter()
+            .map(|h| h.retry_at)
+            .chain(self.lease_retry_at())
+            .map(|at| at.saturating_duration_since(now))
+            .min()
+            .unwrap_or(self.retry.backoff)
+            .clamp(Duration::from_millis(10), Duration::from_secs(1))
+    }
+
+    fn flush_scope(&self, scope: Scope, deadline: Option<Duration>) -> Result<usize, ShipError> {
+        let until = deadline.map(|d| Instant::now() + d);
+        let past = || until.is_some_and(|u| Instant::now() >= u);
+        let left = || {
+            until.map_or(Duration::MAX, |u| {
+                u.saturating_duration_since(Instant::now())
+            })
+        };
         let mut total = 0;
         loop {
-            match self.pass(scope, Some(until), true) {
+            match self.pass(scope, until, true) {
                 Ok(pass) => {
                     total += pass.shipped;
                     if pass.done {
                         return Ok(total);
                     }
-                    if pass.shipped == 0 && Instant::now() < until {
-                        // Nothing moved (a claim lost to a coalescing snap): not a hot loop.
-                        thread::sleep(
-                            self.retry
-                                .backoff
-                                .min(until.saturating_duration_since(Instant::now())),
-                        );
+                    if pass.shipped == 0 && !past() {
+                        // Nothing moved (a claim lost to a coalescing snap, a held capture, a
+                        // lost lease): not a hot loop.
+                        thread::sleep(self.idle_wait().min(left()));
                     }
                 }
                 Err(ShipError::Fenced(e)) => return Err(ShipError::Fenced(e)),
                 Err(ShipError::Conflict(e)) => return Err(ShipError::Conflict(e)),
                 Err(e) => {
-                    if Instant::now() >= until {
+                    if past() {
                         return Err(e);
                     }
-                    thread::sleep(
-                        self.retry
-                            .backoff
-                            .min(until.saturating_duration_since(Instant::now())),
-                    );
+                    thread::sleep(self.retry.backoff.min(left()));
                 }
             }
-            if Instant::now() >= until {
+            if past() {
                 return Ok(total);
             }
         }
@@ -1586,6 +1706,7 @@ mod tests {
                             Vec::new(),
                         ),
                         bulk: crate::manifest::BulkState::pending(),
+                        other_bulk: Default::default(),
                     },
                     checkpoint: None,
                 },

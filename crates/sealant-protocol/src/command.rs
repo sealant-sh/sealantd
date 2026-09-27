@@ -470,10 +470,22 @@ pub enum Command {
         /// Why the capture is taken.
         kind: CaptureKind,
     },
-    /// Final small-class capture, then ship and register everything staged, bounded by the
-    /// shutdown grace period (the platform's suspend / terminate hooks call this).
+    /// A forced capture, then ship and register what `kind` waits for (the platform's suspend
+    /// and terminate hooks call this). `suspend`: a small-class snap; returns once every capture
+    /// ahead of a bulk capture still uploading is registered. `final`: a small-class and a
+    /// bulk-class snap; returns once nothing is pending (bulk included), on a fence or a chain
+    /// conflict, or at `deadline_ms`. `deadline_ms` is honoured as given, never clamped to the
+    /// shutdown grace; absent, a suspend flush is bounded by the shutdown grace and a final
+    /// flush by nothing.
     #[serde(rename = "capture.flush")]
-    CaptureFlush,
+    CaptureFlush {
+        /// What the flush waits for.
+        #[serde(default)]
+        kind: CaptureFlushKind,
+        /// How long it may take, milliseconds.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        deadline_ms: Option<u64>,
+    },
     /// Report the capture engine's state.
     #[serde(rename = "capture.status")]
     CaptureStatus,
@@ -486,6 +498,19 @@ pub enum Command {
     /// from there. Idempotent: a plan that names what the executor already has does nothing.
     #[serde(rename = "capture.replan")]
     CaptureReplan,
+}
+
+/// What a `capture.flush` waits for.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum CaptureFlushKind {
+    /// Every capture ahead of a bulk capture still uploading is registered (a change, a diff);
+    /// the bulk capture keeps uploading. What a client that sends no kind gets.
+    #[default]
+    Suspend,
+    /// The executor is going away: both classes are snapped and everything ships, bulk
+    /// included.
+    Final,
 }
 
 /// Why a capture is taken (ADR-0015 manifest `kind`).
@@ -537,7 +562,7 @@ impl Command {
             Self::SignalSession { .. } => "signalSession",
             Self::ReadSessionOutput(_) => "readSessionOutput",
             Self::CaptureNow { .. } => "capture.now",
-            Self::CaptureFlush => "capture.flush",
+            Self::CaptureFlush { .. } => "capture.flush",
             Self::CaptureStatus => "capture.status",
             Self::LeaseEpoch => "lease.epoch",
             Self::CaptureReplan => "capture.replan",
@@ -944,11 +969,16 @@ pub struct CaptureStatusReport {
     /// a backoff until the budget allows. Cleared when the class registers.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub refused: Vec<CaptureClass>,
-    /// Of `pending`, the bulk captures whose objects are still uploading. `capture.flush`
-    /// returns once every other capture is registered: a small capture is staged ahead of a
-    /// bulk one still uploading, so these register after it, in the background.
+    /// Of `pending`, the bulk captures whose objects are still uploading. A `suspend`
+    /// `capture.flush` returns once every other capture is registered: a small capture is
+    /// staged ahead of a bulk one still uploading, so these register after it, in the
+    /// background. A `final` flush waits for them.
     #[serde(default)]
     pub pending_bulk: u64,
+    /// Bytes staged on this disk that no upload has taken yet, over every pending capture (an
+    /// object two captures share counts once): what would be lost if the disk went now.
+    #[serde(default)]
+    pub pending_bytes: u64,
 }
 
 /// Result of `capture.replan`: the identity the executor now acts under and what the delta

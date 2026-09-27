@@ -5,7 +5,8 @@
 > yields to small snaps at chunk boundaries — when it builds, and when it uploads: a small capture
 > is staged, shipped and registered ahead of a bulk capture still uploading (see "Small captures
 > ahead of a bulk upload"); turn boundaries, checkpoints, `capture.flush` and the
-> SIGTERM/SIGINT/`gracefulShutdown` paths force a small snap ahead of the timers. Watch budget not
+> SIGTERM/SIGINT/`gracefulShutdown` paths force a small snap ahead of the timers (a `final`
+> flush forces a bulk snap too; see "No work product is lost"). Watch budget not
 > met, `IN_Q_OVERFLOW` or no backend → that class polls at its maximum interval (the stat walk).
 > Still open: the registrar wire shape is provisional (`registrar.rs`).
 
@@ -142,9 +143,9 @@ chain head stayed at the capture before the agent's edits, `capture.flush` timed
   queue changes (a capture was staged ahead of it: it ships that one, then resumes where it
   stopped), when a flush is waiting, or at the caller's deadline. Its manifest registers once
   every object is up. One pass runs at a time (`Shipper::pass`).
-- **`capture.flush` returns once every capture ahead of a bulk capture still uploading is
-  registered** (`Shipper::flush_small`): the git pack, the worktree tree and the workspace class,
-  which is what a change or a diff needs. The bulk capture keeps uploading in the worker and
+- **A suspend `capture.flush` returns once every capture ahead of a bulk capture still
+  uploading is registered** (`Shipper::flush_small`): the git pack, the worktree tree and the
+  workspace class, which is what a change or a diff needs. The bulk capture keeps uploading in the worker and
   registers on top; `capture.status` reports it in `pending` and in `pending_bulk`, so a caller
   reads `pending == pending_bulk` as flushed for a change or a diff. A `final` flush does not
   return before the bulk capture is registered (see "No work product is lost").
@@ -255,12 +256,40 @@ restore, byte for byte, so the user never notices the compute changed.
 - **`"pending"` is not "nothing".** A head whose bulk section is `"pending"` restores the other
   classes and leaves the bulk directories on disk as they are — never swept — and the next bulk
   snap captures them.
-- **A `final` flush finishes.** `capture.flush` of kind `final` and the SIGTERM / SIGINT /
-  `runtime.gracefulShutdown` paths snap the bulk class too and ship everything, bulk included,
-  with no deadline (`Shipper::flush_final`): they return once the queue is empty, or on a fence
-  or a chain conflict, when nothing staged can register any more. A transport failure is retried
-  with backoff and a held capture is waited for; the process ending is what stops it. The
-  control plane's `capture.flush` (kind `suspend`) keeps its deadline: the daemon lives on.
+- **A `final` flush finishes.** `capture.flush {kind: final}` and the SIGTERM / SIGINT /
+  `runtime.gracefulShutdown` / harness-exit paths snap the small class and, forced, the bulk
+  class — whatever the bulk clocks say; a scheduled bulk build in progress yields to it at its
+  next chunk boundary and the forced snap resumes its progress, re-reading only files whose
+  size, mtime or inode moved — then ship everything, bulk included (`Shipper::flush_final`).
+  They return once nothing is pending, on a fence or a chain conflict (nothing staged can
+  register any more), or at the caller's `deadline_ms`, when one was given: what is left stays
+  staged, is reported (`pending`, `pending_bulk`, `pending_bytes`, `refused`) and keeps
+  shipping in the worker. Without a deadline — the daemon's own paths never give one — a
+  transport failure is retried with backoff, a held capture is waited for, a lost lease is
+  waited out, and only the process ending stops it.
+- **A deadline is the caller's.** The daemon used to clamp every flush's deadline to its
+  shutdown grace (10 s, never configured at boot), so a caller that allowed 30 minutes for a
+  dependency tree got 10 s. A flush now runs for exactly the `deadline_ms` it was given. A
+  suspend flush sent without one (every client before this change) is bounded by the shutdown
+  grace, as it always was; the grace is configurable (`SEALANT_SHUTDOWN_GRACE_MS` at boot,
+  `sealantd serve --shutdown-grace-ms`) and bounds nothing else a capture does.
+- **A lost lease pauses, it is not a conflict.** A 409 `lease-lost` from `upload.urls`,
+  `upload.complete` or `capture.register` (the lease lapsed, was released before the executor
+  was done, or a standby is not claimed yet) is `RegistrarError::LeaseLost`: the shipper pauses
+  and asks again after 1 s, doubling to 30 s at most (`LEASE_LOST_BACKOFF`), with everything
+  staged. It used to read as a wrong parent, a chain conflict, which ended a final flush with
+  the captures still on the disk. A 409 naming another `live_epoch` is still a fence.
+- **Another platform's dependency tree stays on the chain.** A head whose bulk section was
+  captured on another platform is answered `"pending"` and not restored here, and it used to be
+  dropped by this executor's next capture, so the platform that built it could never restore
+  it. The engine now carries it in the manifest's `sections.other_bulk` (keyed by platform)
+  through every capture; this executor's own bulk snap fills `bulk` beside it. A registrar
+  answers an executor `bulk` when it was captured on its platform, else `other_bulk[platform]`,
+  else `"pending"`. The executor itself never restores a bulk section stamped for another
+  platform, whatever the registrar answered.
+- **`pending_bytes` says what is at stake.** `capture.status` and every `capture.flush` report
+  the bytes staged on this disk that no upload has taken yet, an object two captures share
+  counted once (`Staging::pending_bytes`): what would be lost if the disk went now.
 - **A restart resumes its disk.** The engine records the capture it staged last
   (`index/last.json`). A boot whose staging names the plan's worktree and whose last capture is
   the head, or descends from it through the captures still queued (`CaptureEngine::pickup`),
@@ -273,7 +302,11 @@ restore, byte for byte, so the user never notices the compute changed.
   staging does not continue the chain (none, another worktree, a chain that moved on without it)
   is materialized over, as before.
 
-`tests/no_loss.rs` holds each of these; `tests/quota_refusals.rs` the refusals.
+`tests/no_loss.rs` and `tests/flush_modes.rs` hold each of these; `tests/quota_refusals.rs`
+the refusals; `crates/sealantd/src/capture.rs` a flush that runs past the 10 s it was once
+clamped to, and the grace bounding a suspend flush without a deadline;
+`crates/sealantd/src/boot/capture.rs` another platform's dependency tree carried through an
+executor's captures and restored on its own platform byte for byte.
 
 ## Wire additions
 
@@ -294,11 +327,59 @@ Of `pending`, the bulk captures whose objects are still uploading. Additive (`ui
 `CaptureStatusReport`; `0` from an older daemon). A control plane that treated `pending == 0` as
 a complete flush reads `pending == pending_bulk` instead.
 
+### `capture.flush`: `kind` and `deadline_ms`
+
+The command carried `Empty`; it now carries `CaptureFlushArgs` at the same field (29), so an
+older client's bytes decode as a suspend flush with no deadline.
+
+```proto
+enum CaptureFlushKind { CAPTURE_FLUSH_KIND_UNSPECIFIED = 0; CAPTURE_FLUSH_KIND_SUSPEND = 1;
+                        CAPTURE_FLUSH_KIND_FINAL = 2; }
+message CaptureFlushArgs { CaptureFlushKind kind = 1; optional uint64 deadline_ms = 2; }
+```
+
+`UNSPECIFIED` is `SUSPEND`. The result is `CaptureStatusReport`, as before. `sealantctl capture
+flush [--final] [--deadline 15m]` sends it (`500ms`, `90s`, `15m`, `2h`; a bare number is
+seconds).
+
+| kind | snaps | returns when | no `deadline_ms` |
+|---|---|---|---|
+| `suspend` | small | every capture ahead of a bulk upload is registered | the shutdown grace |
+| `final` | small + bulk (forced) | nothing is pending, a fence, a conflict, or the deadline | none |
+
+### `pending_bytes` on `capture.status` / `capture.flush`
+
+`uint64` field 14 of `CaptureStatusReport`: bytes staged on the executor's disk that no upload
+has taken yet, over every pending capture, each object counted once. `0` from an older daemon.
+A caller that has to decide whether a workspace can go reads `pending == 0` (and
+`pending_bytes` for how far off that is).
+
+### `other_bulk` in a manifest
+
+`sections.other_bulk`: bulk sections captured on other platforms, keyed by
+`<os>-<arch>-<libc>`, each a bulk section as `bulk` is. Absent when empty, so every manifest
+without one encodes exactly as before. A registrar reads its packs (and `dir_packs`) as it reads
+`bulk`'s: it keeps them alive in retention, and answers `other_bulk[platform]` as the head's
+bulk section to an executor of that platform, with its packs in `get_urls`.
+
+```json
+"sections":{"git":{…},"workspace":{…},
+            "bulk":{"root":"…","packs":[…],"platform":"linux-x86_64-gnu","format":2,"dir_packs":[…]},
+            "other_bulk":{"linux-aarch64-gnu":{"root":"…","packs":[…],"platform":"linux-aarch64-gnu"}}}
+```
+
+### `lease-lost` on the session channel
+
+A 409 `{"reason":"lease-lost"}` from any call, without a `live_epoch` other than the caller's,
+is a lost lease: the executor pauses shipping and asks again, and never reads it as a chain
+conflict. Nothing new on the wire; the reading changed.
+
 ### `platform` on `plan.get`
 
 The request carries the executor's `<os>-<arch>-<libc>` (the same key the bulk class stamps on
 its captures, `engine::default_platform`). A registrar answers the head's bulk section as
-`"pending"` when it was captured for another platform and omits its packs from `get_urls`:
+`"pending"` when it was captured for another platform and `other_bulk` carries none for this
+one (see "`other_bulk` in a manifest"), and omits its packs from `get_urls`:
 the executor never restores a dependency tree built elsewhere, the control plane runs the
 project's install in the workspace instead. A registrar that ignores the field, or a request
 without it (an older executor), gets the head as is. `InMemoryRegistrar` implements the rule;
@@ -424,6 +505,11 @@ Mend installs today) must now say so, or boot refuses.
 - §"Write order": packs → dir packs → manifest → register.
 - Byte-quota refusals (amendment of the capture channel): a refused capture is held and asked for
   again, never dropped.
+- §"Manifest": sections gain `other_bulk`, the bulk sections captured on other platforms, keyed
+  by platform and carried from capture to capture (see "`other_bulk` in a manifest").
+- §"Executor hooks": `capture.flush` takes `kind` (`suspend` | `final`) and `deadline_ms`; the
+  flush on `SIGTERM`/`SIGINT`/`runtime.gracefulShutdown` is a final flush with no deadline,
+  not bounded by the shutdown grace. A 409 `lease-lost` pauses shipping (never a conflict).
 
 - §"Capture format", CDC packs: "≤ 64 MiB, one PUT, never multipart" → packs stay ≤ 64 MiB but
   are uploaded as multipart at or above the shipper's threshold (default 16 MiB); git packs may

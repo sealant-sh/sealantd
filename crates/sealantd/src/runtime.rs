@@ -236,22 +236,45 @@ impl Runtime {
         self.capture.get().cloned()
     }
 
-    /// Flush captures: a snap of `kind`, ship and register, bounded by the shutdown grace
-    /// period — except a `final` flush, which snaps the bulk class as well and returns only once
-    /// everything staged is registered (or the lease is fenced): the disk goes with the daemon,
-    /// so the process ending is what stops it. A no-op without a capture engine; errors are
-    /// logged, never fatal.
-    pub async fn flush_captures(&self, kind: sealant_protocol::CaptureKind) {
+    /// Flush captures on the daemon's own way out (SIGTERM, SIGINT, `runtime.gracefulShutdown`,
+    /// the harness exiting): a `final` flush snaps both classes and returns only once everything
+    /// staged is registered, or the lease is fenced, or the chain conflicts — no deadline, since
+    /// the disk goes with the daemon and the process ending is what stops it. A no-op without a
+    /// capture engine; errors are logged, never fatal.
+    pub async fn flush_captures(&self, kind: sealant_protocol::CaptureFlushKind) {
         let Some(capture) = self.capture() else {
             return;
         };
-        let grace = Duration::from_millis(self.shutdown.grace_ms());
-        match tokio::task::spawn_blocking(move || capture.flush(kind, grace)).await {
+        let deadline = self.flush_deadline(kind, None);
+        match tokio::task::spawn_blocking(move || capture.flush(kind, deadline)).await {
             Ok(Ok(report)) => {
-                tracing::info!(head_n = ?report.head_n, pending = report.pending, "captures flushed");
+                tracing::info!(
+                    head_n = ?report.head_n,
+                    pending = report.pending,
+                    pending_bulk = report.pending_bulk,
+                    pending_bytes = report.pending_bytes,
+                    "captures flushed"
+                );
             }
             Ok(Err(error)) => tracing::warn!(%error, "capture flush failed"),
             Err(error) => tracing::warn!(%error, "capture flush task failed"),
+        }
+    }
+
+    /// The deadline a `capture.flush` of `kind` runs under: the caller's, as given; without one,
+    /// a suspend flush is bounded by the shutdown grace (as it always was) and a final flush by
+    /// nothing.
+    fn flush_deadline(
+        &self,
+        kind: sealant_protocol::CaptureFlushKind,
+        deadline_ms: Option<u64>,
+    ) -> Option<Duration> {
+        match (deadline_ms, kind) {
+            (Some(ms), _) => Some(Duration::from_millis(ms)),
+            (None, sealant_protocol::CaptureFlushKind::Suspend) => {
+                Some(Duration::from_millis(self.shutdown.grace_ms()))
+            }
+            (None, sealant_protocol::CaptureFlushKind::Final) => None,
         }
     }
 
@@ -562,7 +585,7 @@ impl Runtime {
                 ControlResponse::ok_with(rid, CommandResult::Metrics(self.metrics()))
             }
             Command::RuntimeGracefulShutdown { grace_millis } => {
-                self.flush_captures(sealant_protocol::CaptureKind::Final)
+                self.flush_captures(sealant_protocol::CaptureFlushKind::Final)
                     .await;
                 self.shutdown.request_graceful(grace_millis);
                 ControlResponse::ok_with(
@@ -713,15 +736,11 @@ impl Runtime {
                     }
                 }
             },
-            Command::CaptureFlush => match self.capture() {
+            Command::CaptureFlush { kind, deadline_ms } => match self.capture() {
                 None => ControlResponse::error(rid, crate::capture::not_enabled()),
                 Some(capture) => {
-                    let grace = Duration::from_millis(self.shutdown.grace_ms());
-                    match tokio::task::spawn_blocking(move || {
-                        capture.flush(sealant_protocol::CaptureKind::Suspend, grace)
-                    })
-                    .await
-                    {
+                    let deadline = self.flush_deadline(kind, deadline_ms);
+                    match tokio::task::spawn_blocking(move || capture.flush(kind, deadline)).await {
                         Ok(Ok(report)) => {
                             ControlResponse::ok_with(rid, CommandResult::CaptureStatus(report))
                         }

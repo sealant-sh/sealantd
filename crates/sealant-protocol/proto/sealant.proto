@@ -418,6 +418,24 @@ enum CaptureKind {
   CAPTURE_KIND_FINAL = 5;
 }
 message CaptureNowArgs { CaptureKind kind = 1; }
+// What a `capture.flush` waits for. UNSPECIFIED is SUSPEND: a client that predates the field
+// sends an empty `CaptureFlushArgs` (the command carried `Empty` before), and gets what it got.
+enum CaptureFlushKind {
+  CAPTURE_FLUSH_KIND_UNSPECIFIED = 0;
+  // A small-class snap; returns once every capture ahead of a bulk capture still uploading is
+  // registered (what a change or a diff needs). The bulk capture keeps uploading.
+  CAPTURE_FLUSH_KIND_SUSPEND = 1;
+  // The executor is going away: a small-class AND a bulk-class snap, then ship until nothing is
+  // pending (bulk included), the lease is fenced, the chain conflicts, or `deadline_ms` passes.
+  CAPTURE_FLUSH_KIND_FINAL = 2;
+}
+message CaptureFlushArgs {
+  CaptureFlushKind kind = 1;
+  // How long the flush may take, milliseconds. Honoured as given (never clamped to the shutdown
+  // grace). Absent: a suspend flush is bounded by the daemon's shutdown grace, as before; a final
+  // flush has no deadline and returns only when nothing is pending, or on a fence or a conflict.
+  optional uint64 deadline_ms = 2;
+}
 // What a capture snapped: the small class (git, `.git` bookkeeping, harness home) or the bulk
 // class (dependencies, build outputs).
 enum CaptureClass {
@@ -467,7 +485,7 @@ message Command {
     ReadSessionOutputArgs read_session_output = 26;
     BindMountArgs bind_mount = 27;
     CaptureNowArgs capture_now = 28;
-    Empty capture_flush = 29;
+    CaptureFlushArgs capture_flush = 29;
     Empty capture_status = 30;
     Empty lease_epoch = 31;
     Empty capture_replan = 32;
@@ -595,9 +613,13 @@ message CaptureStatusReport {
   // keeps snapping, and the executor asks again after a backoff until the budget allows.
   repeated CaptureClass refused = 12;
   // Of `pending`, the bulk captures (dependency trees, build outputs) whose objects are still
-  // uploading. capture.flush returns once every other capture is registered; these follow in
-  // the background and register after it.
+  // uploading. A suspend capture.flush returns once every other capture is registered; these
+  // follow in the background and register after it. A final flush waits for them.
   uint64 pending_bulk = 13;
+  // Bytes staged on this disk that no upload has taken yet, over every pending capture (an
+  // object two captures share is counted once). What is lost if the disk goes now; 0 once
+  // everything is up (captures can still wait to register).
+  uint64 pending_bytes = 14;
 }
 message LeaseEpochReport { uint64 epoch = 1; string worktree_id = 2; bool fenced = 3; }
 message CaptureReplanned {

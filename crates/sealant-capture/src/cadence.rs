@@ -161,6 +161,9 @@ struct Shared {
     cv: Condvar,
     /// Small-class snaps waiting for (or holding) the engine; a bulk build yields while > 0.
     small_waiting: AtomicUsize,
+    /// Forced bulk snaps (a final flush) waiting for (or holding) the engine; a scheduled bulk
+    /// build yields to them, and the forced snap resumes its progress.
+    forced_bulk: AtomicUsize,
     yield_lock: Mutex<()>,
     yield_cv: Condvar,
     watch: Mutex<Option<WatchHandle>>,
@@ -246,12 +249,35 @@ impl Shared {
         result
     }
 
-    /// A bulk-class snap, yielding to small-class snaps until it completes.
-    fn bulk_snap(&self) -> Result<StagedCapture, EngineError> {
+    /// A bulk-class snap, yielding to small-class snaps until it completes. A `forced` one (a
+    /// final flush) also preempts a scheduled bulk build in progress: that build yields at its
+    /// next chunk boundary and this snap resumes its progress, reading only what changed since
+    /// (a file's size, mtime or inode moved), so it captures the tree as it is now without
+    /// waiting for the scheduled build to finish first.
+    fn bulk_snap(&self, forced: bool) -> Result<StagedCapture, EngineError> {
+        if forced {
+            self.forced_bulk.fetch_add(1, Ordering::SeqCst);
+        }
+        let result = self.bulk_snap_inner(forced);
+        if forced {
+            self.forced_bulk.fetch_sub(1, Ordering::SeqCst);
+            let _g = self
+                .yield_lock
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            self.yield_cv.notify_all();
+        }
+        result
+    }
+
+    fn bulk_snap_inner(&self, forced: bool) -> Result<StagedCapture, EngineError> {
         self.state().bulk.clear();
         self.counters.bulk_running.store(true, Ordering::SeqCst);
         let seq = self.seq.fetch_add(1, Ordering::Relaxed);
-        let preempt = || self.small_waiting.load(Ordering::SeqCst) > 0;
+        let preempt = || {
+            self.small_waiting.load(Ordering::SeqCst) > 0
+                || (!forced && self.forced_bulk.load(Ordering::SeqCst) > 0)
+        };
         let result = loop {
             // Let a waiting small snap take the engine first.
             {
@@ -259,7 +285,7 @@ impl Shared {
                     .yield_lock
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner);
-                while preempt() && !self.state().stop {
+                while preempt() && (forced || !self.state().stop) {
                     g = self
                         .yield_cv
                         .wait_timeout(g, Duration::from_millis(50))
@@ -267,7 +293,9 @@ impl Shared {
                         .0;
                 }
             }
-            if self.state().stop {
+            // A forced snap runs on a stopped runner (the daemon is shutting down, and this is
+            // the capture that must reach the store); a scheduled one does not.
+            if !forced && self.state().stop {
                 self.counters.bulk_running.store(false, Ordering::SeqCst);
                 return Err(EngineError::Io(std::io::Error::other("runner stopped")));
             }
@@ -400,7 +428,7 @@ impl Shared {
                         drop(st);
                         continue;
                     }
-                    match self.bulk_snap() {
+                    match self.bulk_snap(false) {
                         Ok(staged) if !staged.unchanged => {
                             tracing::debug!(n = staged.n, ?trigger, "bulk capture staged");
                         }
@@ -467,6 +495,7 @@ impl CadenceRunner {
                 }),
                 cv: Condvar::new(),
                 small_waiting: AtomicUsize::new(0),
+                forced_bulk: AtomicUsize::new(0),
                 yield_lock: Mutex::new(()),
                 yield_cv: Condvar::new(),
                 watch: Mutex::new(None),
@@ -579,31 +608,38 @@ impl CadenceRunner {
     }
 
     /// A forced small-class snap of `kind`, then ship and register it and every capture ahead
-    /// of it, bounded by `deadline`. Blocking. A bulk capture whose objects are still uploading
-    /// does not hold the flush: the snap is staged ahead of it and the flush returns once the
-    /// snap is registered, while the worker keeps uploading the bulk capture (`capture.status`
-    /// counts it in `pending` and `pending_bulk`).
+    /// of it, bounded by `deadline` (none: until they are registered). Blocking. A bulk capture
+    /// whose objects are still uploading does not hold the flush: the snap is staged ahead of
+    /// it and the flush returns once the snap is registered, while the worker keeps uploading
+    /// the bulk capture (`capture.status` counts it in `pending` and `pending_bulk`).
     ///
     /// A `final` flush — the executor is going away, and its disk with it — takes a bulk snap
-    /// as well (the dependency tree as it is now, whatever the bulk clocks say) and ships and
-    /// registers everything, bulk included, with no deadline ([`Shipper::flush_final`]): it
-    /// returns once the queue is empty, or on a fence or a chain conflict, when nothing staged
-    /// can register any more. `deadline` does not bound it; the process ending does.
+    /// as well, forced (the dependency tree as it is now, whatever the bulk clocks say; a
+    /// scheduled bulk build in progress yields to it), and ships and registers everything, bulk
+    /// included ([`Shipper::flush_final`]): it returns once the queue is empty, at `deadline`
+    /// when one is given, or on a fence or a chain conflict, when nothing staged can register
+    /// any more. Without a deadline only the process ending stops it.
     ///
     /// # Errors
     /// The engine's error, or the shipper's when shipping stops on a fence or a conflict.
-    pub fn flush(&self, kind: CaptureKind, deadline: Duration) -> Result<usize, EngineError> {
+    pub fn flush(
+        &self,
+        kind: CaptureKind,
+        deadline: Option<Duration>,
+    ) -> Result<usize, EngineError> {
+        let until = deadline.map(|d| Instant::now() + d);
+        let left = || until.map(|u| u.saturating_duration_since(Instant::now()));
         self.snap(kind)?;
         if kind != CaptureKind::Final {
-            return Ok(self.shared.shipper.flush_small(deadline)?);
+            return Ok(self.shared.shipper.flush_small(left())?);
         }
         if self.shared.capture_bulk
-            && let Err(error) = self.shared.bulk_snap()
+            && let Err(error) = self.shared.bulk_snap(true)
         {
             // What the last bulk snap staged still ships; the error is the engine's (I/O).
             tracing::warn!(%error, "final bulk snap failed");
         }
-        Ok(self.shared.shipper.flush_final()?)
+        Ok(self.shared.shipper.flush_final(left())?)
     }
 
     /// Ship everything pending now, bounded by `deadline`, without a snap.

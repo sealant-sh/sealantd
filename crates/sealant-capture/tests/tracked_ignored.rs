@@ -140,6 +140,7 @@ fn control_plane_base(
             },
             workspace: WorkspaceSection::objects(root_key, vec![]),
             bulk: BulkState::pending(),
+            other_bulk: Default::default(),
         },
         checkpoint: None,
     }

@@ -105,6 +105,14 @@ pub enum SinkError {
         /// Bytes the refused call asked for.
         requested: Option<u64>,
     },
+    /// The registrar answered that the worktree lease is not live (409 `lease-lost`): no URL
+    /// is minted and no upload completes until it is. Not a failure of the object; the shipper
+    /// pauses and asks again ([`crate::ship::ShipError::LeaseLost`]).
+    #[error("lease lost: {key}")]
+    LeaseLost {
+        /// Key.
+        key: String,
+    },
     /// A multipart upload could not be assembled: the registrar minted the wrong number of part
     /// URLs, a part answered without an ETag, the complete was refused, or the assembled object
     /// has the wrong size.
@@ -128,6 +136,7 @@ impl SinkError {
             Self::Transport { .. } | Self::Io(_) => true,
             Self::Http { status, .. } => *status >= 500 || *status == 429 || *status == 408,
             Self::NoUrl { .. }
+            | Self::LeaseLost { .. }
             | Self::NotFound(_)
             | Self::Multipart { .. }
             | Self::QuotaRefused { .. } => false,
