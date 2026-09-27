@@ -36,3 +36,9 @@ tracked file under a bulk-named directory such as `build/` or `dist/`.
 A tracked path whose metadata cannot be read (under a directory that cannot be searched) keeps
 its previous entry in an automatic capture and is counted in `capture.status`'s `unreadable`; a
 final capture fails on it, as it does on any work it cannot read.
+
+A restored `packed-refs` claimed git's `peeled fully-peeled` traits without carrying a single
+`^<peeled>` line, which tells git no ref in it is an annotated tag: on git 2.43 and 2.52
+`git describe` found no annotated tag, `show-ref -d` and a fetch from the restored repository
+lost `v1^{}`, and 2.52's `for-each-ref %(*objectname)` failed with "bad tag". The file now
+claims only `sorted`, and git peels each tag from its object.

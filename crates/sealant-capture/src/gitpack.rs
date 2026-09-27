@@ -990,7 +990,12 @@ pub fn write_packed_refs(
             });
         }
     }
-    let mut text = String::from("# pack-refs with: peeled fully-peeled sorted \n");
+    // No `peeled` trait: this file carries no `^<peeled>` lines, and a file that claimed the
+    // trait without them tells git that no ref here is an annotated tag. Git 2.43 and 2.52
+    // believe it: `describe` finds no annotated tag, `show-ref -d` and the refs a fetch is
+    // offered lose `v1^{}`, and 2.52's `for-each-ref %(*objectname)` fails on "bad tag".
+    // Without the trait git peels each tag from its object, on every version.
+    let mut text = String::from("# pack-refs with: sorted \n");
     for (name, sha) in refs {
         if name.starts_with(PSEUDO_REF_PREFIX) || symrefs.contains_key(name) {
             continue;
@@ -1431,5 +1436,61 @@ mod tests {
         let entries = stdout_string(&out);
         assert!(entries.contains("160000 commit"), "{entries}");
         assert!(!entries.contains("vendor/x"), "{entries}");
+    }
+
+    /// An annotated tag restored through `packed-refs` still peels to its commit: the file
+    /// never claims a peel trait it does not carry the `^` lines for (checked on the file
+    /// itself, so it holds whichever git runs it), and git sees the tag as annotated.
+    #[test]
+    fn an_annotated_tag_in_packed_refs_still_peels() {
+        let (dir, repo) = fixture();
+        repo.run(&["tag", "-a", "v1", "-m", "v1"]).unwrap();
+        repo.run(&["tag", "light"]).unwrap();
+        let scratch = dir.path().join("scratch");
+        let r = build_git_pack(&repo, &scratch, &[], &[]).unwrap();
+        let fresh = GitRepo::init(&dir.path().join("fresh")).unwrap();
+        let pack = r.pack.as_ref().unwrap();
+        install_pack(&fresh, &pack.sha256, &fs::read(&pack.path).unwrap(), None).unwrap();
+        write_packed_refs(&fresh, &r.closure.refs, &r.closure.symrefs).unwrap();
+        write_head(&fresh, &r.closure.head).unwrap();
+
+        let text = fs::read_to_string(fresh.common_dir.join("packed-refs")).unwrap();
+        let header = text.lines().next().unwrap_or_default();
+        let claims_peeled = header.starts_with("# pack-refs with:")
+            && header
+                .split_whitespace()
+                .any(|t| t == "peeled" || t == "fully-peeled");
+        let lines: Vec<&str> = text.lines().collect();
+        for (i, line) in lines.iter().enumerate() {
+            let Some((sha, name)) = line.split_once(' ') else {
+                continue;
+            };
+            if line.starts_with('#') || line.starts_with('^') {
+                continue;
+            }
+            let kind = stdout_string(&fresh.run(&["cat-file", "-t", sha]).unwrap());
+            if claims_peeled && kind.trim() == "tag" {
+                let peeled =
+                    stdout_string(&fresh.run(&["rev-parse", &format!("{sha}^{{}}")]).unwrap());
+                assert_eq!(
+                    lines.get(i + 1).copied(),
+                    Some(format!("^{}", peeled.trim()).as_str()),
+                    "{name} is an annotated tag the peel trait leaves unpeeled:\n{text}"
+                );
+            }
+        }
+
+        let peel = |dir: &GitRepo| {
+            stdout_string(
+                &dir.run(&[
+                    "for-each-ref",
+                    "--format=%(refname) %(objectname) %(*objectname)",
+                ])
+                .unwrap(),
+            )
+        };
+        assert_eq!(peel(&fresh), peel(&repo));
+        let describe = |dir: &GitRepo| stdout_string(&dir.run(&["describe", "HEAD"]).unwrap());
+        assert_eq!(describe(&fresh).trim(), "v1");
     }
 }
