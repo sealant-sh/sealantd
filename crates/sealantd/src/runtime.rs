@@ -155,6 +155,8 @@ pub struct Runtime {
     /// runtime in it would take every other's processes, so a unit test's runtime starts with
     /// a mark nobody holds.
     sweep_mark: Mutex<Option<String>>,
+    /// The sweep's scope as a test sets it (`None`: [`crate::sweep::Scope::detect`]).
+    sweep_scope: Mutex<Option<crate::sweep::Scope>>,
     /// The last quiesce's outcome (`None`: none ran; `Some(None)`: every writer stopped). A
     /// final flush asked again after one that stopped every writer does not quiesce again:
     /// admission is closed, and nothing is left to stop.
@@ -169,6 +171,9 @@ pub struct Runtime {
     /// The workspace's own Docker daemon, whose containers the final capture stops
     /// ([`crate::docker`]). Set by boot; none by default.
     workspace_docker: Mutex<Option<crate::docker::DockerEndpoint>>,
+    /// The processes at the far end of the live control-socket connections, which the final
+    /// capture's sweep spares while their connection is open ([`crate::sweep`]).
+    control_peers: sealant_control::ControlPeers,
 }
 
 impl Runtime {
@@ -256,10 +261,12 @@ impl Runtime {
             quiesced: Mutex::new(None),
             quiesces: std::sync::atomic::AtomicU64::new(0),
             sweep_mark: Mutex::new(cfg!(test).then(|| format!("unit-test-{}", new_unit_mark()))),
+            sweep_scope: Mutex::new(None),
             features,
             pidfd_supported,
             subreaper: AtomicBool::new(subreaper),
             workspace_docker: Mutex::new(None),
+            control_peers: sealant_control::ControlPeers::default(),
         })
     }
 
@@ -403,7 +410,11 @@ impl Runtime {
             mark.as_deref()
                 .is_none_or(|m| crate::sweep::has_env_entry(pid, SWEEP_MARK_ENV, m))
         };
-        let sweeper = crate::sweep::Sweeper::this_process();
+        let mut sweeper = crate::sweep::Sweeper::this_process();
+        sweeper.scope = self.sweep_scope();
+        // The far ends of the live control connections: the one carrying this flush's reply.
+        let control_peers = self.control_peers.clone();
+        let peers = move || control_peers.pids();
         let docker = self
             .workspace_docker
             .lock()
@@ -421,7 +432,7 @@ impl Runtime {
         let ((), (), (swept, sweep_left), containers) = tokio::join!(
             self.sessions.terminate_all(grace),
             self.processes.terminate_all(signal, grace),
-            sweeper.sweep(grace, self.shutdown.is_hard(), &admit),
+            sweeper.sweep(grace, self.shutdown.is_hard(), &admit, &peers),
             stop_containers,
         );
         let managed_left = self.processes.registry.running().len() + self.sessions.registry.len();
@@ -475,7 +486,7 @@ impl Runtime {
     /// Every final flush on such a daemon is incomplete (`sweep-unavailable`).
     #[must_use]
     pub fn sweep_unavailable(&self) -> bool {
-        crate::sweep::Scope::detect() == crate::sweep::Scope::Descendants
+        self.sweep_scope() == crate::sweep::Scope::Descendants
             && !self.subreaper.load(Ordering::Relaxed)
     }
 
@@ -484,6 +495,21 @@ impl Runtime {
     #[must_use]
     pub fn quiesce_count(&self) -> u64 {
         self.quiesces.load(Ordering::Relaxed)
+    }
+
+    /// The final flush's sweep scope: [`crate::sweep::Scope::detect`], unless a test set one.
+    fn sweep_scope(&self) -> crate::sweep::Scope {
+        self.sweep_scope
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(crate::sweep::Scope::detect)
+    }
+
+    /// Test hook: sweep as if sealantd were (`Namespace`) or were not (`Descendants`) PID 1 of
+    /// its PID namespace. Narrow the sweep with [`Runtime::set_sweep_mark`] first.
+    #[doc(hidden)]
+    pub fn set_sweep_scope_for_test(&self, scope: crate::sweep::Scope) {
+        *self.sweep_scope.lock().unwrap_or_else(|e| e.into_inner()) = Some(scope);
     }
 
     /// Test hook: behave as if `PR_SET_CHILD_SUBREAPER` had (not) taken effect.
@@ -1335,5 +1361,9 @@ impl ControlService for Runtime {
 
     fn max_frame_bytes(&self) -> u32 {
         self.config.limits.max_frame_bytes
+    }
+
+    fn control_peers(&self) -> Option<sealant_control::ControlPeers> {
+        Some(self.control_peers.clone())
     }
 }

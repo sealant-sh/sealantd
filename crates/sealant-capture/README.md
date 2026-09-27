@@ -378,7 +378,13 @@ restore, byte for byte, so the user never notices the compute changed.
      sealantd, which as the child subreaper inherits every orphan of what it started — the
      VM's agent and its `sealantctl` are never touched. sealantd, its threads, its own helpers
      (its own process group: the capture engine's `git`), kernel threads and zombies are left
-     alone. A daemon that is not PID 1 of its namespace and did not become a child subreaper
+     alone, and so is the process at the far end of a live control-socket connection
+     (`SO_PEERCRED`) with its ancestors short of PID 1, while that connection is open — when
+     its ancestry leaves the namespace or reaches PID 1 without passing through sealantd: in
+     Docker, Core reaches the socket through `docker exec … socat - UNIX-CONNECT:…`, and
+     stopping that `socat` lost the final flush's own reply ("connection closed" on every
+     stop). A process sealantd started or adopted is swept whatever connection it holds. A
+     daemon that is not PID 1 of its namespace and did not become a child subreaper
      cannot see an orphan, so every final flush it runs is incomplete (`sweep-unavailable`,
      logged at boot). And every running container of the workspace's own Docker daemon is
      stopped (`POST /containers/{id}/stop?t=<grace>`, `crates/sealantd/src/docker.rs`) until
@@ -497,7 +503,9 @@ that runs past the 10 s it was once clamped to, the grace bounding a suspend flu
 deadline, a writer's `SIGTERM` handler landing in the head of a final flush and of
 `runtime.gracefulShutdown`, and the fenced and cut-short final flushes answering incomplete;
 `crates/sealantd/tests/final_sweep.rs` a `setsid`'d, double-forked writer stopped before the
-last snap, its `SIGTERM` handler's file in the head; `crates/sealantd/src/capture.rs` also the
+last snap, its `SIGTERM` handler's file in the head;
+`crates/sealantd/tests/final_sweep_control_peer.rs` the relay carrying a final flush over a
+real control socket spared (its reply arrives) while a bystander in the same scope is stopped; `crates/sealantd/src/capture.rs` also the
 containers of a fake Docker daemon stopped (and a stuck one, or no daemon, incomplete), a
 daemon without a subreaper incomplete, and a flush past its deadline completing in the
 background and answering `complete` when asked again without a second quiesce;
