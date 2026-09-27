@@ -103,15 +103,17 @@ fn control_plane_base(
     let pack = packed.pack.expect("the project pack");
     let head_sha = git(&src.root, &["rev-parse", "HEAD"]);
     let head_tree = git(&src.root, &["rev-parse", "HEAD^{tree}"]);
-    assert_eq!(packed.closure.refs[WORKTREE_TREE_REF], head_tree);
+    assert_eq!(packed.closure.worktree_tree, head_tree);
     let pack_key = format!("projects/p1/packs/{}", pack.sha256);
     sink.put_if_absent(&pack_key, BlobSource::File(&pack.path))
         .unwrap();
     sink.put_if_absent(&format!("{pack_key}.idx"), BlobSource::File(&pack.idx_path))
         .unwrap();
+    // The control plane's own key, written without a generation.
     let keys = KeyPrefix {
         worktree_id: "wt".into(),
         epoch: 1,
+        generation: None,
     };
     let empty = DirObject::default().encode();
     let root_key = keys.tree(&empty.sha256);
@@ -138,6 +140,10 @@ fn control_plane_base(
                 head: "refs/heads/main".into(),
                 fsck: FsckStatus::Verified,
                 symrefs: Default::default(),
+                // The control plane's base: the trees as pseudo-refs, as before `git_trees`.
+                worktree_tree: None,
+                index_tree: None,
+                raw_tree: None,
             },
             workspace: WorkspaceSection::objects(root_key, vec![]),
             bulk: BulkState::pending(),
@@ -185,6 +191,7 @@ fn assert_complete(restored: &Path, truth: &Path, manifest: &Manifest) {
         "fsck of {restored:?}"
     );
     for (name, sha) in &manifest.sections.git.refs {
+        // (An older manifest's pseudo-refs name trees, which are packed like any tip.)
         assert!(
             git_ok(restored, &["cat-file", "-t", sha]),
             "{name} → {sha} is in no pack the manifest lists"
@@ -252,7 +259,7 @@ fn tracked_files_matching_gitignore_survive_a_control_plane_base_and_the_next_ca
     snap_ship(&mut engine, &sink, &registrar, 1);
     let head1 = registrar.head().unwrap();
     assert_eq!(head1.n, 1);
-    let wt_tree = &head1.manifest.sections.git.refs[WORKTREE_TREE_REF];
+    let wt_tree = head1.manifest.sections.git.worktree_tree_id().unwrap();
     let listed = git(&ws, &["ls-tree", "-r", "--name-only", wt_tree]);
     assert!(
         listed.contains("tooling/core.json"),
@@ -260,8 +267,8 @@ fn tracked_files_matching_gitignore_survive_a_control_plane_base_and_the_next_ca
     );
     assert!(listed.contains("GARAGE-PROOF.md"), "{listed}");
     assert_eq!(
-        head1.manifest.sections.git.refs[INDEX_TREE_REF],
-        head0.manifest.sections.git.refs[INDEX_TREE_REF],
+        head1.manifest.sections.git.index_tree_id(),
+        head0.manifest.sections.git.index_tree_id(),
         "nothing staged: the index tree is still the commit tree"
     );
     assert_eq!(
@@ -321,8 +328,8 @@ fn a_file_written_before_the_seed_is_packed_by_the_next_capture() {
     snap_ship(&mut engine, &sink, &registrar, 1);
     let head1 = registrar.head().unwrap();
     assert_ne!(
-        head1.manifest.sections.git.refs[INDEX_TREE_REF],
-        head1.manifest.sections.git.refs[WORKTREE_TREE_REF]
+        head1.manifest.sections.git.index_tree_id(),
+        head1.manifest.sections.git.worktree_tree_id()
     );
     let ws2: PathBuf = base.join("ws2");
     let report = Materializer::new(sink.as_ref(), MaterializeTargets::new(&ws2, None))

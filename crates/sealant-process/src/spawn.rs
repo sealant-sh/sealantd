@@ -20,7 +20,7 @@
 
 use std::collections::HashSet;
 use std::io;
-use std::process::{Child, ChildStdin, Command, ExitStatus, Output, Stdio};
+use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Output, Stdio};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 /// OS pids this process has spawned and not yet reaped.
@@ -141,6 +141,12 @@ impl GatedChild {
     /// Take the child's stdin pipe (present only when the command asked for one).
     pub fn take_stdin(&mut self) -> Option<ChildStdin> {
         self.child.stdin.take()
+    }
+
+    /// Take the child's stdout pipe (present only when the command asked for one), to stream
+    /// what it writes; [`Self::wait_with_output`] then collects stderr only.
+    pub fn take_stdout(&mut self) -> Option<ChildStdout> {
+        self.child.stdout.take()
     }
 
     /// Wait for the child, collecting its piped stdout/stderr.

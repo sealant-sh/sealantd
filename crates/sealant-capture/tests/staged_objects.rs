@@ -148,7 +148,7 @@ fn an_unchanged_snap_keeps_the_objects_a_queued_capture_lists() {
             !staging.objects_dir().join(file).exists(),
             "{file} swept after ack"
         );
-        assert!(staging.is_uploaded(file));
+        assert!(staging.is_uploaded_now(file));
     }
     let third = snap(&mut engine, Class::Small, 3);
     assert!(third.unchanged);

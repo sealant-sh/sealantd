@@ -101,13 +101,17 @@
 //!        "missing":["captures/wt/3/packs/<sha256>"]}
 //! ```
 //!
-//! This is [`RegistrarError::RegisterRefused`]. The shipper never drops the capture: it drops
-//! the upload acks of the named keys it staged and uploads them again (every key of the capture,
-//! each checked against the store, when none is named), then registers again; a key it did
-//! not stage (a pack an earlier capture uploaded and retention removed), or the same capture
-//! refused a second time, makes the engine rebuild the capture from disk in its place with the
-//! named packs forgotten ([`crate::ship::RepairRequest`]). Both are reported in `capture.status`.
-//! Before, the shipper retried the same register forever and the chain stopped advancing.
+//! This is [`RegistrarError::RegisterRefused`]. The shipper never drops the capture: the engine
+//! rebuilds it from disk in its place with the named packs forgotten
+//! ([`crate::ship::RepairRequest`]; every pack of the capture's sections when none is named),
+//! reported in `capture.status`. It never puts a key again once a register naming it was
+//! refused (cross-repo decision 6: a refused key may be one retention condemned, which the
+//! registrar refuses for good, and a delete retention paused would take it back out from under
+//! a capture that named it again): the rebuild first moves the staging's key generation on, so
+//! every object it uploads — the same bytes included — goes up under a new key,
+//! `captures/<worktree>/<epoch>/g<generation>/…` ([`crate::keys`]). A registrar keeps a key's
+//! tombstone forever and refuses it by name (`missing-objects`); a key without a `g<n>`
+//! segment was written before generations and is read as before.
 //!
 //! # `manifest_format` on `plan.get`
 //!
@@ -134,11 +138,21 @@
 //! `symrefs`; `other_bulk` — the stored head has a non-empty `other_bulk`, or its ready `bulk`
 //! was captured on another platform than the request names; `raw_names` — a dir entry of the
 //! answered workspace or bulk section carries `raw_name` or `raw_target`; `final_seal` — the
-//! head carries `final_seal`.
+//! head carries `final_seal`; `git_trees` — the git section carries `worktree_tree`.
+//!
+//! The executor writes `git_trees` only for a registrar whose answer lists it (else the trees
+//! ride `refs` as pseudo-refs, as before): the git section then names `worktree_tree`,
+//! `index_tree` (absent when the index has unmerged entries) and `raw_tree` in their own fields,
+//! and `refs` holds the repository's refs only, whatever their names — a ref under
+//! `refs/sealant/capture/` is the user's. A registrar that reads it takes the worktree tree from
+//! `worktree_tree` when present (else the `refs/sealant/capture/worktree` entry), treats every
+//! `refs` entry as a ref in a section that has it, keeps all three trees' objects alive (they are
+//! pack tips like any ref), and restores `raw_tree`'s blobs byte for byte: no smudge filter, no
+//! end-of-line or encoding conversion.
 //!
 //! ```json
 //! → {"worktree_id":null,"epoch":0,"platform":"linux-x86_64-gnu","manifest_format":2,
-//!    "manifest_features":["worktree_meta","symrefs","other_bulk","raw_names","final_seal"]}
+//!    "manifest_features":["worktree_meta","symrefs","other_bulk","raw_names","final_seal","git_trees"]}
 //! ← 409 {"reason":"manifest-features","message":"…","missing":["final_seal"]}
 //! ```
 //!
@@ -201,12 +215,13 @@ use crate::manifest::{
 
 /// Every manifest feature this build reads, validates and carries on (`plan.get`
 /// `manifest_features`): see the module docs.
-pub const MANIFEST_FEATURES: [&str; 5] = [
+pub const MANIFEST_FEATURES: [&str; 6] = [
     "worktree_meta",
     "symrefs",
     "other_bulk",
     "raw_names",
     "final_seal",
+    "git_trees",
 ];
 use crate::transport::{ChannelTransport, TransportError};
 
@@ -345,6 +360,7 @@ pub fn missing_manifest_features(
         ),
         ("raw_names", raw_names),
         ("final_seal", planned.final_seal.is_some()),
+        ("git_trees", planned.sections.git.has_tree_fields()),
     ]
     .into_iter()
     .filter(|(feature, held)| *held && !reads.iter().any(|r| r == feature))
@@ -1808,6 +1824,9 @@ mod tests {
                     head: "refs/heads/main".into(),
                     fsck: FsckStatus::Verified,
                     symrefs: BTreeMap::new(),
+                    worktree_tree: None,
+                    index_tree: None,
+                    raw_tree: None,
                 },
                 workspace: WorkspaceSection::objects("r", vec![]),
                 bulk: BulkState::pending(),
@@ -2079,7 +2098,8 @@ mod tests {
                 "symrefs",
                 "other_bulk",
                 "raw_names",
-                "final_seal"
+                "final_seal",
+                "git_trees"
             ])
         );
         let bare = PlanGetRequest {
@@ -2177,8 +2197,17 @@ mod tests {
             missing_manifest_features(&stored, &plain, Some("linux-aarch64-gnu"), &none, false)
                 .is_empty()
         );
+        // Trees in their own fields: an executor that does not read them would take a user ref
+        // for the worktree tree, or restore no tree at all.
+        let mut trees = manifest(0, None);
+        trees.sections.git.worktree_tree = Some("t".into());
+        assert_eq!(
+            missing_manifest_features(&trees, &trees, None, &none, false),
+            vec!["git_trees"]
+        );
         let all: Vec<String> = MANIFEST_FEATURES.iter().map(|f| (*f).to_owned()).collect();
         assert!(missing_manifest_features(&stored, &plain, Some("x"), &all, true).is_empty());
+        assert!(missing_manifest_features(&trees, &trees, None, &all, false).is_empty());
     }
 
     /// Every key of a prefetch batch travels with its size (not only multipart candidates), so

@@ -4,9 +4,10 @@
 //! rather than acknowledge a capture it cannot restore — review 2026-09-27 #4: retention removed
 //! a pack no live capture named while the executor's chunk index still pointed at it. The
 //! shipper used to retry that register forever: the chain stopped, and a final flush never
-//! completed. Now the shipper uploads the named objects it staged again and registers again;
-//! when that cannot help (a key it did not stage) or the same capture is refused again, the
-//! engine rebuilds the capture from disk in its place with the named packs forgotten.
+//! completed. Now the engine rebuilds a refused capture from disk in its place with the named
+//! packs forgotten — under a new key generation, so no key a refusal named is ever put again
+//! (review 2026-09-28, cross-repo decision 6: a refused key may be one retention condemned; the
+//! registrar refuses it for good, and a delete retention paused would remove it again).
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -15,6 +16,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
+use sealant_capture::keys::{key_digest, key_generation};
 use sealant_capture::registrar::{
     ChangeSummaryRequest, HeartbeatRequest, HeartbeatResponse, PlanGetRequest, PlanGetResponse,
     RegisterRequest, RegisterResponse, UploadCompleteRequest, UploadCompleteResponse,
@@ -69,15 +71,21 @@ fn workspace(root: &Path) {
 }
 
 /// What Mend checks before it acknowledges a register: every pack (and git pack index) the
-/// manifest names, and the manifest itself, is in the bucket. `refuse` more registers are
-/// refused `unrestorable` whatever the bucket holds; `drop_first` names a key removed from the
-/// bucket just before the first register (retention running under the executor).
+/// manifest names, and the manifest itself, is in the bucket, and none is a key retention
+/// condemned. `refuse` more registers are refused `unrestorable` whatever the bucket holds;
+/// `drop_first` names a key removed from the bucket just before the first register (retention
+/// running under the executor). A key a register is refused for is tombstoned for good
+/// (cross-repo decision 6): refused by name ever after, whatever the bucket holds, and its
+/// bytes deleted — as a paused retention delete would, later.
 struct Mend {
     inner: Arc<InMemoryRegistrar>,
     store: Arc<LocalDir>,
     refuse: AtomicU32,
     drop_first: Mutex<Option<String>>,
     refusals: Mutex<Vec<(String, Vec<String>)>>,
+    tombstones: Mutex<BTreeSet<String>>,
+    /// Tombstoned keys a register found in the bucket again: written after they were condemned.
+    revived: Mutex<Vec<String>>,
 }
 
 impl Mend {
@@ -88,7 +96,24 @@ impl Mend {
             refuse: AtomicU32::new(0),
             drop_first: Mutex::new(None),
             refusals: Mutex::new(Vec::new()),
+            tombstones: Mutex::new(BTreeSet::new()),
+            revived: Mutex::new(Vec::new()),
         })
+    }
+
+    /// Every tombstoned key is still gone from the bucket: nothing ever wrote one again.
+    fn assert_no_tombstone_revived(&self) {
+        assert_eq!(
+            self.revived.lock().unwrap().clone(),
+            Vec::<String>::new(),
+            "condemned keys written again"
+        );
+        for key in self.tombstones.lock().unwrap().iter() {
+            assert!(
+                !self.store.exists(key).unwrap(),
+                "{key} was condemned and written again"
+            );
+        }
     }
 
     fn named_keys(req: &RegisterRequest) -> Vec<String> {
@@ -153,11 +178,25 @@ impl Registrar for Mend {
         {
             return refuse("unrestorable", Vec::new());
         }
-        let missing: Vec<String> = Self::named_keys(req)
-            .into_iter()
-            .filter(|k| !self.store.exists(k).unwrap())
-            .collect();
+        let missing: Vec<String> = {
+            let tombstones = self.tombstones.lock().unwrap();
+            Self::named_keys(req)
+                .into_iter()
+                .filter(|k| tombstones.contains(k) || !self.store.exists(k).unwrap())
+                .collect()
+        };
         if !missing.is_empty() {
+            let mut tombstones = self.tombstones.lock().unwrap();
+            for key in &missing {
+                if self.store.exists(key).unwrap() {
+                    if tombstones.contains(key) {
+                        self.revived.lock().unwrap().push(key.clone());
+                    }
+                    fs::remove_file(self.store.dir().join(key)).unwrap();
+                }
+                tombstones.insert(key.clone());
+            }
+            drop(tombstones);
             return refuse("missing-objects", missing);
         }
         self.inner.capture_register(req)
@@ -228,11 +267,14 @@ fn snap(engine: &mut CaptureEngine, kind: CaptureKind, seq: u64) {
         .unwrap();
 }
 
-/// Refused once for an object the capture staged itself (the upload never landed, or retention
-/// removed it between the upload and the register): the shipper uploads it again and the same
-/// capture registers — in the same pass, never dropped.
+/// Refused for an object the capture staged itself (the upload never landed, or retention
+/// removed it between the upload and the register): the key may be one retention condemned, so
+/// it is never put again (decision 6). The capture is rebuilt from disk in its place under a
+/// new key generation — the same bytes, a new key — and registers at the same `n`. Before, the
+/// shipper put the same key again: a condemned key was revived, refused for good, and the
+/// capture never registered.
 #[test]
-fn a_capture_refused_for_its_own_missing_object_is_uploaded_again_and_registers() {
+fn a_refused_key_is_never_put_again_and_the_rebuild_registers_under_new_keys() {
     let fx = fixture();
     let mut engine = fx.engine();
     let shipper = fx.shipper(&engine);
@@ -247,24 +289,42 @@ fn a_capture_refused_for_its_own_missing_object_is_uploaded_again_and_registers(
         .first()
         .cloned()
         .expect("the workspace class packed big.bin");
+    assert_eq!(key_generation(&own_pack), Some(0));
     // The objects are up; the pack goes before the register.
     *fx.mend.drop_first.lock().unwrap() = Some(own_pack.clone());
 
-    assert_eq!(
-        shipper.ship_pending().unwrap(),
-        1,
-        "registered in the same pass"
-    );
-    let head = fx.mend.inner.head().unwrap();
-    assert_eq!(
-        head.capture_id, entry.capture_id,
-        "the same capture, not a new one"
-    );
+    assert_eq!(shipper.ship_pending().unwrap(), 0, "refused, not dropped");
+    fx.mend.assert_no_tombstone_revived();
     assert_eq!(
         fx.mend.refusals.lock().unwrap().clone(),
         vec![("missing-objects".to_owned(), vec![own_pack.clone()])]
     );
-    assert!(fx.store.exists(&own_pack).unwrap(), "uploaded again");
+    assert!(shipper.status.snapshot().repair_pending);
+
+    // The next snap rebuilds it, under generation 1.
+    snap(&mut engine, CaptureKind::Auto, 2);
+    let rebuilt = engine.staging().pending().unwrap();
+    assert_eq!(rebuilt.len(), 1);
+    assert_eq!(rebuilt[0].n, entry.n);
+    let packs = &rebuilt[0].register.manifest.sections.workspace.packs;
+    assert!(!packs.contains(&own_pack), "{packs:?}");
+    // What the rebuild staged is under the new generation; what it carries from the refused
+    // capture (its git pack, which no refusal named) keeps its key; the refused key is in
+    // neither.
+    assert!(
+        rebuilt[0].uploads.iter().all(|u| u.key != own_pack
+            && (key_generation(&u.key) == Some(1) || entry.uploads.iter().any(|o| o.key == u.key))),
+        "{:?}",
+        rebuilt[0].uploads
+    );
+    assert!(
+        packs
+            .iter()
+            .any(|k| key_digest(k) == key_digest(&own_pack) && *k != own_pack),
+        "the same bytes under a new key: {packs:?}"
+    );
+    assert_eq!(shipper.ship_pending().unwrap(), 1);
+    fx.mend.assert_no_tombstone_revived();
     assert_eq!(shipper.status.snapshot().register_refusals, 1);
     assert!(
         shipper.register_refusal().is_none(),
@@ -275,6 +335,20 @@ fn a_capture_refused_for_its_own_missing_object_is_uploaded_again_and_registers(
     assert_eq!(
         fs::read(out.join("ignored/big.bin")).unwrap(),
         noise(1, 200_000)
+    );
+    // A restart keeps the generation: nothing staged later reuses generation 0.
+    drop(shipper);
+    drop(engine);
+    let mut engine = fx.engine();
+    fs::write(fx.root.join("ignored/later"), b"after a restart\n").unwrap();
+    snap(&mut engine, CaptureKind::Turn, 3);
+    let later = engine.staging().pending().unwrap();
+    assert!(
+        later
+            .iter()
+            .flat_map(|e| &e.uploads)
+            .all(|u| key_generation(&u.key) == Some(1)),
+        "{later:?}"
     );
 }
 
@@ -335,9 +409,8 @@ fn a_capture_naming_a_pack_the_store_lost_is_rebuilt_from_disk_in_its_place() {
     assert_eq!(rebuilt[0].n, refused.n);
     assert_eq!(rebuilt[0].register.parent, refused.register.parent);
     assert_eq!(rebuilt[0].kind, CaptureKind::Turn);
-    // The file is read again and packed again: a pack of the same chunks has the same key, so
-    // the rebuilt capture may name the lost key — it stages it this time.
-    let staged: BTreeSet<&String> = rebuilt[0].uploads.iter().map(|u| &u.key).collect();
+    // The file is read again and packed again, under a new key generation: a pack of the same
+    // chunks is a new key, and no lost key is named again.
     let named_lost: Vec<&String> = rebuilt[0]
         .register
         .manifest
@@ -347,11 +420,9 @@ fn a_capture_naming_a_pack_the_store_lost_is_rebuilt_from_disk_in_its_place() {
         .iter()
         .filter(|k| lost.contains(*k))
         .collect();
-    assert!(
-        named_lost.iter().all(|k| staged.contains(k)),
-        "every lost pack it names is staged by it: {named_lost:?}"
-    );
+    assert!(named_lost.is_empty(), "{named_lost:?}");
     assert_eq!(shipper.ship_pending().unwrap(), 1);
+    fx.mend.assert_no_tombstone_revived();
     assert!(!shipper.status.snapshot().repair_pending);
     let head = fx.mend.inner.head().unwrap();
     assert_eq!(head.n, refused.n);
@@ -367,8 +438,9 @@ fn a_capture_naming_a_pack_the_store_lost_is_rebuilt_from_disk_in_its_place() {
     );
 }
 
-/// The same capture refused a second time (the tree does not restore, whatever is uploaded):
-/// rebuilt from disk with every pack its section named forgotten, then registered.
+/// A capture refused with no key named (the tree does not restore, whatever is uploaded):
+/// rebuilt from disk with every pack its section named forgotten, under a new key generation,
+/// then registered; refused again, rebuilt again under the next one.
 #[test]
 fn a_capture_refused_twice_is_rebuilt_from_disk() {
     let fx = fixture();
@@ -379,16 +451,42 @@ fn a_capture_refused_twice_is_rebuilt_from_disk() {
     fx.mend.refuse.store(2, Ordering::SeqCst);
 
     assert_eq!(shipper.ship_pending().unwrap(), 0);
-    assert_eq!(
-        fx.mend.refusals.lock().unwrap().len(),
-        2,
-        "uploaded again once"
-    );
+    assert_eq!(fx.mend.refusals.lock().unwrap().len(), 1, "never put again");
     assert!(shipper.status.snapshot().repair_pending);
     snap(&mut engine, CaptureKind::Auto, 2);
+    assert_eq!(shipper.ship_pending().unwrap(), 0, "refused again");
+    assert_eq!(fx.mend.refusals.lock().unwrap().len(), 2);
+    snap(&mut engine, CaptureKind::Auto, 3);
     let rebuilt = engine.staging().pending().unwrap();
     assert_eq!(rebuilt.len(), 1);
     assert_eq!(rebuilt[0].n, refused.n);
+    // Refused with no key named: every key of its workspace section is forgotten, and none
+    // is staged or put again; its content is under generation 2.
+    let section: BTreeSet<&String> = refused
+        .register
+        .manifest
+        .sections
+        .workspace
+        .packs
+        .iter()
+        .collect();
+    assert!(
+        rebuilt[0].uploads.iter().all(|u| !section.contains(&u.key)),
+        "{:?}",
+        rebuilt[0].uploads
+    );
+    assert!(
+        rebuilt[0]
+            .register
+            .manifest
+            .sections
+            .workspace
+            .packs
+            .iter()
+            .all(|k| key_generation(k) == Some(2)),
+        "{:?}",
+        rebuilt[0].register.manifest.sections.workspace.packs
+    );
     assert_eq!(shipper.ship_pending().unwrap(), 1);
     assert_eq!(shipper.status.snapshot().register_refusals, 2);
     let out = fx.restore("restored");

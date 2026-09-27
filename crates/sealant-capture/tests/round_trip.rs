@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use sealant_capture::gitpack::GitRepo;
-use sealant_capture::manifest::{FsckStatus, INDEX_TREE_REF, PSEUDO_REF_PREFIX};
+use sealant_capture::manifest::FsckStatus;
 use sealant_capture::registrar::Registrar;
 use sealant_capture::{
     CaptureConfig, CaptureEngine, CaptureKind, Class, InMemoryRegistrar, LocalDir,
@@ -252,8 +252,8 @@ fn round_trip_materializes_an_identical_workspace() {
             .manifest
             .sections
             .git
-            .refs
-            .contains_key(INDEX_TREE_REF)
+            .index_tree_id()
+            .is_some()
     );
     assert_eq!(
         git(&restore, &["stash", "list"]),
@@ -271,9 +271,14 @@ fn round_trip_materializes_an_identical_workspace() {
         git(&restore, &["diff", "--cached"]),
         git(&fx.root, &["diff", "--cached"])
     );
-    assert!(!git(&restore, &["for-each-ref"]).contains(PSEUDO_REF_PREFIX));
-    let wt_tree =
-        &small.manifest.manifest.sections.git.refs[sealant_capture::manifest::WORKTREE_TREE_REF];
+    assert!(!git(&restore, &["for-each-ref"]).contains("refs/sealant/"));
+    let wt_tree = small
+        .manifest
+        .manifest
+        .sections
+        .git
+        .worktree_tree_id()
+        .unwrap();
     assert!(!git(&fx.root, &["ls-tree", "--name-only", wt_tree]).contains(".sealantd"));
     assert!(git(&fx.root, &["ls-tree", "--name-only", wt_tree]).contains("notes.md"));
 
