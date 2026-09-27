@@ -15,3 +15,9 @@ ctime), a read right after a change is not trusted by the next capture, and a pa
 written is read again. File names and symlink text that are not UTF-8 keep their bytes: dir
 entries gain optional `raw_name`, `raw_target` and `unread` fields, written only when they apply,
 so every existing dir object is unchanged.
+
+A directory `git add -A` cannot open no longer drops out of the worktree tree (or falls back to
+the index's blobs): an automatic capture carries the previous capture's entries for it, and a
+final capture fails naming it. `capture.status` gains `unreadable`, `carried` and
+`unreadable_paths` (fields 17–19 of `CaptureStatusReport`): what the last capture of each class
+could not read, never taken as deleted.

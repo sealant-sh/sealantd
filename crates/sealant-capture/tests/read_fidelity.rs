@@ -290,3 +290,101 @@ fn names_and_symlink_text_that_are_not_utf8_round_trip() {
         b"caf\xe9"
     );
 }
+
+/// A worktree with an untracked, non-ignored directory (`un/`) and a tracked one (`tr/`, its
+/// file edited and never staged), captured once.
+fn worktree_with_dirs(fx: &Fixture) -> CaptureEngine {
+    let s = &fx.source;
+    fs::create_dir_all(s.join("un/deep")).unwrap();
+    fs::write(s.join("un/u"), b"untracked work\n").unwrap();
+    fs::write(s.join("un/deep/d"), b"deeper\n").unwrap();
+    fs::create_dir_all(s.join("tr")).unwrap();
+    fs::write(s.join("tr/a"), b"committed\n").unwrap();
+    git(s, &["add", "tr/a"]);
+    git(s, &["commit", "-q", "-m", "tr"]);
+    fs::write(s.join("tr/a"), b"edited, never staged\n").unwrap();
+    let mut engine = fx.engine(Duration::ZERO);
+    fx.snap(&mut engine, CaptureKind::Turn, Class::Small, 1)
+        .unwrap();
+    fx.ship(&engine);
+    engine
+}
+
+fn set_mode(paths: &[PathBuf], mode: u32) {
+    for p in paths {
+        fs::set_permissions(p, fs::Permissions::from_mode(mode)).unwrap();
+    }
+}
+
+/// `git add -A` skips a directory it cannot open with a warning: an untracked one dropped out
+/// of the worktree tree, a tracked one fell back to the index's blob instead of the edit the
+/// last capture held. An automatic capture now gives both the previous capture's entries and
+/// counts them in its stats; neither is a deletion.
+#[test]
+fn an_unreadable_worktree_directory_is_carried_from_the_previous_capture() {
+    let fx = Fixture::new();
+    if !permissions_bind(&fx.base) {
+        eprintln!("skipped: permission bits do not bind this process");
+        return;
+    }
+    let mut engine = worktree_with_dirs(&fx);
+    let s = &fx.source;
+    let locked = [s.join("un"), s.join("tr")];
+    set_mode(&locked, 0o000);
+    fs::write(s.join("other"), b"a change elsewhere\n").unwrap();
+    let turn = fx.snap(&mut engine, CaptureKind::Turn, Class::Small, 2);
+    set_mode(&locked, 0o755);
+    let turn = turn.expect("an automatic capture carries what it cannot read");
+    assert_eq!(turn.stats.unreadable, 2, "{:?}", turn.stats);
+    assert_eq!(turn.stats.carried, 2, "{:?}", turn.stats);
+    assert_eq!(turn.stats.unreadable_paths, vec!["tree/tr", "tree/un"]);
+    fx.ship(&engine);
+    let out = fx.restore("restored");
+    assert_eq!(fs::read(out.join("un/u")).unwrap(), b"untracked work\n");
+    assert_eq!(fs::read(out.join("un/deep/d")).unwrap(), b"deeper\n");
+    assert_eq!(
+        fs::read(out.join("tr/a")).unwrap(),
+        b"edited, never staged\n",
+        "the last captured edit, not the index's blob"
+    );
+    assert_eq!(
+        fs::read(out.join("other")).unwrap(),
+        b"a change elsewhere\n"
+    );
+}
+
+/// A final capture that cannot read a worktree directory fails naming it, stages nothing, and
+/// leaves the chain whole: the next capture's git pack still holds every object it needs (the
+/// failed snap's tips once became the next pack's negatives, so a restore of the next capture
+/// could not read its own blobs).
+#[test]
+fn a_final_capture_fails_on_an_unreadable_worktree_directory_and_the_chain_stays_whole() {
+    let fx = Fixture::new();
+    if !permissions_bind(&fx.base) {
+        eprintln!("skipped: permission bits do not bind this process");
+        return;
+    }
+    let mut engine = worktree_with_dirs(&fx);
+    let s = &fx.source;
+    let locked = [s.join("un"), s.join("tr")];
+    set_mode(&locked, 0o000);
+    fs::write(s.join("other"), b"a change elsewhere\n").unwrap();
+    let fin = fx.snap(&mut engine, CaptureKind::Final, Class::Small, 2);
+    set_mode(&locked, 0o755);
+    let text = fin
+        .expect_err("a final capture that cannot read work fails")
+        .to_string();
+    assert!(
+        text.contains("tree/un") && text.contains("tree/tr"),
+        "{text}"
+    );
+    fx.snap(&mut engine, CaptureKind::Turn, Class::Small, 3)
+        .unwrap();
+    fx.ship(&engine);
+    let out = fx.restore("restored");
+    assert_eq!(
+        fs::read(out.join("other")).unwrap(),
+        b"a change elsewhere\n"
+    );
+    assert_eq!(fs::read(out.join("un/u")).unwrap(), b"untracked work\n");
+}

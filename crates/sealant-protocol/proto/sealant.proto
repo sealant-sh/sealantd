@@ -643,6 +643,15 @@ message CaptureStatusReport {
   // `pending` (a capture was staged after the final flush), `internal` (the flush's task
   // failed). Absent when `complete`.
   optional string incomplete_reason = 16;
+  // Paths the last snap of each class could not read (listed, stat'ed or opened; a directory
+  // counts once), summed over both classes. Never taken as deleted: an automatic snap carries a
+  // path's last captured content forward, a final snap fails instead. Absent from an older daemon.
+  optional uint64 unreadable = 17;
+  // Of `unreadable`, the paths whose last captured content was carried forward.
+  optional uint64 carried = 18;
+  // The first 20 unreadable paths, virtual (`tree/<path>` under the worktree, `.git/<path>`,
+  // `harness/<path>`), small class first.
+  repeated string unreadable_paths = 19;
 }
 message LeaseEpochReport { uint64 epoch = 1; string worktree_id = 2; bool fenced = 3; }
 message CaptureReplanned {

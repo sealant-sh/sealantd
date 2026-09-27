@@ -373,6 +373,21 @@ impl GitRepo {
         scratch_dir: &Path,
         excludes: &[String],
     ) -> Result<(String, Vec<String>), GitError> {
+        let wt = self.worktree_tree_carrying(scratch_dir, excludes, None)?;
+        Ok((wt.tree, wt.gitlinks))
+    }
+
+    /// [`Self::worktree_tree`], and what `git add` could not read: a directory it could not
+    /// open (it skips one with a warning, so an untracked one would silently drop out of the
+    /// tree and a tracked one fall back to the index's stale blobs) or a path it could not
+    /// stat or open. With `carry_from` (the previous capture's worktree tree), each such path
+    /// takes that tree's entry, never a deletion; see [`WorktreeTree`].
+    pub fn worktree_tree_carrying(
+        &self,
+        scratch_dir: &Path,
+        excludes: &[String],
+        carry_from: Option<&str>,
+    ) -> Result<WorktreeTree, GitError> {
         fs::create_dir_all(scratch_dir)?;
         let tmp_index = scratch_dir.join("snap-index");
         let real_index = self.git_dir.join("index");
@@ -392,6 +407,8 @@ impl GitRepo {
         let (add, mut nested) = self.worktree_add_args(&tmp_index, excludes)?;
         let out = git_command(&self.root)
             .env("GIT_INDEX_FILE", &tmp_index)
+            // Untranslated messages: what could not be read is read off them.
+            .env("LC_ALL", "C")
             .args(&add)
             .output_gated()?;
         // Belt and braces: anything `--ignore-errors` skipped past that the enumeration did not
@@ -409,6 +426,11 @@ impl GitRepo {
                 stderr: stderr.trim().to_owned(),
             });
         }
+        let unreadable = unreadable_in_add(&self.root, &stderr);
+        let carried = match carry_from {
+            Some(from) => self.carry_into_index(&tmp_index, from, &unreadable),
+            None => Vec::new(),
+        };
         let wt = ["write-tree"];
         let out = check(
             &wt,
@@ -436,7 +458,82 @@ impl GitRepo {
         gitlinks.sort();
         gitlinks.dedup();
         fs::remove_file(&tmp_index).ok();
-        Ok((tree, gitlinks))
+        Ok(WorktreeTree {
+            tree,
+            gitlinks,
+            unreadable,
+            carried,
+        })
+    }
+
+    /// Give each unreadable path in `tmp_index` the entry `from` (a tree) holds for it: the
+    /// index's entries at and under the path are removed, then a subtree is read in under the
+    /// path's prefix, or a blob (or gitlink) entry is added. A path `from` does not hold is left
+    /// as `git add` left it (an untracked one absent, a tracked one at the index's blob).
+    /// Returns the paths carried; a git failure skips that path, logged.
+    fn carry_into_index(
+        &self,
+        tmp_index: &Path,
+        from: &str,
+        unreadable: &[(String, String)],
+    ) -> Vec<String> {
+        let git = |args: &[&str]| -> Result<Output, GitError> {
+            check(
+                args,
+                git_command(&self.root)
+                    .env("GIT_INDEX_FILE", tmp_index)
+                    .env("GIT_LITERAL_PATHSPECS", "1")
+                    .args(args)
+                    .output_gated()?,
+            )
+        };
+        let mut carried = Vec::new();
+        for (path, _) in unreadable {
+            let carry = || -> Result<bool, GitError> {
+                let listed = git(&["ls-tree", "-z", from, "--", path])?;
+                let Some((meta, _)) = listed.stdout.split(|b| *b == 0).next().and_then(|e| {
+                    let e = std::str::from_utf8(e).ok()?;
+                    e.split_once('\t')
+                }) else {
+                    return Ok(false);
+                };
+                let mut fields = meta.split(' ');
+                let (Some(mode), Some(kind), Some(sha)) =
+                    (fields.next(), fields.next(), fields.next())
+                else {
+                    return Ok(false);
+                };
+                git(&[
+                    "rm",
+                    "-r",
+                    "--cached",
+                    "-f",
+                    "-q",
+                    "--ignore-unmatch",
+                    "--",
+                    path,
+                ])?;
+                if kind == "tree" {
+                    git(&["read-tree", &format!("--prefix={path}/"), sha])?;
+                } else {
+                    git(&[
+                        "update-index",
+                        "--add",
+                        "--cacheinfo",
+                        &format!("{mode},{sha},{path}"),
+                    ])?;
+                }
+                Ok(true)
+            };
+            match carry() {
+                Ok(true) => carried.push(path.clone()),
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::warn!(%path, %error, "could not carry an unreadable path from the previous capture");
+                }
+            }
+        }
+        carried
     }
 
     /// Filter `shas` to the ones the object store holds.
@@ -481,6 +578,74 @@ fn abs(root: &Path, p: &str) -> PathBuf {
     }
 }
 
+/// A worktree tree and what went into it ([`GitRepo::worktree_tree_carrying`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeTree {
+    /// The tree.
+    pub tree: String,
+    /// Nested repositories and paths git could not index (the chunked class carries them).
+    pub gitlinks: Vec<String>,
+    /// Paths `git add` could not read, root-relative, with what the filesystem said: each one
+    /// verified on disk (it exists and cannot be listed, stat'ed or opened), outermost only.
+    pub unreadable: Vec<(String, String)>,
+    /// Of `unreadable`, the paths that took the previous capture's entry.
+    pub carried: Vec<String>,
+}
+
+/// The paths `git add` (run with `LC_ALL=C`) said it could not read: `warning: could not open
+/// directory '<p>/': …`, `error: open("<p>"): …`, and a bare `<p>: …` (a tracked path it could
+/// not stat). A candidate counts only when the filesystem agrees it exists and cannot be read;
+/// a path under another kept one is dropped.
+fn unreadable_in_add(root: &Path, stderr: &str) -> Vec<(String, String)> {
+    let mut found: Vec<(String, String)> = Vec::new();
+    for line in stderr.lines() {
+        let candidate = if let Some(rest) = line.strip_prefix("warning: could not open directory '")
+        {
+            rest.rsplit_once("': ").map(|(p, _)| p)
+        } else if let Some(rest) = line.strip_prefix("error: open(\"") {
+            rest.rsplit_once("\"): ").map(|(p, _)| p)
+        } else if line.starts_with("error: ")
+            || line.starts_with("warning: ")
+            || line.starts_with("fatal: ")
+        {
+            None
+        } else {
+            line.rsplit_once(": ").map(|(p, _)| p)
+        };
+        let Some(p) = candidate.map(|p| p.trim_end_matches('/')) else {
+            continue;
+        };
+        if p.is_empty() || Path::new(p).is_absolute() || found.iter().any(|(f, _)| f == p) {
+            continue;
+        }
+        let abs = root.join(p);
+        let error = match fs::symlink_metadata(&abs) {
+            Err(e) => Some(e),
+            Ok(m) if m.is_dir() => fs::read_dir(&abs).err(),
+            Ok(m) if m.is_file() => File::open(&abs).err(),
+            Ok(_) => None,
+        };
+        if let Some(e) = error
+            && !crate::index::is_vanished(&e)
+        {
+            found.push((p.to_owned(), e.to_string()));
+        }
+    }
+    found.sort();
+    let outer: Vec<(String, String)> = found
+        .iter()
+        .filter(|(p, _)| {
+            !found.iter().any(|(o, _)| {
+                o != p
+                    && p.strip_prefix(o.as_str())
+                        .is_some_and(|r| r.starts_with('/'))
+            })
+        })
+        .cloned()
+        .collect();
+    outer
+}
+
 /// The closure read before packing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Closure {
@@ -494,6 +659,10 @@ pub struct Closure {
     /// Paths of nested repositories under the worktree (left out of the worktree tree; the
     /// chunked class carries their bytes).
     pub gitlinks: Vec<String>,
+    /// Paths the worktree tree could not read ([`WorktreeTree::unreadable`]).
+    pub unreadable: Vec<(String, String)>,
+    /// Of those, the ones carried from the previous capture's worktree tree.
+    pub carried: Vec<String>,
 }
 
 /// Read the closure (refs, `HEAD`, index, stash, reflog, worktree) in that order. `excludes` are
@@ -502,6 +671,17 @@ pub fn read_closure(
     repo: &GitRepo,
     scratch_dir: &Path,
     excludes: &[String],
+) -> Result<Closure, GitError> {
+    read_closure_carrying(repo, scratch_dir, excludes, None)
+}
+
+/// [`read_closure`], carrying what the worktree could not read from `carry_from` (the previous
+/// capture's worktree tree; see [`GitRepo::worktree_tree_carrying`]).
+pub fn read_closure_carrying(
+    repo: &GitRepo,
+    scratch_dir: &Path,
+    excludes: &[String],
+    carry_from: Option<&str>,
 ) -> Result<Closure, GitError> {
     let mut refs = repo.refs()?;
     let head = repo.head()?;
@@ -517,7 +697,12 @@ pub fn read_closure(
         None => tips.extend(repo.index_blobs()?),
     }
     tips.extend(repo.reflog_tips()?);
-    let (wt, gitlinks) = repo.worktree_tree(scratch_dir, excludes)?;
+    let WorktreeTree {
+        tree: wt,
+        gitlinks,
+        unreadable,
+        carried,
+    } = repo.worktree_tree_carrying(scratch_dir, excludes, carry_from)?;
     refs.insert(WORKTREE_TREE_REF.to_owned(), wt.clone());
     tips.push(wt);
     tips.sort();
@@ -527,6 +712,8 @@ pub fn read_closure(
         head,
         tips,
         gitlinks,
+        unreadable,
+        carried,
     })
 }
 
@@ -662,11 +849,23 @@ pub fn build_git_pack(
     previous_tips: &[String],
     excludes: &[String],
 ) -> Result<GitPackResult, GitError> {
+    build_git_pack_carrying(repo, out_dir, previous_tips, excludes, None)
+}
+
+/// [`build_git_pack`], carrying what the worktree could not read from `carry_from` (the
+/// previous capture's worktree tree; see [`GitRepo::worktree_tree_carrying`]).
+pub fn build_git_pack_carrying(
+    repo: &GitRepo,
+    out_dir: &Path,
+    previous_tips: &[String],
+    excludes: &[String],
+    carry_from: Option<&str>,
+) -> Result<GitPackResult, GitError> {
     fs::create_dir_all(out_dir)?;
     let negatives = repo.existing(previous_tips)?;
     let mut last: Option<(Option<FinishedGitPack>, Closure)> = None;
     for attempt in 1..=PACK_ATTEMPTS {
-        let closure = read_closure(repo, out_dir, excludes)?;
+        let closure = read_closure_carrying(repo, out_dir, excludes, carry_from)?;
         let packed = match pack_once(repo, out_dir, &closure.tips, &negatives, attempt) {
             Ok(p) => p,
             Err(e) => {
@@ -702,7 +901,7 @@ pub fn build_git_pack(
     // Retries exhausted: the last closure is packed once more, shipped unverified.
     let closure = match last {
         Some((_, c)) => c,
-        None => read_closure(repo, out_dir, excludes)?,
+        None => read_closure_carrying(repo, out_dir, excludes, carry_from)?,
     };
     let packed = pack_once(repo, out_dir, &closure.tips, &negatives, PACK_ATTEMPTS + 1)?;
     Ok(GitPackResult {

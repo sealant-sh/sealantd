@@ -73,6 +73,8 @@ pub struct CaptureRuntime {
     layout: SourceLayout,
     paused: AtomicBool,
     last_snap_unix_ms: AtomicU64,
+    /// What each class's last snap could not read (never waits on a build in progress).
+    reads: Arc<sealant_capture::ReadReports>,
     harness: Mutex<Option<ProcessId>>,
     /// The boot left a disk that continued the chain as it was (`CaptureBoot::resumed`).
     resumed: bool,
@@ -100,6 +102,7 @@ impl CaptureRuntime {
                 .shipper(boot.sink.clone(), boot.registrar.clone()),
         );
         let resumed = boot.resumed;
+        let reads = boot.engine.read_reports();
         Arc::new(Self {
             runner: CadenceRunner::new(boot.engine, shipper),
             resumed,
@@ -110,6 +113,7 @@ impl CaptureRuntime {
             layout: boot.layout,
             paused: AtomicBool::new(false),
             last_snap_unix_ms: AtomicU64::new(0),
+            reads,
             harness: Mutex::new(None),
             final_outcome: Mutex::new(FinalOutcome::NotRun),
         })
@@ -455,6 +459,7 @@ impl CaptureRuntime {
             }
             FinalOutcome::Snapped { .. } => None,
         };
+        let reads = self.reads.current();
         CaptureStatusReport {
             epoch,
             worktree_id,
@@ -478,6 +483,9 @@ impl CaptureRuntime {
             pending_bytes,
             complete: incomplete_reason.is_none(),
             incomplete_reason: incomplete_reason.map(str::to_owned),
+            unreadable: Some(reads.unreadable),
+            carried: Some(reads.carried),
+            unreadable_paths: reads.paths,
         }
     }
 
@@ -885,6 +893,43 @@ mod tests {
 
         capture.runner().shipper().reset_after_replan(Some(0));
         assert!(capture.status().refused.is_empty());
+    }
+
+    /// What the last snap could not read is in `capture.status`: how many paths, how many were
+    /// carried, and their names; a later snap that reads everything clears it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn capture_status_counts_unreadable_and_carried_paths() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let (boot, _registrar) = boot(tmp.path());
+        let root = boot.layout.working_directory.clone();
+        let probe = tmp.path().join("probe");
+        std::fs::write(&probe, b"p").unwrap();
+        std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::File::open(&probe).is_ok() {
+            eprintln!("skipped: permission bits do not bind this process");
+            return;
+        }
+        std::fs::create_dir_all(root.join("notes")).unwrap();
+        std::fs::write(root.join("notes/n.md"), "work\n").unwrap();
+        let capture = CaptureRuntime::new(boot);
+        assert_eq!(capture.status().unreadable, Some(0));
+        capture.snap(CaptureKind::Turn).unwrap();
+
+        let notes = root.join("notes");
+        std::fs::set_permissions(&notes, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let snapped = capture.snap(CaptureKind::Turn);
+        std::fs::set_permissions(&notes, std::fs::Permissions::from_mode(0o755)).unwrap();
+        snapped.unwrap();
+        let status = capture.status();
+        assert_eq!(status.unreadable, Some(1), "{status:?}");
+        assert_eq!(status.carried, Some(1), "{status:?}");
+        assert_eq!(status.unreadable_paths, vec!["tree/notes".to_owned()]);
+
+        capture.snap(CaptureKind::Turn).unwrap();
+        let status = capture.status();
+        assert_eq!((status.unreadable, status.carried), (Some(0), Some(0)));
+        assert!(status.unreadable_paths.is_empty());
     }
 
     /// The standby flow end to end: the project base is captured for `wt-real` (epoch 1); a

@@ -402,7 +402,18 @@ A capture holds what is on disk, and says so when it cannot.
   complete. Any other snap carries each unreadable path's last read content from the index
   (content, size, mtime; the mode it has now), marks the entry `unread: true` (and a directory it
   could not list, which then holds what the last reads under it found), and logs a warning; a
-  path never read before has nothing to carry and is left out of that automatic snap. A SQLite
+  path never read before has nothing to carry and is left out of that automatic snap. The git
+  class holds the same rule: `git add -A` skips a directory it cannot open with only a warning (an
+  untracked one dropped out of the worktree tree; a tracked one fell back to the index's blobs,
+  not the edit the last capture held), so the engine runs it with `LC_ALL=C`, reads the paths off
+  its warnings, keeps those the filesystem confirms are unreadable
+  (`gitpack::WorktreeTree::unreadable`), and an automatic snap gives each the previous capture's
+  worktree-tree entry in the throwaway index (`GitRepo::worktree_tree_carrying`) while a `final`
+  snap fails naming it (`tree/<path>`). A snap that fails after packing no longer makes its git
+  tips the next pack's negatives (they once left the next capture's new objects out of every
+  pack). Each snap's `SnapStats` counts `unreadable` paths, the `carried` ones and names the
+  first 20 (`unreadable_paths`); `capture.status` reports the same for the last snap of each
+  class (see "Unreadable paths on `capture.status`"). A SQLite
   `-wal` that vanishes mid-read no longer takes its database with it, and a hardlink group whose
   first member vanished is carried by the next one.
 - **A file is read again unless its stat key says otherwise.** The key is size, mtime, ctime
@@ -422,6 +433,17 @@ A capture holds what is on disk, and says so when it cannot.
 bytes); `index.rs`, `tree.rs` and `watch.rs` unit tests hold the pieces.
 
 ## Wire additions
+
+### Unreadable paths on `capture.status`
+
+`CaptureStatusReport` gains `optional uint64 unreadable = 17`, `optional uint64 carried = 18` and
+`repeated string unreadable_paths = 19` (fields 15 and 16 are the final-flush report's
+`complete` and `incomplete_reason`). `unreadable` is the number of paths the last snap of each
+class could not read, summed over both (a directory counts once); `carried` how many of them had
+their last captured content carried forward; `unreadable_paths` the first 20, virtual
+(`tree/<path>` under the worktree, `.git/<path>`, `harness/<path>`), small class first. An older
+daemon sends none of them. A client can show `2 paths unreadable · carried` and name them; after
+a failed `final` snap they name what it could not read (`carried` 0).
 
 ### Dir entries: `raw_name`, `raw_target`, `unread`
 

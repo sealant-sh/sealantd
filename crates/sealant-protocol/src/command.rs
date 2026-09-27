@@ -995,6 +995,17 @@ pub struct CaptureStatusReport {
     /// `pending` or `internal`. Absent when `complete`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub incomplete_reason: Option<String>,
+    /// Paths the last snap of each class could not read, summed over both classes (a
+    /// directory counts once). Never taken as deleted: an automatic snap carries a path's last
+    /// captured content forward, a final snap fails instead. `None` from an older daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unreadable: Option<u64>,
+    /// Of `unreadable`, the paths whose last captured content was carried forward.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub carried: Option<u64>,
+    /// The first 20 unreadable paths, virtual (`tree/<path>`, `.git/<path>`, `harness/<path>`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unreadable_paths: Vec<String>,
 }
 
 /// Result of `capture.replan`: the identity the executor now acts under and what the delta

@@ -1413,6 +1413,9 @@ impl From<CommandResult> for wire::command_result::Result {
                 pending_bytes: c.pending_bytes,
                 complete: c.complete,
                 incomplete_reason: c.incomplete_reason,
+                unreadable: c.unreadable,
+                carried: c.carried,
+                unreadable_paths: c.unreadable_paths,
             }),
             CommandResult::LeaseEpoch(l) => W::LeaseEpoch(wire::LeaseEpochReport {
                 epoch: l.epoch,
@@ -1523,6 +1526,9 @@ impl TryFrom<wire::command_result::Result> for CommandResult {
                 pending_bytes: c.pending_bytes,
                 complete: c.complete,
                 incomplete_reason: c.incomplete_reason,
+                unreadable: c.unreadable,
+                carried: c.carried,
+                unreadable_paths: c.unreadable_paths,
             }),
             W::LeaseEpoch(l) => CommandResult::LeaseEpoch(LeaseEpochReport {
                 epoch: l.epoch,
@@ -2108,6 +2114,9 @@ mod tests {
                 pending_bytes: 812_000_000,
                 complete: false,
                 incomplete_reason: Some("deadline".to_owned()),
+                unreadable: Some(2),
+                carried: Some(1),
+                unreadable_paths: vec!["tree/un".to_owned(), "tree/pgdata".to_owned()],
             }),
             CommandResult::CaptureStatus(CaptureStatusReport {
                 epoch: 2,
@@ -2126,6 +2135,9 @@ mod tests {
                 pending_bytes: 0,
                 complete: true,
                 incomplete_reason: None,
+                unreadable: None,
+                carried: None,
+                unreadable_paths: vec![],
             }),
             CommandResult::LeaseEpoch(LeaseEpochReport {
                 epoch: 2,

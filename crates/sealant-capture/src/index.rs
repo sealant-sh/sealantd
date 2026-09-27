@@ -576,7 +576,9 @@ impl UnreadableWork {
         error.get_ref()?.downcast_ref()
     }
 
-    fn into_io(self) -> io::Error {
+    /// Wrapped in an [`io::Error`], as a strict build returns it.
+    #[must_use]
+    pub fn into_io(self) -> io::Error {
         io::Error::other(self)
     }
 }
@@ -624,6 +626,17 @@ pub struct BuildStats {
     pub carried: u64,
 }
 
+/// A path a build could not read, and whether its last read content was carried.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnreadablePath {
+    /// Virtual path (`.git/…`, `tree/…`, `harness/…` in the workspace class).
+    pub path: String,
+    /// What the filesystem said.
+    pub error: String,
+    /// Something under it was carried from the last read (an automatic build only).
+    pub carried: bool,
+}
+
 /// A built tree: the root dir object key, every dir object (new or not), the chunk set it
 /// references and the updated index.
 #[derive(Debug)]
@@ -636,6 +649,8 @@ pub struct BuiltTree {
     pub chunks: HashSet<ChunkId>,
     /// Stats.
     pub stats: BuildStats,
+    /// What could not be read (an automatic build; a strict one fails instead), in path order.
+    pub unreadable: Vec<UnreadablePath>,
 }
 
 /// What reading one file found.
@@ -931,6 +946,7 @@ impl<'a> TreeBuilder<'a> {
             .iter()
             .map(|(v, src)| (v.clone(), Node::Listed(src)))
             .collect();
+        let mut carried_paths: HashSet<String> = HashSet::new();
         let carry_from = if self.strict {
             None
         } else {
@@ -963,6 +979,7 @@ impl<'a> TreeBuilder<'a> {
                 }
                 if ancestors_ok {
                     nodes.insert(v.clone(), Node::Carried(file.clone()));
+                    carried_paths.insert(u.clone());
                 }
             }
         }
@@ -1046,6 +1063,7 @@ impl<'a> TreeBuilder<'a> {
                             new_index.insert(c.clone(), file);
                             canonical_entry.insert(c.clone(), e);
                             stats.carried += 1;
+                            carried_paths.insert(m.clone());
                             canonical = Some(c);
                         }
                         break;
@@ -1249,6 +1267,7 @@ impl<'a> TreeBuilder<'a> {
                                 && let Some(file) = self.index.files.get(v).cloned()
                             {
                                 stats.carried += 1;
+                                carried_paths.insert(v.clone());
                                 chunks_all.extend(file.chunks.iter().copied());
                                 entries.push(carried_entry(name, mode, &file));
                                 new_index.insert(v.clone(), file);
@@ -1282,11 +1301,20 @@ impl<'a> TreeBuilder<'a> {
         self.index.files = new_index;
         self.index.racy = std::mem::take(&mut self.racy);
         let root = root.unwrap_or_else(|| DirObject::default().encode());
+        let unreadable = unreadable
+            .into_iter()
+            .map(|(path, error)| UnreadablePath {
+                carried: carried_paths.contains(&path),
+                path,
+                error,
+            })
+            .collect();
         Ok(Some(BuiltTree {
             root,
             dirs,
             chunks: chunks_all,
             stats,
+            unreadable,
         }))
     }
 
