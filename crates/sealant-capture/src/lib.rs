@@ -29,7 +29,7 @@ pub mod tree;
 pub mod watch;
 pub mod worktree_meta;
 
-pub use cadence::{CadenceRunner, CadenceSnapshot, FinalFlush, Incomplete};
+pub use cadence::{CadenceRunner, CadenceSnapshot, FinalFlush, Incomplete, SnapHealth};
 pub use engine::{
     Cadence, CaptureConfig, CaptureEngine, Class, EngineError, ReadReport, ReadReports,
     SnapOutcome, SnapRequest, SnapStats, StagedCapture, UNREADABLE_PATHS_CAP,

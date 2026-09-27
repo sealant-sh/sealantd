@@ -14,8 +14,8 @@ use sealant_capture::{
     Registrar,
 };
 use sealant_protocol::{
-    CaptureClass, CaptureKind, CaptureReplanned, CaptureStaged, CaptureStatusReport, ControlError,
-    LeaseEpochReport, ProcessId, Signal,
+    CaptureClass, CaptureClassSnaps, CaptureKind, CaptureReplanned, CaptureStaged,
+    CaptureStatusReport, ControlError, LeaseEpochReport, ProcessId, Signal,
 };
 
 use crate::boot::capture::{CaptureBoot, SharedMinter, SourceLayout};
@@ -460,14 +460,35 @@ impl CaptureRuntime {
         let staged_bytes = staging.staged_bytes().unwrap_or(0);
         let last = self.last_snap_unix_ms.load(Ordering::Relaxed);
         let (worktree_id, epoch) = self.identity();
+        // Each class's snaps: a class whose last snap failed has changes on this disk only.
+        let (small_health, bulk_health) = self.runner.snap_health();
+        let captures_bulk = self.runner.captures_bulk();
+        let snap_failing = small_health.failing() || (captures_bulk && bulk_health.failing());
+        let snaps: Vec<CaptureClassSnaps> = [
+            (CaptureClass::Small, small_health),
+            (CaptureClass::Bulk, bulk_health),
+        ]
+        .into_iter()
+        .filter(|(class, _)| *class == CaptureClass::Small || captures_bulk)
+        .map(|(class, health)| CaptureClassSnaps {
+            class,
+            snaps_failed: health.failed,
+            last_snap_error: health.last_error,
+            snap_failing_since_unix_ms: health.failing_since.map(|at| {
+                at.duration_since(UNIX_EPOCH)
+                    .map_or(0, |d| d.as_millis() as u64)
+            }),
+        })
+        .collect();
         // Complete only after a final flush stopped every writer and snapped both classes, and
         // only once everything is registered: nothing pending or being built, the lease not
-        // fenced.
+        // fenced, no class whose last snap failed.
         let outcome = *self.final_outcome.lock().unwrap_or_else(|e| e.into_inner());
         let incomplete_reason = match outcome {
             FinalOutcome::NotRun => Some("not-final"),
             FinalOutcome::Incomplete(reason) => Some(reason),
             FinalOutcome::Snapped { .. } if ship.fenced => Some("fenced"),
+            FinalOutcome::Snapped { .. } if snap_failing => Some("snapshot-failed"),
             FinalOutcome::Snapped { shipping } if pending > 0 => {
                 Some(shipping.unwrap_or("pending"))
             }
@@ -511,6 +532,7 @@ impl CaptureRuntime {
             register_refusals: Some(ship.register_refusals),
             repairing: ship.repair_pending,
             bulk_building,
+            snaps,
         }
     }
 
@@ -979,6 +1001,73 @@ mod tests {
         let status = capture.status();
         assert_eq!((status.unreadable, status.carried), (Some(0), Some(0)));
         assert!(status.unreadable_paths.is_empty());
+    }
+
+    /// Docker end to end, round 3: every automatic snap failed for the rest of the session and
+    /// every suspend flush was refused, while `capture.status` read `pending 0`, `unreadable 0`,
+    /// and nothing surfaced it. A snap that fails for any reason is now in `snaps` — counted,
+    /// its error and the moment the class started failing kept until one succeeds — and an
+    /// executor whose class's last snap failed is not `complete`, even after a final flush.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn capture_status_reports_a_class_whose_snaps_fail() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (boot, _registrar) = boot(tmp.path());
+        let root = boot.layout.working_directory.clone();
+        let mut config = RuntimeConfig::new(new_runtime_id());
+        config.workspace_root = root.clone();
+        let runtime = Runtime::new(config, Arc::new(ShutdownSignal::new(2_000)));
+        runtime.mark_healthy();
+        let capture = CaptureRuntime::new(boot);
+        assert!(runtime.install_capture(capture.clone()));
+        let small = |status: &CaptureStatusReport| {
+            status
+                .snaps
+                .iter()
+                .find(|s| s.class == CaptureClass::Small)
+                .cloned()
+                .expect("the small class is reported")
+        };
+        let status = capture.status();
+        assert_eq!(small(&status).snaps_failed, 0, "{status:?}");
+        assert_eq!(small(&status).last_snap_error, None);
+        assert!(status.snaps.iter().any(|s| s.class == CaptureClass::Bulk));
+
+        // Something every snap of the class trips over (here the repository itself).
+        let head = std::fs::read(root.join(".git/HEAD")).unwrap();
+        std::fs::write(root.join(".git/HEAD"), "not a ref\n").unwrap();
+        let before = now_unix_ms();
+        assert!(capture.snap(CaptureKind::Turn).is_err());
+        assert!(capture.snap(CaptureKind::Turn).is_err());
+        let status = capture.status();
+        let failing = small(&status);
+        assert_eq!(failing.snaps_failed, 2, "{status:?}");
+        assert!(failing.last_snap_error.is_some(), "{status:?}");
+        let since = failing.snap_failing_since_unix_ms.expect("failing since");
+        assert!(since >= before, "{since} {before}");
+        assert!(!status.complete);
+
+        // A final flush over it is incomplete, and says why.
+        let report = runtime.final_flush(None, Some(2_000)).await.unwrap();
+        assert!(!report.complete, "{report:?}");
+        assert_eq!(report.incomplete_reason.as_deref(), Some("snapshot-failed"));
+        assert_eq!(small(&report).snaps_failed, 3, "{report:?}");
+
+        // Once a snap succeeds, the class is healthy again; the count stays.
+        std::fs::write(root.join(".git/HEAD"), &head).unwrap();
+        let report = runtime.final_flush(None, Some(2_000)).await.unwrap();
+        assert!(report.complete, "{report:?}");
+        let healthy = small(&report);
+        assert_eq!(healthy.snaps_failed, 3, "{report:?}");
+        assert_eq!(healthy.last_snap_error, None);
+        assert_eq!(healthy.snap_failing_since_unix_ms, None);
+
+        // A snap that fails after the final flush was complete takes `complete` back.
+        std::fs::write(root.join(".git/HEAD"), "not a ref\n").unwrap();
+        assert!(capture.snap(CaptureKind::Turn).is_err());
+        let status = capture.status();
+        assert!(!status.complete, "{status:?}");
+        assert_eq!(status.incomplete_reason.as_deref(), Some("snapshot-failed"));
+        std::fs::write(root.join(".git/HEAD"), &head).unwrap();
     }
 
     /// A bulk build in progress has staged packs no queued capture lists: `capture.status`

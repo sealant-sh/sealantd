@@ -10,9 +10,9 @@ use crate::ids::{
 use crate::wire;
 use crate::{
     ArtifactRef, AttachMode, AttachSessionArgs, Base64Bytes, Capabilities, CaptureClass,
-    CaptureFlushKind, CaptureKind, CaptureMethod, CaptureMode, CapturePolicy, CaptureReplanned,
-    CaptureStaged, CaptureStatusReport, ClientMessage, Command, CommandResult, Confidence,
-    ControlError, ControlErrorCode, ControlRequest, ControlResponse, Encoding, EnvVar,
+    CaptureClassSnaps, CaptureFlushKind, CaptureKind, CaptureMethod, CaptureMode, CapturePolicy,
+    CaptureReplanned, CaptureStaged, CaptureStatusReport, ClientMessage, Command, CommandResult,
+    Confidence, ControlError, ControlErrorCode, ControlRequest, ControlResponse, Encoding, EnvVar,
     EventEnvelope, EventPayload, ExecAccepted, ExecArgs, ExecutionStartArgs, ExitReason, Feature,
     FeatureMatrix, FeatureState, ForwardOpened, ForwardProtocol, HealthReport, IoChunk,
     LeaseEpochReport, Limits, NetworkMode, OpenForwardArgs, OpenSessionArgs, OpenSftpArgs,
@@ -1423,6 +1423,16 @@ impl From<CommandResult> for wire::command_result::Result {
                     register_refusals: c.register_refusals,
                     repairing: c.repairing,
                     bulk_building: c.bulk_building,
+                    snaps: c
+                        .snaps
+                        .into_iter()
+                        .map(|s| wire::CaptureClassSnaps {
+                            class: enum_i32::<_, wire::CaptureClass>(s.class),
+                            snaps_failed: s.snaps_failed,
+                            last_snap_error: s.last_snap_error,
+                            snap_failing_since_unix_ms: s.snap_failing_since_unix_ms,
+                        })
+                        .collect(),
                 }))
             }
             CommandResult::LeaseEpoch(l) => W::LeaseEpoch(wire::LeaseEpochReport {
@@ -1543,6 +1553,18 @@ impl TryFrom<wire::command_result::Result> for CommandResult {
                 register_refusals: c.register_refusals,
                 repairing: c.repairing,
                 bulk_building: c.bulk_building,
+                snaps: c
+                    .snaps
+                    .into_iter()
+                    .map(|s| {
+                        Ok::<_, WireError>(CaptureClassSnaps {
+                            class: capture_class(s.class)?,
+                            snaps_failed: s.snaps_failed,
+                            last_snap_error: s.last_snap_error,
+                            snap_failing_since_unix_ms: s.snap_failing_since_unix_ms,
+                        })
+                    })
+                    .collect::<Result<_, _>>()?,
             })),
             W::LeaseEpoch(l) => CommandResult::LeaseEpoch(LeaseEpochReport {
                 epoch: l.epoch,
@@ -2135,6 +2157,20 @@ mod tests {
                 register_refusals: Some(2),
                 repairing: true,
                 bulk_building: true,
+                snaps: vec![
+                    CaptureClassSnaps {
+                        class: CaptureClass::Small,
+                        snaps_failed: 7,
+                        last_snap_error: Some("worktree metadata x: I/O error".to_owned()),
+                        snap_failing_since_unix_ms: Some(1_790_000_000_000),
+                    },
+                    CaptureClassSnaps {
+                        class: CaptureClass::Bulk,
+                        snaps_failed: 0,
+                        last_snap_error: None,
+                        snap_failing_since_unix_ms: None,
+                    },
+                ],
             })),
             CommandResult::CaptureStatus(Box::new(CaptureStatusReport {
                 epoch: 2,
@@ -2162,6 +2198,7 @@ mod tests {
                 register_refusals: Some(0),
                 repairing: false,
                 bulk_building: false,
+                snaps: vec![],
             })),
             CommandResult::LeaseEpoch(LeaseEpochReport {
                 epoch: 2,

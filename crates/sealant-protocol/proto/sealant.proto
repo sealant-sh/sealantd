@@ -604,6 +604,17 @@ message ForwardOpened { string channel_id = 1; }
 message SftpOpened { string channel_id = 1; }
 message ProcessAttached { string process_id = 1; int32 pid = 2; int32 pgid = 3; string channel_id = 4; }
 message CaptureStaged { uint64 n = 1; string capture_id = 2; CaptureKind kind = 3; bool unchanged = 4; }
+// One class's snaps (`CaptureStatusReport.snaps`). A snap that fails for any reason, scheduled or
+// forced, is counted here and its error kept until one succeeds.
+message CaptureClassSnaps {
+  CaptureClass class = 1;
+  // Snaps of this class that failed since the daemon started.
+  uint64 snaps_failed = 2;
+  // The last snap's error, while the last snap failed; absent once one succeeds.
+  optional string last_snap_error = 3;
+  // When the current run of failed snaps began (Unix ms), while the last snap failed.
+  optional uint64 snap_failing_since_unix_ms = 4;
+}
 message CaptureStatusReport {
   uint64 epoch = 1;
   string worktree_id = 2;
@@ -633,7 +644,8 @@ message CaptureStatusReport {
   // that, and everything registered (`pending` 0, not fenced). The only answer a control plane
   // may read as "saved"; `pending == 0` alone is not. False from an older daemon.
   bool complete = 15;
-  // Why `complete` is false: `not-final` (no final flush has run), `processes-remain` (a process
+  // Why `complete` is false: `not-final` (no final flush has run), `in-progress` (a final flush is
+  // running: stopping the writers, snapping, shipping), `processes-remain` (a process
   // or a container of the workspace's Docker daemon outlived SIGKILL, or that daemon could not
   // be reached), `sweep-unavailable` (the daemon cannot see every writer: not a child subreaper
   // and not PID 1 of its PID namespace), `snapshot-failed` (a final snap of either class failed),
@@ -641,7 +653,8 @@ message CaptureStatusReport {
   // `fenced`, `conflict` (the chain moved under this executor), `deadline` (`deadline_ms`
   // passed with captures pending), `ship-failed` (shipping kept failing until the deadline),
   // `pending` (a capture was staged after the final flush), `internal` (the flush's task
-  // failed). Absent when `complete`.
+  // failed). A class whose last snap failed (`snaps`) is `snapshot-failed` too, whenever it
+  // failed. Absent when `complete`.
   optional string incomplete_reason = 16;
   // Paths the last snap of each class could not read (listed, stat'ed or opened; a directory
   // counts once), summed over both classes. Never taken as deleted: an automatic snap carries a
@@ -669,6 +682,10 @@ message CaptureStatusReport {
   // capture): its capture is not queued yet, so `pending` and `pending_bulk` do not count it, but
   // `pending_bytes` counts what it has staged so far. A drain is not done while this is true.
   bool bulk_building = 25;
+  // Each captured class's snaps: how many failed, and the last one's error while it fails (a
+  // snap that fails stages nothing: what changed since the last capture is on this disk only).
+  // `complete` is false while any class's last snap failed. Absent from an older daemon.
+  repeated CaptureClassSnaps snaps = 26;
 }
 message LeaseEpochReport { uint64 epoch = 1; string worktree_id = 2; bool fenced = 3; }
 message CaptureReplanned {
