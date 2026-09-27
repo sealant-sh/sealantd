@@ -729,6 +729,8 @@ pub struct InMemoryRegistrar {
     quota: Mutex<Option<ByteQuota>>,
     /// The `manifest_format` `plan.get` answers.
     manifest_format: u32,
+    /// The `manifest_features` `plan.get` answers (default: every one this build reads).
+    manifest_features: Vec<String>,
     /// The executor the token is scoped to: answered on `plan.get`, and the only one whose
     /// final seal is recorded.
     executor: Option<String>,
@@ -780,6 +782,7 @@ impl InMemoryRegistrar {
             multipart: None,
             completer: None,
             manifest_format: MAX_SECTION_FORMAT,
+            manifest_features: MANIFEST_FEATURES.iter().map(|f| (*f).to_owned()).collect(),
             executor: None,
         }
     }
@@ -796,6 +799,14 @@ impl InMemoryRegistrar {
     #[must_use]
     pub fn seals(&self) -> Vec<(u64, FinalSeal)> {
         self.lock().seals.clone()
+    }
+
+    /// Answer `manifest_features` on `plan.get` (default: every one this build reads): a
+    /// registrar that leaves one out stands for one that does not read it.
+    #[must_use]
+    pub fn with_manifest_features(mut self, features: &[&str]) -> Self {
+        self.manifest_features = features.iter().map(|f| (*f).to_owned()).collect();
+        self
     }
 
     /// Answer `manifest_format` on `plan.get` (default: the highest this build reads). At 1 the
@@ -1124,7 +1135,7 @@ impl Registrar for InMemoryRegistrar {
             sources,
             remotes: state.remotes.clone(),
             manifest_format: self.manifest_format.min(reads),
-            manifest_features: MANIFEST_FEATURES.iter().map(|f| (*f).to_owned()).collect(),
+            manifest_features: self.manifest_features.clone(),
             executor: self.executor.clone(),
         })
     }

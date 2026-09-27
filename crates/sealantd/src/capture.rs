@@ -1258,9 +1258,8 @@ mod tests {
             .manifest
             .sections
             .git
-            .refs
-            .get(sealant_capture::manifest::WORKTREE_TREE_REF)
-            .cloned()
+            .worktree_tree_id()
+            .map(str::to_owned)
             .expect("a worktree tree");
         let out = Proc::new("git")
             .current_dir(&root)

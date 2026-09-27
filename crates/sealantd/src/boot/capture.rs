@@ -238,6 +238,16 @@ pub fn boot_from(
     }
     // Dir packs only for a registrar that reads them; either format materializes here.
     config.dir_format = DirFormat::for_registrar(plan.manifest_format);
+    // The git section's trees in their own fields (and the raw tree beside them) only for a
+    // registrar that reads them; for one that does not, the trees ride `refs` as before.
+    config.git_trees = plan.manifest_features.iter().any(|f| f == "git_trees");
+    if !config.git_trees {
+        tracing::warn!(
+            "the registrar does not read git_trees: the worktree and index trees ride refs as \
+             pseudo-refs, no raw tree is captured, and a restore checks the worktree out as git \
+             converts it"
+        );
+    }
     config.watch.raise_limit = source.raise_inotify_limit;
     let layout = SourceLayout {
         workspace_root: workspace_root.to_path_buf(),
@@ -1217,6 +1227,45 @@ mod tests {
         )
         .unwrap();
         assert_eq!(boot.engine.config().executor.as_deref(), Some("launch-7"));
+    }
+
+    /// The git section's trees go in their own fields (`git_trees`) only for a registrar whose
+    /// plan lists that feature; for one that does not, they ride `refs` as before (an older
+    /// Mend reads the worktree tree only there).
+    #[test]
+    fn git_trees_are_written_only_for_a_registrar_that_reads_them() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reads = Arc::new(InMemoryRegistrar::new("wt-boot", 1, None));
+        let sink: Arc<dyn BlobSink> = capture_source(tmp.path(), &reads);
+        let boot = boot_from(
+            reads,
+            Some(sink),
+            &source(),
+            &tmp.path().join("a"),
+            tmp.path(),
+        )
+        .unwrap();
+        assert!(boot.engine.config().git_trees);
+        drop(boot);
+        let older = Arc::new(
+            InMemoryRegistrar::new("wt-boot", 1, None).with_manifest_features(&[
+                "worktree_meta",
+                "symrefs",
+                "other_bulk",
+                "raw_names",
+                "final_seal",
+            ]),
+        );
+        let sink: Arc<dyn BlobSink> = capture_source(&tmp.path().join("b"), &older);
+        let boot = boot_from(
+            older,
+            Some(sink),
+            &source(),
+            &tmp.path().join("b/ws"),
+            tmp.path(),
+        )
+        .unwrap();
+        assert!(!boot.engine.config().git_trees);
     }
 
     /// A recovery boot's fallback (no staging continues the head) binds the disk to the exact
