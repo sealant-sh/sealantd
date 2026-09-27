@@ -262,6 +262,12 @@ impl CaptureRuntime {
     /// # Errors
     /// Returns [`ControlError`] when the snap fails or shipping stops on a fence or a conflict.
     pub fn flush_suspend(&self, deadline: Duration) -> Result<CaptureStatusReport, ControlError> {
+        // After a complete final flush, over the disk it captured, a suspend flush is a status
+        // read: it answers the final flush's report and stages nothing (a suspend capture of
+        // the same tree after the final one left the chain's head reading `suspend`).
+        if self.runner.sealed_and_current() {
+            return Ok(self.status());
+        }
         self.runner
             .flush(EngineKind::Suspend, Some(deadline))
             .map_err(|error| ControlError::internal(error.to_string()))?;
@@ -310,13 +316,14 @@ impl CaptureRuntime {
     }
 
     /// A final flush begins ([`Runtime::final_flush`], before it stops the writers):
-    /// `capture.status` reads `in-progress` until it ends — unless the last one completed and
-    /// the disk is as it left it ([`CadenceRunner::final_is_current`]), when this one snaps
-    /// nothing and the status stays `complete` throughout.
+    /// `capture.status` reads `in-progress` until it ends — unless the last one completed, the
+    /// disk is as it left it and the chain still ends on its final capture
+    /// ([`CadenceRunner::sealed_and_current`]), when this one snaps nothing and the status stays
+    /// `complete` throughout.
     pub fn begin_final(&self) {
         let mut outcome = self.final_outcome.lock().unwrap_or_else(|e| e.into_inner());
         let current =
-            matches!(*outcome, FinalOutcome::Snapped { .. }) && self.runner.final_is_current();
+            matches!(*outcome, FinalOutcome::Snapped { .. }) && self.runner.sealed_and_current();
         if !current {
             *outcome = FinalOutcome::Running;
         }
@@ -513,6 +520,9 @@ impl CaptureRuntime {
             FinalOutcome::Snapped { shipping } if pending > 0 => {
                 Some(shipping.unwrap_or("pending"))
             }
+            // A capture staged after the final one (a turn boundary): the chain no longer ends
+            // on the final capture until the next final flush seals it.
+            FinalOutcome::Snapped { .. } if !self.runner.chain_sealed() => Some("pending"),
             // A capture being built after the final one: staged, not queued yet.
             FinalOutcome::Snapped { .. } if bulk_building => Some("pending"),
             FinalOutcome::Snapped { .. } => None,
@@ -2366,5 +2376,152 @@ mod tests {
             "no new capture of an unchanged disk"
         );
         assert!(!runtime.capture_incomplete());
+    }
+
+    /// A runtime over a workspace with a dependency tree (both classes watched) and a harness
+    /// that sleeps: the shape of a Docker end to end's executor.
+    async fn watched_runtime(
+        base: &Path,
+    ) -> (
+        Arc<Runtime>,
+        Arc<CaptureRuntime>,
+        Arc<InMemoryRegistrar>,
+        std::path::PathBuf,
+    ) {
+        let (boot, registrar) = boot(base);
+        let ws = boot.layout.working_directory.clone();
+        std::fs::write(ws.join(".gitignore"), "node_modules/\n").unwrap();
+        for p in 0..20 {
+            let dir = ws.join(format!("node_modules/pkg{p}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            for f in 0..20 {
+                std::fs::write(dir.join(format!("m{f}.js")), format!("// {p} {f}\n")).unwrap();
+            }
+        }
+        let mut config = RuntimeConfig::new(new_runtime_id());
+        config.workspace_root = ws.clone();
+        let runtime = Runtime::new(config, Arc::new(ShutdownSignal::new(3_000)));
+        runtime.mark_healthy();
+        let capture = CaptureRuntime::new(boot);
+        assert!(runtime.install_capture(capture.clone()));
+        let harness = runtime
+            .spawn_managed(sh("exec sleep 3600", &ws))
+            .expect("spawn");
+        capture.start(runtime.clone(), harness.process_id);
+        let modes = capture.runner().snapshot();
+        assert_eq!(
+            (modes.small_mode, modes.bulk_mode),
+            (
+                sealant_capture::WatchMode::Watched,
+                sealant_capture::WatchMode::Watched
+            ),
+            "both classes are watched"
+        );
+        (runtime, capture, registrar, ws)
+    }
+
+    /// Docker end to end, round 4: `sealantctl capture flush --final` inside the executor, then
+    /// Mend's Stop sent two suspend flushes, which staged n=22 and n=23 as `suspend` captures
+    /// of the unchanged disk; the final flush after them took the no-snap path and sealed
+    /// nothing, so the head's kind was `suspend` and Mend concluded the executor was lost. A
+    /// suspend flush after a complete final one, over a disk nothing changed since, stages
+    /// nothing: it reads the final flush's report.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_suspend_flush_after_a_complete_final_one_stages_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (runtime, capture, registrar, _ws) = watched_runtime(tmp.path()).await;
+
+        let first = runtime.final_flush(None, Some(3_000)).await.unwrap();
+        assert!(first.complete, "{first:?}");
+        let chain = registrar.chain();
+        assert_eq!(
+            chain.last().unwrap().manifest.kind,
+            EngineKind::Final,
+            "the final flush ends the chain"
+        );
+        let registered = chain.len();
+
+        for rid in ["s1", "s2"] {
+            let report = flush_report(
+                runtime
+                    .dispatch(ControlRequest::new(
+                        RequestId::new(rid),
+                        Command::CaptureFlush {
+                            kind: CaptureFlushKind::Suspend,
+                            deadline_ms: Some(10_000),
+                            grace_ms: None,
+                        },
+                    ))
+                    .await,
+            );
+            assert!(report.complete, "{report:?}");
+            assert_eq!(report.pending, 0, "{report:?}");
+        }
+        assert_eq!(
+            registrar.chain().len(),
+            registered,
+            "a suspend flush over the final capture of an unchanged disk stages nothing"
+        );
+
+        let last = runtime.final_flush(None, Some(3_000)).await.unwrap();
+        assert!(last.complete, "{last:?}");
+        let chain = registrar.chain();
+        assert_eq!(chain.len(), registered);
+        assert_eq!(chain.last().unwrap().manifest.kind, EngineKind::Final);
+        assert!(capture.status().complete);
+    }
+
+    /// Whatever stages a capture after a complete final flush (a turn boundary here), the chain
+    /// no longer ends on a final capture: `capture.status` stops saying `complete` (`pending`,
+    /// a capture staged after the final flush), and the next final flush seals the chain with
+    /// a final capture before it reports `complete` — even though the disk is as the last one
+    /// captured it and it snaps nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_capture_staged_after_a_final_flush_is_sealed_by_the_next() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (runtime, capture, registrar, _ws) = watched_runtime(tmp.path()).await;
+
+        let first = runtime.final_flush(None, Some(3_000)).await.unwrap();
+        assert!(first.complete, "{first:?}");
+        let registered = registrar.chain().len();
+
+        let resp = runtime
+            .dispatch(ControlRequest::new(
+                RequestId::new("t1"),
+                Command::CaptureNow {
+                    kind: CaptureKind::Turn,
+                },
+            ))
+            .await;
+        let ResponseOutcome::Ok {
+            result: Some(CommandResult::CaptureStaged(staged)),
+        } = resp.outcome
+        else {
+            panic!("capture.now: {:?}", resp.outcome);
+        };
+        assert!(!staged.unchanged, "a turn capture is staged");
+        let chain = wait_chain(&registrar, registered + 1);
+        assert_eq!(chain.last().unwrap().manifest.kind, EngineKind::Turn);
+        let status = capture.status();
+        assert!(!status.complete, "{status:?}");
+        assert_eq!(status.incomplete_reason.as_deref(), Some("pending"));
+
+        let start = Instant::now();
+        let sealed = runtime.final_flush(None, Some(3_000)).await.unwrap();
+        assert!(sealed.complete, "{sealed:?}");
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "nothing to snap: {:?}",
+            start.elapsed()
+        );
+        let chain = registrar.chain();
+        assert_eq!(chain.len(), registered + 2);
+        assert_eq!(
+            chain.last().unwrap().manifest.kind,
+            EngineKind::Final,
+            "the chain ends on a final capture again"
+        );
+        assert!(capture.status().complete);
+        assert_eq!(runtime.quiesce_count(), 1);
     }
 }

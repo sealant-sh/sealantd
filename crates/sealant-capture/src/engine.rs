@@ -2051,13 +2051,15 @@ impl CaptureEngine {
         };
 
         // Nothing changed: an `auto` snap stages nothing rather than growing the chain, and nor
-        // does a final flush's bulk snap (its small snap is the capture that marks the end), or
-        // a final snap over a final capture (the same final flush asked again).
+        // does a final flush's bulk snap (its small snap is the capture that marks the end), a
+        // final snap over a final capture (the same final flush asked again), or a suspend snap
+        // over a final capture (a suspend flush after the final one: the chain must end on the
+        // final capture, and a suspend capture of the same tree after it only hid it).
+        let over_final = follows.is_some_and(|p| p.manifest.kind == CaptureKind::Final);
         if repairing.is_none()
             && (req.kind == CaptureKind::Auto
-                || (req.kind == CaptureKind::Final
-                    && (req.class == Class::Bulk
-                        || follows.is_some_and(|p| p.manifest.kind == CaptureKind::Final))))
+                || (req.kind == CaptureKind::Final && (req.class == Class::Bulk || over_final))
+                || (req.kind == CaptureKind::Suspend && over_final))
             && let Some(prev) = follows
             && prev.manifest.sections == sections
         {
@@ -2464,5 +2466,45 @@ mod tests {
         let work = error.unreadable().expect("fails as unreadable work");
         assert_eq!(work.paths.len(), 1, "{work}");
         assert_eq!(work.paths[0].0, "tree/notes.txt");
+    }
+
+    /// Docker end to end, round 4: two suspend flushes after a final one staged two `suspend`
+    /// captures of the same tree over the final capture, and the chain's head read `suspend`.
+    /// A suspend snap over a final capture of an unchanged tree stages nothing, whatever the
+    /// watcher says (this is the engine, below it); one over a changed tree still does.
+    #[test]
+    fn a_suspend_snap_over_a_final_capture_of_the_same_tree_stages_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("ws");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        git(&root, &["init", "-q", "-b", "main"]);
+        git(&root, &["config", "user.email", "t@t"]);
+        git(&root, &["config", "user.name", "t"]);
+        std::fs::write(root.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+        git(&root, &["add", "-A"]);
+        git(&root, &["commit", "-q", "-m", "one"]);
+        let mut engine = CaptureEngine::open(CaptureConfig::new("wt", 1, &root), None).unwrap();
+        let req = |kind, seq| SnapRequest {
+            kind,
+            class: Class::Small,
+            seq,
+        };
+        let last = engine.snap(req(CaptureKind::Final, 1)).unwrap();
+        assert!(!last.unchanged);
+        for seq in 2..4 {
+            let again = engine.snap(req(CaptureKind::Suspend, seq)).unwrap();
+            assert!(again.unchanged, "nothing staged over the final capture");
+            assert_eq!(again.n, last.n);
+        }
+        assert_eq!(
+            engine.previous().unwrap().manifest.kind,
+            CaptureKind::Final,
+            "the chain still ends on the final capture"
+        );
+
+        std::fs::write(root.join("src/lib.rs"), "pub fn f() { g() }\n").unwrap();
+        let changed = engine.snap(req(CaptureKind::Suspend, 4)).unwrap();
+        assert!(!changed.unchanged, "a change is staged");
+        assert_eq!(changed.manifest.manifest.kind, CaptureKind::Suspend);
     }
 }

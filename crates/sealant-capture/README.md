@@ -762,6 +762,14 @@ meanwhile). A class that polls, or a change the watcher saw, snaps again. After 
 returned at its deadline (`deadline`, `ship-failed`), `complete` turns true once the worker has
 shipped the rest: poll `capture.status`, or send the final flush again. An older daemon's report decodes with `complete: false`.
 
+A suspend flush after a complete final one, over the disk it captured, is a status read: it
+snaps nothing and answers the final flush's report (Mend's Stop sent two after a final flush,
+and each staged a `suspend` capture of the same tree, so the head read `suspend`); the engine
+also stages no suspend capture of an unchanged tree over a final capture. Anything staged after
+the final capture all the same (a turn boundary) turns `complete` false (`pending`), and the
+next final flush seals the chain with a final capture before it says `complete` again, though
+it snaps nothing (`CadenceRunner::chain_sealed`).
+
 ```json
 ← {"pending":0,"pendingBulk":0,"pendingBytes":0,"complete":true}
 ← {"pending":3,"pendingBulk":1,"pendingBytes":2147,"fenced":true,"complete":false,

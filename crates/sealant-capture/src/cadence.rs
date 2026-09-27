@@ -314,9 +314,20 @@ struct Shared {
     health: Mutex<[SnapHealth; 2]>,
     /// Change signals the watcher delivered (either class), for [`CadenceRunner::final_is_current`].
     changes: AtomicU64,
-    /// The last final flush snapped every class without an error: the change count before its
-    /// first snap. `None` until one does, and after a final flush whose snaps failed.
-    sealed: Mutex<Option<u64>>,
+    /// Captures staged by snaps (either class, any kind) and by sealing, for
+    /// [`CadenceRunner::chain_sealed`].
+    staged: AtomicU64,
+    /// The last final flush snapped every class without an error. `None` until one does, and
+    /// after a final flush whose snaps failed.
+    sealed: Mutex<Option<Seal>>,
+}
+
+/// What a final flush that snapped every class left: the change count before its first snap,
+/// and the staged count once it had sealed the chain with a final capture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Seal {
+    changes: u64,
+    staged: u64,
 }
 
 impl Shared {
@@ -416,6 +427,7 @@ impl Shared {
         if let Ok(staged) = &result
             && !staged.unchanged
         {
+            self.staged.fetch_add(1, Ordering::SeqCst);
             self.counters.small_staged.fetch_add(1, Ordering::Relaxed);
             self.wake_worker();
         }
@@ -509,6 +521,7 @@ impl Shared {
         if let Ok(staged) = &result
             && !staged.unchanged
         {
+            self.staged.fetch_add(1, Ordering::SeqCst);
             self.counters.bulk_staged.fetch_add(1, Ordering::Relaxed);
             self.wake_worker();
         }
@@ -706,6 +719,7 @@ impl CadenceRunner {
                 counters: Counters::default(),
                 health: Mutex::new([SnapHealth::default(), SnapHealth::default()]),
                 changes: AtomicU64::new(0),
+                staged: AtomicU64::new(0),
                 sealed: Mutex::new(None),
             }),
             threads: Mutex::new(Vec::new()),
@@ -845,7 +859,18 @@ impl CadenceRunner {
             };
         }
         let until = deadline.map(|d| Instant::now() + d);
-        self.snap(kind)?;
+        if self.sealed_and_current() {
+            // After a complete final flush, over the disk it captured: a snap would only add
+            // a capture of the same tree after the final one, and the chain would no longer
+            // end on it (observed: Mend's Stop sent two suspend flushes after a final one, and
+            // the head read `suspend`). Nothing is snapped; what is left ships.
+            tracing::info!(
+                ?kind,
+                "flush after a complete final flush over an unchanged disk: nothing to snap"
+            );
+        } else {
+            self.snap(kind)?;
+        }
         Ok(self
             .shared
             .shipper
@@ -859,6 +884,9 @@ impl CadenceRunner {
     /// delivered no change since before that flush's first snap. Not a guess from "the writers
     /// are stopped": a class that polls, a change the watcher saw, or a runner without the
     /// hook answers `false`, and the flush snaps again.
+    ///
+    /// It says nothing of the chain: a capture staged after that flush (a turn boundary) leaves
+    /// the disk current and the chain unsealed ([`Self::chain_sealed`]).
     #[must_use]
     pub fn final_is_current(&self) -> bool {
         let Some(sealed) = *self
@@ -882,7 +910,7 @@ impl CadenceRunner {
                 return false;
             }
         }
-        if self.shared.changes.load(Ordering::SeqCst) != sealed
+        if self.shared.changes.load(Ordering::SeqCst) != sealed.changes
             || self.shared.staging.repair_request().is_some()
         {
             return false;
@@ -892,6 +920,25 @@ impl CadenceRunner {
             .engine
             .try_lock()
             .is_ok_and(|e| !e.bulk_in_progress())
+    }
+
+    /// Whether the chain ends on the final capture of the last final flush that snapped every
+    /// class: nothing was staged after it. A capture staged since (a turn boundary, a
+    /// checkpoint) is the chain's head until the next final flush seals it.
+    #[must_use]
+    pub fn chain_sealed(&self) -> bool {
+        self.shared
+            .sealed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_some_and(|seal| seal.staged == self.shared.staged.load(Ordering::SeqCst))
+    }
+
+    /// [`Self::final_is_current`] and [`Self::chain_sealed`]: a complete final flush's capture
+    /// is the chain's head and the disk is as it captured it.
+    #[must_use]
+    pub fn sealed_and_current(&self) -> bool {
+        self.final_is_current() && self.chain_sealed()
     }
 
     /// The final flush — the executor is going away, and its disk with it; the caller has
@@ -920,6 +967,35 @@ impl CadenceRunner {
                 "final flush: the disk is as the last final flush captured it (the writers are \
                  stopped and the watcher saw no change since); nothing to snap"
             );
+            // Something was staged after that flush's final capture (a turn boundary, a
+            // suspend flush over a disk the watcher does not see): the chain ends on it, not
+            // on a final capture. Seal it with one (the disk is as it was, so the final capture
+            // lists what the newest one does) before this reports complete.
+            if !self.chain_sealed() {
+                let seq = self.shared.seq.fetch_add(1, Ordering::Relaxed);
+                let sealed = self.shared.engine().seal_final(seq);
+                match sealed {
+                    Ok(staged) => {
+                        if staged.is_some() {
+                            self.shared.staged.fetch_add(1, Ordering::SeqCst);
+                            self.shared.wake_worker();
+                        }
+                        if let Some(seal) = self
+                            .shared
+                            .sealed
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .as_mut()
+                        {
+                            seal.staged = self.shared.staged.load(Ordering::SeqCst);
+                        }
+                    }
+                    Err(error) => {
+                        tracing::error!(%error, "staging the final capture failed");
+                        incomplete = Some(Incomplete::from_snap(Class::Small, &error));
+                    }
+                }
+            }
         } else {
             *self
                 .shared
@@ -953,7 +1029,10 @@ impl CadenceRunner {
                 let seq = self.shared.seq.fetch_add(1, Ordering::Relaxed);
                 let sealed = self.shared.engine().seal_final(seq);
                 match sealed {
-                    Ok(Some(_)) => self.shared.wake_worker(),
+                    Ok(Some(_)) => {
+                        self.shared.staged.fetch_add(1, Ordering::SeqCst);
+                        self.shared.wake_worker();
+                    }
                     Ok(None) => {}
                     Err(error) => {
                         tracing::error!(%error, "staging the final capture failed");
@@ -966,7 +1045,10 @@ impl CadenceRunner {
                     .shared
                     .sealed
                     .lock()
-                    .unwrap_or_else(PoisonError::into_inner) = Some(changes);
+                    .unwrap_or_else(PoisonError::into_inner) = Some(Seal {
+                    changes,
+                    staged: self.shared.staged.load(Ordering::SeqCst),
+                });
             }
         }
         let mut shipped = 0;
