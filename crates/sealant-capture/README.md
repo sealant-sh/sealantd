@@ -263,10 +263,20 @@ restore, byte for byte, so the user never notices the compute changed.
   `Runtime::final_flush` (`crates/sealantd/src/runtime.rs`), in this order:
   1. admission closes for good: no new process, exec (attached or not), session, SFTP bridge,
      execution, bind or re-plan is accepted, and the boot supervisor launches nothing more;
-  2. every managed process and session is terminated and awaited: SFTP bridges are closed, a
-     process group the fence stopped is continued, then `SIGTERM` (`SIGHUP` for sessions), then
-     `SIGKILL` after the grace (`grace_ms`, else the shutdown grace; a hard shutdown kills at
-     once);
+  2. every writer is terminated and awaited: SFTP bridges are closed, a process group the
+     fence stopped is continued, then `SIGTERM` (`SIGHUP` for sessions), then `SIGKILL` after
+     the grace (`grace_ms`, else the shutdown grace; a hard shutdown kills at once) — the
+     managed process groups and sessions, and at the same time every process outside them
+     that `/proc` shows in the sweep's scope (`crates/sealantd/src/sweep.rs`), re-scanned
+     until none is left: a writer that `setsid`'d or double-forked out of its group used to
+     keep writing after the last snap. Scope: when sealantd is PID 1 of its PID namespace
+     (`sealantd boot` as a container's entrypoint, Docker and Kubernetes), every process in
+     the namespace, `docker exec`'d ones included; otherwise (a Lambda MicroVM, where Core's
+     agent is PID 1 and starts `sealantd boot`; `sealantd serve`), every descendant of
+     sealantd, which as the child subreaper inherits every orphan of what it started — the
+     VM's agent and its `sealantctl` are never touched. sealantd, its threads, its own helpers
+     (its own process group: the capture engine's `git`), kernel threads and zombies are left
+     alone;
   3. the small class and, forced, the bulk class are snapped (`CadenceRunner::flush_final`) —
      whatever the bulk clocks say; a scheduled bulk build in progress yields to it at its next
      chunk boundary and the forced snap resumes its progress, re-reading only files whose size,
@@ -336,6 +346,8 @@ the refusals; `tests/restage_crash.rs` the restage; `crates/sealantd/src/capture
 that runs past the 10 s it was once clamped to, the grace bounding a suspend flush without a
 deadline, a writer's `SIGTERM` handler landing in the head of a final flush and of
 `runtime.gracefulShutdown`, and the fenced and cut-short final flushes answering incomplete;
+`crates/sealantd/tests/final_sweep.rs` a `setsid`'d, double-forked writer stopped before the
+last snap, its `SIGTERM` handler's file in the head;
 `crates/sealantd/src/boot/capture.rs` another platform's dependency tree carried through an
 executor's captures and restored on its own platform byte for byte.
 

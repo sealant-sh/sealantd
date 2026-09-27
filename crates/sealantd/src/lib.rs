@@ -12,6 +12,7 @@ pub mod capture;
 pub(crate) mod control_frontends;
 pub mod runtime;
 pub mod shutdown;
+pub mod sweep;
 
 pub use app::run;
 pub use boot::{BootConfig, run_boot};

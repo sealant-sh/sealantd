@@ -11,8 +11,11 @@ execution, bind or re-plan); every managed process and session is terminated (`S
 `SIGKILL` after the grace) and awaited; the small and the bulk class are snapped, and both must
 succeed; everything ships until nothing is pending. Before, the daemon snapped first and
 terminated after, so anything a process wrote during the upload or from its `SIGTERM` handler
-was lost. The SIGTERM, SIGINT, `runtime.gracefulShutdown` and harness-exit paths use the same
-order.
+was lost. Writers outside the managed process groups are stopped the same way: every process
+in the PID namespace when sealantd is its PID 1 (a container), otherwise every descendant of
+sealantd, the child subreaper (a MicroVM), so a process that `setsid`'d or double-forked out of
+its group no longer writes past the last snap. The SIGTERM, SIGINT, `runtime.gracefulShutdown`
+and harness-exit paths use the same order.
 
 `CaptureFlushArgs` gains `graceMs` (field 3): how long managed processes get after `SIGTERM`
 before `SIGKILL`, counted inside `deadlineMs`. Absent, the daemon's shutdown grace.

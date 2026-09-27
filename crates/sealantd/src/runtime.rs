@@ -29,6 +29,16 @@ use crate::shutdown::ShutdownSignal;
 /// Daemon build version.
 pub const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// The environment entry a test marks its processes with, to narrow a sweep to them.
+pub const SWEEP_MARK_ENV: &str = "SEALANTD_SWEEP_MARK";
+
+/// A mark no process holds.
+fn new_unit_mark() -> u64 {
+    use std::sync::atomic::AtomicU64;
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
 /// The exit code of a daemon whose final capture flush did not complete (`EX_TEMPFAIL`): what
 /// is on this disk is not all registered, and the staging directory is left as it is.
 pub const EXIT_CAPTURE_INCOMPLETE: u8 = 75;
@@ -139,6 +149,12 @@ pub struct Runtime {
     /// One final capture flush at a time (the signal listener's, a control command's, and the
     /// boot supervisor's after the harness exits can overlap).
     final_lock: tokio::sync::Mutex<()>,
+    /// Narrows the final flush's sweep of processes outside the managed groups to those whose
+    /// environment holds `SEALANTD_SWEEP_MARK=<mark>`. `None` in a daemon: the sweep takes
+    /// every process in its scope ([`crate::sweep`]). Unit tests share one process, and every
+    /// runtime in it would take every other's processes, so a unit test's runtime starts with
+    /// a mark nobody holds.
+    sweep_mark: Mutex<Option<String>>,
     features: Mutex<HashMap<Feature, bool>>,
     pidfd_supported: bool,
     subreaper: bool,
@@ -226,6 +242,7 @@ impl Runtime {
             shutdown,
             admission_closed: AtomicBool::new(false),
             final_lock: tokio::sync::Mutex::new(()),
+            sweep_mark: Mutex::new(cfg!(test).then(|| format!("unit-test-{}", new_unit_mark()))),
             features,
             pidfd_supported,
             subreaper,
@@ -321,10 +338,12 @@ impl Runtime {
         self.capture().is_some_and(|c| !c.status().complete)
     }
 
-    /// Close admission and stop every writer this daemon manages: SFTP bridges closed, paused
+    /// Close admission and stop every writer in the workspace: SFTP bridges closed, paused
     /// processes continued, then `SIGTERM` (or `SIGKILL` on a hard shutdown) to every managed
-    /// process group and `SIGHUP` to every session, `SIGKILL` after `grace`, and awaited.
-    /// Returns how many managed processes and sessions are still alive after that.
+    /// process group and `SIGHUP` to every session, `SIGKILL` after `grace`, and awaited; then
+    /// at the same time every process outside those groups ([`crate::sweep`]: the PID namespace
+    /// when sealantd is its PID 1, else sealantd's descendants) the same way.
+    /// Returns how many are still alive after that.
     async fn quiesce(&self, grace: Duration) -> usize {
         self.admission_closed.store(true, Ordering::SeqCst);
         let sftp = self.sftp.close_all();
@@ -345,27 +364,53 @@ impl Runtime {
             let _ = self.processes.signal(&process.process_id, Signal::Cont);
         }
         let sessions = self.sessions.registry.len();
+        // Every other writer at the same time, under the same grace: a process that left its
+        // group (`setsid`, a double fork, a daemon) is in none of the groups terminated here,
+        // and would write past the last snap. The sweep also sees the managed processes (they
+        // are sealantd's descendants); a second `SIGTERM` changes nothing for them.
+        let mark = self
+            .sweep_mark
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let admit = move |pid: i32| {
+            mark.as_deref()
+                .is_none_or(|m| crate::sweep::has_env_entry(pid, SWEEP_MARK_ENV, m))
+        };
+        let sweeper = crate::sweep::Sweeper::this_process();
         let started = Instant::now();
-        tokio::join!(
+        let ((), (), (swept, sweep_left)) = tokio::join!(
             self.sessions.terminate_all(grace),
             self.processes.terminate_all(signal, grace),
+            sweeper.sweep(grace, self.shutdown.is_hard(), &admit),
         );
-        let remaining = self.processes.registry.running().len() + self.sessions.registry.len();
+        let managed_left = self.processes.registry.running().len() + self.sessions.registry.len();
+        let remaining = managed_left + sweep_left;
         tracing::info!(
             processes = running.len(),
             sessions,
             sftp,
+            swept,
+            sweep_scope = ?sweeper.scope,
             remaining,
             took_ms = started.elapsed().as_millis() as u64,
-            "admission closed; managed processes terminated for the final capture"
+            "admission closed; every writer terminated for the final capture"
         );
         if remaining > 0 {
             tracing::error!(
                 remaining,
-                "managed processes outlived SIGKILL; the final capture cannot be complete"
+                "processes outlived SIGKILL; the final capture cannot be complete"
             );
         }
         remaining
+    }
+
+    /// Narrow the final flush's sweep to processes whose environment holds
+    /// `SEALANTD_SWEEP_MARK=<mark>` ([`SWEEP_MARK_ENV`]); `None` sweeps every process in scope,
+    /// as a daemon does. For tests that share a process with other runtimes.
+    #[doc(hidden)]
+    pub fn set_sweep_mark(&self, mark: Option<String>) {
+        *self.sweep_mark.lock().unwrap_or_else(|e| e.into_inner()) = mark;
     }
 
     /// The error for new work once a final capture flush closed admission.
