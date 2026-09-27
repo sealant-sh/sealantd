@@ -1,6 +1,8 @@
 //! Change detection for the cadence (ADR-0015 *Cadence and budgets*): the `sealant-fs` pruned
 //! per-directory inotify watcher run over the capture roots under the capture ignore policy.
-//! Every event marks a class dirty; nothing is hashed here. The watcher runs under a watch
+//! Every event marks a class dirty; nothing is hashed here. A write or create also names its path
+//! in the engine's [`Invalidations`], so the next build of that class reads the file again
+//! whatever its stat says. The watcher runs under a watch
 //! budget: directories are counted before registration, `fs.inotify.max_user_watches` is raised
 //! only when the policy says so, and a class whose watches do not fit polls instead (the stat
 //! walk the engine does anyway). `IN_Q_OVERFLOW` (`need_rescan`) reports an [`ChangeSignal::Overflow`]
@@ -8,6 +10,7 @@
 
 use std::collections::HashSet;
 use std::fs;
+use std::mem;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc};
 
@@ -17,7 +20,7 @@ use sealant_fs::watcher::{pruned_dirs, watch_pruned};
 
 use crate::engine::Class;
 use crate::gitpack::GitRepo;
-use crate::index::{CREDENTIAL_FILES, DAEMON_DIR, has_component_in, is_excluded_name};
+use crate::index::{CREDENTIAL_FILES, DAEMON_DIR, Suspects, has_component_in, is_git_transient};
 
 /// The `fs.inotify.max_user_watches` sysctl.
 pub const MAX_USER_WATCHES: &str = "/proc/sys/fs/inotify/max_user_watches";
@@ -65,6 +68,42 @@ pub enum ChangeSignal {
     Overflow,
 }
 
+/// Paths the watcher saw written or created, per class, since that class's last build took them
+/// ([`crate::index::TreeBuilder::suspects`]). The stat key already catches every write that
+/// moves a file's ctime; these catch the ones that land in the same timestamp tick as a read.
+#[derive(Debug, Default)]
+pub struct Invalidations {
+    small: std::sync::Mutex<Suspects>,
+    bulk: std::sync::Mutex<Suspects>,
+}
+
+impl Invalidations {
+    fn slot(&self, class: Class) -> std::sync::MutexGuard<'_, Suspects> {
+        match class {
+            Class::Small => &self.small,
+            Class::Bulk => &self.bulk,
+        }
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Note a write to `path`, a path of `class`.
+    pub fn note(&self, class: Class, path: &Path) {
+        self.slot(class).insert(path.to_path_buf());
+    }
+
+    /// Take every path noted for `class`.
+    #[must_use]
+    pub fn take(&self, class: Class) -> Suspects {
+        mem::take(&mut *self.slot(class))
+    }
+
+    /// Put back paths a build took but did not read (the build failed).
+    pub fn restore(&self, class: Class, paths: Suspects) {
+        self.slot(class).extend(paths);
+    }
+}
+
 /// The paths a workspace is watched by.
 #[derive(Debug, Clone)]
 pub struct WatchSpec {
@@ -80,6 +119,8 @@ pub struct WatchSpec {
     pub capture_bulk: bool,
     /// Policy.
     pub policy: WatchPolicy,
+    /// Where written paths are noted for the engine; `None` notes nothing.
+    pub invalidations: Option<Arc<Invalidations>>,
 }
 
 /// The result of starting the watcher: which class is watched and the handle keeping it alive.
@@ -147,6 +188,7 @@ struct Policy {
     daemon_dir: PathBuf,
     bulk_dirs: Vec<String>,
     capture_bulk: bool,
+    invalidations: Option<Arc<Invalidations>>,
 }
 
 impl Policy {
@@ -174,7 +216,20 @@ impl Policy {
             daemon_dir: spec.root.join(DAEMON_DIR),
             bulk_dirs: spec.bulk_dirs.clone(),
             capture_bulk: spec.capture_bulk,
+            invalidations: spec.invalidations.clone(),
         }
+    }
+
+    /// Git's transient bookkeeping ([`is_git_transient`]), in a git dir of the repository or
+    /// in any `.git` under the roots.
+    fn is_git_transient(&self, abs: &Path) -> bool {
+        let rel = self
+            .git_dirs
+            .iter()
+            .find_map(|g| abs.strip_prefix(g).ok())
+            .map(|rel| format!(".git/{}", rel.to_string_lossy()))
+            .unwrap_or_else(|| abs.to_string_lossy().into_owned());
+        is_git_transient(&rel)
     }
 
     fn is_daemon(&self, abs: &Path) -> bool {
@@ -186,14 +241,7 @@ impl Policy {
         if self.is_daemon(abs) {
             return None;
         }
-        let name = abs.file_name().map(|n| n.to_string_lossy());
-        let parent_name = abs
-            .parent()
-            .and_then(Path::file_name)
-            .map(|n| n.to_string_lossy());
-        if let Some(name) = &name
-            && is_excluded_name(name, parent_name.as_deref())
-        {
+        if self.is_git_transient(abs) {
             return None;
         }
         if let Some(home) = &self.harness_home
@@ -218,8 +266,11 @@ impl Policy {
 
     /// Whether to descend into `dir` when registering small-class watches. Bulk directories, the
     /// daemon's directories, the harness home (its own root) and the parts of `.git` the engine
-    /// never lists (`objects`, `worktrees`, `lfs`: refs, `HEAD`, the index and the logs are what
-    /// move when history does) are pruned.
+    /// never lists (`objects`, `worktrees`; refs, `HEAD`, the index and the logs are what move
+    /// when history does) are pruned. So is `lfs`, which the engine does list: its sharded
+    /// object directories would spend the watch budget, and git-lfs writes a local object while
+    /// `git add` writes the index (a watched change), so the snap that change triggers walks
+    /// `lfs` and finds it; every forced snap walks it too.
     fn prune_small(&self, dir: &Path, name: &str) -> bool {
         if self.bulk_dirs.iter().any(|b| b == name) || name == DAEMON_DIR || self.is_daemon(dir) {
             return true;
@@ -449,11 +500,15 @@ fn handle_event(
         return;
     }
     let mut classes: [bool; 2] = [false, false];
+    let written = matches!(event.kind, EventKind::Create(_) | EventKind::Modify(_));
     for path in &event.paths {
         let Some(class) = policy.classify(path) else {
             continue;
         };
         classes[usize::from(class == Class::Bulk)] = true;
+        if written && let Some(inv) = &policy.invalidations {
+            inv.note(class, path);
+        }
         // A directory created or renamed in needs watches like the initial set (files created
         // inside it before its watch existed are caught by the snap's stat walk).
         let is_new_dir = match &event.kind {
@@ -508,6 +563,7 @@ mod tests {
                 .collect(),
             capture_bulk: true,
             policy: WatchPolicy::default(),
+            invalidations: None,
         }
     }
 
@@ -534,6 +590,20 @@ mod tests {
             Some(Class::Small)
         );
         assert_eq!(policy.classify(&root.join(".git/index.lock")), None);
+        assert_eq!(
+            policy.classify(&root.join("vendor/x/.git/HEAD.lock")),
+            None,
+            "a nested repository's lock files are git's too"
+        );
+        assert_eq!(
+            policy.classify(&root.join("Cargo.lock")),
+            Some(Class::Small),
+            "a user's lock file is work product"
+        );
+        assert_eq!(
+            policy.classify(&root.join("tmp/server.pid")),
+            Some(Class::Small)
+        );
         assert_eq!(
             policy.classify(&root.join("node_modules/a/x.js")),
             Some(Class::Bulk)
@@ -610,6 +680,35 @@ mod tests {
         fs::write(root.join("src/deep/b.rs"), "x").unwrap();
         let s = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
         assert_eq!(s, ChangeSignal::Changed(Class::Small));
+        drop(started);
+    }
+
+    /// A write names its path in the engine's invalidations, per class, so the next build of
+    /// that class reads it whatever its stat says; reads never do.
+    #[test]
+    fn writes_are_noted_as_invalidations() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("ws");
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/a.rs"), "x").unwrap();
+        let inv = Arc::new(Invalidations::default());
+        let mut s = spec(&root, None);
+        s.invalidations = Some(Arc::clone(&inv));
+        let (tx, rx) = mpsc::channel();
+        let started = start(
+            &s,
+            Arc::new(move |s| {
+                let _ = tx.send(s);
+            }),
+        )
+        .unwrap();
+        let _ = fs::read(root.join("src/a.rs")).unwrap();
+        fs::write(root.join("src/a.rs"), "y").unwrap();
+        let s = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        assert_eq!(s, ChangeSignal::Changed(Class::Small));
+        let noted = inv.take(Class::Small);
+        assert!(noted.contains(&root.join("src/a.rs")), "{noted:?}");
+        assert!(inv.take(Class::Bulk).is_empty());
         drop(started);
     }
 }

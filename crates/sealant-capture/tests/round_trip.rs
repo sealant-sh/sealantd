@@ -144,7 +144,7 @@ impl Fixture {
         fs::write(nested.join("v.txt"), "vendored\n").unwrap();
         fs::create_dir_all(nested.join(".git/objects/pack")).unwrap();
         fs::write(nested.join(".git/objects/pack/pack-abc.pack"), b"PACK").unwrap();
-        // Harness home: transcript, SQLite db + wal (+ shm, excluded), credentials (excluded).
+        // Harness home: transcript, SQLite db + wal + shm, credentials (excluded).
         fs::write(
             home.join("transcript.jsonl"),
             transcript_bytes(transcript_len, 5),
@@ -169,6 +169,9 @@ impl Fixture {
     fn config(&self, epoch: u64) -> CaptureConfig {
         let mut c = CaptureConfig::new("wt-fixture", epoch, &self.root);
         c.harness_home = Some(self.home.clone());
+        // The fixture is written just before the first snap, so every read of it is racy and
+        // would be read again; these tests count reads, so the stat is trusted at once.
+        c.racy_window = std::time::Duration::ZERO;
         c
     }
 
@@ -276,7 +279,7 @@ fn round_trip_materializes_an_identical_workspace() {
 
     let tree_diff = diff_r(&fx.root, &restore, &[".git", ".sealantd"]);
     assert!(tree_diff.is_empty(), "tree differs:\n{tree_diff}");
-    let home_diff = diff_r(&fx.home, &home2, &[".credentials.json", "state.db-shm"]);
+    let home_diff = diff_r(&fx.home, &home2, &[".credentials.json"]);
     assert!(home_diff.is_empty(), "harness home differs:\n{home_diff}");
 
     // (d) the `.pack` without `.idx` was skipped; the nested repo otherwise came back.
@@ -286,11 +289,12 @@ fn round_trip_materializes_an_identical_workspace() {
             .join("vendor/x/.git/objects/pack/pack-abc.pack")
             .exists()
     );
-    // (e) index.lock excluded; credentials and -shm excluded.
+    // (e) git's index.lock and the credentials excluded; a SQLite -shm is a file like any other
+    // (SQLite rebuilds a stale one when the first connection opens the database).
     assert!(fx.root.join(".git/index.lock").exists());
     assert!(!restore.join(".git/index.lock").exists());
     assert!(!home2.join(".claude/.credentials.json").exists());
-    assert!(!home2.join("state.db-shm").exists());
+    assert!(home2.join("state.db-shm").exists());
     // Hardlink groups materialize as links; mtimes are restored.
     let a = fs::metadata(restore.join("node_modules/pkg1/lib/shared.js")).unwrap();
     let b = fs::metadata(restore.join("node_modules/.pnpm/store/shared.js")).unwrap();

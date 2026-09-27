@@ -2,10 +2,14 @@
 //! listings and the materializer's sweep share. Whatever a snap would list is exactly what a
 //! materialize may remove when the plan no longer has it; everything else on disk is left alone.
 
+use std::ffi::OsStr;
+use std::io;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use crate::gitpack::{GitError, GitRepo};
-use crate::index::{self, DAEMON_DIR, Listing, has_component_in};
+use crate::index::{self, DAEMON_DIR, Listing, has_component_in, rel_key};
+use crate::tree::os_of_key;
 
 /// Where the classes live on disk.
 #[derive(Debug, Clone)]
@@ -30,17 +34,19 @@ impl ClassRoots {
     }
 
     /// The workspace class listing: `.git/` bookkeeping (minus objects, refs, `HEAD`,
-    /// `packed-refs`), `tree/` (git-ignored files and the nested repositories in `gitlinks`),
-    /// `harness/` (the harness home minus credential files).
+    /// `packed-refs`, other worktrees' admin directories, and git's transient files), local
+    /// git-lfs objects (`.git/lfs/`, which may exist nowhere else), `tree/` (git-ignored files
+    /// and the nested repositories in `gitlinks`), `harness/` (the harness home minus credential
+    /// files).
     pub fn workspace_listing(
         &self,
         repo: &GitRepo,
         gitlinks: &[String],
     ) -> Result<Listing, GitError> {
         let mut listing = Listing::default();
-        let git_prune = |_: &Path, v: &str, _: &str| {
-            v == ".git/objects" || v == ".git/worktrees" || v == ".git/lfs"
-        };
+        // Objects and refs travel in the git section; `worktrees/` holds other worktrees'
+        // bookkeeping, which is theirs to capture.
+        let git_prune = |_: &Path, v: &str, _: &str| v == ".git/objects" || v == ".git/worktrees";
         let git_include = |_: &Path, v: &str, _: &str| {
             !(v == ".git/HEAD"
                 || v == ".git/packed-refs"
@@ -55,7 +61,8 @@ impl ClassRoots {
 
         let bulk = &self.bulk_dirs;
         let root = &self.root;
-        let mut tree_roots: Vec<String> = Vec::new();
+        // Paths as bytes, exactly: a name that is not UTF-8 is still a file to capture.
+        let mut tree_roots: Vec<(PathBuf, bool)> = Vec::new();
         let out = repo.run(&[
             "ls-files",
             "-o",
@@ -64,18 +71,30 @@ impl ClassRoots {
             "--directory",
             "-z",
         ])?;
-        for rel in String::from_utf8_lossy(&out.stdout).split('\0') {
+        for rel in out.stdout.split(|b| *b == 0) {
             if !rel.is_empty() {
-                tree_roots.push(rel.to_owned());
+                let is_dir = rel.ends_with(b"/");
+                let rel = rel.strip_suffix(b"/").unwrap_or(rel);
+                tree_roots.push((PathBuf::from(OsStr::from_bytes(rel)), is_dir));
             }
         }
-        tree_roots.extend(gitlinks.iter().map(|g| format!("{g}/")));
-        for rel in tree_roots {
-            let is_dir = rel.ends_with('/');
-            let rel = rel.trim_end_matches('/');
-            let abs = root.join(rel);
-            if has_component_in(Path::new(rel), bulk)
-                || rel == DAEMON_DIR
+        // A directory git could not open may hold ignored files it never saw: what is under it
+        // is unknown, not absent.
+        for dir in unopened_dirs(&out.stderr, root) {
+            let abs = root.join(&dir);
+            if has_component_in(&dir, bulk) || self.is_daemon_path(&abs) {
+                continue;
+            }
+            let error = std::fs::read_dir(&abs)
+                .err()
+                .unwrap_or_else(|| io::Error::other("git could not open it"));
+            listing.note_unreadable(format!("tree/{}", rel_key(&dir)), abs, &error);
+        }
+        tree_roots.extend(gitlinks.iter().map(|g| (PathBuf::from(g), true)));
+        for (rel, is_dir) in tree_roots {
+            let abs = root.join(&rel);
+            if has_component_in(&rel, bulk)
+                || rel.as_os_str() == DAEMON_DIR
                 || self.is_daemon_path(&abs)
             {
                 continue;
@@ -84,12 +103,12 @@ impl ClassRoots {
                 listing.mount(
                     "tree",
                     root,
-                    rel,
+                    &rel,
                     |abs, _, name| bulk.iter().any(|b| b == name) || self.is_daemon_path(abs),
                     |_, _, _| true,
                 );
             } else {
-                listing.mount_file(&format!("tree/{rel}"), "tree", root, &abs);
+                listing.mount_file(&format!("tree/{}", rel_key(&rel)), "tree", root, &abs);
             }
         }
         if let Some(home) = &self.harness_home
@@ -144,7 +163,37 @@ impl ClassRoots {
         Some(if rest.is_empty() {
             base
         } else {
-            base.join(rest)
+            base.join(os_of_key(rest))
         })
     }
+}
+
+/// The directories `git ls-files` warned it could not open (`warning: could not open directory
+/// '<path>/': <reason>`), relative to the worktree. The message may be translated, so every
+/// single-quoted path on a stderr line is a candidate, and the filesystem decides: a candidate
+/// is kept when it is a directory under `root` that cannot be listed.
+fn unopened_dirs(stderr: &[u8], root: &Path) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    for line in stderr.split(|b| *b == b'\n') {
+        for (i, quoted) in line.split(|b| *b == b'\'').enumerate() {
+            if i % 2 == 0 {
+                continue;
+            }
+            let path = quoted.strip_suffix(b"/").unwrap_or(quoted);
+            if path.is_empty() {
+                continue;
+            }
+            let rel = PathBuf::from(OsStr::from_bytes(path));
+            if rel.is_absolute() || dirs.contains(&rel) {
+                continue;
+            }
+            if let Err(error) = std::fs::read_dir(root.join(&rel))
+                && !index::is_vanished(&error)
+                && std::fs::symlink_metadata(root.join(&rel)).is_ok_and(|m| m.is_dir())
+            {
+                dirs.push(rel);
+            }
+        }
+    }
+    dirs
 }

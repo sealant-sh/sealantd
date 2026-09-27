@@ -473,6 +473,7 @@ impl<'a> Materializer<'a> {
                     &mut report,
                 )?;
             }
+            refresh_linked(write.index, &write.links, &resolve);
             Self::restore_dirs(&write.dirs);
         }
         if matches!(class, MaterializeClass::Bulk | MaterializeClass::All)
@@ -496,7 +497,7 @@ impl<'a> Materializer<'a> {
                 &mut write,
                 &mut report,
             )?;
-            let resolve = |v: &str| Some(root.join(v));
+            let resolve = |v: &str| Some(root.join(crate::tree::os_of_key(v)));
             Self::link_all(&write.links, &resolve, &mut report)?;
             let listing = roots.bulk_listing();
             // Only bulk directories are swept; their ancestors are the worktree's.
@@ -515,6 +516,7 @@ impl<'a> Materializer<'a> {
                 write.index,
                 &mut report,
             )?;
+            refresh_linked(write.index, &write.links, &resolve);
             Self::restore_dirs(&write.dirs);
         }
         // After every class (the workspace class restores `.git/info/exclude` as captured):
@@ -779,7 +781,7 @@ impl<'a> Materializer<'a> {
             write.planned.insert(vdir.to_owned());
         }
         for entry in &obj.entries {
-            let path = dir.join(&entry.name);
+            let path = dir.join(entry.os_name());
             let v = join_virtual(vdir, &entry.name);
             write.planned.insert(v.clone());
             match entry.kind {
@@ -824,12 +826,12 @@ impl<'a> Materializer<'a> {
                     );
                 }
                 EntryKind::Symlink => {
-                    let target = entry.target.as_deref().unwrap_or("");
-                    if fs::read_link(&path).is_ok_and(|t| t == Path::new(target)) {
+                    let target = PathBuf::from(entry.os_target().unwrap_or_default());
+                    if fs::read_link(&path).is_ok_and(|t| t == target) {
                         continue;
                     }
                     remove_existing(&path)?;
-                    std::os::unix::fs::symlink(target, &path)?;
+                    std::os::unix::fs::symlink(&target, &path)?;
                     report.symlinks += 1;
                 }
                 EntryKind::HardlinkGroup => {
@@ -950,5 +952,28 @@ pub fn system_time_from_ns(mtime_ns: i64) -> SystemTime {
         UNIX_EPOCH + Duration::from_nanos(mtime_ns as u64)
     } else {
         UNIX_EPOCH - Duration::from_nanos(mtime_ns.unsigned_abs())
+    }
+}
+
+/// Linking a member onto a canonical file, or sweeping one away, moves the canonical's ctime (its
+/// link count changed), so the stat the write recorded no longer matches. Record it again once
+/// links and sweep are done, or the next delta rewrites the canonical and relinks every member,
+/// and the engine reads it again.
+fn refresh_linked(
+    index: &mut TreeIndex,
+    links: &[(String, PathBuf, u32)],
+    resolve: &dyn Fn(&str) -> Option<PathBuf>,
+) {
+    for (canonical_v, _, _) in links {
+        if let Some(known) = index.files.get_mut(canonical_v)
+            && let Some(path) = resolve(canonical_v)
+            && let Ok(meta) = fs::symlink_metadata(&path)
+            && meta.is_file()
+            && meta.len() == known.stat.size
+            && crate::index::mtime_ns(&meta) == known.stat.mtime
+            && meta.ino() == known.stat.ino
+        {
+            known.stat = FileStat::of(&meta);
+        }
     }
 }

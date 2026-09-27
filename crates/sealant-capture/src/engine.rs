@@ -11,7 +11,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::chunk::ChunkId;
 use crate::gitpack::{self, GitError, GitRepo};
-use crate::index::{self, BuildStats, ChunkSink, DAEMON_DIR, Listing, TreeBuilder, TreeIndex};
+use crate::index::{
+    self, BuildStats, ChunkSink, DAEMON_DIR, Listing, Suspects, TreeBuilder, TreeIndex,
+    UnreadableWork,
+};
 use crate::keys::KeyPrefix;
 use crate::manifest::{
     BulkSection, BulkState, CaptureKind, DirFormat, EncodedManifest, GitSection, Manifest,
@@ -30,7 +33,7 @@ use crate::ship::{
 };
 use crate::sink::BlobSink;
 use crate::tree::EncodedDir;
-use crate::watch::WatchPolicy;
+use crate::watch::{Invalidations, WatchPolicy};
 
 /// Snap cadence (ADR-0015 *Cadence and budgets*).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,6 +112,9 @@ pub struct CaptureConfig {
     pub dir_format: DirFormat,
     /// Single-PUT uploads in flight at once ([`crate::ship::DEFAULT_UPLOADS_IN_FLIGHT`]).
     pub uploads_in_flight: usize,
+    /// A file read this close to its last change is read again by the next build rather than
+    /// trusted by its stat ([`index::RACY_WINDOW`]; see `index` "When a file is re-read").
+    pub racy_window: Duration,
 }
 
 impl CaptureConfig {
@@ -134,6 +140,7 @@ impl CaptureConfig {
             pack_cap: MAX_PACK_BYTES,
             dir_format: DirFormat::Packs,
             uploads_in_flight: crate::ship::DEFAULT_UPLOADS_IN_FLIGHT,
+            racy_window: index::RACY_WINDOW,
         }
     }
 
@@ -186,6 +193,18 @@ pub enum EngineError {
     /// A final flush did not complete ([`crate::cadence::CadenceRunner::flush_final`]).
     #[error("final flush incomplete: {0}")]
     Incomplete(#[from] crate::cadence::Incomplete),
+}
+
+impl EngineError {
+    /// The work a `final` snap could not read, when that is why it failed: the snap does not
+    /// hold those paths, so the capture it would have made is not a complete one.
+    #[must_use]
+    pub fn unreadable(&self) -> Option<&UnreadableWork> {
+        match self {
+            Self::Io(e) => UnreadableWork::of(e),
+            _ => None,
+        }
+    }
 }
 
 /// Numbers from one snap.
@@ -377,6 +396,8 @@ struct ClassWork {
     index: TreeIndex,
     packs: Vec<Upload>,
     chunks: HashMap<ChunkId, String>,
+    /// Paths the watcher reported written that this build has not read yet.
+    suspects: Suspects,
 }
 
 /// The outcome of a preemptible snap.
@@ -409,6 +430,8 @@ pub struct CaptureEngine {
     /// the chain with this manifest's bulk section, and the bulk capture moves on top of it. See
     /// [`CaptureEngine::snap_preemptible`].
     below: Option<EncodedManifest>,
+    /// Paths the watcher saw written, per class, not yet read again.
+    invalidations: Arc<Invalidations>,
 }
 
 impl std::fmt::Debug for CaptureEngine {
@@ -515,6 +538,7 @@ impl CaptureEngine {
             dirs,
             last_tips,
             below: None,
+            invalidations: Arc::new(Invalidations::default()),
         };
         // Captures staged under another identity (a lease that moved to a new epoch while the
         // daemon was down) can never register; left queued, a snap would coalesce with one and
@@ -725,6 +749,13 @@ impl CaptureEngine {
         &self.config
     }
 
+    /// Where the watcher notes written paths for this engine's builds
+    /// (`watch::WatchSpec::invalidations`).
+    #[must_use]
+    pub fn invalidations(&self) -> Arc<Invalidations> {
+        Arc::clone(&self.invalidations)
+    }
+
     /// Staging area (shared with the shipper).
     #[must_use]
     pub fn staging(&self) -> Arc<Staging> {
@@ -798,7 +829,9 @@ impl CaptureEngine {
 
     /// Build a chunked class into new packs; returns what its section names (the root, the
     /// packs the tree needs, and in format 2 its dir packs), or `None` when a bulk build yielded
-    /// to `preempt` (its progress is kept in `bulk_work`; the next bulk build resumes it).
+    /// to `preempt` (its progress is kept in `bulk_work`; the next bulk build resumes it). A
+    /// `strict` build (a `final` snap) fails with [`UnreadableWork`] when anything it should
+    /// hold cannot be read; any other build carries such a path's last read content forward.
     fn build_class(
         &mut self,
         listing: &Listing,
@@ -806,6 +839,7 @@ impl CaptureEngine {
         uploads: &mut Vec<Upload>,
         stats: &mut SnapStats,
         preempt: &dyn Fn() -> bool,
+        strict: bool,
     ) -> Result<Option<BuiltClass>, EngineError> {
         let objects = self.staging.objects_dir();
         let prefix = self.prefix.clone();
@@ -825,6 +859,7 @@ impl CaptureEngine {
                 ..ClassWork::default()
             }),
         };
+        work.suspects.extend(self.invalidations.take(class));
         let mut sink = PackSink {
             builder: PackBuilder::new(&objects, self.config.pack_cap),
             known: &self.chunks.packs,
@@ -832,10 +867,17 @@ impl CaptureEngine {
             cycle: DutyCycle::new(self.config.cpu_fraction),
             preempt: (class == Class::Bulk).then_some(preempt),
         };
-        let built = TreeBuilder::new(&mut work.index, &key_for_dir).build(listing, &mut sink);
+        let built = TreeBuilder::new(&mut work.index, &key_for_dir)
+            .strict(strict)
+            .racy_window(self.config.racy_window)
+            .suspects(&mut work.suspects)
+            .build(listing, &mut sink);
         let (built, packs) = match built {
             Ok(built) => (built, sink.builder.finish()),
             Err(e) => {
+                // What was not read yet stays suspect for the next build.
+                self.invalidations
+                    .restore(class, std::mem::take(&mut work.suspects));
                 if class == Class::Small {
                     self.workspace_index = work.index;
                 }
@@ -874,7 +916,9 @@ impl CaptureEngine {
             self.bulk_work = Some(work);
             return Ok(None);
         };
-        // Commit: the index, the chunk map and the pack uploads.
+        // Commit: the index, the chunk map and the pack uploads. A suspect the build did not
+        // read is not in this class's listing (removed, or another class's path).
+        work.suspects.clear();
         match class {
             Class::Small => self.workspace_index = work.index,
             Class::Bulk => self.bulk_index = work.index,
@@ -1192,8 +1236,14 @@ impl CaptureEngine {
                     git_packs.push(key);
                 }
                 let listing = self.workspace_listing(&repo, &git.closure.gitlinks)?;
-                let Some(built) =
-                    self.build_class(&listing, Class::Small, &mut uploads, &mut stats, preempt)?
+                let Some(built) = self.build_class(
+                    &listing,
+                    Class::Small,
+                    &mut uploads,
+                    &mut stats,
+                    preempt,
+                    req.kind == CaptureKind::Final,
+                )?
                 else {
                     return Err(io::Error::other("small-class build yielded").into());
                 };
@@ -1224,8 +1274,14 @@ impl CaptureEngine {
             }
             Class::Bulk => {
                 let listing = self.bulk_listing();
-                let Some(built) =
-                    self.build_class(&listing, Class::Bulk, &mut uploads, &mut stats, preempt)?
+                let Some(built) = self.build_class(
+                    &listing,
+                    Class::Bulk,
+                    &mut uploads,
+                    &mut stats,
+                    preempt,
+                    req.kind == CaptureKind::Final,
+                )?
                 else {
                     tracing::debug!(
                         files_read = stats.files_read,
