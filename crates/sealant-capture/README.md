@@ -606,6 +606,32 @@ A capture holds what is on disk, and says so when it cannot.
 - **Names are bytes.** A name or symlink text that is not UTF-8 keeps its bytes (see "Dir
   entries: `raw_name`, `raw_target`, `unread`"); two names a lossy conversion would merge stay two
   files. `git ls-files -z` output is taken as bytes too.
+- **A path of any length** (`longpath.rs`). The kernel refuses a path of `PATH_MAX` (4,096)
+  bytes or more in one call, and the third Docker end to end had one: an untracked file 4,186
+  bytes below the root (17 directories of 243-byte names). Its `lstat` failed with
+  `ENAMETOOLONG`, which failed the worktree metadata overlay, which failed every snap for the
+  rest of the session. Every filesystem call a snap or a restore makes now takes a path of any
+  length: one that fits goes to `std::fs`; a longer one is resolved through `openat`, a run of
+  whole components at a time, and the call is made relative to its parent (`fstatat` through an
+  `O_PATH` descriptor, `readlinkat`, `mkdirat`, `unlinkat`, `renameat`, `linkat`, `symlinkat`,
+  `fchmodat`, `utimensat`); `longpath::walk` replaces `walkdir`. Git runs in the worktree and
+  passes each path whole to one call, so it cannot reach a file of `PATH_MAX` bytes or more
+  (`git add` dies: `unable to stat`) nor open a directory one byte shorter (it warns — in a
+  message its 4 KB buffer cuts — and drops it). Those paths
+  (`GitRepo::beyond_reach`: the long files git lists, and under the directory the cut warning
+  still names whole, every untracked directory too long to open) are excluded from the add and
+  carried by the workspace class like a nested repository (`tree/<path>`), and restored from
+  there; ignored and bulk paths were never git's. A restore writes a file under a short staging
+  name when `.<name>.capture-tmp` would pass `NAME_MAX`. A directory the watcher cannot watch
+  (`inotify_add_watch` takes a path) makes its class poll, at start and when one appears later.
+- **One path is one path.** Whatever error one path's metadata gives (not only `EACCES`), it is
+  that path's: the overlay reports it unreadable and carries its previous entry (and, for a
+  directory it cannot list, the directories the previous document held under it); a `final`
+  snap fails `unreadable` naming it. A `git add` that still dies on one path (`fatal: unable to
+  stat`) sets it aside for the chunked class and runs again. A path too long for git that no
+  class carries (a filesystem whose listings give no entry types) is reported the same way,
+  never dropped. And a snap that fails for any other reason is counted in `capture.status`
+  (see "`snaps` on `capture.status`").
 
 `tests/read_fidelity.rs` holds each of these end to end (snap, ship, fresh materialize, compare
 bytes); `index.rs`, `tree.rs` and `watch.rs` unit tests hold the pieces.
@@ -710,10 +736,29 @@ after a final flush ran to the end on this executor — admission closed, every 
 terminated and awaited, the small and the bulk class snapped after that, everything registered
 — and while that still holds (nothing staged since, the lease not fenced). It is the only answer
 a control plane may read as saved: `pending == 0` alone is not (a failed snap leaves nothing
-pending). `incomplete_reason` says why not: `not-final`, `processes-remain`, `snapshot-failed`,
-`fenced`, `conflict`, `deadline`, `ship-failed`, `pending` (staged, or a bulk capture being
-built, after the final flush),
-`sweep-unavailable`, `unreadable` or `internal`; absent when `complete`. After a flush that
+pending). `incomplete_reason` says why not: `not-final`, `in-progress` (a final flush is running,
+from its first moment — before it stops the writers — to its answer; it read `not-final` for
+the 38 s one ran), `processes-remain`, `snapshot-failed` (a final snap failed, or a class's last
+snap did, whenever: `snaps`), `fenced`, `conflict`, `deadline`, `ship-failed`, `pending`
+(staged, or a bulk capture being built, after the final flush),
+`sweep-unavailable`, `unreadable` or `internal`; absent when `complete`.
+
+Once `complete` is said, nothing more is captured. The final flush ends the chain as the disk
+is: when its bulk snap staged a capture and the small snap found tracked files with names in
+the bulk class (a pnpm `file:` package hardlinked into `node_modules`: the overlay records those
+links from the bulk index, empty until the first bulk snap), the small class is snapped again
+inside the same flush; and when the newest capture is not a final one (the final small snap was
+staged ahead of a scheduled bulk capture still uploading, and the final bulk snap found that
+capture current), a final capture with its sections seals the chain (`seal_final`, its manifest
+only). Before, the flush after the one that said `complete` registered those (8 KB and 19 KB,
+`files_read=0`), and until then the head was of kind `auto` or lacked the links. A final flush
+asked again (the drain's, the SIGTERM handler's, the boot's on the harness's exit) snaps
+nothing when the last one snapped every class without an error, snaps are no longer allowed
+(the writers are stopped, admission closed) and the watcher — watching both classes, never
+overflowed — delivered no change since before that flush's first snap
+(`CadenceRunner::final_is_current`): it ships what is left and answers in milliseconds, and
+`complete` holds throughout (each walked the bulk class again for 2.5–3 s, `bulk_building`
+meanwhile). A class that polls, or a change the watcher saw, snaps again. After a flush that
 returned at its deadline (`deadline`, `ship-failed`), `complete` turns true once the worker has
 shipped the rest: poll `capture.status`, or send the final flush again. An older daemon's report decodes with `complete: false`.
 
@@ -721,6 +766,31 @@ shipped the rest: poll `capture.status`, or send the final flush again. An older
 ← {"pending":0,"pendingBulk":0,"pendingBytes":0,"complete":true}
 ← {"pending":3,"pendingBulk":1,"pendingBytes":2147,"fenced":true,"complete":false,
    "incompleteReason":"fenced"}
+```
+
+### `snaps` on `capture.status` / `capture.flush`
+
+`repeated CaptureClassSnaps snaps = 26` of `CaptureStatusReport`, one per captured class:
+
+```proto
+message CaptureClassSnaps {
+  CaptureClass class = 1;
+  uint64 snaps_failed = 2;                         // since the daemon started
+  optional string last_snap_error = 3;             // while the last snap failed
+  optional uint64 snap_failing_since_unix_ms = 4;  // when the current run of failures began
+}
+```
+
+A snap that fails for any reason, scheduled or forced, is counted and its error kept until one
+succeeds (logged at error when the class starts failing, at info when it recovers). While any
+class's last snap failed, `complete` is false with `snapshot-failed`. The third Docker end to end
+had every snap failing for the rest of a session with `pending 0` and `unreadable 0` and nothing
+to say so. Absent from an older daemon.
+
+```json
+← {"complete":false,"incompleteReason":"snapshot-failed","snaps":[{"class":"small",
+   "snapsFailed":7,"lastSnapError":"…","snapFailingSinceUnixMs":1790533559474},
+   {"class":"bulk","snapsFailed":0}]}
 ```
 
 ### `pending_bytes` on `capture.status` / `capture.flush`

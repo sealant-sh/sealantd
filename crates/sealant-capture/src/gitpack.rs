@@ -50,9 +50,28 @@ pub enum GitError {
     /// Not a git repository.
     #[error("{0} is not a git repository")]
     NotARepo(PathBuf),
+    /// I/O on a path: what was done, and where.
+    #[error("{op} {}: {source}", path.display())]
+    IoAt {
+        /// What was done (`mkdir -p`, `write`, `rename`, …).
+        op: &'static str,
+        /// Where.
+        path: PathBuf,
+        /// What the filesystem said.
+        source: io::Error,
+    },
     /// I/O.
     #[error(transparent)]
     Io(#[from] io::Error),
+}
+
+/// An I/O error on `path`, named (a bare `Permission denied` names no path).
+fn at<'a>(op: &'static str, path: &'a Path) -> impl FnOnce(io::Error) -> GitError + 'a {
+    move |source| GitError::IoAt {
+        op,
+        path: path.to_path_buf(),
+        source,
+    }
 }
 
 /// What [`GitRepo::set_remote`] did.
@@ -133,7 +152,7 @@ impl GitRepo {
 
     /// `git init` a repository at `root` if none exists there, then open it.
     pub fn init(root: &Path) -> Result<Self, GitError> {
-        fs::create_dir_all(root)?;
+        fs::create_dir_all(root).map_err(at("mkdir -p", root))?;
         if !root.join(".git").exists() {
             let args = ["init", "-q"];
             check(&args, git_command(root).args(args).output_gated()?)?;
@@ -145,7 +164,7 @@ impl GitRepo {
     /// it is there already. The user's `.gitignore` is never touched.
     pub fn exclude_locally(&self, pattern: &str) -> Result<(), GitError> {
         let info = self.common_dir.join("info");
-        fs::create_dir_all(&info)?;
+        fs::create_dir_all(&info).map_err(at("mkdir -p", &info))?;
         let path = info.join("exclude");
         let mut text = fs::read_to_string(&path).unwrap_or_default();
         if text.lines().any(|l| l.trim() == pattern) {
@@ -157,8 +176,8 @@ impl GitRepo {
         text.push_str(pattern);
         text.push('\n');
         let tmp = info.join("exclude.capture-tmp");
-        fs::write(&tmp, text)?;
-        fs::rename(tmp, path)?;
+        fs::write(&tmp, text).map_err(at("write", &tmp))?;
+        fs::rename(&tmp, &path).map_err(at("rename into", &path))?;
         Ok(())
     }
 
@@ -1219,16 +1238,17 @@ pub fn install_pack(
     idx: Option<&[u8]>,
 ) -> Result<bool, GitError> {
     let dir = repo.common_dir.join("objects").join("pack");
-    fs::create_dir_all(&dir)?;
+    fs::create_dir_all(&dir).map_err(at("mkdir -p", &dir))?;
     let pack_path = dir.join(format!("pack-{sha256}.pack"));
     let idx_path = dir.join(format!("pack-{sha256}.idx"));
     if pack_path.exists() && idx_path.exists() {
         return Ok(false);
     }
     let tmp = dir.join(format!("tmp-capture-{sha256}.pack"));
-    fs::write(&tmp, pack)?;
+    fs::write(&tmp, pack).map_err(at("write", &tmp))?;
+    let tmp_idx = tmp.with_extension("idx");
     match idx {
-        Some(bytes) => fs::write(tmp.with_extension("idx"), bytes)?,
+        Some(bytes) => fs::write(&tmp_idx, bytes).map_err(at("write", &tmp_idx))?,
         None => {
             let tmp_str = tmp.to_string_lossy().to_string();
             let args = ["index-pack", &tmp_str];
@@ -1236,8 +1256,8 @@ pub fn install_pack(
             fs::remove_file(tmp.with_extension("rev")).ok();
         }
     }
-    fs::rename(tmp.with_extension("idx"), &idx_path)?;
-    fs::rename(&tmp, &pack_path)?;
+    fs::rename(&tmp_idx, &idx_path).map_err(at("rename into", &idx_path))?;
+    fs::rename(&tmp, &pack_path).map_err(at("rename into", &pack_path))?;
     Ok(true)
 }
 
@@ -1277,8 +1297,8 @@ pub fn write_packed_refs(
     }
     let path = repo.common_dir.join("packed-refs");
     let tmp = repo.common_dir.join("packed-refs.capture-tmp");
-    fs::write(&tmp, text)?;
-    fs::rename(tmp, path)?;
+    fs::write(&tmp, text).map_err(at("write", &tmp))?;
+    fs::rename(&tmp, &path).map_err(at("rename into", &path))?;
     // After `packed-refs` holds the manifest's refs: a loose ref shadows a packed one, so none
     // may remain.
     for dir in [&repo.common_dir, &repo.git_dir] {
@@ -1287,9 +1307,9 @@ pub fn write_packed_refs(
     for (name, target) in symrefs {
         let path = repo.common_dir.join(name);
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
+            fs::create_dir_all(parent).map_err(at("mkdir -p", parent))?;
         }
-        fs::write(path, format!("ref: {target}\n"))?;
+        fs::write(&path, format!("ref: {target}\n")).map_err(at("write", &path))?;
     }
     Ok(())
 }
@@ -1313,7 +1333,7 @@ fn remove_loose_refs(dir: &Path, depth: usize) -> Result<(), GitError> {
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e.into()),
+        Err(e) => return Err(at("list", dir)(e)),
     };
     for entry in entries {
         let entry = entry?;
@@ -1325,11 +1345,11 @@ fn remove_loose_refs(dir: &Path, depth: usize) -> Result<(), GitError> {
                 match fs::remove_dir(&path) {
                     Ok(()) => {}
                     Err(e) if e.kind() == io::ErrorKind::DirectoryNotEmpty => {}
-                    Err(e) => return Err(e.into()),
+                    Err(e) => return Err(at("rmdir", &path)(e)),
                 }
             }
         } else {
-            fs::remove_file(&path)?;
+            fs::remove_file(&path).map_err(at("rm", &path))?;
         }
     }
     Ok(())
@@ -1342,7 +1362,8 @@ pub fn write_head(repo: &GitRepo, head: &str) -> Result<(), GitError> {
     } else {
         format!("{head}\n")
     };
-    fs::write(repo.git_dir.join("HEAD"), text)?;
+    let path = repo.git_dir.join("HEAD");
+    fs::write(&path, text).map_err(at("write", &path))?;
     Ok(())
 }
 
@@ -1464,7 +1485,7 @@ pub fn untracked_against(
 }
 
 fn scratch_index(scratch_dir: &Path) -> Result<PathBuf, GitError> {
-    fs::create_dir_all(scratch_dir)?;
+    fs::create_dir_all(scratch_dir).map_err(at("mkdir -p", scratch_dir))?;
     let tmp_index = scratch_dir.join("materialize-index");
     fs::remove_file(&tmp_index).ok();
     Ok(tmp_index)

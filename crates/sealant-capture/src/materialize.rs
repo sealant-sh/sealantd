@@ -148,9 +148,35 @@ pub enum MaterializeError {
     /// Git.
     #[error(transparent)]
     Git(#[from] GitError),
+    /// I/O on a path: what was done, and where.
+    #[error("{op} {}: {source}", path.display())]
+    IoAt {
+        /// What was done (`mkdir -p`, `write`, `rename`, …).
+        op: &'static str,
+        /// Where.
+        path: PathBuf,
+        /// What the filesystem said.
+        source: io::Error,
+    },
     /// I/O.
     #[error(transparent)]
     Io(#[from] io::Error),
+}
+
+/// An I/O error on `path`, named: a restore that cannot write says where (it said only
+/// `Permission denied` to a daemon that could not write the worktree).
+trait At<T> {
+    fn at(self, op: &'static str, path: &Path) -> Result<T, MaterializeError>;
+}
+
+impl<T> At<T> for io::Result<T> {
+    fn at(self, op: &'static str, path: &Path) -> Result<T, MaterializeError> {
+        self.map_err(|source| MaterializeError::IoAt {
+            op,
+            path: path.to_path_buf(),
+            source,
+        })
+    }
 }
 
 /// Counters.
@@ -429,8 +455,8 @@ impl<'a> Materializer<'a> {
         state: &mut DiskState,
     ) -> Result<MaterializeReport, MaterializeError> {
         let mut report = MaterializeReport::default();
-        fs::create_dir_all(&self.targets.root)?;
-        fs::create_dir_all(&self.targets.cache_dir)?;
+        fs::create_dir_all(&self.targets.root).at("mkdir -p", &self.targets.root)?;
+        fs::create_dir_all(&self.targets.cache_dir).at("mkdir -p", &self.targets.cache_dir)?;
         let roots = self.targets.roots();
         // Every content and dir pack the asked classes need, fetched up front and in parallel;
         // a format this build does not read is refused before anything is written.
@@ -742,7 +768,7 @@ impl<'a> Materializer<'a> {
                 }
                 let path = self.targets.root.join(&rel);
                 if longpath::symlink_metadata(&path).is_ok_and(|m| !m.is_dir()) {
-                    longpath::remove_file(&path)?;
+                    longpath::remove_file(&path).at("rm", &path)?;
                     tracing::debug!(path = %path.display(), "materialize: removed a file the worktree tree does not name");
                     report.removed += 1;
                 }
@@ -828,8 +854,9 @@ impl<'a> Materializer<'a> {
         let bytes = self.sink.get(key)?;
         verify_key(key, &bytes)?;
         let tmp = self.targets.cache_dir.join(format!("{sha}.tmp"));
-        fs::write(&tmp, &bytes)?;
-        fs::rename(&tmp, self.targets.cache_dir.join(sha))?;
+        fs::write(&tmp, &bytes).at("write", &tmp)?;
+        let cached = self.targets.cache_dir.join(sha);
+        fs::rename(&tmp, &cached).at("rename into", &cached)?;
         Ok(())
     }
 
@@ -941,9 +968,9 @@ impl<'a> Materializer<'a> {
     ) -> Result<(), MaterializeError> {
         let obj = self.read_dir(dirs, key, report)?;
         if longpath::symlink_metadata(dir).is_ok_and(|m| !m.is_dir()) {
-            remove_existing(dir)?;
+            remove_existing(dir).at("rm", dir)?;
         }
-        longpath::create_dir_all(dir)?;
+        longpath::create_dir_all(dir).at("mkdir -p", dir)?;
         if !vdir.is_empty() {
             write.planned.insert(vdir.to_owned());
         }
@@ -968,25 +995,26 @@ impl<'a> Materializer<'a> {
                         if let Ok(meta) = longpath::symlink_metadata(&path)
                             && meta.mode() & 0o7777 != entry.mode
                         {
-                            longpath::set_mode(&path, entry.mode)?;
+                            longpath::set_mode(&path, entry.mode).at("chmod", &path)?;
                         }
                         continue;
                     }
                     let tmp = dir.join(tmp_name(&entry.name));
                     {
-                        let mut f = longpath::create(&tmp)?;
+                        let mut f = longpath::create(&tmp).at("create", &tmp)?;
                         for id in entry.chunks.iter().flatten() {
                             let data = store.read(id)?;
-                            f.write_all(&data)?;
+                            f.write_all(&data).at("write", &tmp)?;
                             report.bytes += data.len() as u64;
                         }
-                        f.set_permissions(fs::Permissions::from_mode(entry.mode))?;
-                        set_mtime(&f, entry.mtime)?;
+                        f.set_permissions(fs::Permissions::from_mode(entry.mode))
+                            .at("chmod", &tmp)?;
+                        set_mtime(&f, entry.mtime).at("set the mtime of", &tmp)?;
                     }
-                    remove_existing(&path)?;
-                    longpath::rename(&tmp, &path)?;
+                    remove_existing(&path).at("rm", &path)?;
+                    longpath::rename(&tmp, &path).at("rename into", &path)?;
                     report.files += 1;
-                    let meta = longpath::symlink_metadata(&path)?;
+                    let meta = longpath::symlink_metadata(&path).at("stat", &path)?;
                     write.index.files.insert(
                         v,
                         IndexedFile {
@@ -1005,8 +1033,8 @@ impl<'a> Materializer<'a> {
                         }
                         continue;
                     }
-                    remove_existing(&path)?;
-                    longpath::symlink(&target, &path)?;
+                    remove_existing(&path).at("rm", &path)?;
+                    longpath::symlink(&target, &path).at("symlink", &path)?;
                     set_symlink_mtime(&path, entry.mtime)?;
                     report.symlinks += 1;
                 }
@@ -1043,15 +1071,15 @@ impl<'a> Materializer<'a> {
             {
                 continue;
             }
-            remove_existing(path)?;
+            remove_existing(path).at("rm", path)?;
             match longpath::hard_link(&canonical, path) {
                 Ok(()) => {}
                 // The class spans directories that can sit on different filesystems here (the
                 // harness home beside the worktree): a copy is the closest thing.
                 Err(e) if e.kind() == io::ErrorKind::CrossesDevices => {
                     tracing::warn!(canonical = %canonical.display(), member = %path.display(), "hardlink across filesystems; copied");
-                    longpath::copy(&canonical, path)?;
-                    longpath::set_mode(path, *mode)?;
+                    longpath::copy(&canonical, path).at("copy into", path)?;
+                    longpath::set_mode(path, *mode).at("chmod", path)?;
                 }
                 Err(e) => {
                     return Err(MaterializeError::Metadata {
@@ -1100,7 +1128,13 @@ impl<'a> Materializer<'a> {
                         report.removed += 1;
                     }
                     Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                    Err(e) => return Err(e.into()),
+                    Err(source) => {
+                        return Err(MaterializeError::IoAt {
+                            op: "rm",
+                            path: src.abs.clone(),
+                            source,
+                        });
+                    }
                 }
                 index.files.remove(v.as_str());
             }

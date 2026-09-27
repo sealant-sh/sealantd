@@ -497,6 +497,24 @@ pub struct BootConfig {
 }
 
 /// Whether a string is one of the truthy tokens `1` / `true`.
+/// Where session journals go when `SEALANT_SESSION_JOURNAL_DIR` is unset: `/var/lib/sealantd/
+/// session-journals` for root. A daemon running as any other user cannot create that (the third
+/// Docker end to end's non-root boot stopped there), so it takes its own state directory:
+/// `$XDG_STATE_HOME/sealantd/session-journals`, else `$HOME/.local/state/sealantd/
+/// session-journals`, else the root default (and boot names the directory it could not make).
+fn default_session_journal_dir(env: &dyn EnvSource, root: bool) -> PathBuf {
+    if !root {
+        let set = |key: &str| env.get(key).filter(|v| v.starts_with('/'));
+        if let Some(state) = set("XDG_STATE_HOME") {
+            return Path::new(&state).join("sealantd/session-journals");
+        }
+        if let Some(home) = set("HOME") {
+            return Path::new(&home).join(".local/state/sealantd/session-journals");
+        }
+    }
+    PathBuf::from(DEFAULT_SESSION_JOURNAL_DIR)
+}
+
 fn is_truthy(value: &str) -> bool {
     matches!(value.trim(), "1" | "true" | "TRUE" | "True")
 }
@@ -635,8 +653,10 @@ impl BootConfig {
             session_journal_dir: env
                 .get("SEALANT_SESSION_JOURNAL_DIR")
                 .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| DEFAULT_SESSION_JOURNAL_DIR.to_owned())
-                .into(),
+                .map_or_else(
+                    || default_session_journal_dir(env, nix::unistd::geteuid().is_root()),
+                    PathBuf::from,
+                ),
             execution_id: env.get("SEALANT_EXECUTION_ID").filter(|s| !s.is_empty()),
             workspace_id: env.get("SEALANT_WORKSPACE_ID").filter(|s| !s.is_empty()),
             shutdown_grace_ms: match env
@@ -1200,6 +1220,32 @@ mod tests {
             ("SEALANT_OS_FAMILY", "fedora"),
             ("SEALANT_HARNESS_LAUNCH_COMMAND", "sleep infinity"),
         ]
+    }
+
+    /// A daemon that is not root cannot create `/var/lib/sealantd/session-journals`: without
+    /// `SEALANT_SESSION_JOURNAL_DIR` it keeps its journals under its own state directory.
+    #[test]
+    fn a_daemon_that_is_not_root_keeps_its_journals_under_its_state_directory() {
+        let env = MapEnv::from_pairs(&[("HOME", "/home/dev")]);
+        assert_eq!(
+            default_session_journal_dir(&env, true),
+            PathBuf::from("/var/lib/sealantd/session-journals")
+        );
+        assert_eq!(
+            default_session_journal_dir(&env, false),
+            PathBuf::from("/home/dev/.local/state/sealantd/session-journals")
+        );
+        let env = MapEnv::from_pairs(&[("HOME", "/home/dev"), ("XDG_STATE_HOME", "/state")]);
+        assert_eq!(
+            default_session_journal_dir(&env, false),
+            PathBuf::from("/state/sealantd/session-journals")
+        );
+        let env = MapEnv::from_pairs(&[("HOME", "relative")]);
+        assert_eq!(
+            default_session_journal_dir(&env, false),
+            PathBuf::from("/var/lib/sealantd/session-journals"),
+            "only an absolute directory is taken"
+        );
     }
 
     #[test]

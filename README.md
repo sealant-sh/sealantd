@@ -39,6 +39,20 @@ Phases 0–8 complete (plan §22): protocol, process/PTY runtime, telemetry + du
 filesystem and network telemetry, security hardening, and packaging. Tracked phase-by-phase in
 `docs/runtime/requirements-matrix.md`.
 
+## Runs as root
+
+`sealantd boot` runs as root (uid 0), as PID 1 of the workspace's PID namespace in Docker and
+Kubernetes: it creates `/root` and runs the harness with `HOME=/root` (dotfiles are applied
+there), its final capture's sweep terminates every process in the namespace whoever owns it, and
+it writes `fs.inotify.max_user_watches` when `SEALANT_CAPTURE_INOTIFY_RAISE` asks. Another user is
+not supported. What such a daemon would need, and how far it gets today: the workspace root and
+working directory writable by it (the volume the orchestrator mounts; a restore that cannot write
+names the path it could not), the control socket's directory (`SEALANT_CONTROL_SOCKET`, default
+`/run/sealant/control.sock`) and `/run/sealant` writable, and a session journal directory —
+`SEALANT_SESSION_JOURNAL_DIR`, else `$XDG_STATE_HOME/sealantd/session-journals`, else
+`$HOME/.local/state/sealantd/session-journals` (root's default, `/var/lib/sealantd/…`, is not
+one it can create). The harness's `HOME` stays `/root`.
+
 ## Build & validate
 
 ```
