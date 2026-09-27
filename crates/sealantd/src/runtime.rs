@@ -318,6 +318,8 @@ impl Runtime {
     ) -> Option<sealant_protocol::CaptureStatusReport> {
         let capture = self.capture()?;
         let _one = self.final_lock.lock().await;
+        // `capture.status` reads `in-progress` from here until the report (not `not-final`).
+        capture.begin_final();
         let start = Instant::now();
         let deadline = deadline_ms.map(Duration::from_millis);
         let grace = Duration::from_millis(grace_ms.unwrap_or_else(|| self.shutdown.grace_ms()));

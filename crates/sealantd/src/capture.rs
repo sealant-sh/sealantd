@@ -52,6 +52,9 @@ fn now_unix_ms() -> u64 {
 enum FinalOutcome {
     /// No final flush has run.
     NotRun,
+    /// A final flush is running (stopping the writers, snapping, shipping), and the disk is
+    /// not known to be as a completed one left it.
+    Running,
     /// Every writer stopped and both classes snapped after that: complete once nothing is
     /// pending (the ship worker keeps going after a flush that returned at its deadline).
     /// `shipping` is why that flush returned with captures pending (`deadline`,
@@ -306,6 +309,19 @@ impl CaptureRuntime {
         self.status()
     }
 
+    /// A final flush begins ([`Runtime::final_flush`], before it stops the writers):
+    /// `capture.status` reads `in-progress` until it ends — unless the last one completed and
+    /// the disk is as it left it ([`CadenceRunner::final_is_current`]), when this one snaps
+    /// nothing and the status stays `complete` throughout.
+    pub fn begin_final(&self) {
+        let mut outcome = self.final_outcome.lock().unwrap_or_else(|e| e.into_inner());
+        let current =
+            matches!(*outcome, FinalOutcome::Snapped { .. }) && self.runner.final_is_current();
+        if !current {
+            *outcome = FinalOutcome::Running;
+        }
+    }
+
     /// Record a final flush that could not finish for a reason outside the engine (its task
     /// failed).
     pub fn record_final_incomplete(&self, reason: &'static str) {
@@ -486,6 +502,7 @@ impl CaptureRuntime {
         let outcome = *self.final_outcome.lock().unwrap_or_else(|e| e.into_inner());
         let incomplete_reason = match outcome {
             FinalOutcome::NotRun => Some("not-final"),
+            FinalOutcome::Running => Some("in-progress"),
             FinalOutcome::Incomplete(reason) => Some(reason),
             FinalOutcome::Snapped { .. } if ship.fenced => Some("fenced"),
             FinalOutcome::Snapped { .. } if snap_failing => Some("snapshot-failed"),
@@ -2082,6 +2099,185 @@ mod tests {
         fn exists(&self, key: &str) -> Result<bool, sealant_capture::sink::SinkError> {
             self.inner.exists(key)
         }
+    }
+
+    /// Every `complete` / `incomplete_reason` reading of `capture.status`, every millisecond, from
+    /// another thread until the returned flag is set (and one after); the readings come back
+    /// from the handle.
+    type Readings = Vec<(bool, Option<String>)>;
+
+    fn watch_status(
+        capture: &Arc<CaptureRuntime>,
+    ) -> (Arc<AtomicBool>, std::thread::JoinHandle<Readings>) {
+        let stop = Arc::new(AtomicBool::new(false));
+        let (flag, capture) = (stop.clone(), capture.clone());
+        let handle = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            loop {
+                // One reading after the flag, too: the state the caller stopped in.
+                let done = flag.load(Ordering::SeqCst);
+                let status = capture.status();
+                seen.push((status.complete, status.incomplete_reason));
+                if done {
+                    return seen;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        });
+        (stop, handle)
+    }
+
+    /// Docker end to end, round 3: every stop ran four final flushes (Mend's, Core's drain, the
+    /// SIGTERM handler, the boot's own on the harness's exit), and each after the first walked
+    /// the bulk class again — 2.5–3 s each, `complete: false` / `bulk_building: true` meanwhile.
+    /// Once a final flush snapped everything with the writers stopped and admission closed, a
+    /// final flush asked again, while the watcher has seen no change, snaps nothing: it answers
+    /// in milliseconds and `capture.status` reads `complete` throughout. A change the watcher
+    /// sees makes the next one snap again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_final_flush_after_a_complete_one_snaps_nothing_and_stays_complete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (boot, registrar) = boot(tmp.path());
+        let ws = boot.layout.working_directory.clone();
+        std::fs::write(ws.join(".gitignore"), "node_modules/\n").unwrap();
+        for p in 0..100 {
+            let dir = ws.join(format!("node_modules/pkg{p}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            for f in 0..40 {
+                std::fs::write(dir.join(format!("m{f}.js")), format!("// {p} {f}\n")).unwrap();
+            }
+        }
+        let mut config = RuntimeConfig::new(new_runtime_id());
+        config.workspace_root = ws.clone();
+        let runtime = Runtime::new(config, Arc::new(ShutdownSignal::new(3_000)));
+        runtime.mark_healthy();
+        let capture = CaptureRuntime::new(boot);
+        assert!(runtime.install_capture(capture.clone()));
+        let harness = runtime
+            .spawn_managed(sh("exec sleep 3600", &ws))
+            .expect("spawn");
+        capture.start(runtime.clone(), harness.process_id);
+        let modes = capture.runner().snapshot();
+        assert_eq!(
+            (modes.small_mode, modes.bulk_mode),
+            (
+                sealant_capture::WatchMode::Watched,
+                sealant_capture::WatchMode::Watched
+            ),
+            "both classes are watched"
+        );
+
+        let first = runtime.final_flush(None, Some(3_000)).await.unwrap();
+        assert!(first.complete, "{first:?}");
+        let registered = registrar.chain().len();
+
+        for _ in 0..3 {
+            let (stop, watcher) = watch_status(&capture);
+            let start = Instant::now();
+            let again = runtime.final_flush(None, Some(3_000)).await.unwrap();
+            let took = start.elapsed();
+            stop.store(true, Ordering::SeqCst);
+            let seen = watcher.join().unwrap();
+            assert!(again.complete, "{again:?}");
+            let not_complete: Vec<_> = seen.iter().filter(|(complete, _)| !complete).collect();
+            assert!(
+                not_complete.is_empty(),
+                "complete throughout: {} of {} readings were not: {:?}",
+                not_complete.len(),
+                seen.len(),
+                not_complete.first()
+            );
+            assert!(took < Duration::from_millis(100), "took {took:?}");
+        }
+        assert_eq!(
+            registrar.chain().len(),
+            registered,
+            "nothing new was captured"
+        );
+        assert_eq!(runtime.quiesce_count(), 1);
+
+        // Something changes after all (nothing sealantd admitted): the watcher sees it, and
+        // the next final flush captures it.
+        std::fs::write(ws.join("node_modules/pkg0/late.js"), "late\n").unwrap();
+        let start = Instant::now();
+        while !capture.runner().snapshot().bulk_dirty {
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "the watcher sees it"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let report = runtime.final_flush(None, Some(3_000)).await.unwrap();
+        assert!(report.complete, "{report:?}");
+        assert_eq!(registrar.chain().len(), registered + 1);
+        let fresh = restore_head(tmp.path(), &registrar, "fresh");
+        assert_eq!(
+            std::fs::read_to_string(fresh.join("node_modules/pkg0/late.js")).unwrap(),
+            "late\n"
+        );
+    }
+
+    /// Docker end to end, round 3: `incomplete_reason` read `not-final` for the whole 38 s of a
+    /// running final flush, as if none had been asked for. It reads `in-progress` from the moment
+    /// the flush starts (before it stops the writers) until it answers.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_running_final_flush_reads_in_progress() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (boot, _registrar) = boot_with(tmp.path(), |inner| {
+            Arc::new(Slow {
+                inner,
+                delay: Duration::from_millis(100),
+            })
+        });
+        let ws = tmp.path().join("ws");
+        let mut config = RuntimeConfig::new(new_runtime_id());
+        config.workspace_root = ws.clone();
+        let runtime = Runtime::new(config, Arc::new(ShutdownSignal::new(3_000)));
+        runtime.mark_healthy();
+        let capture = CaptureRuntime::new(boot);
+        assert!(runtime.install_capture(capture.clone()));
+        let harness = runtime
+            .spawn_managed(sh("exec sleep 600", &ws))
+            .expect("spawn");
+        capture.start(runtime.clone(), harness.process_id);
+        assert_eq!(
+            capture.status().incomplete_reason.as_deref(),
+            Some("not-final")
+        );
+
+        let (stop, watcher) = watch_status(&capture);
+        let report = runtime.final_flush(None, Some(2_000)).await.unwrap();
+        stop.store(true, Ordering::SeqCst);
+        let seen = watcher.join().unwrap();
+        assert!(report.complete, "{report:?}");
+        // Readings taken before the flush began say `not-final`; from its first moment to its
+        // answer, `in-progress`; then nothing (complete).
+        let reasons: Vec<Option<String>> = seen.into_iter().map(|(_, reason)| reason).collect();
+        let mut distinct: Vec<Option<&str>> = reasons.iter().map(Option::as_deref).collect();
+        distinct.dedup();
+        assert_eq!(
+            distinct.last(),
+            Some(&None),
+            "complete once it answered: {distinct:?}"
+        );
+        let running: Vec<Option<&str>> = distinct
+            .iter()
+            .copied()
+            .skip_while(|r| *r == Some("not-final"))
+            .collect();
+        assert_eq!(
+            running,
+            [Some("in-progress"), None],
+            "`in-progress` while the flush runs, never `not-final` after it began: {distinct:?}"
+        );
+        assert!(
+            reasons
+                .iter()
+                .filter(|r| r.as_deref() == Some("in-progress"))
+                .count()
+                > 20,
+            "read many times while it ran"
+        );
     }
 
     /// Core's drain sends a final flush with a deadline and polls. A final flush that returns at

@@ -312,6 +312,11 @@ struct Shared {
     counters: Counters,
     /// Each class's snaps, failed and not: small, bulk.
     health: Mutex<[SnapHealth; 2]>,
+    /// Change signals the watcher delivered (either class), for [`CadenceRunner::final_is_current`].
+    changes: AtomicU64,
+    /// The last final flush snapped every class without an error: the change count before its
+    /// first snap. `None` until one does, and after a final flush whose snaps failed.
+    sealed: Mutex<Option<u64>>,
 }
 
 impl Shared {
@@ -338,6 +343,9 @@ impl Shared {
 
     fn signal(&self, signal: ChangeSignal) {
         let now = Instant::now();
+        // Every signal counts (a change, an overflow, an unwatched directory): a final flush
+        // after it snaps again.
+        self.changes.fetch_add(1, Ordering::SeqCst);
         let mut st = self.state();
         match signal {
             ChangeSignal::Changed(Class::Small) => st.small.dirty(now),
@@ -697,6 +705,8 @@ impl CadenceRunner {
                 seq: AtomicU64::new(0),
                 counters: Counters::default(),
                 health: Mutex::new([SnapHealth::default(), SnapHealth::default()]),
+                changes: AtomicU64::new(0),
+                sealed: Mutex::new(None),
             }),
             threads: Mutex::new(Vec::new()),
         };
@@ -842,6 +852,48 @@ impl CadenceRunner {
             .flush_small(until.map(|u| u.saturating_duration_since(Instant::now())))?)
     }
 
+    /// Whether a final flush now would find the disk as the last one captured it, so it need
+    /// snap nothing: the last final flush snapped every class without an error, snaps are no
+    /// longer allowed (the daemon's hook says so once a final flush stopped every writer and
+    /// admission is closed), and the watcher — watching both classes, never overflowed — has
+    /// delivered no change since before that flush's first snap. Not a guess from "the writers
+    /// are stopped": a class that polls, a change the watcher saw, or a runner without the
+    /// hook answers `false`, and the flush snaps again.
+    #[must_use]
+    pub fn final_is_current(&self) -> bool {
+        let Some(sealed) = *self
+            .shared
+            .sealed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+        else {
+            return false;
+        };
+        if self.shared.allowed() {
+            return false;
+        }
+        {
+            let st = self.shared.state();
+            if st.overflowed
+                || st.repair
+                || st.small_mode != Mode::Watched
+                || (self.shared.capture_bulk && st.bulk_mode != Mode::Watched)
+            {
+                return false;
+            }
+        }
+        if self.shared.changes.load(Ordering::SeqCst) != sealed
+            || self.shared.staging.repair_request().is_some()
+        {
+            return false;
+        }
+        // A bulk build paused mid-way holds progress no capture lists yet.
+        self.shared
+            .engine
+            .try_lock()
+            .is_ok_and(|e| !e.bulk_in_progress())
+    }
+
     /// The final flush — the executor is going away, and its disk with it; the caller has
     /// stopped every writer first. A forced small-class snap AND a forced bulk-class snap (the
     /// dependency tree as it is now, whatever the bulk clocks say; a scheduled bulk build in
@@ -852,19 +904,70 @@ impl CadenceRunner {
     /// fence, a conflict or the deadline. Whatever fails, what could be staged still ships
     /// before this returns (bounded by `deadline`, none: until the process ends), and the rest
     /// stays staged. Blocking.
+    ///
+    /// The chain ends as the disk is: a small snap whose overlay names the bulk class's names
+    /// of tracked files is taken again after a bulk snap that staged a capture
+    /// ([`CaptureEngine::small_depends_on_bulk`]), and a newest capture of another kind is
+    /// sealed with a final one ([`CaptureEngine::seal_final`]) — so once this reports complete,
+    /// a final flush asked again stages nothing. When [`Self::final_is_current`], it snaps
+    /// nothing at all and only ships what is left.
     pub fn flush_final(&self, deadline: Option<Duration>) -> FinalFlush {
         let until = deadline.map(|d| Instant::now() + d);
         let left = || until.map(|u| u.saturating_duration_since(Instant::now()));
         let mut incomplete = None;
-        if let Err(error) = self.snap(CaptureKind::Final) {
-            tracing::error!(%error, "final small-class snap failed");
-            incomplete = Some(Incomplete::from_snap(Class::Small, &error));
-        }
-        if self.shared.capture_bulk
-            && let Err(error) = self.shared.bulk_snap(true)
-        {
-            tracing::error!(%error, "final bulk-class snap failed");
-            incomplete.get_or_insert(Incomplete::from_snap(Class::Bulk, &error));
+        if self.final_is_current() {
+            tracing::info!(
+                "final flush: the disk is as the last final flush captured it (the writers are \
+                 stopped and the watcher saw no change since); nothing to snap"
+            );
+        } else {
+            *self
+                .shared
+                .sealed
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = None;
+            let changes = self.shared.changes.load(Ordering::SeqCst);
+            if let Err(error) = self.snap(CaptureKind::Final) {
+                tracing::error!(%error, "final small-class snap failed");
+                incomplete = Some(Incomplete::from_snap(Class::Small, &error));
+            }
+            let mut bulk_staged = false;
+            if self.shared.capture_bulk {
+                match self.shared.bulk_snap(true) {
+                    Ok(staged) => bulk_staged = !staged.unchanged,
+                    Err(error) => {
+                        tracing::error!(%error, "final bulk-class snap failed");
+                        incomplete.get_or_insert(Incomplete::from_snap(Class::Bulk, &error));
+                    }
+                }
+            }
+            if incomplete.is_none()
+                && bulk_staged
+                && self.shared.engine().small_depends_on_bulk()
+                && let Err(error) = self.shared.small_snap(CaptureKind::Final)
+            {
+                tracing::error!(%error, "final small-class snap after the bulk capture failed");
+                incomplete = Some(Incomplete::from_snap(Class::Small, &error));
+            }
+            if incomplete.is_none() {
+                let seq = self.shared.seq.fetch_add(1, Ordering::Relaxed);
+                let sealed = self.shared.engine().seal_final(seq);
+                match sealed {
+                    Ok(Some(_)) => self.shared.wake_worker(),
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::error!(%error, "staging the final capture failed");
+                        incomplete = Some(Incomplete::from_snap(Class::Small, &error));
+                    }
+                }
+            }
+            if incomplete.is_none() {
+                *self
+                    .shared
+                    .sealed
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) = Some(changes);
+            }
         }
         let mut shipped = 0;
         let mut repairs = 0u32;

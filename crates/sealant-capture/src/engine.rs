@@ -610,6 +610,10 @@ pub struct CaptureEngine {
     /// content). Empty after a restart, when such a path's metadata is left out and the path is
     /// reported unreadable all the same.
     last_meta: Option<worktree_meta::MetaDocument>,
+    /// The last small snap found tracked files with names outside the worktree (hardlinks
+    /// another class carries): its overlay names the bulk class's names as the bulk index had
+    /// them, so a bulk capture staged after it can change what the next small snap records.
+    shared_outside: bool,
     /// A refused capture being rebuilt in its place ([`CaptureEngine::repair`]): the next
     /// snap takes its `n` and parent and folds the captures staged after it into itself.
     repair_target: Option<RepairTarget>,
@@ -734,6 +738,7 @@ impl CaptureEngine {
             dirs,
             last_tips,
             last_meta: None,
+            shared_outside: false,
             repair_target: None,
             repair_git: None,
             below: None,
@@ -1883,6 +1888,7 @@ impl CaptureEngine {
                             })
                             .collect();
                         git_unreadable = merge_unreadable(git_unreadable, meta_unreadable);
+                        self.shared_outside = !captured.outside.is_empty();
                         let mut doc = captured.doc;
                         // A tracked file under a bulk directory is the overlay's own name.
                         let own: HashSet<&str> =
@@ -2281,6 +2287,102 @@ impl CaptureEngine {
             stats,
             unchanged: false,
         })))
+    }
+
+    /// Whether the last small snap's worktree metadata overlay depends on the bulk index: it
+    /// found tracked files with names another class carries, and records the bulk class's
+    /// names of them as the last bulk snap indexed them. A final flush whose bulk snap staged a
+    /// capture snaps the small class again then, so the chain's last capture records them as
+    /// they are (Docker end to end, round 3: the flush after the one that reported `complete`
+    /// registered a final capture whose only difference was these links).
+    #[must_use]
+    pub fn small_depends_on_bulk(&self) -> bool {
+        self.shared_outside
+    }
+
+    /// End the chain in a final capture: when the newest capture is of another kind, stage a
+    /// final one with its sections — nothing is read, and the capture holds nothing new. A final
+    /// flush calls this after both final snaps, which found the disk as that capture holds it
+    /// (a scheduled bulk capture the final small snap was staged ahead of is the newest one, and
+    /// the final bulk snap found it unchanged). Without it the flush reported `complete` with a
+    /// head of kind `auto`, and the next final flush staged the final capture instead (Docker
+    /// end to end, round 3: two captures registered after `complete: true`). `None` when the
+    /// newest capture is final already, or there is none.
+    ///
+    /// # Errors
+    /// Staging I/O.
+    pub fn seal_final(&mut self, seq: u64) -> Result<Option<StagedCapture>, EngineError> {
+        let Some(prev) = self.previous.clone() else {
+            return Ok(None);
+        };
+        if prev.manifest.kind == CaptureKind::Final {
+            return Ok(None);
+        }
+        let staging = Arc::clone(&self.staging);
+        let guard = staging.coalesce_guard();
+        let n = prev.manifest.n + 1;
+        let manifest = Manifest {
+            worktree_id: self.config.worktree_id.clone(),
+            n,
+            parent: Some(prev.capture_id.clone()),
+            epoch: self.config.epoch,
+            seq,
+            kind: CaptureKind::Final,
+            created_at: rfc3339_now(),
+            sections: prev.manifest.sections.clone(),
+            checkpoint: None,
+        }
+        .encode();
+        let manifest_key = self.prefix.manifest(&manifest.capture_id);
+        let manifest_file = format!("manifest-{}", manifest.capture_id);
+        fs::write(
+            self.staging.objects_dir().join(&manifest_file),
+            &manifest.bytes,
+        )?;
+        let uploads = vec![Upload {
+            key: manifest_key.clone(),
+            file: manifest_file,
+            bytes: manifest.bytes.len() as u64,
+        }];
+        let stats = SnapStats {
+            staged_bytes: manifest.bytes.len() as u64,
+            ..SnapStats::default()
+        };
+        let entry = QueueEntry {
+            n,
+            capture_id: manifest.capture_id.clone(),
+            kind: CaptureKind::Final,
+            class: Some(Class::Small),
+            uploads,
+            register: RegisterRequest {
+                worktree_id: self.config.worktree_id.clone(),
+                epoch: self.config.epoch,
+                n,
+                parent: manifest.manifest.parent.clone(),
+                capture_id: manifest.capture_id.clone(),
+                manifest_key: manifest_key.clone(),
+                manifest: manifest.manifest.clone(),
+            },
+        };
+        self.staging.enqueue(&entry)?;
+        drop(guard);
+        self.previous = Some(manifest.clone());
+        self.persist()?;
+        tracing::info!(
+            n,
+            sealed = prev.manifest.n,
+            sealed_kind = ?prev.manifest.kind,
+            "final capture staged over the newest capture, which the final snaps found current"
+        );
+        Ok(Some(StagedCapture {
+            n,
+            manifest,
+            manifest_key,
+            kind: CaptureKind::Final,
+            class: Class::Small,
+            stats,
+            unchanged: false,
+        }))
     }
 
     /// Final small-class snap, then ship everything pending, bounded by `deadline`.
