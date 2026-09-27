@@ -257,7 +257,6 @@ async fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use clap::Parser as _;
 
     use super::*;
 
