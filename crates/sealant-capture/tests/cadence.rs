@@ -121,10 +121,20 @@ fn fast_bulk(mut cadence: Cadence, quiet_ms: u64, max_ms: u64) -> Cadence {
 }
 
 /// (a) A change registers within the quiet period (2 s) plus the snap and a local ship.
+///
+/// The quiet timer is held to the configured period (it does no I/O). What follows it — the
+/// snap, the worker's wake-up, the ship and the registration — is held to the same work forced
+/// (an identical workspace's first capture, snapped and shipped right after on the same
+/// machine), not to a wall-clock constant: on a runner with a slow disk every fsync and git
+/// spawn is slower, for both alike. A missed wake-up (the capture waiting for the ship worker's
+/// 5 s tick, ≈ 1.5 s after the timer here) still fails it wherever a snap and ship take well
+/// under a second.
 #[test]
 fn a_change_registers_within_the_quiet_period() {
     let fx = Fixture::build();
-    let runner = fx.runner(fx.config(Cadence::default()));
+    let cadence = Cadence::default();
+    let quiet = cadence.quiet;
+    let runner = fx.runner(fx.config(cadence));
     assert_eq!(runner.snapshot().small_mode, WatchMode::Watched);
     // Nothing changes: nothing is captured.
     std::thread::sleep(Duration::from_millis(1500));
@@ -132,23 +142,54 @@ fn a_change_registers_within_the_quiet_period() {
 
     let t0 = Instant::now();
     fs::write(fx.root.join("src/new.rs"), "fn n() {}\n").unwrap();
-    let took = fx
-        .wait_for_chain(1, Duration::from_secs(6))
-        .expect("a capture registers");
-    eprintln!("(a) change → registered in {took:?}");
-    assert!(
-        took >= Duration::from_millis(1800),
-        "not before the quiet period: {took:?}"
-    );
-    assert!(
-        took <= Duration::from_millis(3000),
-        "quiet + snap + ship: {took:?}"
-    );
+    let mut fired = None;
+    let registered = loop {
+        assert!(
+            t0.elapsed() < quiet + Duration::from_secs(30),
+            "no capture registered (quiet timer fired after {fired:?})"
+        );
+        if fired.is_none() && runner.snapshot().quiet_fired > 0 {
+            fired = Some(t0.elapsed());
+        }
+        if !fx.chain().is_empty() {
+            break t0.elapsed();
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    let fired = fired.unwrap_or(registered);
+    let after_quiet = registered.saturating_sub(fired);
     let snap = runner.snapshot();
     assert_eq!(snap.quiet_fired, 1);
     assert_eq!(snap.max_fired, 0);
     assert!(!snap.small_dirty, "a snap clears dirty");
-    let _ = t0;
+
+    // The same work forced, with no timer and no wake-up: the first capture of an identical
+    // workspace, snapped and shipped on this machine right after.
+    let twin = Fixture::build();
+    let twin_runner = twin.runner(twin.config(Cadence::default()));
+    fs::write(twin.root.join("src/new.rs"), "fn n() {}\n").unwrap();
+    let t1 = Instant::now();
+    assert!(!twin_runner.snap(CaptureKind::Turn).unwrap().unchanged);
+    twin_runner.ship(Duration::from_secs(30)).unwrap();
+    let forced = t1.elapsed();
+    assert_eq!(twin.chain().len(), 1, "the forced capture registered");
+    twin_runner.stop();
+    eprintln!(
+        "(a) change → quiet timer {fired:?} → registered {after_quiet:?} later; \
+         forced snap + ship {forced:?}"
+    );
+
+    // The event arrives after the write, and the timer runs from the event.
+    assert!(fired >= quiet, "not before the quiet period: {fired:?}");
+    assert!(
+        fired <= quiet + Duration::from_secs(1),
+        "the quiet timer fires at the quiet period: {fired:?}"
+    );
+    assert!(
+        after_quiet <= forced * 3 + Duration::from_millis(500),
+        "snap + ship after the quiet timer took {after_quiet:?}; forced, the same work took \
+         {forced:?}"
+    );
     runner.stop();
 }
 
