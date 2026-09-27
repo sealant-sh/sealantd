@@ -26,6 +26,7 @@ pub mod sink;
 pub mod transport;
 pub mod tree;
 pub mod watch;
+pub mod worktree_meta;
 
 pub use cadence::{CadenceRunner, CadenceSnapshot, FinalFlush, Incomplete};
 pub use engine::{

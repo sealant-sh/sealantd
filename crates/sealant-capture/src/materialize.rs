@@ -28,6 +28,17 @@
 //! the index pseudo-ref and owns whenever the workspace class carries none. A standby executor
 //! materializes the project base at boot and applies the head over it at claim
 //! (`capture.replan`).
+//!
+//! # Worktree metadata and refs
+//!
+//! A git checkout restores bytes and the executable bit only. When the workspace section
+//! carries `worktree_meta`, the overlay ([`crate::worktree_meta`]) is verified before anything
+//! is written and applied after every class: exact modes, nanosecond mtimes, untracked (empty)
+//! directories and hardlink groups of the working tree. The bulk class never writes or sweeps a
+//! path the worktree tree names (a tracked file under `build/` is the git class's). The ref set
+//! is made exactly the manifest's: every loose ref goes, `packed-refs` holds the rest. Metadata
+//! that cannot be restored — the overlay's, a chunked class's directory mode or mtime, a
+//! symlink's mtime, a hardlink — fails the materialize.
 
 use std::collections::{BTreeSet, HashMap};
 use std::fs::{self, File};
@@ -44,12 +55,13 @@ use crate::index::{self, DAEMON_DIR, FileStat, IndexedFile, Listing, TreeIndex};
 use crate::keys::key_digest;
 use crate::manifest::{
     EncodedManifest, FORMAT_DIR_OBJECTS, FORMAT_DIR_PACKS, FsckStatus, INDEX_TREE_REF,
-    MAX_SECTION_FORMAT, Manifest, TreeRef, WORKTREE_TREE_REF,
+    MAX_SECTION_FORMAT, Manifest, TreeRef, WORKTREE_META_FORMAT, WORKTREE_TREE_REF, WorktreeMeta,
 };
 use crate::pack::{PackError, PackReader};
 use crate::roots::ClassRoots;
 use crate::sink::{BlobSink, SinkError};
 use crate::tree::{DirEntry, DirObject, EntryKind};
+use crate::worktree_meta::{self, MetaDocument, MetaError, MetaScope};
 
 /// Which classes to materialize.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,6 +102,23 @@ pub enum MaterializeError {
         section: &'static str,
         /// The section's format.
         format: u32,
+    },
+    /// A worktree metadata overlay in a format this build does not read.
+    #[error(
+        "the worktree metadata overlay is format {0}; this build reads formats up to {WORKTREE_META_FORMAT}"
+    )]
+    UnsupportedMetaFormat(u32),
+    /// The worktree metadata overlay could not be read or applied: the restore is incomplete.
+    #[error(transparent)]
+    WorktreeMeta(#[from] MetaError),
+    /// A chunked class entry's metadata (a directory's mode or mtime, a symlink's mtime, a
+    /// hardlink) could not be restored: the restore is incomplete.
+    #[error("{path}: {reason}")]
+    Metadata {
+        /// The path on disk.
+        path: String,
+        /// What failed.
+        reason: String,
     },
     /// A dir object could not be parsed.
     #[error("dir object {key}: {reason}")]
@@ -149,6 +178,10 @@ pub struct MaterializeReport {
     pub git_paths_changed: Option<u64>,
     /// fsck outcome after the git class, when run (a delta that installed no pack skips it).
     pub fsck: Option<FsckStatus>,
+    /// Worktree paths the metadata overlay changed: directories created or removed, hardlinks
+    /// made, modes and mtimes set (0 when the plan carries no overlay, or the disk already
+    /// matched it).
+    pub worktree_meta: u64,
 }
 
 /// Where the workspace class's virtual roots land.
@@ -328,6 +361,8 @@ impl ChunkStore {
 /// to restore once nothing writes into them any more.
 struct ClassWrite<'i> {
     index: &'i mut TreeIndex,
+    /// Paths the git class owns (the worktree tree's): never written or swept by this class.
+    tracked: &'i BTreeSet<String>,
     planned: BTreeSet<String>,
     /// (canonical virtual path, member path on disk, mode).
     links: Vec<(String, PathBuf, u32)>,
@@ -410,7 +445,27 @@ impl<'a> Materializer<'a> {
             packs.extend(&bulk.packs);
             packs.extend(&bulk.dir_packs);
         }
+        // The worktree metadata overlay goes with the git class (it describes the tree the git
+        // class checks out).
+        let meta = manifest
+            .sections
+            .workspace
+            .worktree_meta
+            .as_ref()
+            .filter(|_| matches!(class, MaterializeClass::Git | MaterializeClass::All));
+        if let Some(meta) = meta {
+            if meta.format == 0 || meta.format > WORKTREE_META_FORMAT {
+                return Err(MaterializeError::UnsupportedMetaFormat(meta.format));
+            }
+            packs.extend(&meta.packs);
+        }
         self.fetch_packs(&packs, &mut report)?;
+        // Read before anything is written: a document that does not verify or decode fails
+        // the materialize with the disk untouched.
+        let meta = match meta {
+            Some(meta) => Some(self.read_worktree_meta(meta, &mut report)?),
+            None => None,
+        };
         if matches!(class, MaterializeClass::Git | MaterializeClass::All) {
             self.materialize_git(manifest, state, &mut report)?;
         }
@@ -425,8 +480,10 @@ impl<'a> Materializer<'a> {
             let git_dir = repo
                 .as_ref()
                 .map_or_else(|| self.targets.root.join(".git"), |r| r.git_dir.clone());
+            let none = BTreeSet::new();
             let mut write = ClassWrite {
                 index: &mut state.workspace,
+                tracked: &none,
                 planned: BTreeSet::new(),
                 links: Vec::new(),
                 dirs: Vec::new(),
@@ -474,7 +531,7 @@ impl<'a> Materializer<'a> {
                 )?;
             }
             refresh_linked(write.index, &write.links, &resolve);
-            Self::restore_dirs(&write.dirs);
+            Self::restore_dirs(&write.dirs)?;
         }
         if matches!(class, MaterializeClass::Bulk | MaterializeClass::All)
             && let Some(bulk) = manifest.sections.bulk.section()
@@ -482,8 +539,13 @@ impl<'a> Materializer<'a> {
             let store = self.open_packs(&bulk.packs, &mut report)?;
             let dirs = self.open_dirs("bulk", bulk.tree(), &mut report)?;
             let root = self.targets.root.clone();
+            // A tracked file under a bulk-named directory (`build/`, `dist/`) is the git class's:
+            // a bulk section older than the worktree tree must neither write its older bytes
+            // over it nor sweep one it never saw.
+            let tracked = self.tracked_paths(manifest)?;
             let mut write = ClassWrite {
                 index: &mut state.bulk,
+                tracked: &tracked,
                 planned: BTreeSet::new(),
                 links: Vec::new(),
                 dirs: Vec::new(),
@@ -507,6 +569,7 @@ impl<'a> Materializer<'a> {
                 .filter(|v| !index::has_component_in(Path::new(v), &roots.bulk_dirs))
                 .cloned()
                 .chain(write.planned.iter().cloned())
+                .chain(tracked.iter().cloned())
                 .collect();
             Self::sweep(
                 &listing,
@@ -517,14 +580,79 @@ impl<'a> Materializer<'a> {
                 &mut report,
             )?;
             refresh_linked(write.index, &write.links, &resolve);
-            Self::restore_dirs(&write.dirs);
+            Self::restore_dirs(&write.dirs)?;
         }
         // After every class (the workspace class restores `.git/info/exclude` as captured):
         // the daemon directory stays out of the restored tree's index before anything runs in it.
         if matches!(class, MaterializeClass::Git | MaterializeClass::All) {
-            GitRepo::open(&self.targets.root)?.exclude_locally(&format!("/{DAEMON_DIR}/"))?;
+            let repo = GitRepo::open(&self.targets.root)?;
+            repo.exclude_locally(&format!("/{DAEMON_DIR}/"))?;
+            // Last of all: restoring the other classes moved the mtimes of the directories they
+            // wrote into.
+            if let Some(doc) = &meta {
+                let scope = self.meta_scope(&repo)?;
+                report.worktree_meta = worktree_meta::apply(&repo, doc, &scope)?;
+            }
         }
         Ok(report)
+    }
+
+    /// Every path of the plan's worktree tree (files, symlinks, directories), relative to the
+    /// root; empty when the root is not a repository or does not hold the tree.
+    fn tracked_paths(&self, manifest: &Manifest) -> Result<BTreeSet<String>, MaterializeError> {
+        let Some(tree) = manifest.sections.git.refs.get(WORKTREE_TREE_REF) else {
+            return Ok(BTreeSet::new());
+        };
+        let Ok(repo) = GitRepo::open(&self.targets.root) else {
+            return Ok(BTreeSet::new());
+        };
+        if repo.existing(std::slice::from_ref(tree))?.is_empty() {
+            return Ok(BTreeSet::new());
+        }
+        Ok(gitpack::tree_names(&repo, tree)?)
+    }
+
+    /// Fetch (from the pack cache) and verify the worktree metadata overlay.
+    fn read_worktree_meta(
+        &self,
+        meta: &WorktreeMeta,
+        report: &mut MaterializeReport,
+    ) -> Result<MetaDocument, MaterializeError> {
+        let store = self.open_packs(&meta.packs, report)?;
+        let mut bytes = Vec::with_capacity(usize::try_from(meta.size).unwrap_or(0));
+        for id in &meta.chunks {
+            bytes.extend_from_slice(&store.read(id)?);
+        }
+        let actual = sha256_hex(&bytes);
+        if bytes.len() as u64 != meta.size || actual != meta.sha256 {
+            return Err(MaterializeError::Corrupt {
+                key: format!("worktree_meta {}", meta.sha256),
+                actual,
+            });
+        }
+        Ok(MetaDocument::decode(&bytes)?)
+    }
+
+    /// What the overlay covers on this disk, as [`crate::CaptureEngine`] scopes it at capture.
+    fn meta_scope(&self, repo: &GitRepo) -> Result<MetaScope, MaterializeError> {
+        let t = &self.targets;
+        let mut excludes = vec![DAEMON_DIR.to_owned()];
+        if let Ok(rel) = t.staging_dir.strip_prefix(&t.root) {
+            let rel = rel.to_string_lossy().trim_matches('/').to_owned();
+            if !rel.is_empty() {
+                excludes.push(rel);
+            }
+        }
+        Ok(MetaScope {
+            root: t.root.clone(),
+            excludes,
+            bulk_dirs: t.bulk_dirs.clone(),
+            nested: repo.nested_repositories(None)?,
+            skip_abs: [Some(t.staging_dir.clone()), t.harness_home.clone()]
+                .into_iter()
+                .flatten()
+                .collect(),
+        })
     }
 
     fn materialize_git(
@@ -784,6 +912,9 @@ impl<'a> Materializer<'a> {
             let path = dir.join(entry.os_name());
             let v = join_virtual(vdir, &entry.name);
             write.planned.insert(v.clone());
+            if entry.kind != EntryKind::Dir && write.tracked.contains(&v) {
+                continue;
+            }
             match entry.kind {
                 EntryKind::Dir => {
                     if let Some(child) = &entry.child {
@@ -828,10 +959,16 @@ impl<'a> Materializer<'a> {
                 EntryKind::Symlink => {
                     let target = PathBuf::from(entry.os_target().unwrap_or_default());
                     if fs::read_link(&path).is_ok_and(|t| t == target) {
+                        if fs::symlink_metadata(&path)
+                            .is_ok_and(|m| index::mtime_ns(&m) != entry.mtime)
+                        {
+                            set_symlink_mtime(&path, entry.mtime)?;
+                        }
                         continue;
                     }
                     remove_existing(&path)?;
                     std::os::unix::fs::symlink(&target, &path)?;
+                    set_symlink_mtime(&path, entry.mtime)?;
                     report.symlinks += 1;
                 }
                 EntryKind::HardlinkGroup => {
@@ -851,8 +988,12 @@ impl<'a> Materializer<'a> {
     ) -> Result<(), MaterializeError> {
         for (canonical_v, path, mode) in links {
             let Some(canonical) = resolve(canonical_v) else {
-                tracing::warn!(canonical = %canonical_v, "hardlink group canonical outside the class roots; skipped");
-                continue;
+                return Err(MaterializeError::Metadata {
+                    path: path.display().to_string(),
+                    reason: format!(
+                        "hardlink group canonical {canonical_v} is outside the class roots"
+                    ),
+                });
             };
             if let (Ok(a), Ok(b)) = (fs::symlink_metadata(&canonical), fs::symlink_metadata(path))
                 && a.is_file()
@@ -862,10 +1003,21 @@ impl<'a> Materializer<'a> {
                 continue;
             }
             remove_existing(path)?;
-            if fs::hard_link(&canonical, path).is_err() {
-                // Cross-device or unsupported: copy instead.
-                fs::copy(&canonical, path)?;
-                fs::set_permissions(path, fs::Permissions::from_mode(*mode))?;
+            match fs::hard_link(&canonical, path) {
+                Ok(()) => {}
+                // The class spans directories that can sit on different filesystems here (the
+                // harness home beside the worktree): a copy is the closest thing.
+                Err(e) if e.kind() == io::ErrorKind::CrossesDevices => {
+                    tracing::warn!(canonical = %canonical.display(), member = %path.display(), "hardlink across filesystems; copied");
+                    fs::copy(&canonical, path)?;
+                    fs::set_permissions(path, fs::Permissions::from_mode(*mode))?;
+                }
+                Err(e) => {
+                    return Err(MaterializeError::Metadata {
+                        path: path.display().to_string(),
+                        reason: format!("link to {}: {e}", canonical.display()),
+                    });
+                }
             }
             report.hardlinks += 1;
         }
@@ -913,14 +1065,19 @@ impl<'a> Materializer<'a> {
         Ok(())
     }
 
-    /// Restore directory modes and mtimes once nothing writes into them any more.
-    fn restore_dirs(dirs: &[(PathBuf, u32, i64)]) {
+    /// Restore directory modes and mtimes once nothing writes into them any more. A failure
+    /// fails the materialize: a directory left with the wrong mode or mtime is not restored.
+    fn restore_dirs(dirs: &[(PathBuf, u32, i64)]) -> Result<(), MaterializeError> {
         for (path, mode, mtime) in dirs {
-            fs::set_permissions(path, fs::Permissions::from_mode(*mode)).ok();
-            if let Ok(f) = File::open(path) {
-                set_mtime(&f, *mtime).ok();
-            }
+            let failed = |what: &str, e: io::Error| MaterializeError::Metadata {
+                path: path.display().to_string(),
+                reason: format!("{what}: {e}"),
+            };
+            fs::set_permissions(path, fs::Permissions::from_mode(*mode))
+                .map_err(|e| failed("chmod", e))?;
+            worktree_meta::set_mtime_nofollow(path, *mtime).map_err(|e| failed("mtime", e))?;
         }
+        Ok(())
     }
 }
 
@@ -975,5 +1132,32 @@ fn refresh_linked(
         {
             known.stat = FileStat::of(&meta);
         }
+    }
+}
+
+fn set_symlink_mtime(path: &Path, mtime_ns: i64) -> Result<(), MaterializeError> {
+    worktree_meta::set_mtime_nofollow(path, mtime_ns).map_err(|e| MaterializeError::Metadata {
+        path: path.display().to_string(),
+        reason: format!("symlink mtime: {e}"),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A directory whose metadata cannot be restored fails the materialize (it used to be
+    /// ignored, leaving the directory with whatever mode and mtime the writes gave it).
+    #[test]
+    fn a_directory_metadata_failure_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let there = dir.path().join("there");
+        fs::create_dir(&there).unwrap();
+        Materializer::restore_dirs(&[(there.clone(), 0o700, 1_600_000_000_123_456_789)]).unwrap();
+        let meta = fs::metadata(&there).unwrap();
+        assert_eq!(meta.mode() & 0o7777, 0o700);
+        assert_eq!(index::mtime_ns(&meta), 1_600_000_000_123_456_789);
+        let err = Materializer::restore_dirs(&[(dir.path().join("gone"), 0o755, 0)]).unwrap_err();
+        assert!(matches!(err, MaterializeError::Metadata { .. }), "{err}");
     }
 }

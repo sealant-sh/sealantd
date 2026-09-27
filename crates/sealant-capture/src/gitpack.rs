@@ -955,8 +955,11 @@ pub fn install_pack(
     Ok(true)
 }
 
-/// Write `packed-refs` from `refs`, skipping the pseudo-refs, and remove loose refs that would
-/// shadow it.
+/// Make the repository's refs exactly `refs` (the pseudo-refs skipped): `packed-refs` is
+/// written from them and every loose ref is removed, whether the manifest names it or not, so
+/// a branch, tag, remote-tracking ref or stash the disk held beyond the manifest does not
+/// survive a materialize. Directories under `refs/` a loose ref leaves empty go too, except
+/// `refs/heads` and `refs/tags`, which git expects.
 pub fn write_packed_refs(repo: &GitRepo, refs: &BTreeMap<String, String>) -> Result<(), GitError> {
     let mut text = String::from("# pack-refs with: peeled fully-peeled sorted \n");
     for (name, sha) in refs {
@@ -967,15 +970,44 @@ pub fn write_packed_refs(repo: &GitRepo, refs: &BTreeMap<String, String>) -> Res
         text.push(' ');
         text.push_str(name);
         text.push('\n');
-        let loose = repo.common_dir.join(name);
-        if loose.is_file() {
-            fs::remove_file(loose)?;
-        }
     }
     let path = repo.common_dir.join("packed-refs");
     let tmp = repo.common_dir.join("packed-refs.capture-tmp");
     fs::write(&tmp, text)?;
     fs::rename(tmp, path)?;
+    // After `packed-refs` holds the manifest's refs: a loose ref shadows a packed one, so none
+    // may remain.
+    for dir in [&repo.common_dir, &repo.git_dir] {
+        remove_loose_refs(&dir.join("refs"), 0)?;
+    }
+    Ok(())
+}
+
+/// Remove every file under `dir` (a `refs/` directory) and the directories that empties, but
+/// `refs/` itself, `refs/heads` and `refs/tags`.
+fn remove_loose_refs(dir: &Path, depth: usize) -> Result<(), GitError> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        if entry.file_type()?.is_dir() {
+            remove_loose_refs(&path, depth + 1)?;
+            let keep = depth == 0 && (entry.file_name() == "heads" || entry.file_name() == "tags");
+            if !keep {
+                match fs::remove_dir(&path) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == io::ErrorKind::DirectoryNotEmpty => {}
+                    Err(e) => return Err(e.into()),
+                }
+            }
+        } else {
+            fs::remove_file(&path)?;
+        }
+    }
     Ok(())
 }
 
@@ -1112,6 +1144,29 @@ fn scratch_index(scratch_dir: &Path) -> Result<PathBuf, GitError> {
     let tmp_index = scratch_dir.join("materialize-index");
     fs::remove_file(&tmp_index).ok();
     Ok(tmp_index)
+}
+
+/// Every path `tree` names — blobs, symlinks, subtrees and gitlinks — relative to the root.
+/// A name that is not UTF-8 is converted lossily.
+pub fn tree_names(
+    repo: &GitRepo,
+    tree: &str,
+) -> Result<std::collections::BTreeSet<String>, GitError> {
+    let out = repo.run(&[
+        "ls-tree",
+        "-r",
+        "-t",
+        "-z",
+        "--name-only",
+        "--full-tree",
+        tree,
+    ])?;
+    Ok(out
+        .stdout
+        .split(|b| *b == 0)
+        .filter(|p| !p.is_empty())
+        .map(|p| String::from_utf8_lossy(p).into_owned())
+        .collect())
 }
 
 /// Rebuild the real index from `tree` (used when the workspace class carried no index).

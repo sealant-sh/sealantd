@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-use crate::chunk::ChunkId;
+use crate::chunk::{Chunk, ChunkId, chunk_bytes, sha256_hex};
 use crate::gitpack::{self, GitError, GitRepo};
 use crate::index::{
     self, BuildStats, ChunkSink, DAEMON_DIR, Listing, Suspects, TreeBuilder, TreeIndex,
@@ -18,7 +18,7 @@ use crate::index::{
 use crate::keys::KeyPrefix;
 use crate::manifest::{
     BulkSection, BulkState, CaptureKind, DirFormat, EncodedManifest, GitSection, Manifest,
-    Sections, WORKTREE_TREE_REF, WorkspaceSection, rfc3339_now,
+    Sections, WORKTREE_META_FORMAT, WORKTREE_TREE_REF, WorkspaceSection, WorktreeMeta, rfc3339_now,
 };
 use crate::materialize::{
     DiskState, MaterializeClass, MaterializeError, MaterializeReport, MaterializeTargets,
@@ -34,6 +34,7 @@ use crate::ship::{
 use crate::sink::BlobSink;
 use crate::tree::EncodedDir;
 use crate::watch::{Invalidations, WatchPolicy};
+use crate::worktree_meta::{self, MetaError, MetaScope};
 
 /// Snap cadence (ADR-0015 *Cadence and budgets*).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -187,6 +188,9 @@ pub enum EngineError {
     /// Materialize.
     #[error(transparent)]
     Materialize(#[from] MaterializeError),
+    /// The worktree metadata overlay.
+    #[error(transparent)]
+    WorktreeMeta(#[from] MetaError),
     /// I/O.
     #[error(transparent)]
     Io(#[from] io::Error),
@@ -922,6 +926,24 @@ impl CaptureEngine {
         Ok(self.roots().workspace_listing(repo, gitlinks)?)
     }
 
+    /// What the worktree metadata overlay covers: the working tree minus the daemon's paths,
+    /// the harness home, bulk directories and the nested repositories in `nested`.
+    fn meta_scope(&self, nested: &[String]) -> MetaScope {
+        MetaScope {
+            root: self.config.root.clone(),
+            excludes: self.daemon_excludes(),
+            bulk_dirs: self.config.bulk_dirs.clone(),
+            nested: nested.to_vec(),
+            skip_abs: [
+                Some(self.config.staging_dir()),
+                self.config.harness_home.clone(),
+            ]
+            .into_iter()
+            .flatten()
+            .collect(),
+        }
+    }
+
     /// The bulk class listing: every bulk directory under the root.
     fn bulk_listing(&self) -> Listing {
         self.roots().bulk_listing()
@@ -939,6 +961,7 @@ impl CaptureEngine {
         &mut self,
         listing: &Listing,
         class: Class,
+        extra: &[Chunk],
         uploads: &mut Vec<Upload>,
         stats: &mut SnapStats,
         preempt: &dyn Fn() -> bool,
@@ -971,11 +994,25 @@ impl CaptureEngine {
             cycle: DutyCycle::new(self.config.cpu_fraction),
             preempt: (class == Class::Bulk).then_some(preempt),
         };
-        let built = TreeBuilder::new(&mut work.index, &key_for_dir)
-            .strict(strict)
-            .racy_window(self.config.racy_window)
-            .suspects(&mut work.suspects)
-            .build(listing, &mut sink);
+        // Chunks the section names beside its tree (the worktree metadata overlay) go into the
+        // same packs, deduplicated like a file's.
+        let mut extra_put = Ok(());
+        for chunk in extra {
+            if !sink.contains(&chunk.id)
+                && let Err(e) = sink.put(chunk.id, &chunk.data)
+            {
+                extra_put = Err(e);
+                break;
+            }
+        }
+        let built = match extra_put {
+            Ok(()) => TreeBuilder::new(&mut work.index, &key_for_dir)
+                .strict(strict)
+                .racy_window(self.config.racy_window)
+                .suspects(&mut work.suspects)
+                .build(listing, &mut sink),
+            Err(e) => Err(e),
+        };
         let (mut built, packs) = match built {
             Ok(built) => (built, sink.builder.finish()),
             Err(e) => {
@@ -1055,7 +1092,7 @@ impl CaptureEngine {
         self.chunks.packs.extend(work.chunks);
         uploads.extend(work.packs);
         let mut needed: BTreeSet<String> = BTreeSet::new();
-        for c in &built.chunks {
+        for c in built.chunks.iter().chain(extra.iter().map(|c| &c.id)) {
             if let Some(k) = self.chunks.packs.get(c) {
                 needed.insert(k.clone());
             } else {
@@ -1405,9 +1442,22 @@ impl CaptureEngine {
                     git_packs.push(key);
                 }
                 let listing = self.workspace_listing(&repo, &git.closure.gitlinks)?;
+                // What the worktree tree does not carry: modes, mtimes, untracked directories,
+                // hardlink groups.
+                let meta_doc = match git.closure.refs.get(WORKTREE_TREE_REF) {
+                    Some(tree) => Some(worktree_meta::capture(
+                        &repo,
+                        tree,
+                        &self.meta_scope(&git.closure.gitlinks),
+                    )?),
+                    None => None,
+                };
+                let meta_bytes = meta_doc.as_ref().map(worktree_meta::MetaDocument::encode);
+                let meta_chunks = meta_bytes.as_deref().map(chunk_bytes).unwrap_or_default();
                 let Some(built) = self.build_class(
                     &listing,
                     Class::Small,
+                    &meta_chunks,
                     &mut uploads,
                     &mut stats,
                     preempt,
@@ -1416,6 +1466,31 @@ impl CaptureEngine {
                 )?
                 else {
                     return Err(io::Error::other("small-class build yielded").into());
+                };
+                let worktree_meta = match meta_bytes {
+                    Some(bytes) => {
+                        let mut packs: Vec<String> = Vec::new();
+                        for c in &meta_chunks {
+                            let key = self.chunks.packs.get(&c.id).ok_or_else(|| {
+                                io::Error::other(format!(
+                                    "worktree metadata chunk {} is in no pack",
+                                    c.id
+                                ))
+                            })?;
+                            if !packs.contains(key) {
+                                packs.push(key.clone());
+                            }
+                        }
+                        packs.sort();
+                        Some(WorktreeMeta {
+                            format: WORKTREE_META_FORMAT,
+                            size: bytes.len() as u64,
+                            sha256: sha256_hex(&bytes),
+                            chunks: meta_chunks.iter().map(|c| c.id).collect(),
+                            packs,
+                        })
+                    }
+                    None => None,
                 };
                 // Only a snap that goes on to stage its git pack makes that pack's tips the next
                 // pack's negatives: a snap that fails here (a final one that cannot read work)
@@ -1433,6 +1508,7 @@ impl CaptureEngine {
                         packs: built.packs,
                         format: built.format,
                         dir_packs: built.dir_packs,
+                        worktree_meta,
                     },
                     bulk: self
                         .previous
@@ -1451,6 +1527,7 @@ impl CaptureEngine {
                 let Some(built) = self.build_class(
                     &listing,
                     Class::Bulk,
+                    &[],
                     &mut uploads,
                     &mut stats,
                     preempt,

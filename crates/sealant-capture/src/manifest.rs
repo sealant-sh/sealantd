@@ -28,6 +28,11 @@
 //!   `child` are dir object digests, so a dir object's bytes do not depend on where it is
 //!   stored, and a reader resolves a digest through the listed packs' trailing indexes.
 //!
+//! The workspace section can carry `worktree_meta` ([`WorktreeMeta`]): the worktree metadata
+//! overlay (modes, nanosecond mtimes, untracked directories and hardlink groups of the working
+//! tree the worktree pseudo-ref describes), a JSON document chunked into the section's own packs.
+//! Absent in every capture before it, and then restored as git checks the tree out.
+//!
 //! The engine writes format 2 only for a registrar whose `plan.get` announces
 //! `manifest_format` ≥ 2 ([`DirFormat::for_registrar`]); a reader refuses a section whose format
 //! is above [`MAX_SECTION_FORMAT`].
@@ -37,7 +42,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::chunk::sha256_hex;
+use crate::chunk::{ChunkId, sha256_hex};
 
 /// Pseudo-ref naming the working-tree tree object in `sections.git.refs`.
 pub const WORKTREE_TREE_REF: &str = "refs/sealant/capture/worktree";
@@ -177,6 +182,32 @@ pub struct TreeRef<'a> {
     pub dir_packs: &'a [String],
 }
 
+/// Format of the worktree metadata document ([`WorktreeMeta`]) this build reads and writes.
+pub const WORKTREE_META_FORMAT: u32 = 1;
+
+/// The worktree metadata overlay: what a git tree does not carry about the working tree the
+/// [`WORKTREE_TREE_REF`] tree describes — exact mode bits, nanosecond mtimes of files, symlinks
+/// and directories (the root included), directories git does not track (empty ones among them)
+/// and hardlink groups. The document is JSON ([`crate::worktree_meta::MetaDocument`]), CDC
+/// chunked into the workspace section's packs: every key in `packs` is also in the section's
+/// `packs`, so a registrar that presigns and retains the section's packs covers it unchanged.
+/// A materializer applies it after every class it restores; a manifest without it restores the
+/// working tree as git checks it out, as before the overlay existed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorktreeMeta {
+    /// Document format ([`WORKTREE_META_FORMAT`]); a reader refuses one above it before
+    /// writing anything.
+    pub format: u32,
+    /// Length of the document in bytes.
+    pub size: u64,
+    /// sha256 of the whole document.
+    pub sha256: String,
+    /// The document's chunks, in order.
+    pub chunks: Vec<ChunkId>,
+    /// The packs holding those chunks (a subset of the workspace section's `packs`).
+    pub packs: Vec<String>,
+}
+
 /// The workspace section.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceSection {
@@ -194,6 +225,10 @@ pub struct WorkspaceSection {
     /// Format 2: every dir pack the tree needs, across epochs.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub dir_packs: Vec<String>,
+    /// The worktree metadata overlay. Absent in every capture before it (and then not written,
+    /// so such a section encodes exactly as before).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_meta: Option<WorktreeMeta>,
 }
 
 impl WorkspaceSection {
@@ -205,6 +240,7 @@ impl WorkspaceSection {
             packs,
             format: FORMAT_DIR_OBJECTS,
             dir_packs: Vec::new(),
+            worktree_meta: None,
         }
     }
 
@@ -613,6 +649,7 @@ mod tests {
             packs: vec![],
             format: FORMAT_DIR_PACKS,
             dir_packs: vec!["captures/wt/1/packs/p".into()],
+            worktree_meta: None,
         };
         let e = m.clone().encode();
         let text = String::from_utf8(e.bytes.clone()).unwrap();
@@ -626,6 +663,41 @@ mod tests {
         assert_eq!(DirFormat::for_registrar(1), DirFormat::Objects);
         assert_eq!(DirFormat::for_registrar(2), DirFormat::Packs);
         assert_eq!(DirFormat::for_registrar(3), DirFormat::Packs);
+    }
+
+    /// The worktree metadata overlay is additive: absent, a workspace section encodes as it did
+    /// before it (so the capture id of an older capture is unchanged); present, it follows the
+    /// section's other fields and decodes back; a manifest without it decodes to `None`.
+    #[test]
+    fn worktree_meta_is_written_only_when_present() {
+        let legacy = sample().encode();
+        assert!(!String::from_utf8_lossy(&legacy.bytes).contains("worktree_meta"));
+        let mut m = sample();
+        m.sections.workspace.worktree_meta = Some(WorktreeMeta {
+            format: WORKTREE_META_FORMAT,
+            size: 3,
+            sha256: "e".repeat(64),
+            chunks: vec![ChunkId::of(b"abc")],
+            packs: vec!["captures/wt/1/packs/p".into()],
+        });
+        let e = m.clone().encode();
+        let text = String::from_utf8(e.bytes.clone()).unwrap();
+        let chunk = ChunkId::of(b"abc").to_hex();
+        let expected = format!(
+            r#""workspace":{{"root":"captures/wt/1/trees/t","packs":[],"worktree_meta":{{"format":1,"size":3,"sha256":"{}","chunks":["{chunk}"],"packs":["captures/wt/1/packs/p"]}}}}"#,
+            "e".repeat(64)
+        );
+        assert!(text.contains(&expected), "{text}");
+        assert_eq!(Manifest::decode(&e.bytes).unwrap().manifest, m);
+        assert_eq!(
+            Manifest::decode(&legacy.bytes)
+                .unwrap()
+                .manifest
+                .sections
+                .workspace
+                .worktree_meta,
+            None
+        );
     }
 
     #[test]

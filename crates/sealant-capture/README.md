@@ -45,9 +45,65 @@ directories of a `"pending"` bulk section. Content and dir packs are fetched up 
 the pack cache (`.sealantd/capture/cache/`), and a pack already there is not fetched again.
 `tests/delta.rs` measures it: a head applied over a
 materialized base wrote 9 files / 213 KB where a fresh materialize writes 427 files / 1.7 MB,
-the two trees compare identical (bytes, modes, mtimes, links), and the head over itself writes
-nothing. This is what lets a standby executor pre-materialize the project base and apply the
+the two trees compare identical (bytes, modes, mtimes, links — tracked files' too, through the
+worktree metadata overlay), and the head over itself writes and changes nothing. This is what lets a standby executor pre-materialize the project base and apply the
 claimed worktree's head over it (`capture.replan`).
+
+## Worktree metadata and refs (`worktree_meta.rs`, `materialize.rs`, `gitpack.rs`)
+
+A git tree carries a file's bytes and whether it is executable. A checkout writes every file
+`0644`/`0755` under the umask with the time of the checkout, creates no directory git does not
+track, and writes every name of a hardlinked file as a file of its own. Found by review
+(2026-09-27): a tracked `0600` file came back `0644`, tracked hardlinks came back as two inodes,
+and empty directories and every tracked mtime were lost.
+
+- **The overlay.** Every small capture records the working tree's metadata beside its tree, in
+  the workspace section's `worktree_meta` (see "`worktree_meta` in a manifest"): exact mode bits
+  (`st_mode & 0o7777`) of files and directories, the root included; nanosecond mtimes of files,
+  symlinks and directories; every directory no other class carries (empty ones among them); and
+  hardlink groups among the worktree tree's files. It covers the paths the worktree tree names
+  plus the directories of the working tree, minus `.git`, the daemon directory and staging, the
+  harness home, bulk directories, nested repositories and every directory git ignores — those
+  are the chunked classes', which carry their own metadata. The document is deterministic, so an
+  unchanged tree is still an unchanged capture, and a change of mode or mtime alone is a capture.
+- **Applied last.** The materializer applies it after every class (restoring an ignored file or a
+  bulk directory moves the mtime of the directory it lands in): it creates the directories the
+  document names, removes the empty directories in its scope the document does not name, links
+  hardlink groups, then sets modes and mtimes (files and symlinks, then directories deepest
+  first), touching only what differs. `MaterializeReport::worktree_meta` counts what it changed;
+  a head over itself changes nothing. The document is fetched and verified (each chunk and the
+  whole document's sha256 and size) before anything is written, and a format this build does
+  not read (`WORKTREE_META_FORMAT`) is refused then too.
+- **Fails loudly.** A path the document names that is missing or of another kind after the
+  checkout, or a `chmod`, `utimensat` or link that fails, fails the materialize; so does a
+  directory of a chunked class whose mode or mtime cannot be set (it used to be ignored), a
+  hardlink member whose canonical path is outside the class roots (it used to be skipped with a
+  warning) and a failed link (it used to fall back to a copy; only a link across filesystems still
+  does). Chunked-class symlinks get their own mtime back (`utimensat` without following them),
+  on a delta too.
+- **A capture without it** (every capture before this) restores as it always did.
+- **Tracked files are the git class's.** A tracked file under a bulk-named directory (`build/`,
+  `dist/`) is in both the worktree tree and the bulk section. A bulk section older than the
+  worktree tree used to sweep a tracked file it never saw and write its older bytes back over one
+  that changed since; the bulk class now neither writes nor sweeps a path the worktree tree names.
+- **The ref set is the manifest's.** `packed-refs` is written from the manifest's refs, and every
+  loose ref is removed, named by the manifest or not (only the ones it named went before), so a
+  branch, tag, remote-tracking ref or stash the disk held beyond the manifest does not survive a
+  materialize; `HEAD` is written as before.
+
+`tests/restore_metadata.rs` writes a worktree with all of it (modes, ns mtimes of files,
+directories, symlinks and the root, empty directories, a hardlink pair, loose and packed refs, an
+annotated tag, a stash), captures it, materializes it fresh and compares everything; drifts the
+restored disk (extra loose and packed refs, `HEAD` moved, modes and mtimes off, a broken hardlink,
+a stray empty directory) and materializes the head over it; changes metadata alone and checks it
+is captured and restored by a delta and a fresh materialize. `tests/delta.rs` compares the mtimes
+of the whole working tree.
+
+Not covered: a hardlink between a tracked file and a file of another class (each class restores
+its own names), symbolic refs other than `HEAD` (a ref's value is its resolved sha, as before),
+names that are not UTF-8 (skipped with a warning, as dir objects convert them), and a
+directory whose restored mode forbids the owner to write (a later delta that writes into it
+fails, loudly).
 
 ## Sources beside the worktree
 
@@ -556,6 +612,48 @@ bulk section to an executor of that platform, with its packs in `get_urls`.
             "other_bulk":{"linux-aarch64-gnu":{"root":"…","packs":[…],"platform":"linux-aarch64-gnu"}}}
 ```
 
+### `worktree_meta` in a manifest
+
+`sections.workspace.worktree_meta`: the worktree metadata overlay (see "Worktree metadata and
+refs"). Absent in every capture before it, and then not written, so such a manifest encodes byte
+for byte as before.
+
+```json
+"workspace":{"root":"…","packs":["captures/wt/3/packs/<a>","captures/wt/3/packs/<b>"],"format":2,"dir_packs":[…],
+             "worktree_meta":{"format":1,"size":5821,"sha256":"<sha256 of the document>",
+                              "chunks":["<chunk sha256>",…],"packs":["captures/wt/3/packs/<b>"]}}
+```
+
+- `packs` holds the document's chunks and is a subset of the section's `packs`, so a registrar
+  that presigns and retains the section's packs covers it with no change; `chunks` are CDC chunk
+  ids, read from those packs as a file's chunks are (each verified against its id); the
+  concatenation is `size` bytes whose sha256 is `sha256`.
+- `format` is the document's (`1`). A reader refuses a format above the one it knows before it
+  writes anything; an older executor ignores the field and restores as before.
+- The document is compact JSON:
+
+  ```json
+  {"format":1,
+   "entries":[{"path":"","kind":"dir","mode":488,"mtime":1599999000999999999},
+              {"path":"empty","kind":"dir","mode":448,"mtime":1599827199999999986},
+              {"path":"run.sh","kind":"file","mode":488,"mtime":1600000001123456796},
+              {"path":"to-secret","kind":"symlink","mtime":1600000007123456838}],
+   "hardlinks":[["link.txt","src/twin.txt"]]}
+  ```
+
+  `entries` are sorted by `path` (worktree-relative, `/`-separated, `""` the root; no `.`, `..`
+  or empty component); `kind` is `file`, `symlink` or `dir`; `mode` is `st_mode & 0o7777`
+  (absent for a symlink); `mtime` is nanoseconds since the epoch. `hardlinks` (absent when empty)
+  lists groups of two or more `file` paths sharing one inode, each sorted, the first being the
+  one the others link to.
+- Applying it (sealantd's `worktree_meta::apply`, after the worktree tree is checked out and every
+  other class restored): create each `dir` that is missing; every other path must exist with its
+  kind; remove the empty directories in scope that no entry names; link each group's members to
+  its first path; set files' and symlinks' mode and mtime (a symlink's own, never followed), then
+  directories' deepest first. A reader that only lists or reads a class's files (Mend's
+  `listCaptureDir`, `statCaptureEntry`, `readCaptureFile`, `materialize` of the workspace or bulk
+  class) is unaffected: the overlay describes the git class's working tree, not a chunked class.
+
 ### `lease-lost` on the session channel
 
 A 409 `{"reason":"lease-lost"}` from any call, without a `live_epoch` other than the caller's,
@@ -701,6 +799,9 @@ Mend installs today) must now say so, or boot refuses.
   again, never dropped.
 - §"Manifest": sections gain `other_bulk`, the bulk sections captured on other platforms, keyed
   by platform and carried from capture to capture (see "`other_bulk` in a manifest").
+- §"Manifest": the workspace section gains `worktree_meta`, the worktree metadata overlay, and
+  §"Materialize" applies it after every class and reconciles the ref set to the manifest's
+  (see "Worktree metadata and refs").
 - §"Executor hooks": `capture.flush` takes `kind` (`suspend` | `final`), `deadline_ms` and
   `grace_ms`; the flush on `SIGTERM`/`SIGINT`/`runtime.gracefulShutdown`/harness exit is a
   final flush with no deadline, not bounded by the shutdown grace. A final flush closes

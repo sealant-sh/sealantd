@@ -149,8 +149,8 @@ impl Fixture {
 struct Entry {
     kind: &'static str,
     mode: u32,
-    /// Compared only where the class restores mtimes (files of the chunked classes; git does
-    /// not, and a symlink's is never restored).
+    /// Compared under `MTIMES_UNDER`: the working tree and the chunked classes' files under
+    /// `.git` (the rest of `.git` is the git class's own bookkeeping).
     mtime: Option<i64>,
     bytes: Vec<u8>,
     link: Option<PathBuf>,
@@ -182,7 +182,7 @@ fn walk(root: &Path, mtimes_under: &[&str]) -> BTreeMap<String, Entry> {
             Entry {
                 kind: "symlink",
                 mode: meta.mode() & 0o7777,
-                mtime: None,
+                mtime,
                 bytes: Vec::new(),
                 link: Some(fs::read_link(e.path()).unwrap()),
             }
@@ -199,6 +199,20 @@ fn walk(root: &Path, mtimes_under: &[&str]) -> BTreeMap<String, Entry> {
     }
     out
 }
+
+/// Where mtimes are compared: every path of the working tree (tracked files through the
+/// worktree metadata overlay) and the chunked classes' files under `.git`.
+const MTIMES_UNDER: &[&str] = &[
+    "a.txt",
+    "src",
+    "todo.md",
+    ".gitignore",
+    "node_modules",
+    "dist",
+    ".env",
+    ".git/index",
+    ".git/logs",
+];
 
 fn assert_same_tree(a: &Path, b: &Path, mtimes_under: &[&str]) {
     let wa = walk(a, mtimes_under);
@@ -342,11 +356,7 @@ fn head_over_base_equals_a_fresh_materialize_and_writes_only_the_delta() {
         100.0 * r1.bytes as f64 / r2.bytes as f64
     );
 
-    assert_same_tree(
-        &restore,
-        &fresh,
-        &["node_modules", "dist", ".env", ".git/index", ".git/logs"],
-    );
+    assert_same_tree(&restore, &fresh, MTIMES_UNDER);
     assert_same_tree(&home_r, &home_f, &[""]);
     assert_eq!(
         git(&restore, &["status", "--porcelain"]),
@@ -372,15 +382,18 @@ fn head_over_base_equals_a_fresh_materialize_and_writes_only_the_delta() {
         .unwrap();
     print_report("head over head", &r3);
     assert_eq!(
-        (r3.files, r3.bytes, r3.removed, r3.symlinks, r3.hardlinks),
-        (0, 0, 0, 0, 0)
+        (
+            r3.files,
+            r3.bytes,
+            r3.removed,
+            r3.symlinks,
+            r3.hardlinks,
+            r3.worktree_meta
+        ),
+        (0, 0, 0, 0, 0, 0)
     );
     assert_eq!(r3.git_paths_changed, Some(0));
-    assert_same_tree(
-        &restore,
-        &fresh,
-        &["node_modules", "dist", ".env", ".git/index", ".git/logs"],
-    );
+    assert_same_tree(&restore, &fresh, MTIMES_UNDER);
 
     // A plan whose bulk section is pending (another platform's dependency tree, or none yet)
     // leaves the bulk directories on disk alone.
