@@ -501,6 +501,28 @@ restore, byte for byte, so the user never notices the compute changed.
   SIGINT, `runtime.gracefulShutdown`, the harness exiting on its own), whose final flush has no
   deadline, exits with 75 (`EX_TEMPFAIL`) when it ends incomplete — never 0 — after logging
   `FINAL CAPTURE INCOMPLETE` at error, and leaves the staging directory as it is.
+- **A retained executor boots in recovery mode.** Core keeps an executor that ended without a
+  complete final flush, and recovers it by starting it again on its own disk (Docker:
+  `docker start` of the kept container). That boot must save what the disk holds and add
+  nothing, so it is a recovery boot (`crates/sealantd/src/boot`, `BootConfig::recovery`): the
+  environment says `SEALANT_RECOVERY=1` (an adapter that starts a new container or Pod over the
+  kept disk), or the file `/.sealantd-recovery` exists (a kept Docker container restarts with
+  the environment it was created with: Core writes the marker into the stopped container with
+  `docker cp` before `docker start`; the root of the container's filesystem is outside every
+  capture root). A recovery boot resumes the disk's own staging and never materializes over
+  it: it boots only when its staging continues the chain head, or its materialize of the head
+  completed (`index/materialized.json` names the head's worktree tree; every change since is on
+  the disk, to be snapped), and otherwise refuses to boot and touches nothing. It runs no
+  lifecycle step, no dotfiles and no harness, and closes admission from the start (no exec,
+  session or SFTP bridge); the ship worker uploads what is staged, a scheduled snap captures
+  what changed since the last one, and the final flush — asked over the control socket, or run
+  on the daemon's own stop — snaps both classes, ships, seals the chain and answers `complete`.
+  It exits 0 only after a complete final flush, else 75, and a recovery boot that cannot start
+  (the channel refuses, the disk is not its own, the capture token is gone) exits 75 too:
+  still unsaved work, never a clean exit. Capture-store workspaces only (any other source
+  refuses the flag). The capture token must still be there: a boot reads it from
+  `SEALANT_SECRET_ENV_FILE`, which Core removes once the executor is ready, so Core must stage
+  it again (a token Mend still honours for the session) before it starts a retained executor.
 - **A deadline is the caller's.** The daemon used to clamp every flush's deadline to its
   shutdown grace (10 s, never configured at boot), so a caller that allowed 30 minutes for a
   dependency tree got 10 s. A flush now runs for exactly the `deadline_ms` it was given. A

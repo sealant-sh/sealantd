@@ -132,7 +132,16 @@ impl CaptureRuntime {
     /// Start the cadence runner (watcher, class clocks, ship worker) and the heartbeat loop.
     /// `harness` is the process the fence pauses and resumes.
     pub fn start(self: &Arc<Self>, runtime: Arc<Runtime>, harness: ProcessId) {
-        *self.harness.lock().unwrap_or_else(|e| e.into_inner()) = Some(harness);
+        self.start_with(runtime, Some(harness));
+    }
+
+    /// [`Self::start`] with no harness to pause on a fence (a recovery boot runs none).
+    pub fn start_without_harness(self: &Arc<Self>, runtime: Arc<Runtime>) {
+        self.start_with(runtime, None);
+    }
+
+    fn start_with(self: &Arc<Self>, runtime: Arc<Runtime>, harness: Option<ProcessId>) {
+        *self.harness.lock().unwrap_or_else(|e| e.into_inner()) = harness;
         let cadence = self.runner.with_engine(|e| e.config().cadence);
 
         // Scheduled snaps stop once the daemon is hard-stopping, and once a final flush stopped
@@ -1291,6 +1300,7 @@ mod tests {
                 object_ca_pem: None,
                 object_ca_file: None,
                 executor_id: None,
+                recovery: false,
             },
             &ws,
             tmp.path(),
@@ -2489,6 +2499,55 @@ mod tests {
         assert!(report.complete, "{report:?}");
         assert_eq!(registrar.chain().len(), registered);
         assert_eq!(registrar.seals().len(), 1);
+    }
+
+    /// A recovery boot (Core restarted a retained executor): admission is closed from the start
+    /// and no harness runs, so nothing but the capture engine touches the disk. An exec is
+    /// refused; the final flush snaps the disk as the executor left it — the work it never
+    /// snapped included — ships, seals, and answers complete.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_recovery_boot_admits_nothing_and_its_final_flush_saves_the_disk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (boot, registrar) = boot_tuned(
+            tmp.path(),
+            |store| store,
+            |config| config.executor = Some(EXECUTOR.to_owned()),
+        );
+        let ws = boot.layout.working_directory.clone();
+        std::fs::write(
+            ws.join("src/unsaved.rs"),
+            "// never snapped before the exit\n",
+        )
+        .unwrap();
+        let mut config = RuntimeConfig::new(new_runtime_id());
+        config.workspace_root = ws.clone();
+        let runtime = Runtime::new(config, Arc::new(ShutdownSignal::new(3_000)));
+        runtime.mark_healthy();
+        runtime.close_admission();
+        let capture = CaptureRuntime::new(boot);
+        assert!(runtime.install_capture(capture.clone()));
+        capture.start_without_harness(runtime.clone());
+
+        let refused = runtime
+            .spawn_managed(sh("echo late > src/late.rs", &ws))
+            .expect_err("nothing is admitted");
+        assert!(
+            format!("{refused:?}").contains("closed admission"),
+            "{refused:?}"
+        );
+        let report = runtime
+            .final_flush(None, Some(1_000))
+            .await
+            .expect("a capture engine");
+        assert!(report.complete, "{report:?}");
+        assert!(!runtime.capture_incomplete());
+        assert_eq!(registrar.seals().len(), 1);
+        let fresh = restore_head(tmp.path(), &registrar, "restored");
+        assert_eq!(
+            std::fs::read_to_string(fresh.join("src/unsaved.rs")).unwrap(),
+            "// never snapped before the exit\n"
+        );
+        assert!(!ws.join("src/late.rs").exists());
     }
 
     /// A final flush whose quiesce could not stop every writer (here: no subreaper, so an

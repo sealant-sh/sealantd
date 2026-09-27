@@ -81,6 +81,11 @@ pub fn run_boot(log_level: &str) -> ExitCode {
         Err(error) => {
             tracing::error!(%error, "boot preparation failed");
             eprintln!("sealantd boot: {error}");
+            // A recovery boot that could not start has not saved what the disk holds: it is
+            // still unsaved work, never a clean exit.
+            if config.recovery {
+                return ExitCode::from(crate::runtime::EXIT_CAPTURE_INCOMPLETE);
+            }
             return ExitCode::FAILURE;
         }
     };
@@ -423,11 +428,17 @@ async fn boot_serve(
         return shutdown_before_control(&runtime, ExitCode::FAILURE).await;
     }
 
+    // A recovery boot: nothing is admitted from the start — no exec, session or SFTP bridge
+    // may write to the disk being saved — and nothing below runs but the capture engine.
+    if config.recovery {
+        runtime.close_admission();
+    }
+
     // Step 12: runtime dotfiles, synchronously, BEFORE the control socket binds. The launching
     // adapter and the gateway treat the socket as the readiness signal, and everything they inject
     // after readiness (credential files into $HOME) must never race a dotfiles apply that writes
     // the same tree.
-    if let Some(dotfiles) = &config.dotfiles
+    if let Some(dotfiles) = config.dotfiles.as_ref().filter(|_| !config.recovery)
         && let Err(error) = dotfiles::apply(dotfiles, &ssh_runtime_dir(&config))
     {
         tracing::error!(%error, "dotfiles apply failed");
@@ -435,7 +446,10 @@ async fn boot_serve(
         return shutdown_before_control(&runtime, ExitCode::FAILURE).await;
     }
     // Caller-provided archives apply after the repo so local selections override its files.
-    if let Some(dir) = &config.dotfiles_archives
+    if let Some(dir) = config
+        .dotfiles_archives
+        .as_ref()
+        .filter(|_| !config.recovery)
         && let Err(error) = dotfiles::apply_archives(dir)
     {
         tracing::error!(%error, "dotfiles archive apply failed");
@@ -467,6 +481,10 @@ async fn boot_serve(
         wss_listener,
         serve_rx,
     );
+
+    if config.recovery {
+        return recover(runtime, config, capture_boot, serve_tx, control_handle).await;
+    }
 
     // Print the harness banner (E8) now that prep is done.
     tracing::info!(banner = %config.banner, "{}", config.banner);
@@ -591,6 +609,60 @@ async fn boot_serve(
     };
 
     // Steps 17–18.
+    shutdown_with(&runtime, &serve_tx, control_handle, exit_code).await
+}
+
+/// A recovery boot's supervisor ([`BootConfig::recovery`]): the capture engine resumes this
+/// disk's staging and ships, beside no lifecycle step and no harness, admission closed; the
+/// daemon waits for its stop (or its control server's end), runs the final flush as any boot
+/// does on its way out — and serves one asked for meanwhile — and exits 0 only when it is
+/// complete, else 75.
+async fn recover(
+    runtime: Arc<Runtime>,
+    config: BootConfig,
+    capture_boot: Option<capture::CaptureBoot>,
+    serve_tx: watch::Sender<bool>,
+    mut control_handle: tokio::task::JoinHandle<std::io::Result<()>>,
+) -> ExitCode {
+    let Some(boot) = capture_boot else {
+        tracing::error!("recovery boot without a capture engine");
+        return shutdown_with(
+            &runtime,
+            &serve_tx,
+            control_handle,
+            ExitCode::from(crate::runtime::EXIT_CAPTURE_INCOMPLETE),
+        )
+        .await;
+    };
+    let capture_runtime = crate::capture::CaptureRuntime::new(boot);
+    if runtime.install_capture(capture_runtime.clone()) {
+        capture_runtime.start_without_harness(runtime.clone());
+    }
+    runtime.set_workspace_docker(config.workspace_docker.clone());
+    tracing::warn!(
+        "recovery boot: shipping this disk's staged captures; no lifecycle step or harness runs \
+         and nothing is admitted — waiting for the final flush and the stop"
+    );
+    let exit_code = tokio::select! {
+        () = runtime.shutdown().wait() => ExitCode::SUCCESS,
+        join = &mut control_handle => {
+            if let Err(error) = join {
+                tracing::warn!(%error, "control server task ended unexpectedly");
+            }
+            ExitCode::FAILURE
+        }
+    };
+    runtime.final_flush(None, None).await;
+    let exit_code = if runtime.capture_incomplete() {
+        tracing::error!(
+            code = crate::runtime::EXIT_CAPTURE_INCOMPLETE,
+            "recovery: final capture incomplete; exiting with EX_TEMPFAIL and keeping the \
+             staging directory"
+        );
+        ExitCode::from(crate::runtime::EXIT_CAPTURE_INCOMPLETE)
+    } else {
+        exit_code
+    };
     shutdown_with(&runtime, &serve_tx, control_handle, exit_code).await
 }
 

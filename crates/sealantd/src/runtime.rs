@@ -568,6 +568,13 @@ impl Runtime {
         )
     }
 
+    /// Close admission from the start (a recovery boot, `boot::config::BootConfig::recovery`):
+    /// no exec, session, SFTP bridge or other writer is admitted, exactly as after a final
+    /// flush's quiesce. The final flush and `capture.status` are still served.
+    pub fn close_admission(&self) {
+        self.admission_closed.store(true, Ordering::SeqCst);
+    }
+
     /// Whether a final capture flush closed admission (the executor is ending).
     #[must_use]
     pub fn admission_is_closed(&self) -> bool {

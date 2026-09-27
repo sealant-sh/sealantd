@@ -89,7 +89,22 @@ const CONSUMED_KEYS: &[&str] = &[
     "SEALANT_EXECUTION_ID",
     "SEALANT_WORKSPACE_ID",
     "SEALANT_HARNESS_ENV_KEYS",
+    "SEALANT_RECOVERY",
 ];
+
+/// The marker file that asks for a recovery boot ([`BootConfig::recovery`]) when the environment
+/// cannot: a kept Docker container restarts (`docker start`) with the environment it was created
+/// with, so Core writes this file into the stopped container (`docker cp`) before it starts it.
+/// At the root of the container's filesystem: outside every capture root, and present in any
+/// image.
+pub const RECOVERY_MARKER: &str = "/.sealantd-recovery";
+
+/// Whether this boot is a recovery boot: `SEALANT_RECOVERY` is truthy (`1`/`true`; set by an
+/// adapter that starts a new container or Pod over the kept disk), or `marker` exists.
+#[must_use]
+pub fn recovery_requested(env: &dyn EnvSource, marker: &Path) -> bool {
+    env.get("SEALANT_RECOVERY").is_some_and(|v| is_truthy(&v)) || marker.exists()
+}
 
 /// Substring/suffix markers identifying secret env keys that must never reach the harness env.
 const SECRET_MARKERS: &[&str] = &[
@@ -233,6 +248,9 @@ pub struct CaptureSourceConfig {
     /// `SEALANT_WORKSPACE_ID`: the executor a completed final flush is sealed under when
     /// `plan.get` does not name one (`executor`).
     pub executor_id: Option<String>,
+    /// A recovery boot ([`BootConfig::recovery`]): the disk is resumed as it is, never
+    /// materialized over.
+    pub recovery: bool,
 }
 
 /// How the workspace working directory is provisioned.
@@ -497,6 +515,13 @@ pub struct BootConfig {
     /// The workspace's own Docker daemon (`SEALANT_WORKSPACE_DOCKER_HOST`, or a `DOCKER_HOST`
     /// Core reserves for one): the final capture stops its containers.
     pub workspace_docker: Option<crate::docker::DockerEndpoint>,
+    /// A recovery boot (`SEALANT_RECOVERY=1`, or [`RECOVERY_MARKER`]): Core restarted a retained
+    /// executor, one that ended without a complete final flush, to save what its disk holds.
+    /// The daemon resumes its own staging on that disk — never materializing over it — and
+    /// ships; runs no lifecycle step, no dotfiles and no harness; admits no exec, session or
+    /// SFTP; and runs the final flush when asked (or on its stop). Capture-store workspaces
+    /// only.
+    pub recovery: bool,
 }
 
 /// Whether a string is one of the truthy tokens `1` / `true`.
@@ -549,7 +574,7 @@ impl BootConfig {
                 .into(),
         };
 
-        let source = Self::load_source(env)?;
+        let mut source = Self::load_source(env)?;
         let bindable_mounts = Self::load_bindable_mounts(env, &workspace, &source)?;
         let initial_binds = Self::load_initial_binds(env, &bindable_mounts)?;
         // Boot writes runtime state (.ssh-runtime) under the workspace root. For a mounted
@@ -676,6 +701,17 @@ impl BootConfig {
         };
 
         let passthrough_env = passthrough_env(env);
+        let recovery = recovery_requested(env, Path::new(RECOVERY_MARKER));
+        match &mut source {
+            WorkspaceSource::Capture(capture) => capture.recovery = recovery,
+            _ if recovery => {
+                return Err(BootError::config(format!(
+                    "a recovery boot (SEALANT_RECOVERY, or {RECOVERY_MARKER}) applies to a \
+                     capture-store workspace only (SEALANT_WORKSPACE_SOURCE=capture)"
+                )));
+            }
+            _ => {}
+        }
         let workspace_docker = crate::docker::workspace_endpoint(
             env.get(crate::docker::WORKSPACE_DOCKER_HOST_ENV).as_deref(),
             env.get("DOCKER_HOST").as_deref(),
@@ -699,6 +735,7 @@ impl BootConfig {
             control,
             passthrough_env,
             workspace_docker,
+            recovery,
         })
     }
 
@@ -802,6 +839,7 @@ impl BootConfig {
                     executor_id: env
                         .get("SEALANT_WORKSPACE_ID")
                         .filter(|s| !s.trim().is_empty()),
+                    recovery: false,
                 }))
             }
             Some(other) => Err(BootError::config(format!(
@@ -1795,6 +1833,63 @@ mod tests {
             &cfg.source,
             WorkspaceSource::Capture(c) if c.worktree_id.as_deref() == Some("wt-1")
         ));
+    }
+
+    /// A recovery boot is asked for by `SEALANT_RECOVERY` (an adapter that starts a new
+    /// container over the kept disk) or by the marker file (a `docker start` of the kept
+    /// container, whose environment cannot change); it applies to a capture source only, and
+    /// the executor id (`SEALANT_WORKSPACE_ID`) rides the capture source for the final seal.
+    #[test]
+    fn a_recovery_boot_is_asked_for_by_env_or_marker_and_only_for_a_capture_source() {
+        let marker = tempfile::tempdir().unwrap();
+        let absent = marker.path().join("absent");
+        let present = marker.path().join("present");
+        std::fs::write(&present, b"").unwrap();
+        assert!(!recovery_requested(&MapEnv::from_pairs(&[]), &absent));
+        assert!(recovery_requested(&MapEnv::from_pairs(&[]), &present));
+        assert!(recovery_requested(
+            &MapEnv::from_pairs(&[("SEALANT_RECOVERY", "1")]),
+            &absent
+        ));
+        assert!(!recovery_requested(
+            &MapEnv::from_pairs(&[("SEALANT_RECOVERY", "0")]),
+            &absent
+        ));
+
+        let mut pairs: Vec<(&str, &str)> = base_pairs()
+            .into_iter()
+            .filter(|(k, _)| *k != "SEALANT_WORKSPACE_REPO_URL")
+            .collect();
+        pairs.extend_from_slice(&[
+            ("SEALANT_WORKSPACE_SOURCE", "capture"),
+            (
+                "SEALANT_CAPTURE_ENDPOINT",
+                "https://mend.example/api/session/abc",
+            ),
+            ("SEALANT_WORKSPACE_ID", "ws-42"),
+        ]);
+        let cfg = BootConfig::load(&MapEnv::from_pairs(&pairs)).expect("valid");
+        assert!(!cfg.recovery || Path::new(RECOVERY_MARKER).exists());
+        pairs.push(("SEALANT_RECOVERY", "true"));
+        let cfg = BootConfig::load(&MapEnv::from_pairs(&pairs)).expect("valid");
+        assert!(cfg.recovery);
+        assert!(matches!(
+            &cfg.source,
+            WorkspaceSource::Capture(c) if c.recovery && c.executor_id.as_deref() == Some("ws-42")
+        ));
+        assert!(
+            !cfg.passthrough_env
+                .iter()
+                .any(|(k, _)| k == "SEALANT_RECOVERY")
+        );
+
+        let mut clone = base_pairs();
+        clone.push(("SEALANT_RECOVERY", "1"));
+        let refused = BootConfig::load(&MapEnv::from_pairs(&clone)).expect_err("refused");
+        assert!(
+            refused.to_string().contains("capture-store workspace only"),
+            "{refused}"
+        );
     }
 
     #[test]

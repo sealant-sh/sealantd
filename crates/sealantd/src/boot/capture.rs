@@ -8,7 +8,8 @@ use std::time::Duration;
 
 use sealant_capture::engine::Pickup;
 use sealant_capture::gitpack::GitRepo;
-use sealant_capture::manifest::{BulkState, DirFormat, Sections};
+use sealant_capture::manifest::{BulkState, DirFormat, Sections, WORKTREE_TREE_REF};
+use sealant_capture::materialize::DiskState;
 use sealant_capture::registrar::{PlanGetRequest, RegistrarMinter};
 use sealant_capture::{
     BlobSink, CaptureConfig, CaptureEngine, ChannelTransport, HttpRegistrar, MaterializeClass,
@@ -247,7 +248,42 @@ pub(crate) fn boot_from(
     // would take that work back, so the disk is left as it is and the queue resumes.
     let pickup = CaptureEngine::pickup(&config, plan.head.as_ref().map(|h| h.capture_id.as_str()))
         .map_err(|error| BootError::config(format!("capture staging: {error}")))?;
-    let resumed = matches!(pickup, Pickup::Resume { .. });
+    let mut resumed = matches!(pickup, Pickup::Resume { .. });
+    // A recovery boot restores nothing: the disk holds work no registered capture has, and a
+    // materialize would take it back. It resumes this disk as it is when the disk is provably
+    // this executor's own continuation of the head — its staging continues the head (above), or
+    // its materialize of the head completed (and every change since is on disk, to be snapped)
+    // — and refuses to boot otherwise, touching nothing.
+    if source.recovery && !resumed {
+        let materialized = DiskState::load(&config.staging_dir().join("index")).worktree_tree;
+        let holds_head = match &plan.head {
+            Some(head) => {
+                materialized.is_some()
+                    && materialized.as_ref()
+                        == head.manifest.sections.git.refs.get(WORKTREE_TREE_REF)
+            }
+            None => working_directory.join(".git").exists(),
+        };
+        if !holds_head {
+            return Err(BootError::config(format!(
+                "recovery: {} is not this executor's continuation of the chain head (no staging \
+                 that continues it, and no completed materialize of it); refusing to \
+                 materialize over it or to capture it — the disk is left as it is",
+                working_directory.display()
+            )));
+        }
+        tracing::warn!(
+            "recovery: no staging continues the head, but the head's materialize completed on \
+             this disk; resuming it as it is"
+        );
+        resumed = true;
+    }
+    if source.recovery {
+        tracing::warn!(
+            "recovery boot: resuming this disk's own staging; no lifecycle step, no harness, no \
+             exec or session admitted — the final flush saves what is here"
+        );
+    }
     if let Pickup::Resume {
         queued,
         epoch_changed,
@@ -455,6 +491,7 @@ mod tests {
             object_ca_pem: None,
             object_ca_file: None,
             executor_id: None,
+            recovery: false,
         }
     }
 
@@ -511,6 +548,103 @@ mod tests {
         assert_eq!(
             boot.engine.previous().unwrap().manifest.sections.bulk,
             BulkState::pending()
+        );
+    }
+
+    /// A recovery boot never materializes over the disk. An executor materialized the head and
+    /// wrote work it never snapped, and nothing on its disk says its staging continues the head
+    /// (it died before its engine recorded one): an ordinary boot on that disk materializes the
+    /// head again and takes the work back; a recovery boot resumes the disk as it is (its
+    /// materialize of the head completed), and its engine continues from the head. A disk that
+    /// is not this executor's continuation of the head (nothing materialized, nothing staged)
+    /// is refused, touched by nothing.
+    #[test]
+    fn a_recovery_boot_resumes_the_disk_and_never_materializes_over_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let registrar = Arc::new(InMemoryRegistrar::new("wt-boot", 1, None));
+        let sink = capture_source(tmp.path(), &registrar);
+        let dyn_sink: Arc<dyn BlobSink> = sink.clone();
+        let head = registrar.head().unwrap();
+        let recovery = CaptureSourceConfig {
+            recovery: true,
+            ..source()
+        };
+        // The executor's first boot, the work it wrote before any snap, and no record of what
+        // its staging continues.
+        let first_boot = |disk: &Path| {
+            drop(
+                boot_from(
+                    registrar.clone(),
+                    Some(dyn_sink.clone()),
+                    &source(),
+                    disk,
+                    tmp.path(),
+                )
+                .unwrap(),
+            );
+            std::fs::write(disk.join("unsaved.rs"), "// written, never snapped\n").unwrap();
+            std::fs::write(disk.join("lib.rs"), "pub fn f() { edited() }\n").unwrap();
+            let _ = std::fs::remove_file(disk.join(".sealantd/capture/index/last.json"));
+        };
+        // Everything but the daemon's own directory, which the engine keeps.
+        let work = |dir: &Path| -> Vec<(String, Vec<u8>)> {
+            tree(dir)
+                .into_iter()
+                .filter(|(rel, _)| !rel.starts_with(".sealantd/"))
+                .collect()
+        };
+
+        // An ordinary boot on such a disk materializes the head over it: the new file goes.
+        let copy = tmp.path().join("copy");
+        first_boot(&copy);
+        let rebooted = boot_from(
+            registrar.clone(),
+            Some(dyn_sink.clone()),
+            &source(),
+            &copy,
+            tmp.path(),
+        )
+        .unwrap();
+        assert!(!rebooted.resumed);
+        assert!(
+            !copy.join("unsaved.rs").exists(),
+            "an ordinary boot sweeps the work the head does not hold: what a recovery boot \
+             must never do"
+        );
+        drop(rebooted);
+
+        // A recovery boot on the same kind of disk resumes it as it is.
+        let disk = tmp.path().join("disk");
+        first_boot(&disk);
+        let before = work(&disk);
+        let boot = boot_from(
+            registrar.clone(),
+            Some(dyn_sink.clone()),
+            &recovery,
+            &disk,
+            tmp.path(),
+        )
+        .unwrap();
+        assert!(boot.resumed, "the disk is resumed, not materialized over");
+        assert_eq!(work(&disk), before, "nothing on the disk changed");
+        assert_eq!(
+            boot.engine.previous().unwrap().capture_id,
+            head.capture_id,
+            "the engine continues from the head"
+        );
+        drop(boot);
+
+        // A disk nothing materialized: refused, untouched.
+        let foreign = tmp.path().join("foreign");
+        std::fs::create_dir_all(&foreign).unwrap();
+        std::fs::write(foreign.join("notes.txt"), "someone's work\n").unwrap();
+        match boot_from(registrar, Some(dyn_sink), &recovery, &foreign, tmp.path()) {
+            Ok(_) => panic!("a recovery boot over a disk that is not the executor's own"),
+            Err(refused) => assert!(refused.to_string().contains("recovery"), "{refused}"),
+        }
+        assert_eq!(
+            tree(&foreign),
+            vec![("notes.txt".to_owned(), b"someone's work\n".to_vec())]
         );
     }
 
