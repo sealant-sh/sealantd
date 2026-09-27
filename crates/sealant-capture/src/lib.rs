@@ -16,6 +16,7 @@ pub mod engine;
 pub mod gitpack;
 pub mod index;
 pub mod keys;
+pub mod longpath;
 pub mod manifest;
 pub mod materialize;
 pub mod pack;

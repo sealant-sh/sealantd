@@ -1077,7 +1077,6 @@ dependencies = [
  "rcgen",
  "rustls",
  "rustls-pemfile",
- "sealant-fs",
  "sealant-process",
  "serde",
  "serde_json",

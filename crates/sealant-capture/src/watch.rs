@@ -16,11 +16,11 @@ use std::sync::{Arc, Mutex, mpsc};
 
 use notify::event::{CreateKind, ModifyKind, RenameMode};
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use sealant_fs::watcher::{pruned_dirs, watch_pruned};
 
 use crate::engine::Class;
 use crate::gitpack::GitRepo;
 use crate::index::{CREDENTIAL_FILES, DAEMON_DIR, Suspects, has_component_in, is_git_transient};
+use crate::longpath;
 
 /// The `fs.inotify.max_user_watches` sysctl.
 pub const MAX_USER_WATCHES: &str = "/proc/sys/fs/inotify/max_user_watches";
@@ -66,6 +66,9 @@ pub enum ChangeSignal {
     Changed(Class),
     /// The kernel queue overflowed (`IN_Q_OVERFLOW`); events were lost.
     Overflow,
+    /// A directory of the class could not be watched (a path too long for `inotify_add_watch`,
+    /// the watch limit): changes under it would go unseen, so the class polls.
+    Unwatched(Class),
 }
 
 /// Paths the watcher saw written or created, per class, since that class's last build took them
@@ -317,26 +320,84 @@ impl Policy {
             return Vec::new();
         }
         let mut roots = Vec::new();
-        let mut it = walkdir::WalkDir::new(&self.root)
-            .follow_links(false)
-            .min_depth(1)
-            .sort_by_file_name()
-            .into_iter();
-        while let Some(next) = it.next() {
-            let Ok(e) = next else { continue };
-            if !e.file_type().is_dir() {
-                continue;
+        longpath::walk(&self.root, &mut |visit| {
+            let longpath::Visit::Entry { path, kind, .. } = visit else {
+                return false;
+            };
+            if kind != longpath::Kind::Dir {
+                return false;
             }
-            let name = e.file_name().to_string_lossy();
-            if self.prune_bulk(e.path(), &name) {
-                it.skip_current_dir();
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy())
+                .unwrap_or_default();
+            if self.prune_bulk(path, &name) {
+                false
             } else if self.bulk_dirs.iter().any(|b| b.as_str() == name) {
-                roots.push(e.path().to_path_buf());
-                it.skip_current_dir();
+                roots.push(path.to_path_buf());
+                false
+            } else {
+                true
             }
-        }
+        });
         roots
     }
+}
+
+/// Every directory under (and including) `dir` that `prune` does not cut off, whatever its
+/// path's length (the `sealant-fs` walk stops where `walkdir` does, at
+/// `PATH_MAX`, and a directory it never lists is one nobody knows is unwatched).
+fn pruned_dirs(dir: &Path, prune: &dyn Fn(&Path, &str) -> bool) -> Vec<PathBuf> {
+    if !longpath::metadata(dir).is_ok_and(|m| m.is_dir()) {
+        return Vec::new();
+    }
+    let mut dirs = vec![dir.to_path_buf()];
+    longpath::walk(dir, &mut |visit| {
+        let longpath::Visit::Entry { path, kind, .. } = visit else {
+            return false;
+        };
+        if kind != longpath::Kind::Dir {
+            return false;
+        }
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy())
+            .unwrap_or_default();
+        if prune(path, &name) {
+            return false;
+        }
+        dirs.push(path.to_path_buf());
+        true
+    });
+    dirs
+}
+
+/// Register a non-recursive watch on every directory [`pruned_dirs`] yields under `dir` that is
+/// not already in `watched`: `(registered, failed)`. A failure is logged and counted, never
+/// skipped silently: the caller has the class poll.
+fn watch_pruned(
+    watcher: &mut RecommendedWatcher,
+    watched: &mut HashSet<PathBuf>,
+    dir: &Path,
+    prune: &dyn Fn(&Path, &str) -> bool,
+) -> (usize, usize) {
+    let (mut added, mut failed) = (0, 0);
+    for d in pruned_dirs(dir, prune) {
+        if watched.contains(&d) {
+            continue;
+        }
+        match watcher.watch(&d, RecursiveMode::NonRecursive) {
+            Ok(()) => {
+                watched.insert(d);
+                added += 1;
+            }
+            Err(error) => {
+                tracing::warn!(dir = %d.display(), %error, "capture: could not watch a directory; its class polls");
+                failed += 1;
+            }
+        }
+    }
+    (added, failed)
 }
 
 fn count_dirs(roots: &[PathBuf], prune: &dyn Fn(&Path, &str) -> bool) -> usize {
@@ -431,14 +492,33 @@ pub fn start(
             Err(error) => tracing::warn!(%error, "capture watcher error"),
         })?;
     let mut watched: HashSet<PathBuf> = HashSet::new();
+    let mut small_failed = 0;
     for r in &small_roots {
         watcher.watch(r, RecursiveMode::NonRecursive)?;
         watched.insert(r.clone());
-        watch_pruned(&mut watcher, &mut watched, r, &small_prune);
+        small_failed += watch_pruned(&mut watcher, &mut watched, r, &small_prune).1;
     }
+    if small_failed > 0 {
+        tracing::warn!(
+            unwatched = small_failed,
+            "capture: directories of the small class could not be watched; polling at the \
+             maximum intervals"
+        );
+        return Ok(polled);
+    }
+    let mut bulk = bulk;
     if bulk == Mode::Watched {
+        let mut bulk_failed = 0;
         for r in &bulk_roots {
-            watch_pruned(&mut watcher, &mut watched, r, &bulk_prune);
+            bulk_failed += watch_pruned(&mut watcher, &mut watched, r, &bulk_prune).1;
+        }
+        if bulk_failed > 0 {
+            tracing::warn!(
+                unwatched = bulk_failed,
+                "capture: bulk directories could not be watched; the bulk class polls at its \
+                 maximum interval"
+            );
+            bulk = Mode::Polled;
         }
     }
     let watches = watched.len();
@@ -515,7 +595,7 @@ fn handle_event(
             EventKind::Create(CreateKind::Folder) => true,
             EventKind::Create(_)
             | EventKind::Modify(ModifyKind::Name(RenameMode::To | RenameMode::Both)) => {
-                path.is_dir()
+                longpath::metadata(path).is_ok_and(|m| m.is_dir())
             }
             _ => false,
         };
@@ -528,11 +608,16 @@ fn handle_event(
                     .unwrap_or_default();
                 let bulk_root = policy.bulk_dirs.iter().any(|b| b.as_str() == name);
                 if class == Class::Bulk || bulk_root {
-                    if watch_bulk {
-                        watch_pruned(watcher, watched, path, &|d, n| policy.prune_bulk(d, n));
+                    if watch_bulk
+                        && watch_pruned(watcher, watched, path, &|d, n| policy.prune_bulk(d, n)).1
+                            > 0
+                    {
+                        on_signal(ChangeSignal::Unwatched(Class::Bulk));
                     }
-                } else if !policy.prune_small(path, &name) {
-                    watch_pruned(watcher, watched, path, &|d, n| policy.prune_small(d, n));
+                } else if !policy.prune_small(path, &name)
+                    && watch_pruned(watcher, watched, path, &|d, n| policy.prune_small(d, n)).1 > 0
+                {
+                    on_signal(ChangeSignal::Unwatched(Class::Small));
                 }
             }
         }
@@ -629,6 +714,61 @@ mod tests {
         assert!(policy.prune_small(&root.join("node_modules"), "node_modules"));
         assert!(!policy.prune_small(&root.join(".git/refs"), "refs"));
         assert!(policy.prune_small(&root.join(".git/objects"), "objects"));
+    }
+
+    /// A directory deeper than `PATH_MAX` cannot be watched (`inotify_add_watch` takes a path):
+    /// it was never even listed, so changes under it went unseen while its class read
+    /// `Watched`. Now the class that holds it polls, at start and when one appears later.
+    #[test]
+    fn a_directory_that_cannot_be_watched_makes_its_class_poll() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("ws");
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
+        let deep = |top: &Path| {
+            let mut p = top.to_path_buf();
+            for i in 0..18 {
+                p = p.join(format!("d{i:02}{}", "x".repeat(240)));
+                longpath::create_dir(&p).unwrap();
+            }
+        };
+        // A bulk directory that deep: the bulk class polls, the small class is watched.
+        deep(&root.join("node_modules/pkg"));
+        let started = start(&spec(&root, None), Arc::new(|_| {})).unwrap();
+        assert_eq!(started.small, Mode::Watched);
+        assert_eq!(started.bulk, Mode::Polled);
+        drop(started);
+
+        // A worktree directory that deep, there at start: everything polls.
+        deep(&root.join("src"));
+        let started = start(&spec(&root, None), Arc::new(|_| {})).unwrap();
+        assert_eq!(started.small, Mode::Polled);
+        assert!(started.handle.is_none());
+        longpath::remove_dir_all(&root.join("src")).unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+
+        // One made after the watcher started: the class is reported unwatched.
+        let (tx, rx) = mpsc::channel();
+        let started = start(
+            &spec(&root, None),
+            Arc::new(move |s| {
+                let _ = tx.send(s);
+            }),
+        )
+        .unwrap();
+        assert_eq!(started.small, Mode::Watched);
+        let staged = tmp.path().join("staged");
+        fs::create_dir_all(&staged).unwrap();
+        deep(&staged);
+        fs::rename(&staged, root.join("src/moved-in")).unwrap();
+        let mut unwatched = false;
+        while let Ok(s) = rx.recv_timeout(std::time::Duration::from_secs(5)) {
+            if s == ChangeSignal::Unwatched(Class::Small) {
+                unwatched = true;
+                break;
+            }
+        }
+        assert!(unwatched, "a directory it could not watch is reported");
     }
 
     #[test]

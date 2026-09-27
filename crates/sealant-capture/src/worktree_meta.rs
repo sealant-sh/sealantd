@@ -34,18 +34,17 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::OsStr;
-use std::fs::{self, Metadata};
+use std::fs::Metadata;
 use std::io::{self, Read};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
-use nix::sys::stat::{UtimensatFlags, utimensat};
-use nix::sys::time::TimeSpec;
 use serde::{Deserialize, Serialize};
 
 use crate::gitpack::{GitError, GitRepo};
 use crate::index::{has_component_in, mtime_ns};
+use crate::longpath;
 use crate::manifest::WORKTREE_META_FORMAT;
 pub use crate::tree::{bytes_of, key_of, raw_of};
 
@@ -267,13 +266,34 @@ fn under(rel: &[u8], set: &[String]) -> bool {
     })
 }
 
+/// What [`MetaScope::directories`] found.
+#[derive(Debug, Default)]
+struct Directories {
+    /// Directories in scope, root-relative bytes (empty is the root), with their metadata.
+    dirs: BTreeMap<Vec<u8>, Metadata>,
+    /// Paths in scope that could not be listed or stat'ed, or that no class carries, with what
+    /// was wrong: never taken as gone.
+    unreadable: Vec<(Vec<u8>, String)>,
+}
+
+/// A worktree-relative path git cannot reach: it runs in the worktree and passes each path
+/// whole to one system call, which refuses `PATH_MAX` bytes or more — a file's path as it is,
+/// a directory's with the `/` git appends to open it ([`crate::gitpack::GitRepo::beyond_reach`]
+/// lists them for the chunked class).
+#[must_use]
+pub fn beyond_git(rel: &[u8], is_dir: bool) -> bool {
+    rel.len() + usize::from(is_dir) >= longpath::PATH_MAX
+}
+
 impl MetaScope {
     /// Directories under the root the overlay covers, as root-relative bytes (empty is the
     /// root), with their metadata: the walk prunes `.git`, the excludes, bulk directories,
-    /// nested repositories and every directory git reports ignored. A directory that cannot be
-    /// listed is kept and not descended into (git cannot see into it either); one that
-    /// vanished mid-walk is skipped.
-    fn directories(&self, repo: &GitRepo) -> Result<BTreeMap<Vec<u8>, Metadata>, MetaError> {
+    /// nested repositories (and the paths git cannot reach, which the chunked class carries)
+    /// and every directory git reports ignored. A path of any length is walked. A directory
+    /// that cannot be listed is kept and not descended into; one that cannot be stat'ed is left
+    /// out; both are reported unreadable, as is a path git cannot reach that no class carries.
+    /// One that vanished mid-walk is skipped. No single path fails the walk.
+    fn directories(&self, repo: &GitRepo) -> Result<Directories, MetaError> {
         let out = repo.run(&[
             "ls-files",
             "-o",
@@ -282,72 +302,91 @@ impl MetaScope {
             "--directory",
             "-z",
         ])?;
-        let ignored: BTreeSet<&[u8]> = out
+        let listed: Vec<&[u8]> = out
             .stdout
             .split(|b| *b == 0)
-            .filter_map(|p| p.strip_suffix(b"/"))
+            .filter(|p| !p.is_empty())
             .collect();
-        let mut dirs = BTreeMap::new();
-        let walker = walkdir::WalkDir::new(&self.root)
-            .follow_links(false)
-            .sort_by_file_name()
-            .into_iter()
-            .filter_entry(|e| {
-                if !e.file_type().is_dir() {
-                    return false;
-                }
-                if e.depth() == 0 {
-                    return true;
-                }
-                let Ok(rel) = e.path().strip_prefix(&self.root) else {
-                    return false;
-                };
-                let bytes = rel.as_os_str().as_bytes();
-                !(e.file_name() == ".git"
-                    || under(bytes, &self.excludes)
-                    || under(bytes, &self.nested)
-                    || ignored.contains(bytes)
-                    || has_component_in(rel, &self.bulk_dirs)
-                    || self.skip_abs.iter().any(|s| s == e.path()))
-            });
-        for entry in walker {
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(error) => {
-                    let path = error
-                        .path()
-                        .map(|p| p.display().to_string())
-                        .unwrap_or_default();
-                    match error.io_error().map(io::Error::kind) {
-                        Some(io::ErrorKind::NotFound) => continue,
-                        Some(io::ErrorKind::PermissionDenied) => {
-                            tracing::warn!(%path, "worktree metadata: cannot list; not descended");
-                            continue;
-                        }
-                        _ => {
-                            return Err(MetaError::Io {
-                                path,
-                                source: error.into(),
-                            });
-                        }
-                    }
-                }
-            };
-            let rel = entry
-                .path()
-                .strip_prefix(&self.root)
-                .unwrap_or(entry.path())
-                .as_os_str()
-                .as_bytes();
-            let meta = match fs::symlink_metadata(entry.path()) {
-                Ok(meta) if meta.is_dir() => meta,
-                Ok(_) => continue,
-                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
-                Err(e) => return Err(io_err(rel)(e)),
-            };
-            dirs.insert(rel.to_vec(), meta);
+        let ignored: BTreeSet<&[u8]> = listed.iter().filter_map(|p| p.strip_suffix(b"/")).collect();
+        let ignored_files: BTreeSet<&[u8]> = listed
+            .iter()
+            .copied()
+            .filter(|p| !p.ends_with(b"/"))
+            .collect();
+        let mut found = Directories::default();
+        match longpath::symlink_metadata(&self.root) {
+            Ok(meta) if meta.is_dir() => {
+                found.dirs.insert(Vec::new(), meta);
+            }
+            Ok(_) => return Ok(found),
+            Err(e) if crate::index::is_vanished(&e) => return Ok(found),
+            Err(e) => {
+                found.unreadable.push((Vec::new(), e.to_string()));
+                return Ok(found);
+            }
         }
-        Ok(dirs)
+        let rel_of = |path: &Path| -> Vec<u8> {
+            path.strip_prefix(&self.root)
+                .unwrap_or(path)
+                .as_os_str()
+                .as_bytes()
+                .to_vec()
+        };
+        longpath::walk(&self.root, &mut |visit| {
+            let (path, kind) = match visit {
+                longpath::Visit::Entry { path, kind, .. } => (path, kind),
+                longpath::Visit::Error { path, error, .. } => {
+                    if !crate::index::is_vanished(&error) {
+                        tracing::warn!(path = %path.display(), %error, "worktree metadata: cannot list; not descended");
+                        found.unreadable.push((rel_of(path), error.to_string()));
+                    }
+                    return false;
+                }
+            };
+            let rel = rel_of(path);
+            let is_dir = kind == longpath::Kind::Dir;
+            let carried_elsewhere = under(&rel, &self.nested) || under(&rel, &self.excludes);
+            if !is_dir {
+                // Git lists such a file for the chunked class; one it did not list (a
+                // filesystem that gives no entry types) is carried by nobody: say so.
+                if beyond_git(&rel, false)
+                    && !carried_elsewhere
+                    && !ignored_files.contains(rel.as_slice())
+                {
+                    found
+                        .unreadable
+                        .push((rel, "too long for git, and in no other class".to_owned()));
+                }
+                return false;
+            }
+            if path.file_name() == Some(OsStr::new(".git"))
+                || carried_elsewhere
+                || ignored.contains(rel.as_slice())
+                || has_component_in(Path::new(OsStr::from_bytes(&rel)), &self.bulk_dirs)
+                || self.skip_abs.iter().any(|s| s == path)
+            {
+                return false;
+            }
+            if beyond_git(&rel, true) {
+                found
+                    .unreadable
+                    .push((rel, "too long for git, and in no other class".to_owned()));
+                return false;
+            }
+            match longpath::symlink_metadata(path) {
+                Ok(meta) if meta.is_dir() => {
+                    found.dirs.insert(rel, meta);
+                    true
+                }
+                Ok(_) => false,
+                Err(e) if crate::index::is_vanished(&e) => false,
+                Err(e) => {
+                    found.unreadable.push((rel, e.to_string()));
+                    false
+                }
+            }
+        });
+        Ok(found)
     }
 }
 
@@ -482,10 +521,11 @@ pub fn capture(
     type Named = (String, Vec<u8>, u64);
     let mut inodes: BTreeMap<(u64, u64), Vec<Named>> = BTreeMap::new();
     for tp in tree_paths(repo, worktree_tree)? {
-        let meta = match fs::symlink_metadata(scope.root.join(os(&tp.path))) {
+        let meta = match longpath::symlink_metadata(&abs_of(&scope.root, &tp.path)) {
             Ok(meta) => meta,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
-            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+            Err(e) if crate::index::is_vanished(&e) => continue,
+            // Any other error is this path's alone: unreadable, its last entry carried.
+            Err(e) => {
                 let key = key_of(&tp.path).into_owned();
                 let previous = carried.get(key.as_str()).filter(|p| p.kind == tp.kind);
                 if let Some(previous) = previous {
@@ -498,7 +538,6 @@ pub fn capture(
                 });
                 continue;
             }
-            Err(e) => return Err(io_err(&tp.path)(e)),
         };
         if kind_of(&meta) != Some(tp.kind) {
             continue;
@@ -513,9 +552,32 @@ pub fn capture(
         }
         entries.insert(entry.path.clone(), entry);
     }
-    for (rel, meta) in scope.directories(repo)? {
+    let found = scope.directories(repo)?;
+    for (rel, meta) in found.dirs {
         let entry = entry_of(&rel, MetaKind::Dir, &meta);
         entries.entry(entry.path.clone()).or_insert(entry);
+    }
+    // A directory that could not be listed or stat'ed: what the previous document held at and
+    // under it (directories; tracked paths came from the tree) is carried, never dropped.
+    for (rel, error) in found.unreadable {
+        let key = key_of(&rel).into_owned();
+        let prefix = format!("{key}/");
+        let mut carried_any = false;
+        for (path, previous) in &carried {
+            let at_or_under = rel.is_empty() || *path == key || path.starts_with(&prefix);
+            if previous.kind == MetaKind::Dir && at_or_under && !entries.contains_key(*path) {
+                entries.insert((*path).to_owned(), (*previous).clone());
+                carried_any = true;
+            }
+        }
+        match unreadable.iter_mut().find(|u| u.path == key) {
+            Some(u) => u.carried |= carried_any,
+            None => unreadable.push(UnreadableMeta {
+                path: key,
+                error,
+                carried: carried_any,
+            }),
+        }
     }
     let mut hardlinks: Vec<Vec<String>> = Vec::new();
     let mut outside = Vec::new();
@@ -562,11 +624,11 @@ pub struct Applied {
 }
 
 fn same_bytes(a: &Path, b: &Path) -> io::Result<bool> {
-    let (ma, mb) = (fs::metadata(a)?, fs::metadata(b)?);
+    let (ma, mb) = (longpath::metadata(a)?, longpath::metadata(b)?);
     if ma.len() != mb.len() {
         return Ok(false);
     }
-    let (mut fa, mut fb) = (fs::File::open(a)?, fs::File::open(b)?);
+    let (mut fa, mut fb) = (longpath::open(a)?, longpath::open(b)?);
     let (mut ba, mut bb) = (vec![0u8; 1 << 16], vec![0u8; 1 << 16]);
     loop {
         let n = fa.read(&mut ba)?;
@@ -609,7 +671,7 @@ pub fn apply(
     // Directories: parents sort before children.
     for (rel, e) in entries.iter().filter(|(_, e)| e.kind == MetaKind::Dir) {
         let abs = abs_of(root, rel);
-        match fs::symlink_metadata(&abs) {
+        match longpath::symlink_metadata(&abs) {
             Ok(meta) if meta.is_dir() => {}
             Ok(meta) => {
                 return Err(MetaError::Mismatch {
@@ -618,7 +680,7 @@ pub fn apply(
                 });
             }
             Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                fs::create_dir_all(&abs).map_err(io_err(rel))?;
+                longpath::create_dir_all(&abs).map_err(io_err(rel))?;
                 applied.changed += 1;
             }
             Err(err) => return Err(io_err(rel)(err)),
@@ -626,7 +688,7 @@ pub fn apply(
     }
     // Every other path is on disk as the checkout wrote it.
     for (rel, e) in entries.iter().filter(|(_, e)| e.kind != MetaKind::Dir) {
-        let meta = fs::symlink_metadata(abs_of(root, rel)).map_err(io_err(rel))?;
+        let meta = longpath::symlink_metadata(&abs_of(root, rel)).map_err(io_err(rel))?;
         if kind_of(&meta) != Some(e.kind) {
             return Err(MetaError::Mismatch {
                 path: e.path.clone(),
@@ -639,12 +701,13 @@ pub fn apply(
     let planned: BTreeSet<&[u8]> = entries.iter().map(|(b, _)| b.as_slice()).collect();
     let mut stale: Vec<Vec<u8>> = scope
         .directories(repo)?
+        .dirs
         .into_keys()
         .filter(|rel| !rel.is_empty() && !planned.contains(rel.as_slice()))
         .collect();
     stale.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
     for rel in stale {
-        match fs::remove_dir(root.join(os(&rel))) {
+        match longpath::remove_dir(&abs_of(root, &rel)) {
             Ok(()) => applied.changed += 1,
             Err(e)
                 if matches!(
@@ -660,12 +723,12 @@ pub fn apply(
             continue;
         };
         let first = bytes_of(first);
-        let canonical = root.join(os(&first));
-        let target = fs::symlink_metadata(&canonical).map_err(io_err(&first))?;
+        let canonical = abs_of(root, &first);
+        let target = longpath::symlink_metadata(&canonical).map_err(io_err(&first))?;
         for member in rest {
             let member = bytes_of(member);
-            let abs = root.join(os(&member));
-            let meta = fs::symlink_metadata(&abs).map_err(io_err(&member))?;
+            let abs = abs_of(root, &member);
+            let meta = longpath::symlink_metadata(&abs).map_err(io_err(&member))?;
             if (meta.dev(), meta.ino()) == (target.dev(), target.ino()) {
                 continue;
             }
@@ -677,13 +740,13 @@ pub fn apply(
     let mut relinked = Vec::new();
     for link in &doc.shared {
         let tracked = bytes_of(&link.path);
-        let canonical = root.join(os(&tracked));
+        let canonical = abs_of(root, &tracked);
         let member = bytes_of_pair(&link.member, link.raw_member.as_deref())?;
         let Some(abs) = resolve(link.class, &member) else {
             continue;
         };
-        let target = fs::symlink_metadata(&canonical).map_err(io_err(&tracked))?;
-        let meta = match fs::symlink_metadata(&abs) {
+        let target = longpath::symlink_metadata(&canonical).map_err(io_err(&tracked))?;
+        let meta = match longpath::symlink_metadata(&abs) {
             Ok(meta) if meta.is_file() => meta,
             Ok(_) => continue,
             Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
@@ -722,7 +785,7 @@ pub fn apply(
     }
     // Stat relinked names once the shared inode has its final mode and mtime.
     for (class, member, abs, bytes) in relinked {
-        let meta = fs::symlink_metadata(&abs).map_err(io_err(&bytes))?;
+        let meta = longpath::symlink_metadata(&abs).map_err(io_err(&bytes))?;
         applied.relinked.push((class, member, meta));
     }
     Ok(applied)
@@ -735,10 +798,10 @@ pub fn apply(
 fn relink(canonical: &Path, abs: &Path) -> io::Result<()> {
     let parent = abs
         .parent()
-        .map(|dir| fs::symlink_metadata(dir).map(|meta| (dir, mtime_ns(&meta))))
+        .map(|dir| longpath::symlink_metadata(dir).map(|meta| (dir, mtime_ns(&meta))))
         .transpose()?;
-    fs::remove_file(abs)?;
-    fs::hard_link(canonical, abs)?;
+    longpath::remove_file(abs)?;
+    longpath::hard_link(canonical, abs)?;
     if let Some((dir, mtime)) = parent {
         set_mtime_nofollow(dir, mtime)?;
     }
@@ -748,13 +811,13 @@ fn relink(canonical: &Path, abs: &Path) -> io::Result<()> {
 /// Set one path's mode and mtime where they differ; whether anything changed.
 fn settle(root: &Path, rel: &[u8], e: &MetaEntry) -> Result<bool, MetaError> {
     let abs = abs_of(root, rel);
-    let meta = fs::symlink_metadata(&abs).map_err(io_err(rel))?;
+    let meta = longpath::symlink_metadata(&abs).map_err(io_err(rel))?;
     let mut changed = false;
     if let Some(mode) = e.mode
         && e.kind != MetaKind::Symlink
         && meta.mode() & 0o7777 != mode
     {
-        fs::set_permissions(&abs, fs::Permissions::from_mode(mode)).map_err(io_err(rel))?;
+        longpath::set_mode(&abs, mode).map_err(io_err(rel))?;
         changed = true;
     }
     if mtime_ns(&meta) != e.mtime {
@@ -765,25 +828,79 @@ fn settle(root: &Path, rel: &[u8], e: &MetaEntry) -> Result<bool, MetaError> {
 }
 
 /// Set `abs`'s mtime (nanoseconds since the epoch) without following a symlink, so a
-/// symlink gets its own mtime and a file is not opened (its mode may forbid that).
+/// symlink gets its own mtime and a file is not opened (its mode may forbid that). A path of
+/// any length ([`longpath::set_mtime_nofollow`]).
 pub fn set_mtime_nofollow(abs: &Path, mtime_ns: i64) -> io::Result<()> {
-    let mtime = TimeSpec::new(
-        mtime_ns.div_euclid(1_000_000_000),
-        mtime_ns.rem_euclid(1_000_000_000),
-    );
-    utimensat(
-        nix::fcntl::AT_FDCWD,
-        abs,
-        &TimeSpec::UTIME_OMIT,
-        &mtime,
-        UtimensatFlags::NoFollowSymlink,
-    )
-    .map_err(io::Error::from)
+    longpath::set_mtime_nofollow(abs, mtime_ns)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn git(root: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .current_dir(root)
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}");
+    }
+
+    /// Finding 1b of the third Docker end to end: one path whose metadata cannot be read (any
+    /// error, not only `EACCES`) failed the whole overlay, and with it every snap. Now that
+    /// path alone is unreadable — a tracked file's previous entry and an unlistable
+    /// directory's previous subdirectories carried — and every other path is read.
+    #[test]
+    fn one_path_that_cannot_be_read_is_unreadable_and_the_rest_is_captured() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("ws");
+        std::fs::create_dir_all(root.join("u/sub")).unwrap();
+        git(&root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("a.txt"), "a\n").unwrap();
+        std::fs::write(root.join("b.txt"), "b\n").unwrap();
+        std::fs::write(root.join("u/sub/f.txt"), "f\n").unwrap();
+        std::fs::create_dir_all(root.join("v")).unwrap();
+        let repo = GitRepo::open(&root).unwrap();
+        let scope = MetaScope {
+            root: root.clone(),
+            excludes: vec![".sealantd".to_owned()],
+            bulk_dirs: Vec::new(),
+            nested: Vec::new(),
+            skip_abs: Vec::new(),
+        };
+        let scratch = tmp.path().join("scratch");
+        let (tree, _) = repo.worktree_tree(&scratch, &scope.excludes).unwrap();
+        let before = capture(&repo, &tree, &scope, None).unwrap();
+        assert!(before.unreadable.is_empty());
+
+        longpath::inject_fault(&root.join("b.txt"), nix::libc::EIO);
+        longpath::inject_fault(&root.join("u"), nix::libc::EIO);
+        longpath::inject_fault(&root.join("v"), nix::libc::ELOOP);
+        let after = capture(&repo, &tree, &scope, Some(&before.doc)).unwrap();
+        let unreadable: BTreeMap<&str, bool> = after
+            .unreadable
+            .iter()
+            .map(|u| (u.path.as_str(), u.carried))
+            .collect();
+        assert_eq!(
+            unreadable,
+            BTreeMap::from([("b.txt", true), ("u", true), ("v", true)]),
+            "{:?}",
+            after.unreadable
+        );
+        let paths: BTreeSet<&str> = after.doc.entries.iter().map(|e| e.path.as_str()).collect();
+        // Every path is there: read, or (unreadable) carried from the previous document.
+        for p in ["", "a.txt", "b.txt", "u", "u/sub", "u/sub/f.txt", "v"] {
+            assert!(paths.contains(p), "{p} is in the overlay: {paths:?}");
+        }
+
+        // A final snap carries nothing: the same paths are unreadable, none carried.
+        let strict = capture(&repo, &tree, &scope, None).unwrap();
+        assert!(strict.unreadable.iter().all(|u| !u.carried));
+        assert_eq!(strict.unreadable.len(), 3);
+    }
 
     fn file(path: &str) -> MetaEntry {
         MetaEntry {

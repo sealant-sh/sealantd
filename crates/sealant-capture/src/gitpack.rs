@@ -7,16 +7,34 @@
 use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{self, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
 use sealant_process::CommandGateExt;
 
 use crate::chunk::sha256_hex;
+use crate::longpath;
 use crate::manifest::{FsckStatus, INDEX_TREE_REF, PSEUDO_REF_PREFIX, WORKTREE_TREE_REF};
 
 /// Bounded attempts when refs move or objects vanish between the read and the pack.
 pub const PACK_ATTEMPTS: u32 = 3;
+
+/// Bounded re-runs of `git add` that each set aside one more path git died on.
+const FATAL_PATH_RETRIES: usize = 16;
+
+/// The `git add` a worktree tree is written with ([`GitRepo::worktree_add_args`]).
+#[derive(Debug, Clone)]
+struct AddArgs {
+    /// Flags (`add -A --ignore-errors`).
+    args: Vec<String>,
+    /// Pathspecs: `.` and the `:(exclude)` items.
+    pathspecs: Vec<String>,
+    /// Nested repositories left out (the chunked class carries them).
+    nested: Vec<String>,
+    /// Paths git cannot reach, left out (the chunked class carries them).
+    beyond: Vec<String>,
+}
 
 /// Git errors.
 #[derive(Debug, thiserror::Error)]
@@ -281,22 +299,33 @@ impl GitRepo {
             .collect())
     }
 
+    /// `git ls-files -o --exclude-standard -z` (untranslated) against `index` when given, else
+    /// the real index: the untracked paths git would add, and on stderr the directories it
+    /// could not open.
+    fn untracked(&self, index: Option<&Path>) -> Result<Output, GitError> {
+        let mut cmd = git_command(&self.root);
+        if let Some(index) = index {
+            cmd.env("GIT_INDEX_FILE", index);
+        }
+        let others = ["ls-files", "-o", "--exclude-standard", "-z"];
+        check(&others, cmd.env("LC_ALL", "C").args(others).output_gated()?)
+    }
+
     /// Nested repositories under the worktree (directories holding a `.git`, the root's own
     /// excluded), relative to the root: the untracked ones git lists as a lone `dir/` entry
     /// (it never descends into an embedded repository) plus the tracked gitlinks whose
     /// directory holds a `.git` on disk. Ignored ones are not listed; they are carried by the
     /// ignored-files walk already. Read against `index` when given, else the real index.
     pub fn nested_repositories(&self, index: Option<&Path>) -> Result<Vec<String>, GitError> {
-        let mut cmd = git_command(&self.root);
-        if let Some(index) = index {
-            cmd.env("GIT_INDEX_FILE", index);
-        }
-        let others = ["ls-files", "-o", "--exclude-standard", "-z"];
-        let out = check(&others, cmd.args(others).output_gated()?)?;
-        let mut nested: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        let out = self.untracked(index)?;
+        self.nested_in(&out, index)
+    }
+
+    fn nested_in(&self, untracked: &Output, index: Option<&Path>) -> Result<Vec<String>, GitError> {
+        let mut nested: Vec<String> = String::from_utf8_lossy(&untracked.stdout)
             .split('\0')
             .filter_map(|l| l.strip_suffix('/'))
-            .filter(|d| !d.is_empty() && self.root.join(d).join(".git").exists())
+            .filter(|d| !d.is_empty() && longpath::exists(&self.root.join(d).join(".git")))
             .map(str::to_owned)
             .collect();
         let mut cmd = git_command(&self.root);
@@ -310,7 +339,7 @@ impl GitRepo {
                 .split('\0')
                 .filter(|l| l.starts_with("160000 "))
                 .filter_map(|l| l.split_once('\t').map(|(_, p)| p))
-                .filter(|p| self.root.join(p).join(".git").exists())
+                .filter(|p| longpath::exists(&self.root.join(p).join(".git")))
                 .map(str::to_owned),
         );
         nested.sort();
@@ -318,29 +347,191 @@ impl GitRepo {
         Ok(nested)
     }
 
-    /// The `git add` argv for [`Self::worktree_tree`] and the nested repositories it leaves
-    /// out. `excludes` and every nested repository under the root become `:(exclude)`
-    /// pathspec items, so `add -A` never reaches a path git cannot index: a nested
+    /// The paths of the working tree the chunked class carries for the git class: the nested
+    /// repositories ([`Self::nested_repositories`]) and the paths git cannot reach
+    /// ([`Self::beyond_reach`]), sorted. What a materialize sweeps and the worktree metadata
+    /// overlay leaves out, as a snap decided.
+    pub fn chunked_paths(&self, index: Option<&Path>) -> Result<Vec<String>, GitError> {
+        let out = self.untracked(index)?;
+        let mut paths = self.nested_in(&out, index)?;
+        paths.extend(self.beyond_in(&out, index)?);
+        paths.sort();
+        paths.dedup();
+        Ok(paths)
+    }
+
+    /// Untracked paths git cannot reach, relative to the root: it runs in the worktree and
+    /// passes each path whole to one system call, which refuses `PATH_MAX` bytes or more (a
+    /// file's path as it is; a directory's with the `/` git appends to open it,
+    /// [`crate::worktree_meta::beyond_git`]). Git lists such a file, then fails the add on it
+    /// (`fatal: unable to stat`); it warns that it could not open such a directory and drops
+    /// it. The chunked class carries both, whatever their length. Outermost only. A path that
+    /// is not UTF-8 is left to the walks that report what no class carries.
+    pub fn beyond_reach(&self, index: Option<&Path>) -> Result<Vec<String>, GitError> {
+        let out = self.untracked(index)?;
+        self.beyond_in(&out, index)
+    }
+
+    /// [`Self::beyond_reach`] from an [`Self::untracked`] listing. Git's warning about a
+    /// directory it could not open is cut at its message buffer (4 KB) exactly when the
+    /// directory is too long to open, so the path is not read off it: the directory the cut
+    /// text still names whole is walked (a path of any length), and every untracked,
+    /// unignored directory under it that git cannot open is taken — too long, or one this
+    /// walk cannot list either (the chunked class then reports it unreadable).
+    fn beyond_in(&self, untracked: &Output, index: Option<&Path>) -> Result<Vec<String>, GitError> {
+        let mut found: Vec<Vec<u8>> = Vec::new();
+        let mut nested: Vec<&[u8]> = Vec::new();
+        for p in untracked.stdout.split(|b| *b == 0) {
+            if let Some(dir) = p.strip_suffix(b"/") {
+                nested.push(dir);
+            } else if crate::worktree_meta::beyond_git(p, false) {
+                found.push(p.to_vec());
+            }
+        }
+        const WARNING: &[u8] = b"warning: could not open directory '";
+        let mut cut: Vec<Vec<u8>> = Vec::new();
+        for line in untracked.stderr.split(|b| *b == b'\n') {
+            let Some(rest) = line.strip_prefix(WARNING) else {
+                continue;
+            };
+            if rest.windows(3).any(|w| w == b"': ") {
+                // Whole: a directory git could not open for another reason, which the add
+                // reports as unreadable on its own.
+                continue;
+            }
+            let whole = rest
+                .iter()
+                .rposition(|b| *b == b'/')
+                .map_or(&b""[..], |i| &rest[..i]);
+            cut.push(whole.to_vec());
+        }
+        if !cut.is_empty() {
+            cut.sort();
+            cut.dedup();
+            let mut cmd = git_command(&self.root);
+            if let Some(index) = index {
+                cmd.env("GIT_INDEX_FILE", index);
+            }
+            let args = [
+                "ls-files",
+                "-o",
+                "-i",
+                "--exclude-standard",
+                "--directory",
+                "-z",
+            ];
+            let ignored_out = check(&args, cmd.env("LC_ALL", "C").args(args).output_gated()?)?;
+            let ignored: std::collections::BTreeSet<&[u8]> = ignored_out
+                .stdout
+                .split(|b| *b == 0)
+                .filter(|p| !p.is_empty())
+                .map(|p| p.strip_suffix(b"/").unwrap_or(p))
+                .collect();
+            let under_any = |rel: &[u8], set: &[&[u8]]| {
+                set.iter().any(|d| {
+                    rel == *d
+                        || rel
+                            .strip_prefix(*d)
+                            .is_some_and(|r| r.first() == Some(&b'/'))
+                })
+            };
+            let ignored_list: Vec<&[u8]> = ignored.iter().copied().collect();
+            for whole in &cut {
+                if cut
+                    .iter()
+                    .any(|o| o != whole && under_any(whole, &[o.as_slice()]))
+                {
+                    continue;
+                }
+                let base = if whole.is_empty() {
+                    self.root.clone()
+                } else {
+                    self.root.join(std::ffi::OsStr::from_bytes(whole))
+                };
+                let rel_of = |path: &Path| -> Vec<u8> {
+                    path.strip_prefix(&self.root)
+                        .unwrap_or(path)
+                        .as_os_str()
+                        .as_bytes()
+                        .to_vec()
+                };
+                longpath::walk(&base, &mut |visit| {
+                    let (path, kind) = match visit {
+                        longpath::Visit::Entry { path, kind, .. } => (path, kind),
+                        longpath::Visit::Error { path, error, .. } => {
+                            if !crate::index::is_vanished(&error) {
+                                found.push(rel_of(path));
+                            }
+                            return false;
+                        }
+                    };
+                    let rel = rel_of(path);
+                    if under_any(&rel, &ignored_list) || under_any(&rel, &nested) {
+                        return false;
+                    }
+                    if kind != longpath::Kind::Dir {
+                        if crate::worktree_meta::beyond_git(&rel, false) {
+                            found.push(rel);
+                        }
+                        return false;
+                    }
+                    if path.file_name() == Some(std::ffi::OsStr::new(".git")) {
+                        return false;
+                    }
+                    if crate::worktree_meta::beyond_git(&rel, true) {
+                        found.push(rel);
+                        return false;
+                    }
+                    true
+                });
+            }
+        }
+        let mut found: Vec<String> = found
+            .into_iter()
+            .filter_map(|p| String::from_utf8(p).ok())
+            .collect();
+        found.sort();
+        found.dedup();
+        let outer: Vec<String> = found
+            .iter()
+            .filter(|p| {
+                !found.iter().any(|o| {
+                    o != *p
+                        && p.strip_prefix(o.as_str())
+                            .is_some_and(|r| r.starts_with('/'))
+                })
+            })
+            .cloned()
+            .collect();
+        Ok(outer)
+    }
+
+    /// The `git add` flags and pathspecs for [`Self::worktree_tree`], the nested repositories
+    /// it leaves out and the paths git cannot reach ([`Self::beyond_reach`]). `excludes`,
+    /// every nested repository under the root and every path beyond git's reach become
+    /// `:(exclude)` pathspec items, so `add -A` never reaches a path git cannot index: a nested
     /// repository with no commit checked out is a fatal error on git 2.52 (`--ignore-errors`
     /// does not cover "does not have a commit checked out" there) and a skipped "unable to
     /// index" error on 2.55; one with a commit would become an embedded gitlink that carries
-    /// none of its bytes. The chunked class carries the bytes in both cases, so both are
-    /// excluded alike and returned.
+    /// none of its bytes; a file too long for one system call is fatal ("unable to stat"). The
+    /// chunked class carries the bytes in every case, so all are excluded alike and returned.
     /// An exclude git already ignores (the local exclude the engine adds at boot) is skipped by
     /// `.` on its own; naming it in a pathspec makes `git add` report it as an ignored path and
     /// exit 1, so only the paths git would otherwise index get a pathspec item. Nested
     /// repositories below an exclude are left out of the returned list: they are not part of
-    /// the tree the worktree tree describes.
+    /// the tree the worktree tree describes. The pathspecs travel in a file
+    /// (`--pathspec-from-file`): a thousand paths of 4 KB would not fit an argument list.
     fn worktree_add_args(
         &self,
         tmp_index: &Path,
         excludes: &[String],
-    ) -> Result<(Vec<String>, Vec<String>), GitError> {
+    ) -> Result<AddArgs, GitError> {
         // `--ignore-errors` stays as belt and braces for anything the enumeration missed.
-        let mut add: Vec<String> = ["add", "-A", "--ignore-errors", "--", "."]
+        let args: Vec<String> = ["add", "-A", "--ignore-errors"]
             .iter()
             .map(|s| (*s).to_owned())
             .collect();
+        let mut pathspecs: Vec<String> = vec![".".to_owned()];
         let excludes: Vec<&str> = excludes
             .iter()
             .map(|e| e.trim_matches('/'))
@@ -348,7 +539,7 @@ impl GitRepo {
             .collect();
         for e in &excludes {
             if !self.is_ignored(e)? {
-                add.push(format!(":(exclude){e}"));
+                pathspecs.push(format!(":(exclude){e}"));
             }
         }
         let under_exclude = |p: &str| {
@@ -356,17 +547,56 @@ impl GitRepo {
                 .iter()
                 .any(|e| p == *e || p.strip_prefix(e).is_some_and(|r| r.starts_with('/')))
         };
+        let untracked = self.untracked(Some(tmp_index))?;
         let mut nested = Vec::new();
-        for n in self.nested_repositories(Some(tmp_index))? {
+        for n in self.nested_in(&untracked, Some(tmp_index))? {
             if under_exclude(&n) {
                 continue;
             }
             if !self.is_ignored(&n)? {
-                add.push(format!(":(exclude){n}"));
+                pathspecs.push(format!(":(exclude){n}"));
             }
             nested.push(n);
         }
-        Ok((add, nested))
+        let mut beyond = Vec::new();
+        for b in self.beyond_in(&untracked, Some(tmp_index))? {
+            if under_exclude(&b)
+                || nested
+                    .iter()
+                    .any(|n| b == *n || b.starts_with(&format!("{n}/")))
+            {
+                continue;
+            }
+            pathspecs.push(format!(":(exclude){b}"));
+            beyond.push(b);
+        }
+        Ok(AddArgs {
+            args,
+            pathspecs,
+            nested,
+            beyond,
+        })
+    }
+
+    /// Run `git add` as [`AddArgs`] says against `tmp_index`, its pathspecs from a file beside
+    /// it, untranslated (what could not be read is read off the messages).
+    fn run_add(&self, tmp_index: &Path, add: &AddArgs) -> Result<Output, GitError> {
+        let spec_file = tmp_index.with_extension("pathspecs");
+        let mut specs: Vec<u8> = Vec::new();
+        for p in &add.pathspecs {
+            specs.extend_from_slice(p.as_bytes());
+            specs.push(0);
+        }
+        fs::write(&spec_file, &specs)?;
+        let out = git_command(&self.root)
+            .env("GIT_INDEX_FILE", tmp_index)
+            .env("LC_ALL", "C")
+            .args(&add.args)
+            .arg(format!("--pathspec-from-file={}", spec_file.display()))
+            .arg("--pathspec-file-nul")
+            .output_gated();
+        fs::remove_file(&spec_file).ok();
+        Ok(out?)
     }
 
     /// Tree of the working tree: a throwaway copy of the index with `git add -A` applied, then
@@ -416,13 +646,52 @@ impl GitRepo {
                     .output_gated()?,
             )?;
         }
-        let (add, mut nested) = self.worktree_add_args(&tmp_index, excludes)?;
-        let out = git_command(&self.root)
-            .env("GIT_INDEX_FILE", &tmp_index)
-            // Untranslated messages: what could not be read is read off them.
-            .env("LC_ALL", "C")
-            .args(&add)
-            .output_gated()?;
+        let mut add = self.worktree_add_args(&tmp_index, excludes)?;
+        // A path git dies on (`fatal: unable to stat '<p>'`: a file it listed and cannot stat)
+        // fails that path only: it joins the chunked class, which reads it or reports it
+        // unreadable, and the add runs again without it. Bounded; each round names a new path.
+        let mut out = self.run_add(&tmp_index, &add)?;
+        for _ in 0..FATAL_PATH_RETRIES {
+            if out.status.success() {
+                break;
+            }
+            let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+            let fatal: Vec<String> = stderr
+                .lines()
+                .filter_map(|l| l.strip_prefix("fatal: unable to stat '"))
+                .filter_map(|l| l.rsplit_once("': ").map(|(p, _)| p.to_owned()))
+                .filter(|p| !p.is_empty() && !add.beyond.contains(p))
+                .collect();
+            if fatal.is_empty() {
+                break;
+            }
+            for p in fatal {
+                tracing::warn!(path = %p, "git cannot stat this path; the chunked class carries it");
+                add.pathspecs.push(format!(":(exclude){p}"));
+                add.beyond.push(p);
+            }
+            // The add died part way: start again from the index it was given.
+            fs::remove_file(&tmp_index).ok();
+            if real_index.exists() {
+                fs::copy(&real_index, &tmp_index)?;
+            } else if let Some(head_tree) = self.head_tree()? {
+                let rt = ["read-tree", &head_tree];
+                check(
+                    &rt,
+                    git_command(&self.root)
+                        .env("GIT_INDEX_FILE", &tmp_index)
+                        .args(rt)
+                        .output_gated()?,
+                )?;
+            }
+            out = self.run_add(&tmp_index, &add)?;
+        }
+        let AddArgs {
+            args,
+            pathspecs,
+            mut nested,
+            mut beyond,
+        } = add;
         // Belt and braces: anything `--ignore-errors` skipped past that the enumeration did not
         // name joins the chunked class the same way.
         let stderr = String::from_utf8_lossy(&out.stderr).to_string();
@@ -434,7 +703,7 @@ impl GitRepo {
             .collect();
         if !out.status.success() && unindexed.is_empty() {
             return Err(GitError::Command {
-                args: add.join(" "),
+                args: format!("{} -- {}", args.join(" "), pathspecs.join(" ")),
                 stderr: stderr.trim().to_owned(),
             });
         }
@@ -467,6 +736,7 @@ impl GitRepo {
             .collect();
         gitlinks.append(&mut unindexed);
         gitlinks.append(&mut nested);
+        gitlinks.append(&mut beyond);
         gitlinks.sort();
         gitlinks.dedup();
         fs::remove_file(&tmp_index).ok();
@@ -631,10 +901,10 @@ fn unreadable_in_add(root: &Path, stderr: &str) -> Vec<(String, String)> {
             continue;
         }
         let abs = root.join(p);
-        let error = match fs::symlink_metadata(&abs) {
+        let error = match longpath::symlink_metadata(&abs) {
             Err(e) => Some(e),
-            Ok(m) if m.is_dir() => fs::read_dir(&abs).err(),
-            Ok(m) if m.is_file() => File::open(&abs).err(),
+            Ok(m) if m.is_dir() => longpath::read_dir(&abs).err(),
+            Ok(m) if m.is_file() => longpath::open(&abs).err(),
             Ok(_) => None,
         };
         if let Some(e) = error
@@ -1381,8 +1651,12 @@ mod tests {
         let tmp_index = scratch.join("idx");
         fs::copy(repo.git_dir.join("index"), &tmp_index).unwrap();
         let excludes = vec!["ign".to_owned(), "keep-out/".to_owned()];
-        let (args, nested) = repo.worktree_add_args(&tmp_index, &excludes).unwrap();
-        assert_eq!(nested, vec!["vendor/x".to_owned(), "vendor/y".to_owned()]);
+        let add = repo.worktree_add_args(&tmp_index, &excludes).unwrap();
+        let args = &add.pathspecs;
+        assert_eq!(
+            add.nested,
+            vec!["vendor/x".to_owned(), "vendor/y".to_owned()]
+        );
         assert!(args.contains(&":(exclude)vendor/x".to_owned()), "{args:?}");
         assert!(args.contains(&":(exclude)vendor/y".to_owned()), "{args:?}");
         assert!(args.contains(&":(exclude)keep-out".to_owned()), "{args:?}");
@@ -1392,7 +1666,14 @@ mod tests {
         );
 
         // The argv works on its own: drop the flag and run it.
-        let without_flag: Vec<&String> = args.iter().filter(|a| *a != "--ignore-errors").collect();
+        let dashes = "--".to_owned();
+        let without_flag: Vec<&String> = add
+            .args
+            .iter()
+            .filter(|a| *a != "--ignore-errors")
+            .chain(std::iter::once(&dashes))
+            .chain(args.iter())
+            .collect();
         let out = git_command(&root)
             .env("GIT_INDEX_FILE", &tmp_index)
             .args(&without_flag)

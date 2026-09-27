@@ -203,6 +203,8 @@ struct Counters {
     forced: AtomicU64,
     preemptions: AtomicU64,
     overflows: AtomicU64,
+    /// Directories found unwatchable after the watcher started.
+    unwatched: AtomicU64,
     bulk_running: AtomicBool,
 }
 
@@ -303,6 +305,24 @@ impl Shared {
                 // Reconcile now: the next poll is due immediately.
                 st.small.last_snap = now.checked_sub(st.small.max).unwrap_or(now);
                 st.bulk.last_snap = now.checked_sub(st.bulk.max).unwrap_or(now);
+            }
+            ChangeSignal::Unwatched(class) => {
+                self.counters.unwatched.fetch_add(1, Ordering::Relaxed);
+                let st = &mut *st;
+                let (mode, clock) = match class {
+                    Class::Small => (&mut st.small_mode, &mut st.small),
+                    Class::Bulk => (&mut st.bulk_mode, &mut st.bulk),
+                };
+                if *mode == Mode::Watched {
+                    tracing::warn!(
+                        ?class,
+                        "a directory of the class could not be watched; it polls at its \
+                         maximum interval from now on"
+                    );
+                }
+                *mode = Mode::Polled;
+                // What changed there is unseen: the next poll is due now.
+                clock.last_snap = now.checked_sub(clock.max).unwrap_or(now);
             }
         }
         drop(st);

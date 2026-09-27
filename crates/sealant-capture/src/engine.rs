@@ -1160,7 +1160,7 @@ impl CaptureEngine {
                 .config
                 .root
                 .join(std::ffi::OsStr::from_bytes(&worktree_meta::bytes_of(v)));
-            let on_disk = fs::symlink_metadata(abs).is_ok_and(|m| {
+            let on_disk = crate::longpath::symlink_metadata(&abs).is_ok_and(|m| {
                 m.is_file() && (m.dev(), m.ino()) == (known.stat.dev, known.stat.ino)
             });
             if on_disk {
@@ -2308,5 +2308,59 @@ impl CaptureEngine {
         class: MaterializeClass,
     ) -> Result<MaterializeReport, EngineError> {
         Ok(Materializer::new(sink, self.materialize_targets()).materialize(manifest, class)?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn git(root: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .current_dir(root)
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}");
+    }
+
+    /// Finding 1b of the third Docker end to end, through the engine: a path whose metadata
+    /// cannot be read no longer fails the snap. An automatic snap stages the change beside it
+    /// and counts it unreadable (its last capture carried); a final snap fails `unreadable`,
+    /// naming the path, rather than stage a capture that lacks it.
+    #[test]
+    fn a_metadata_error_on_one_path_does_not_stop_the_snap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("ws");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        git(&root, &["init", "-q", "-b", "main"]);
+        git(&root, &["config", "user.email", "t@t"]);
+        git(&root, &["config", "user.name", "t"]);
+        std::fs::write(root.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+        std::fs::write(root.join("notes.txt"), "notes\n").unwrap();
+        git(&root, &["add", "-A"]);
+        git(&root, &["commit", "-q", "-m", "one"]);
+        let mut engine = CaptureEngine::open(CaptureConfig::new("wt", 1, &root), None).unwrap();
+        let req = |kind| SnapRequest {
+            kind,
+            class: Class::Small,
+            seq: 1,
+        };
+        let first = engine.snap(req(CaptureKind::Auto)).unwrap();
+        assert_eq!(first.stats.unreadable, 0);
+
+        crate::longpath::inject_fault(&root.join("notes.txt"), nix::libc::EIO);
+        std::fs::write(root.join("src/lib.rs"), "pub fn f() { g() }\n").unwrap();
+        let second = engine.snap(req(CaptureKind::Auto)).unwrap();
+        assert!(!second.unchanged, "the edit beside it is staged");
+        assert_eq!(second.stats.unreadable, 1, "{:?}", second.stats);
+        assert_eq!(second.stats.carried, 1, "{:?}", second.stats);
+        assert_eq!(second.stats.unreadable_paths, ["tree/notes.txt"]);
+
+        let error = engine.snap(req(CaptureKind::Final)).unwrap_err();
+        let work = error.unreadable().expect("fails as unreadable work");
+        assert_eq!(work.paths.len(), 1, "{work}");
+        assert_eq!(work.paths[0].0, "tree/notes.txt");
     }
 }

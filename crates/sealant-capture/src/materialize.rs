@@ -55,6 +55,7 @@ use crate::chunk::{ChunkId, sha256_hex};
 use crate::gitpack::{self, GitError, GitRepo};
 use crate::index::{self, DAEMON_DIR, FileStat, IndexedFile, Listing, TreeIndex};
 use crate::keys::key_digest;
+use crate::longpath;
 use crate::manifest::{
     EncodedManifest, FORMAT_DIR_OBJECTS, FORMAT_DIR_PACKS, FsckStatus, INDEX_TREE_REF,
     MAX_SECTION_FORMAT, Manifest, TreeRef, WORKTREE_META_FORMAT, WORKTREE_TREE_REF, WorktreeMeta,
@@ -513,7 +514,7 @@ impl<'a> Materializer<'a> {
             let resolve = |v: &str| roots.workspace_path(&git_dir, v);
             Self::link_all(&write.links, &resolve, &mut report)?;
             if let Some(repo) = &repo {
-                let gitlinks = repo.nested_repositories(None)?;
+                let gitlinks = repo.chunked_paths(None)?;
                 let listing = roots.workspace_listing(repo, &gitlinks)?;
                 let keep: Vec<PathBuf> = [
                     Some(self.targets.root.clone()),
@@ -680,7 +681,7 @@ impl<'a> Materializer<'a> {
             root: t.root.clone(),
             excludes,
             bulk_dirs: t.bulk_dirs.clone(),
-            nested: repo.nested_repositories(None)?,
+            nested: repo.chunked_paths(None)?,
             skip_abs: [Some(t.staging_dir.clone()), t.harness_home.clone()]
                 .into_iter()
                 .flatten()
@@ -735,9 +736,13 @@ impl<'a> Materializer<'a> {
             for rel in
                 gitpack::untracked_against(&repo, tree, &self.targets.scratch_dir, &excludes)?
             {
+                // A path git cannot reach is the chunked class's to keep or sweep.
+                if worktree_meta::beyond_git(rel.as_bytes(), false) {
+                    continue;
+                }
                 let path = self.targets.root.join(&rel);
-                if fs::symlink_metadata(&path).is_ok_and(|m| !m.is_dir()) {
-                    fs::remove_file(&path)?;
+                if longpath::symlink_metadata(&path).is_ok_and(|m| !m.is_dir()) {
+                    longpath::remove_file(&path)?;
                     tracing::debug!(path = %path.display(), "materialize: removed a file the worktree tree does not name");
                     report.removed += 1;
                 }
@@ -904,7 +909,7 @@ impl<'a> Materializer<'a> {
     /// matches the index entry for `v` (so its chunks are known) and whose size, mtime and
     /// chunks match the plan.
     fn file_matches(v: &str, entry: &DirEntry, path: &Path, index: &TreeIndex) -> bool {
-        let Ok(meta) = fs::symlink_metadata(path) else {
+        let Ok(meta) = longpath::symlink_metadata(path) else {
             return false;
         };
         if !meta.is_file() {
@@ -935,10 +940,10 @@ impl<'a> Materializer<'a> {
         report: &mut MaterializeReport,
     ) -> Result<(), MaterializeError> {
         let obj = self.read_dir(dirs, key, report)?;
-        if fs::symlink_metadata(dir).is_ok_and(|m| !m.is_dir()) {
+        if longpath::symlink_metadata(dir).is_ok_and(|m| !m.is_dir()) {
             remove_existing(dir)?;
         }
-        fs::create_dir_all(dir)?;
+        longpath::create_dir_all(dir)?;
         if !vdir.is_empty() {
             write.planned.insert(vdir.to_owned());
         }
@@ -960,16 +965,16 @@ impl<'a> Materializer<'a> {
                     if Self::file_matches(&v, entry, &path, write.index) {
                         report.files_skipped += 1;
                         report.bytes_skipped += entry.size;
-                        if let Ok(meta) = fs::symlink_metadata(&path)
+                        if let Ok(meta) = longpath::symlink_metadata(&path)
                             && meta.mode() & 0o7777 != entry.mode
                         {
-                            fs::set_permissions(&path, fs::Permissions::from_mode(entry.mode))?;
+                            longpath::set_mode(&path, entry.mode)?;
                         }
                         continue;
                     }
-                    let tmp = dir.join(format!(".{}.capture-tmp", entry.name));
+                    let tmp = dir.join(tmp_name(&entry.name));
                     {
-                        let mut f = File::create(&tmp)?;
+                        let mut f = longpath::create(&tmp)?;
                         for id in entry.chunks.iter().flatten() {
                             let data = store.read(id)?;
                             f.write_all(&data)?;
@@ -979,9 +984,9 @@ impl<'a> Materializer<'a> {
                         set_mtime(&f, entry.mtime)?;
                     }
                     remove_existing(&path)?;
-                    fs::rename(&tmp, &path)?;
+                    longpath::rename(&tmp, &path)?;
                     report.files += 1;
-                    let meta = fs::symlink_metadata(&path)?;
+                    let meta = longpath::symlink_metadata(&path)?;
                     write.index.files.insert(
                         v,
                         IndexedFile {
@@ -992,8 +997,8 @@ impl<'a> Materializer<'a> {
                 }
                 EntryKind::Symlink => {
                     let target = PathBuf::from(entry.os_target().unwrap_or_default());
-                    if fs::read_link(&path).is_ok_and(|t| t == target) {
-                        if fs::symlink_metadata(&path)
+                    if longpath::read_link(&path).is_ok_and(|t| t == target) {
+                        if longpath::symlink_metadata(&path)
                             .is_ok_and(|m| index::mtime_ns(&m) != entry.mtime)
                         {
                             set_symlink_mtime(&path, entry.mtime)?;
@@ -1001,7 +1006,7 @@ impl<'a> Materializer<'a> {
                         continue;
                     }
                     remove_existing(&path)?;
-                    std::os::unix::fs::symlink(&target, &path)?;
+                    longpath::symlink(&target, &path)?;
                     set_symlink_mtime(&path, entry.mtime)?;
                     report.symlinks += 1;
                 }
@@ -1029,22 +1034,24 @@ impl<'a> Materializer<'a> {
                     ),
                 });
             };
-            if let (Ok(a), Ok(b)) = (fs::symlink_metadata(&canonical), fs::symlink_metadata(path))
-                && a.is_file()
+            if let (Ok(a), Ok(b)) = (
+                longpath::symlink_metadata(&canonical),
+                longpath::symlink_metadata(path),
+            ) && a.is_file()
                 && b.is_file()
                 && (a.dev(), a.ino()) == (b.dev(), b.ino())
             {
                 continue;
             }
             remove_existing(path)?;
-            match fs::hard_link(&canonical, path) {
+            match longpath::hard_link(&canonical, path) {
                 Ok(()) => {}
                 // The class spans directories that can sit on different filesystems here (the
                 // harness home beside the worktree): a copy is the closest thing.
                 Err(e) if e.kind() == io::ErrorKind::CrossesDevices => {
                     tracing::warn!(canonical = %canonical.display(), member = %path.display(), "hardlink across filesystems; copied");
-                    fs::copy(&canonical, path)?;
-                    fs::set_permissions(path, fs::Permissions::from_mode(*mode))?;
+                    longpath::copy(&canonical, path)?;
+                    longpath::set_mode(path, *mode)?;
                 }
                 Err(e) => {
                     return Err(MaterializeError::Metadata {
@@ -1085,9 +1092,9 @@ impl<'a> Materializer<'a> {
                 }
                 // Only an emptied directory goes; one that still holds something the listing
                 // did not cover (an excluded name, a nested mount) stays.
-                fs::remove_dir(&src.abs).ok();
+                longpath::remove_dir(&src.abs).ok();
             } else {
-                match fs::remove_file(&src.abs) {
+                match longpath::remove_file(&src.abs) {
                     Ok(()) => {
                         tracing::debug!(path = %src.abs.display(), "materialize: removed a file the plan does not name");
                         report.removed += 1;
@@ -1110,8 +1117,7 @@ impl<'a> Materializer<'a> {
                 path: path.display().to_string(),
                 reason: format!("{what}: {e}"),
             };
-            fs::set_permissions(path, fs::Permissions::from_mode(*mode))
-                .map_err(|e| failed("chmod", e))?;
+            longpath::set_mode(path, *mode).map_err(|e| failed("chmod", e))?;
             worktree_meta::set_mtime_nofollow(path, *mtime).map_err(|e| failed("mtime", e))?;
         }
         Ok(())
@@ -1126,10 +1132,24 @@ fn check_format(section: &'static str, format: u32) -> Result<(), MaterializeErr
     Ok(())
 }
 
+/// The staging name a file is written under before it is renamed into place: `.<name>.capture-tmp`
+/// while that fits in a name (`NAME_MAX`, 255 bytes), else a digest of the name (a name near
+/// the limit could not be restored at all).
+fn tmp_name(name: &str) -> std::ffi::OsString {
+    let bytes = crate::tree::bytes_of(name);
+    if bytes.len() + ".capture-tmp".len() < 255 {
+        let mut tmp = b".".to_vec();
+        tmp.extend_from_slice(&bytes);
+        tmp.extend_from_slice(b".capture-tmp");
+        return OsStr::from_bytes(&tmp).to_owned();
+    }
+    format!(".capture-tmp-{}", &sha256_hex(&bytes)[..32]).into()
+}
+
 fn remove_existing(path: &Path) -> io::Result<()> {
-    match fs::symlink_metadata(path) {
-        Ok(m) if m.is_dir() => fs::remove_dir_all(path),
-        Ok(_) => fs::remove_file(path),
+    match longpath::symlink_metadata(path) {
+        Ok(m) if m.is_dir() => longpath::remove_dir_all(path),
+        Ok(_) => longpath::remove_file(path),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e),
     }
@@ -1161,7 +1181,7 @@ fn refresh_linked(
     for (canonical_v, _, _) in links {
         if let Some(known) = index.files.get_mut(canonical_v)
             && let Some(path) = resolve(canonical_v)
-            && let Ok(meta) = fs::symlink_metadata(&path)
+            && let Ok(meta) = longpath::symlink_metadata(&path)
             && meta.is_file()
             && meta.len() == known.stat.size
             && crate::index::mtime_ns(&meta) == known.stat.mtime
