@@ -390,14 +390,15 @@ restore, byte for byte, so the user never notices the compute changed.
   all four steps happened and nothing is pending on an unfenced lease; anything else is
   `complete: false` with a reason, never a success: a process that outlived `SIGKILL`
   (`processes-remain`), a failed snap of either class (`snapshot-failed` — a failed bulk snap
-  used to be logged and ignored while older captures drained to zero), a fence (`fenced` — a
+  used to be logged and ignored while older captures drained to zero; `unreadable` when it
+  failed because it could not read work), a fence (`fenced` — a
   shipper already fenced used to answer "done"), a chain conflict (`conflict`), the caller's
   `deadline_ms` (`deadline`, or `ship-failed` when shipping kept failing until then). What
   could be staged still ships; what is left stays staged and is reported (`pending`,
   `pending_bulk`, `pending_bytes`, `refused`). Without a deadline — the daemon's own paths
   never give one — a transport failure is retried with backoff, a held capture is waited for, a
-  lost lease is waited out, and only the process ending (or a fence, a conflict, a failed snap)
-  stops it.
+  lost lease is waited out, a refused register is uploaded again or rebuilt from disk, and only
+  the process ending (or a fence, a conflict, a failed snap) stops it.
 
   A flush that returned at its `deadline_ms` ends nothing: the daemon stays up, admission stays
   closed, the writers stay stopped, the ship worker keeps uploading, and `capture.status` turns
@@ -422,6 +423,32 @@ restore, byte for byte, so the user never notices the compute changed.
   and asks again after 1 s, doubling to 30 s at most (`LEASE_LOST_BACKOFF`), with everything
   staged. It used to read as a wrong parent, a chain conflict, which ended a final flush with
   the captures still on the disk. A 409 naming another `live_epoch` is still a fence.
+- **A refused register is fixed, never dropped.** A registrar acknowledges only what it can
+  restore: Mend's `capture.register` answers 422 `missing-objects` (a key the manifest names is
+  not in the store, the keys in `missing`) or `unrestorable` (a section's tree would not
+  restore) — review 2026-09-27 #4: retention removed a pack no live capture named while this
+  executor's chunk index still pointed at it. The shipper used to retry that register every pass
+  for good: the chain stopped and a final flush never completed. Now
+  (`RegistrarError::RegisterRefused`, `Shipper::after_refusal`, `CaptureEngine::repair`):
+  1. the first refusal of a capture whose named keys are all objects it staged (every object,
+     when none is named) drops their upload acks; they are uploaded again (each checked against
+     the store) and the capture registers again, in the same pass;
+  2. a key it did not stage (a pack an earlier capture uploaded), a staged file already swept,
+     or the same capture refused again writes a `RepairRequest` (`repair.json` in staging, so a
+     restart finishes it) and nothing behind it ships. The engine, at its next snap (the
+     cadence runner's small-class loop is woken for it; a final flush runs it straight away),
+     forgets the named packs — chunk index, dir-pack map, acks; a missing git pack makes the
+     next git pack a full one; none named, every pack of the rebuilt section — and snaps each
+     class whose section named a missing key (the refused capture's class otherwise) as a
+     capture at the refused one's `n`, with its parent. The captures staged after it are
+     folded in: the rebuilt capture holds the disk as it is now and lists every object they
+     staged, and a final one among them makes it final. A pack of the same chunks has the same
+     key, so the rebuilt capture may name a key the store lost: it stages it this time.
+  A final flush rebuilds and ships again until it registers (backing off from the second
+  rebuild on), bounded only by its deadline. `capture.status` reports the refusal
+  (`register_refused`, `register_refused_n`, `register_missing`, `register_refusals`,
+  `repairing`, see "Wire additions"). A missing pack of another platform's bulk section
+  (`other_bulk`) cannot be rebuilt here: it is logged and stays refused, reported.
 - **Another platform's dependency tree stays on the chain.** A head whose bulk section was
   captured on another platform is answered `"pending"` and not restored here, and it used to be
   dropped by this executor's next capture, so the platform that built it could never restore
@@ -490,10 +517,13 @@ A capture holds what is on disk, and says so when it cannot.
   (permission denied, an I/O error). A directory `git ls-files` could not open counts too (its
   ignored files are unknown). A `final` snap with anything unreadable fails with
   `index::UnreadableWork` naming every such path (`EngineError::unreadable`), so the flush is not
-  complete. Any other snap carries each unreadable path's last read content from the index
+  complete, with `incomplete_reason` `unreadable` (not `snapshot-failed`) and the paths in its
+  message; nothing is registered in place of the file, and staging stays. Any other snap carries each unreadable path's last read content from the index
   (content, size, mtime; the mode it has now), marks the entry `unread: true` (and a directory it
   could not list, which then holds what the last reads under it found), and logs a warning; a
-  path never read before has nothing to carry and is left out of that automatic snap. The git
+  path never read before has nothing to carry and is left out of that automatic snap — counted in
+  `unreadable` (not in `carried`) and named in `unreadable_paths`, so the control plane can show
+  it — and the next snap that can read it captures it. The git
   class holds the same rule: `git add -A` skips a directory it cannot open with only a warning (an
   untracked one dropped out of the worktree tree; a tracked one fell back to the index's blobs,
   not the edit the last capture held), so the engine runs it with `LC_ALL=C`, reads the paths off
@@ -569,12 +599,21 @@ character in `U+10FF80..=U+10FFFF` to the byte `codePoint - 0x10FF00` (Node's `f
 
 ### `manifest_format` on `plan.get`
 
-The highest section format the registrar reads — walks to presign a plan, HEADs and prices at
-register, keeps alive in retention. Absent = 1. At 2 the executor writes dir packs (see "Dir
-packs"). Additive: an older executor ignores it, and a registrar that never answers it gets
-format 1, as today.
+The answer: the highest section format the registrar reads — walks to presign a plan, HEADs and
+prices at register, keeps alive in retention. Absent = 1. At 2 the executor writes dir packs
+(see "Dir packs"). Additive: an older executor ignores it, and a registrar that never answers
+it gets format 1, as today.
+
+The request: the highest section format the executor reads, `manifest_format: 2`
+(`MAX_SECTION_FORMAT`; `PlanGetRequest::booting`, every plan a booting or re-planning daemon
+asks for). Absent = 1: an executor from before dir packs. Mend answers `manifest_format` no
+higher than it and refuses a plan holding a section above it (409 `manifest-format`, before the
+claim) — an older reader takes a format-2 root digest for a key. The daemon reads a 409
+`manifest-format` as that refusal (a protocol error, never a chain conflict).
+`InMemoryRegistrar` does the same.
 
 ```json
+→ {"worktree_id":"wt","epoch":0,"platform":"linux-x86_64-gnu","manifest_format":2}
 ← {"worktree_id":"wt","epoch":3,"head":{…},"get_urls":{…},"manifest_format":2}
 ```
 
@@ -712,6 +751,23 @@ what it always did. Absent when empty, so a manifest without one encodes exactly
        "head":"refs/heads/main","fsck":"verified",
        "symrefs":{"refs/remotes/origin/HEAD":"refs/remotes/origin/main"}}
 ```
+
+### Register refusals on `capture.register` and `capture.status`
+
+`capture.register` may answer 422 `{"reason":"missing-objects","message":…,"missing":[keys]}`
+or `{"reason":"unrestorable","message":…}` (see "A refused register is fixed, never dropped"):
+`RegistrarError::RegisterRefused`, never retried as it is. Any other 422 on it is a protocol
+error. `CaptureStatusReport` gains:
+
+```proto
+optional string register_refused = 20;   // reason of the refusal being worked through
+optional uint64 register_refused_n = 21; // that capture's chain position
+repeated string register_missing = 22;   // the first 20 keys it named
+optional uint64 register_refusals = 23;  // refusals seen since the daemon started
+bool repairing = 24;                     // the refused capture waits to be rebuilt from disk
+```
+
+All absent / `false` from an older daemon, and when nothing is refused.
 
 ### `lease-lost` on the session channel
 
@@ -868,6 +924,10 @@ Mend installs today) must now say so, or boot refuses.
   admission and terminates the managed processes before it snaps, and reports `complete`; a
   daemon whose final flush is incomplete exits 75. A 409 `lease-lost` pauses shipping (never a
   conflict).
+- §"Session channel": `plan.get` requests carry `manifest_format` (the highest section format
+  the executor reads); `capture.register` may answer 422 `missing-objects` / `unrestorable`,
+  which the executor fixes by uploading again or rebuilding the capture from disk in its place,
+  never by dropping it.
 
 - §"Capture format", CDC packs: "≤ 64 MiB, one PUT, never multipart" → packs stay ≤ 64 MiB but
   are uploaded as multipart at or above the shipper's threshold (default 16 MiB); git packs may

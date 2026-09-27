@@ -593,6 +593,7 @@ mod tests {
                 worktree_id: None,
                 epoch: 0,
                 platform: Some(riscv.to_owned()),
+                manifest_format: Some(sealant_capture::manifest::MAX_SECTION_FORMAT),
             })
             .unwrap();
         let answered = plan.head.unwrap().manifest.sections.bulk;

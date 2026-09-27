@@ -6,6 +6,8 @@ fn main() {
         std::env::set_var("PROTOC", protoc);
     }
     prost_build::Config::new()
+        // The status report is the largest result by far; boxed, it does not size every other.
+        .boxed(".sealant.v1.CommandResult.result.capture_status")
         .compile_protos(&["proto/sealant.proto"], &["proto"])
         .expect("compile sealant.proto");
     println!("cargo:rerun-if-changed=proto/sealant.proto");

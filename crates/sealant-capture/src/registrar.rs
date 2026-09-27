@@ -90,6 +90,25 @@
 //! doubling, 30 s at most), keeping everything staged. It used to read as a wrong parent — a
 //! chain conflict — which ended a final flush with the captures still on the disk.
 //!
+//! # Register refusals: `missing-objects`, `unrestorable`
+//!
+//! A registrar acknowledges only a capture it can restore. `capture.register` answers 422 when
+//! an object the manifest names is not in the store (`missing-objects`, the keys in `missing`)
+//! or a section's tree would not restore from what it names (`unrestorable`, no keys):
+//!
+//! ```json
+//! ← 422 {"reason":"missing-objects","message":"1 pack(s) the manifest names are not in the bucket",
+//!        "missing":["captures/wt/3/packs/<sha256>"]}
+//! ```
+//!
+//! This is [`RegistrarError::RegisterRefused`]. The shipper never drops the capture: it drops
+//! the upload acks of the named keys it staged and uploads them again (every key of the capture,
+//! each checked against the store, when none is named), then registers again; a key it did
+//! not stage (a pack an earlier capture uploaded and retention removed), or the same capture
+//! refused a second time, makes the engine rebuild the capture from disk in its place with the
+//! named packs forgotten ([`crate::ship::RepairRequest`]). Both are reported in `capture.status`.
+//! Before, the shipper retried the same register forever and the chain stopped advancing.
+//!
 //! # `manifest_format` on `plan.get`
 //!
 //! The answer names the highest section format the registrar reads (`manifest.rs`): what it
@@ -159,16 +178,24 @@ pub struct PlanGetRequest {
     /// `"pending"`. Absent = the head as is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub platform: Option<String>,
+    /// The highest section format this executor reads ([`MAX_SECTION_FORMAT`]). The registrar
+    /// answers `manifest_format` no higher than it and refuses (409 `manifest-format`) a head
+    /// holding a section above it: an older reader takes a format-2 root digest for a key.
+    /// Absent = 1 (an executor from before format 2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_format: Option<u32>,
 }
 
 impl PlanGetRequest {
-    /// The request a booting executor sends: `epoch` 0 and this build's platform.
+    /// The request a booting executor sends: `epoch` 0, this build's platform and the highest
+    /// section format it reads.
     #[must_use]
     pub fn booting(worktree_id: Option<String>) -> Self {
         Self {
             worktree_id,
             epoch: 0,
             platform: Some(crate::engine::default_platform()),
+            manifest_format: Some(MAX_SECTION_FORMAT),
         }
     }
 }
@@ -218,6 +245,13 @@ pub struct PlanGetResponse {
 
 fn manifest_format_one() -> u32 {
     FORMAT_DIR_OBJECTS
+}
+
+/// The highest section format a plan asks its reader to read: its workspace section and the
+/// bulk section answered to the executor (Mend's `planFormatOf`).
+fn plan_format(manifest: &Manifest) -> u32 {
+    let bulk = manifest.sections.bulk.section().map_or(0, |b| b.format);
+    manifest.sections.workspace.format.max(bulk)
 }
 
 /// The store keys a chunked section names for its dir objects: the root key in format 1 (the
@@ -449,6 +483,21 @@ pub enum RegistrarError {
         used: Option<u64>,
         /// Bytes this call asked for.
         requested: Option<u64>,
+    },
+    /// 422 `missing-objects` or `unrestorable` on `capture.register`: the registrar will not
+    /// acknowledge a capture it could not restore — an object it names is not in the store
+    /// (retention removed a pack the executor's chunk index still pointed at, an upload that
+    /// never landed) or a section's tree would not restore. Nothing is registered, nothing is
+    /// dropped: the shipper uploads the named objects again, and rebuilds the capture from disk
+    /// when that is not enough ([`crate::ship::RepairRequest`]).
+    #[error("register refused ({reason}): {message}")]
+    RegisterRefused {
+        /// `missing-objects` or `unrestorable`.
+        reason: String,
+        /// The keys the registrar named (`missing`); empty when it named none.
+        missing: Vec<String>,
+        /// The registrar's message.
+        message: String,
     },
     /// Transport failure (retryable).
     #[error("transport: {0}")]
@@ -874,6 +923,17 @@ impl Registrar for InMemoryRegistrar {
                     .map_or(BulkState::pending(), BulkState::Ready);
             }
         }
+        // Mend's reader gate: a plan holding a section format above what the executor reads
+        // (its workspace section and the bulk section answered to it) is refused before the
+        // claim, and the executor is told to write no higher.
+        let reads = req.manifest_format.unwrap_or(FORMAT_DIR_OBJECTS);
+        if let Some(holds) = head.as_ref().map(|h| plan_format(&h.manifest))
+            && holds > reads
+        {
+            return Err(RegistrarError::Protocol(format!(
+                "plan.get refused: manifest-format (the head holds format {holds}; the executor reads {reads})"
+            )));
+        }
         let mut get_urls = BTreeMap::new();
         if let (Some(h), Some(_)) = (&head, &self.url_base) {
             let s = &h.manifest.sections;
@@ -908,7 +968,7 @@ impl Registrar for InMemoryRegistrar {
             get_urls,
             sources,
             remotes: state.remotes.clone(),
-            manifest_format: self.manifest_format,
+            manifest_format: self.manifest_format.min(reads),
         })
     }
 
@@ -1132,6 +1192,11 @@ struct ConflictBody {
     used: Option<u64>,
     #[serde(default)]
     requested: Option<u64>,
+    /// 422 on `capture.register`: the keys the registrar found missing.
+    #[serde(default)]
+    missing: Vec<String>,
+    #[serde(default)]
+    message: String,
 }
 
 impl ConflictBody {
@@ -1145,6 +1210,8 @@ impl ConflictBody {
             limit: None,
             used: None,
             requested: None,
+            missing: Vec::new(),
+            message: String::new(),
         }
     }
 
@@ -1234,6 +1301,9 @@ fn refusal(name: &str, status: u16, bytes: &[u8], epoch: u64) -> RegistrarError 
             } else if c.reason == "byte-quota" {
                 // The bytes, not the chain: no parent to fix, nothing a retry can change.
                 c.quota_refused()
+            } else if c.reason == "manifest-format" {
+                // The head holds a section this build does not read: nothing to retry.
+                RegistrarError::Protocol(format!("{name} refused: manifest-format"))
             } else if name == "change.summary" {
                 RegistrarError::SummaryRefused(c.reason)
             } else if name == "upload.complete" {
@@ -1254,6 +1324,19 @@ fn refusal(name: &str, status: u16, bytes: &[u8], epoch: u64) -> RegistrarError 
         413 => serde_json::from_slice::<ConflictBody>(bytes)
             .unwrap_or_else(|_| ConflictBody::empty())
             .quota_refused(),
+        422 if name == "capture.register" => {
+            let c: ConflictBody =
+                serde_json::from_slice(bytes).unwrap_or_else(|_| ConflictBody::empty());
+            if c.reason == "missing-objects" || c.reason == "unrestorable" {
+                RegistrarError::RegisterRefused {
+                    reason: c.reason,
+                    missing: c.missing,
+                    message: c.message,
+                }
+            } else {
+                RegistrarError::Protocol(format!("{name}: http 422 {}", c.reason))
+            }
+        }
         404 if name == "lease.heartbeat" => RegistrarError::LeaseLost,
         s if s >= 500 || s == 429 || s == 408 => {
             RegistrarError::Transport(format!("{name}: http {s}"))
@@ -1639,6 +1722,7 @@ mod tests {
                 worktree_id: None,
                 epoch: 1,
                 platform: None,
+                manifest_format: Some(MAX_SECTION_FORMAT),
             })
             .unwrap();
         assert_eq!(plan.head.unwrap().capture_id, "a");
@@ -1668,6 +1752,7 @@ mod tests {
                 worktree_id: None,
                 epoch: 0,
                 platform: platform.map(str::to_owned),
+                manifest_format: Some(MAX_SECTION_FORMAT),
             })
             .unwrap()
         };
@@ -1707,12 +1792,104 @@ mod tests {
             worktree_id: None,
             epoch: 1,
             platform: None,
+            manifest_format: None,
         })
         .unwrap();
         assert!(bare.get("platform").is_none());
         let back: PlanGetRequest =
             serde_json::from_str(r#"{"worktree_id":null,"epoch":2}"#).unwrap();
         assert_eq!(back.platform, None);
+    }
+
+    /// Mend's 422 on `capture.register` (`missing-objects` with the keys, `unrestorable`) is a
+    /// refusal of this capture, never a transport failure to retry as it is (it used to answer
+    /// `protocol: capture.register: http 422`, retried every pass for good).
+    #[test]
+    fn a_422_register_refusal_names_the_missing_keys() {
+        let body = br#"{"reason":"missing-objects","message":"1 pack(s) the manifest names are not in the bucket","missing":["captures/wt/1/packs/abc"]}"#;
+        match refusal("capture.register", 422, body, 1) {
+            RegistrarError::RegisterRefused {
+                reason,
+                missing,
+                message,
+            } => {
+                assert_eq!(reason, "missing-objects");
+                assert_eq!(missing, vec!["captures/wt/1/packs/abc".to_owned()]);
+                assert!(message.contains("not in the bucket"));
+            }
+            other => panic!("{other:?}"),
+        }
+        let unrestorable = refusal(
+            "capture.register",
+            422,
+            br#"{"reason":"unrestorable","message":"chunk c is in no listed pack"}"#,
+            1,
+        );
+        assert!(
+            matches!(&unrestorable, RegistrarError::RegisterRefused { reason, missing, .. }
+                if reason == "unrestorable" && missing.is_empty()),
+            "{unrestorable:?}"
+        );
+        assert!(!unrestorable.is_retryable());
+        let other = refusal(
+            "capture.register",
+            422,
+            br#"{"reason":"capture-id-mismatch"}"#,
+            1,
+        );
+        assert!(matches!(other, RegistrarError::Protocol(_)), "{other:?}");
+    }
+
+    /// A booting executor says which section format it reads (`manifest_format` 2, the highest
+    /// this build reads); a request without it is a format-1 reader. The test double answers as
+    /// Mend does: never above what the executor reads, and a head it could not read is refused
+    /// (409 `manifest-format`, never read as a chain conflict).
+    #[test]
+    fn plan_get_sends_the_manifest_format_it_reads() {
+        assert_eq!(MAX_SECTION_FORMAT, 2);
+        let booting = serde_json::to_value(PlanGetRequest::booting(None)).unwrap();
+        assert_eq!(booting["manifest_format"], 2);
+        let bare = PlanGetRequest {
+            worktree_id: None,
+            epoch: 0,
+            platform: None,
+            manifest_format: None,
+        };
+        assert!(
+            serde_json::to_value(&bare)
+                .unwrap()
+                .get("manifest_format")
+                .is_none()
+        );
+        let back: PlanGetRequest =
+            serde_json::from_str(r#"{"worktree_id":null,"epoch":2}"#).unwrap();
+        assert_eq!(back.manifest_format, None);
+
+        let r = InMemoryRegistrar::new("wt", 1, None);
+        assert_eq!(r.plan_get(&bare).unwrap().manifest_format, 1);
+        assert_eq!(
+            r.plan_get(&PlanGetRequest::booting(None))
+                .unwrap()
+                .manifest_format,
+            2
+        );
+        let mut m = manifest(0, None);
+        m.sections.workspace.format = crate::manifest::FORMAT_DIR_PACKS;
+        r.capture_register(&RegisterRequest {
+            manifest: m,
+            ..register(0, None, "a", 1)
+        })
+        .unwrap();
+        let refused = r.plan_get(&bare).unwrap_err();
+        assert!(refused.to_string().contains("manifest-format"), "{refused}");
+        let plan = r.plan_get(&PlanGetRequest::booting(None)).unwrap();
+        assert_eq!(plan.head.unwrap().capture_id, "a");
+
+        let http = refusal("plan.get", 409, br#"{"reason":"manifest-format"}"#, 0);
+        assert!(
+            matches!(&http, RegistrarError::Protocol(m) if m.contains("manifest-format")),
+            "{http:?}"
+        );
     }
 
     /// Every key of a prefetch batch travels with its size (not only multipart candidates), so
@@ -1850,6 +2027,7 @@ mod tests {
                 worktree_id: None,
                 epoch: 0,
                 platform: Some(platform.into()),
+                manifest_format: Some(MAX_SECTION_FORMAT),
             })
             .unwrap()
         };

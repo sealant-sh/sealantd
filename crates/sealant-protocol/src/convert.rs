@@ -1392,31 +1392,38 @@ impl From<CommandResult> for wire::command_result::Result {
                 kind: enum_i32::<_, wire::CaptureKind>(c.kind),
                 unchanged: c.unchanged,
             }),
-            CommandResult::CaptureStatus(c) => W::CaptureStatus(wire::CaptureStatusReport {
-                epoch: c.epoch,
-                worktree_id: c.worktree_id,
-                head_n: c.head_n,
-                pending: c.pending,
-                staged_bytes: c.staged_bytes,
-                uploaded_objects: c.uploaded_objects,
-                uploaded_bytes: c.uploaded_bytes,
-                registered: c.registered,
-                fenced: c.fenced,
-                paused: c.paused,
-                last_snap_unix_ms: c.last_snap_unix_ms,
-                refused: c
-                    .refused
-                    .into_iter()
-                    .map(enum_i32::<_, wire::CaptureClass>)
-                    .collect(),
-                pending_bulk: c.pending_bulk,
-                pending_bytes: c.pending_bytes,
-                complete: c.complete,
-                incomplete_reason: c.incomplete_reason,
-                unreadable: c.unreadable,
-                carried: c.carried,
-                unreadable_paths: c.unreadable_paths,
-            }),
+            CommandResult::CaptureStatus(c) => {
+                W::CaptureStatus(Box::new(wire::CaptureStatusReport {
+                    epoch: c.epoch,
+                    worktree_id: c.worktree_id,
+                    head_n: c.head_n,
+                    pending: c.pending,
+                    staged_bytes: c.staged_bytes,
+                    uploaded_objects: c.uploaded_objects,
+                    uploaded_bytes: c.uploaded_bytes,
+                    registered: c.registered,
+                    fenced: c.fenced,
+                    paused: c.paused,
+                    last_snap_unix_ms: c.last_snap_unix_ms,
+                    refused: c
+                        .refused
+                        .into_iter()
+                        .map(enum_i32::<_, wire::CaptureClass>)
+                        .collect(),
+                    pending_bulk: c.pending_bulk,
+                    pending_bytes: c.pending_bytes,
+                    complete: c.complete,
+                    incomplete_reason: c.incomplete_reason,
+                    unreadable: c.unreadable,
+                    carried: c.carried,
+                    unreadable_paths: c.unreadable_paths,
+                    register_refused: c.register_refused,
+                    register_refused_n: c.register_refused_n,
+                    register_missing: c.register_missing,
+                    register_refusals: c.register_refusals,
+                    repairing: c.repairing,
+                }))
+            }
             CommandResult::LeaseEpoch(l) => W::LeaseEpoch(wire::LeaseEpochReport {
                 epoch: l.epoch,
                 worktree_id: l.worktree_id,
@@ -1505,7 +1512,7 @@ impl TryFrom<wire::command_result::Result> for CommandResult {
                 kind: capture_kind(c.kind)?,
                 unchanged: c.unchanged,
             }),
-            W::CaptureStatus(c) => CommandResult::CaptureStatus(CaptureStatusReport {
+            W::CaptureStatus(c) => CommandResult::CaptureStatus(Box::new(CaptureStatusReport {
                 epoch: c.epoch,
                 worktree_id: c.worktree_id,
                 head_n: c.head_n,
@@ -1529,7 +1536,12 @@ impl TryFrom<wire::command_result::Result> for CommandResult {
                 unreadable: c.unreadable,
                 carried: c.carried,
                 unreadable_paths: c.unreadable_paths,
-            }),
+                register_refused: c.register_refused,
+                register_refused_n: c.register_refused_n,
+                register_missing: c.register_missing,
+                register_refusals: c.register_refusals,
+                repairing: c.repairing,
+            })),
             W::LeaseEpoch(l) => CommandResult::LeaseEpoch(LeaseEpochReport {
                 epoch: l.epoch,
                 worktree_id: l.worktree_id,
@@ -2050,9 +2062,7 @@ mod tests {
     fn a_status_report_without_complete_is_not_complete() {
         let old = wire::ResponseOutcome {
             outcome: Some(wire::response_outcome::Outcome::Ok(wire::CommandResult {
-                result: Some(wire::command_result::Result::CaptureStatus(
-                    wire::CaptureStatusReport::default(),
-                )),
+                result: Some(wire::command_result::Result::CaptureStatus(Box::default())),
             })),
         };
         let Ok(ResponseOutcome::Ok {
@@ -2097,7 +2107,7 @@ mod tests {
                 kind: CaptureKind::Final,
                 unchanged: false,
             }),
-            CommandResult::CaptureStatus(CaptureStatusReport {
+            CommandResult::CaptureStatus(Box::new(CaptureStatusReport {
                 epoch: 2,
                 worktree_id: "wt".to_owned(),
                 head_n: Some(3),
@@ -2117,8 +2127,13 @@ mod tests {
                 unreadable: Some(2),
                 carried: Some(1),
                 unreadable_paths: vec!["tree/un".to_owned(), "tree/pgdata".to_owned()],
-            }),
-            CommandResult::CaptureStatus(CaptureStatusReport {
+                register_refused: Some("missing-objects".to_owned()),
+                register_refused_n: Some(3),
+                register_missing: vec!["captures/wt/2/packs/abc".to_owned()],
+                register_refusals: Some(2),
+                repairing: true,
+            })),
+            CommandResult::CaptureStatus(Box::new(CaptureStatusReport {
                 epoch: 2,
                 worktree_id: "wt".to_owned(),
                 head_n: Some(9),
@@ -2138,7 +2153,12 @@ mod tests {
                 unreadable: None,
                 carried: None,
                 unreadable_paths: vec![],
-            }),
+                register_refused: None,
+                register_refused_n: None,
+                register_missing: vec![],
+                register_refusals: Some(0),
+                repairing: false,
+            })),
             CommandResult::LeaseEpoch(LeaseEpochReport {
                 epoch: 2,
                 worktree_id: "wt".to_owned(),

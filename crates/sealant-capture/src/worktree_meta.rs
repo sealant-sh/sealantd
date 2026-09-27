@@ -24,7 +24,7 @@
 //! # Paths that are not UTF-8
 //!
 //! A path is bytes; the document is JSON. Every path is written as a *key*, the encoding dir
-//! objects use for names (`tree.rs` on the read-fidelity change): the bytes as UTF-8 when they
+//! objects use for names, with the same functions ([`crate::tree::key_of`]): the bytes as UTF-8 when they
 //! are UTF-8 and hold no character of `U+10FF80..=U+10FFFF`; otherwise each byte of an invalid
 //! sequence, and each byte of such a character, becomes `U+10FF00 + byte`. The mapping is a
 //! bijection ([`key_of`], [`bytes_of`]), and `/` is never escaped, so a path keys component by
@@ -32,7 +32,6 @@
 //! (`raw_member` for a shared link's other name); a reader takes those when present. A path that
 //! is UTF-8 (every path, in practice) encodes as plain text with no extra field.
 
-use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::OsStr;
 use std::fs::{self, Metadata};
@@ -48,6 +47,7 @@ use serde::{Deserialize, Serialize};
 use crate::gitpack::{GitError, GitRepo};
 use crate::index::{has_component_in, mtime_ns};
 use crate::manifest::WORKTREE_META_FORMAT;
+pub use crate::tree::{bytes_of, key_of, raw_of};
 
 /// Overlay errors.
 #[derive(Debug, thiserror::Error)]
@@ -81,74 +81,6 @@ fn io_err(path: &[u8]) -> impl FnOnce(io::Error) -> MetaError + '_ {
         path: String::from_utf8_lossy(path).into_owned(),
         source,
     }
-}
-
-// ---------------------------------------------------------------------------------------------
-// Keys: byte strings as JSON strings (the dir objects' name encoding).
-// ---------------------------------------------------------------------------------------------
-
-/// `U+10FF00`: an escaped byte `b` is the character `ESCAPE_BASE + b`.
-const ESCAPE_BASE: u32 = 0x10_FF00;
-/// The first character of the escape range (`ESCAPE_BASE + 0x80`).
-const ESCAPE_FIRST: u32 = 0x10_FF80;
-
-fn is_escape_char(c: char) -> bool {
-    u32::from(c) >= ESCAPE_FIRST
-}
-
-fn escaped(b: u8) -> char {
-    // `ESCAPE_BASE + b` for `b` in 0..=255 is below `char::MAX` and not a surrogate.
-    char::from_u32(ESCAPE_BASE + u32::from(b)).unwrap_or(char::REPLACEMENT_CHARACTER)
-}
-
-/// The key of a byte string (see the module docs).
-#[must_use]
-pub fn key_of(bytes: &[u8]) -> Cow<'_, str> {
-    if let Ok(s) = std::str::from_utf8(bytes)
-        && !s.chars().any(is_escape_char)
-    {
-        return Cow::Borrowed(s);
-    }
-    let mut out = String::with_capacity(bytes.len() + 8);
-    for chunk in bytes.utf8_chunks() {
-        for c in chunk.valid().chars() {
-            if is_escape_char(c) {
-                let mut buf = [0u8; 4];
-                out.extend(c.encode_utf8(&mut buf).bytes().map(escaped));
-            } else {
-                out.push(c);
-            }
-        }
-        out.extend(chunk.invalid().iter().copied().map(escaped));
-    }
-    Cow::Owned(out)
-}
-
-/// The bytes a key stands for: the inverse of [`key_of`].
-#[must_use]
-pub fn bytes_of(key: &str) -> Cow<'_, [u8]> {
-    if !key.chars().any(is_escape_char) {
-        return Cow::Borrowed(key.as_bytes());
-    }
-    let mut out = Vec::with_capacity(key.len());
-    for c in key.chars() {
-        if is_escape_char(c) {
-            // In the escape range, so `c - ESCAPE_BASE` is 0x80..=0xFF.
-            out.push(u8::try_from(u32::from(c) - ESCAPE_BASE).unwrap_or(b'?'));
-        } else {
-            let mut buf = [0u8; 4];
-            out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
-        }
-    }
-    Cow::Owned(out)
-}
-
-/// The hex of a key's bytes when the key was escaped (`raw_path`, `raw_member`).
-#[must_use]
-pub fn raw_of(key: &str) -> Option<String> {
-    key.chars()
-        .any(is_escape_char)
-        .then(|| hex::encode(bytes_of(key)))
 }
 
 /// The bytes of a `key` + `raw` pair: `raw` wins when present, and must agree with the key.
@@ -873,6 +805,37 @@ mod tests {
         assert_eq!(
             text,
             r#"{"format":1,"entries":[{"path":"a","kind":"file","mode":420,"mtime":1}]}"#
+        );
+    }
+
+    /// The overlay's keys are the dir objects' names (`tree.rs`), byte for byte: a document
+    /// written before the two shared one encoder decodes to the same paths.
+    #[test]
+    fn keys_are_the_dir_objects_encoding() {
+        let corpus: [&[u8]; 6] = [
+            b"plain/utf8",
+            b"caf\xe9/\xff\xfe.txt",
+            "x\u{10FFAA}y".as_bytes(),
+            b"\x80",
+            "\u{10FF7F}".as_bytes(),
+            b"",
+        ];
+        for raw in corpus {
+            assert_eq!(bytes_of(&key_of(raw)).as_ref(), raw);
+        }
+        let entry = file(&key_of(b"caf\xe9"));
+        let text = String::from_utf8(
+            MetaDocument {
+                format: 1,
+                entries: vec![entry],
+                ..MetaDocument::default()
+            }
+            .encode(),
+        )
+        .unwrap();
+        assert_eq!(
+            text,
+            "{\"format\":1,\"entries\":[{\"path\":\"caf\u{10FFE9}\",\"raw_path\":\"636166e9\",\"kind\":\"file\",\"mode\":420,\"mtime\":1}]}"
         );
     }
 

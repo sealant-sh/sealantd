@@ -372,6 +372,25 @@ pub struct SnapRequest {
     pub seq: u64,
 }
 
+/// The queued capture a repair snap replaces, and the captures staged after it (folded in).
+#[derive(Debug, Clone)]
+struct RepairTarget {
+    entry: QueueEntry,
+    followers: Vec<QueueEntry>,
+}
+
+/// The staged file a store key was uploaded from (its ack marker's name).
+fn file_of_key(key: &str) -> Option<String> {
+    let (dir, last) = key.rsplit_once('/')?;
+    let kind = dir.rsplit('/').next()?;
+    match kind {
+        "packs" => Some(last.to_owned()),
+        "trees" => Some(format!("tree-{last}")),
+        "manifests" => Some(format!("manifest-{last}")),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct ChunkMap {
     /// chunk → pack key.
@@ -525,6 +544,12 @@ pub struct CaptureEngine {
     /// content). Empty after a restart, when such a path's metadata is left out and the path is
     /// reported unreadable all the same.
     last_meta: Option<worktree_meta::MetaDocument>,
+    /// A refused capture being rebuilt in its place ([`CaptureEngine::repair`]): the next
+    /// snap takes its `n` and parent and folds the captures staged after it into itself.
+    repair_target: Option<RepairTarget>,
+    /// Git packs the registrar said are missing: the next small snap packs every object
+    /// again (no negatives) and names no missing pack.
+    repair_git: Option<HashSet<String>>,
     /// The manifest the queued bulk capture was staged on (its parent). A small snap while that
     /// bulk capture's objects upload is staged ahead of it: it takes the bulk capture's place on
     /// the chain with this manifest's bulk section, and the bulk capture moves on top of it. See
@@ -640,6 +665,8 @@ impl CaptureEngine {
             dirs,
             last_tips,
             last_meta: None,
+            repair_target: None,
+            repair_git: None,
             below: None,
             invalidations: Arc::new(Invalidations::default()),
             reads: Arc::new(ReadReports::default()),
@@ -1308,6 +1335,173 @@ impl CaptureEngine {
         self.bulk_work.is_some()
     }
 
+    /// Rebuild the capture the registrar refused ([`crate::ship::RepairRequest`], asked for by the shipper)
+    /// from disk, in its place: the packs it named are forgotten (their chunks are read and
+    /// packed again, a dir object is staged again, a missing git pack makes the next git pack a
+    /// full one), then each class whose section named a missing key (the refused capture's own
+    /// class when none is attributable) is snapped as a capture at the refused one's `n` with
+    /// its parent. The captures staged after it are folded in: the rebuilt capture holds the
+    /// disk as it is now and lists every object they staged; nothing is dropped. A final one
+    /// among them makes the rebuilt capture final. Returns whether a repair ran. Snaps run it
+    /// first ([`Self::snap_preemptible`]); the cadence runner's final flush runs it when the
+    /// shipper reports [`crate::ship::ShipError::RepairPending`].
+    ///
+    /// # Errors
+    /// A snap's error; the request stays and is tried again.
+    pub fn repair(&mut self) -> Result<bool, EngineError> {
+        let Some(request) = self.staging.repair_request() else {
+            return Ok(false);
+        };
+        let staging = Arc::clone(&self.staging);
+        let (entry, followers) = {
+            let _guard = staging.coalesce_guard();
+            let pending = staging.pending()?;
+            let Some(at) = pending
+                .iter()
+                .position(|e| e.n == request.n && e.capture_id == request.capture_id)
+            else {
+                staging.clear_repair()?;
+                return Ok(false);
+            };
+            (pending[at].clone(), pending[at + 1..].to_vec())
+        };
+        let sections = &entry.register.manifest.sections;
+        let git_keys: HashSet<String> = sections
+            .git
+            .packs
+            .iter()
+            .flat_map(|k| [k.clone(), format!("{k}.idx")])
+            .collect();
+        let mut small_keys: HashSet<String> = sections
+            .workspace
+            .packs
+            .iter()
+            .chain(&sections.workspace.dir_packs)
+            .cloned()
+            .collect();
+        small_keys.insert(sections.workspace.root.clone());
+        let bulk_keys: HashSet<String> = sections
+            .bulk
+            .section()
+            .map(|b| {
+                b.packs
+                    .iter()
+                    .chain(&b.dir_packs)
+                    .cloned()
+                    .chain([b.root.clone()])
+                    .collect()
+            })
+            .unwrap_or_default();
+        let other_keys: HashSet<&String> = sections
+            .other_bulk
+            .values()
+            .flat_map(|b| b.packs.iter().chain(&b.dir_packs))
+            .collect();
+        let missing: HashSet<String> = request.missing.iter().cloned().collect();
+        let git_missing: HashSet<String> = missing
+            .iter()
+            .filter(|k| git_keys.contains(*k))
+            .map(|k| k.strip_suffix(".idx").unwrap_or(k).to_owned())
+            .collect();
+        let mut small = !git_missing.is_empty() || missing.iter().any(|k| small_keys.contains(k));
+        let mut bulk = missing.iter().any(|k| bulk_keys.contains(k));
+        if !small && !bulk {
+            match request.class {
+                Some(Class::Bulk) => bulk = true,
+                _ => small = true,
+            }
+        }
+        let foreign: Vec<&String> = missing.iter().filter(|k| other_keys.contains(k)).collect();
+        if !foreign.is_empty() {
+            tracing::error!(
+                keys = ?foreign,
+                "the registrar is missing another platform's bulk packs; they cannot be rebuilt here"
+            );
+        }
+        // Forget what the registrar does not hold. Named: those keys. None named (the tree
+        // would not restore): every pack the rebuilt classes' sections name.
+        let forget: HashSet<String> = if missing.is_empty() {
+            let mut all = HashSet::new();
+            if small {
+                all.extend(small_keys.iter().cloned());
+            }
+            if bulk {
+                all.extend(bulk_keys.iter().cloned());
+            }
+            all
+        } else {
+            missing.clone()
+        };
+        self.chunks.packs.retain(|_, k| !forget.contains(k));
+        self.dirs.workspace.retain(|_, k| !forget.contains(k));
+        self.dirs.bulk.retain(|_, k| !forget.contains(k));
+        for key in &forget {
+            if let Some(file) = file_of_key(key) {
+                self.staging.unmark_uploaded(&file)?;
+            }
+        }
+        if !git_missing.is_empty() {
+            self.last_tips.clear();
+            self.repair_git = Some(
+                git_missing
+                    .iter()
+                    .flat_map(|k| [k.clone(), format!("{k}.idx")])
+                    .collect(),
+            );
+        }
+        if bulk {
+            self.bulk_work = None;
+        }
+        self.persist()?;
+
+        let replaced = std::iter::once(&entry).chain(&followers);
+        let kind = if replaced.clone().any(|e| e.kind == CaptureKind::Final) {
+            CaptureKind::Final
+        } else {
+            entry.kind
+        };
+        let seq = replaced.map(|e| e.register.manifest.seq).max().unwrap_or(0);
+        tracing::warn!(
+            n = entry.n,
+            capture = %entry.capture_id,
+            reason = %request.reason,
+            missing = ?request.missing,
+            small,
+            bulk,
+            folded = followers.len(),
+            "rebuilding a refused capture from disk"
+        );
+        let mut target = RepairTarget { entry, followers };
+        for class in [Class::Small, Class::Bulk] {
+            if (class == Class::Small && !small) || (class == Class::Bulk && !bulk) {
+                continue;
+            }
+            self.repair_target = Some(target.clone());
+            let staged = self.snap_preemptible(SnapRequest { kind, class, seq }, &|| false);
+            self.repair_target = None;
+            let staged = match staged? {
+                SnapOutcome::Staged(staged) => staged,
+                SnapOutcome::Preempted => {
+                    return Err(io::Error::other("a repair snap yielded").into());
+                }
+            };
+            // The next class rebuilds the capture just staged in the same place.
+            let pending = self.staging.pending()?;
+            let Some(rebuilt) = pending
+                .into_iter()
+                .find(|e| e.n == staged.n && e.capture_id == staged.manifest.capture_id)
+            else {
+                return Err(io::Error::other("the rebuilt capture is not queued").into());
+            };
+            target = RepairTarget {
+                entry: rebuilt,
+                followers: Vec::new(),
+            };
+        }
+        self.staging.clear_repair()?;
+        Ok(true)
+    }
+
     /// The queued bulk capture a small snap is staged ahead of, with the manifest it was staged
     /// on: the newest queued capture, when it is a bulk one the shipper is not registering, is
     /// the capture this engine staged last, and names the manifest kept as `below` as its
@@ -1430,6 +1624,12 @@ impl CaptureEngine {
                 self.follow_restage(&journal);
             }
         }
+        // A capture the registrar refused is rebuilt before anything is staged after it.
+        if self.repair_target.is_none()
+            && let Err(error) = self.repair()
+        {
+            tracing::error!(%error, "rebuilding a refused capture failed; asked again at the next snap");
+        }
         if req.class == Class::Bulk && self.previous.is_none() {
             // A bulk capture copies the small sections from its predecessor; make one first.
             self.snap(SnapRequest {
@@ -1453,6 +1653,10 @@ impl CaptureEngine {
                 previous_tips.extend(self.last_tips.iter().cloned());
                 previous_tips.sort();
                 previous_tips.dedup();
+                // A git pack the registrar says is missing: pack every object again.
+                if self.repair_git.is_some() {
+                    previous_tips.clear();
+                }
                 let excludes = self.daemon_excludes();
                 // An automatic snap gives what the worktree cannot read the previous capture's
                 // entry; a final one carries nothing and fails on it instead.
@@ -1485,6 +1689,9 @@ impl CaptureEngine {
                     .as_ref()
                     .map(|p| p.manifest.sections.git.packs.clone())
                     .unwrap_or_default();
+                if let Some(missing) = &self.repair_git {
+                    git_packs.retain(|k| !missing.contains(k));
+                }
                 if let Some(p) = &git.pack {
                     stats.git_pack_bytes = p.bytes;
                     stats.git_objects = p.objects;
@@ -1596,6 +1803,7 @@ impl CaptureEngine {
                 // stages nothing, and its tips would leave objects out of every later pack.
                 self.last_tips = git.closure.tips.clone();
                 self.last_meta.clone_from(&meta_doc);
+                self.repair_git = None;
                 Sections {
                     git: GitSection {
                         packs: git_packs,
@@ -1678,9 +1886,12 @@ impl CaptureEngine {
         // Before this, every small capture staged after a bulk one named it as its parent and
         // waited for its whole upload (observed: 800 MB of `node_modules` held the chain at
         // the capture before the agent's edits for 20 minutes).
+        // A repair snap takes the refused capture's place: no hoist, no coalescing, never
+        // "unchanged".
+        let repairing = self.repair_target.take();
         let hoist = match req.class {
-            Class::Small => self.hoist_target()?,
-            Class::Bulk => None,
+            Class::Small if repairing.is_none() => self.hoist_target()?,
+            _ => None,
         };
         if let Some((_, below)) = &hoist {
             sections.bulk = below.manifest.sections.bulk.clone();
@@ -1694,10 +1905,11 @@ impl CaptureEngine {
         // Nothing changed: an `auto` snap stages nothing rather than growing the chain, and nor
         // does a final flush's bulk snap (its small snap is the capture that marks the end), or
         // a final snap over a final capture (the same final flush asked again).
-        if (req.kind == CaptureKind::Auto
-            || (req.kind == CaptureKind::Final
-                && (req.class == Class::Bulk
-                    || follows.is_some_and(|p| p.manifest.kind == CaptureKind::Final))))
+        if repairing.is_none()
+            && (req.kind == CaptureKind::Auto
+                || (req.kind == CaptureKind::Final
+                    && (req.class == Class::Bulk
+                        || follows.is_some_and(|p| p.manifest.kind == CaptureKind::Final))))
             && let Some(prev) = follows
             && prev.manifest.sections == sections
         {
@@ -1732,7 +1944,7 @@ impl CaptureEngine {
         // snap never folds into a bulk capture (it would wait for that upload), nor a bulk
         // snap into a small one. The guard keeps the shipper from claiming that capture until
         // its replacement is in the queue.
-        let coalesce = if req.kind == CaptureKind::Auto {
+        let coalesce = if req.kind == CaptureKind::Auto && repairing.is_none() {
             match &hoist {
                 Some((bulk, _)) => self.staging.coalescible_below(bulk)?,
                 None => self
@@ -1743,10 +1955,11 @@ impl CaptureEngine {
         } else {
             None
         };
-        let (n, parent) = match (&coalesce, &hoist) {
-            (Some(old), _) => (old.n, old.register.parent.clone()),
-            (None, Some((bulk, _))) => (bulk.n, bulk.register.parent.clone()),
-            (None, None) => (
+        let (n, parent) = match (&coalesce, &hoist, &repairing) {
+            (_, _, Some(target)) => (target.entry.n, target.entry.register.parent.clone()),
+            (Some(old), _, None) => (old.n, old.register.parent.clone()),
+            (None, Some((bulk, _)), None) => (bulk.n, bulk.register.parent.clone()),
+            (None, None, None) => (
                 self.previous.as_ref().map_or(0, |p| p.manifest.n + 1),
                 self.previous.as_ref().map(|p| p.capture_id.clone()),
             ),
@@ -1767,6 +1980,19 @@ impl CaptureEngine {
         let manifest_file = format!("manifest-{}", manifest.capture_id);
         fs::write(objects.join(&manifest_file), &manifest.bytes)?;
         let mut all_uploads: Vec<Upload> = Vec::new();
+        if let Some(target) = &repairing {
+            // Everything the replaced captures staged but their manifests: this manifest may
+            // name any of it (a follower's git pack, a bulk section it carries).
+            for u in std::iter::once(&target.entry)
+                .chain(&target.followers)
+                .flat_map(|e| &e.uploads)
+                .filter(|u| !u.file.starts_with("manifest-"))
+            {
+                if !all_uploads.iter().any(|e| e.file == u.file) {
+                    all_uploads.push(u.clone());
+                }
+            }
+        }
         if let Some(old) = &coalesce {
             // Keep the packs the coalesced capture staged (the new manifest may list them).
             // Its dir objects are superseded only when this snap rebuilt the same class: the
@@ -1809,7 +2035,9 @@ impl CaptureEngine {
                 manifest: manifest.manifest.clone(),
             },
         };
-        if req.class == Class::Bulk {
+        if repairing.is_some() {
+            self.below = None;
+        } else if req.class == Class::Bulk {
             match &coalesce {
                 // Staged on the newest capture: that is the manifest a small snap takes this
                 // bulk capture's place with.
@@ -1824,8 +2052,33 @@ impl CaptureEngine {
                 }
             }
         }
-        let newest = match &hoist {
-            Some((bulk, _)) => {
+        let newest = match (&hoist, &repairing) {
+            (_, Some(target)) => {
+                // One journaled step: this capture at the refused one's `n`, the refused one
+                // and every capture staged after it superseded (their objects ride along).
+                let mut superseded = vec![target.entry.clone()];
+                superseded.extend(target.followers.iter().cloned());
+                if let Err(error) = self
+                    .staging
+                    .restage(std::slice::from_ref(&entry), &superseded)
+                {
+                    if self.staging.restage_pending() {
+                        tracing::warn!(%error, "restage interrupted; finishing it from its journal");
+                        self.staging.recover()?;
+                    } else {
+                        return Err(error.into());
+                    }
+                }
+                tracing::warn!(
+                    n,
+                    replaced = %target.entry.capture_id,
+                    folded = target.followers.len(),
+                    class = ?req.class,
+                    "refused capture rebuilt from disk in its place"
+                );
+                manifest.clone()
+            }
+            (Some((bulk, _)), None) => {
                 // The bulk capture first (at `n + 1`, over its own queue file when this capture
                 // coalesced the one below it), then this capture in its place, then the bulk
                 // capture's old manifest goes — as one journaled step, so a crash between the
@@ -1855,7 +2108,7 @@ impl CaptureEngine {
                 );
                 moved_manifest
             }
-            None => {
+            (None, None) => {
                 match &coalesce {
                     Some(old) => self.staging.replace(old, &entry)?,
                     None => self.staging.enqueue(&entry)?,
