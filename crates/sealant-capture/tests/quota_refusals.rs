@@ -223,3 +223,62 @@ fn a_refusal_at_register_drops_the_capture_after_the_packs_landed() {
     assert_eq!(shipper.ship_pending().unwrap(), 0);
     assert_eq!(registrar.chain().len(), 1);
 }
+
+/// A bulk capture refused after a small capture was staged ahead of it: the small capture
+/// registers, only the bulk capture is dropped, and the chain continues from the small capture
+/// (the manifest the bulk capture was re-staged on), not from the capture before both.
+#[test]
+fn a_bulk_refusal_behind_a_small_capture_keeps_the_small_capture() {
+    let server = common::serve();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("ws");
+    workspace(&root, 200);
+
+    let registrar = Arc::new(InMemoryRegistrar::new("wt", 1, Some(server.base.clone())));
+    let dyn_registrar: Arc<dyn Registrar> = registrar.clone();
+    let minter = Arc::new(RegistrarMinter::new(
+        dyn_registrar.clone(),
+        "wt",
+        1,
+        Default::default(),
+    ));
+    let sink: Arc<dyn BlobSink> = Arc::new(PresignedHttp::new(
+        Box::new(minter),
+        std::time::Duration::from_secs(30),
+    ));
+    let mut engine = CaptureEngine::open(CaptureConfig::new("wt", 1, &root), None).unwrap();
+    let shipper = engine.shipper(sink, dyn_registrar);
+
+    snap(&mut engine, Class::Small, 1);
+    assert_eq!(shipper.ship_pending().unwrap(), 1);
+    registrar.set_byte_quota(Some(registrar.used_bytes() + 64 * 1024), None);
+
+    let bulk = snap(&mut engine, Class::Bulk, 2);
+    assert_eq!(bulk.n, 1);
+    fs::write(root.join("src/lib.rs"), "pub fn f() { g() }\n").unwrap();
+    let small = snap(&mut engine, Class::Small, 3);
+    assert_eq!(small.n, 1, "staged ahead of the bulk capture");
+    assert_eq!(engine.staging().pending().unwrap().len(), 2);
+
+    assert_eq!(shipper.ship_pending().unwrap(), 1, "the small capture only");
+    assert_eq!(
+        registrar.head().unwrap().capture_id,
+        small.manifest.capture_id
+    );
+    assert!(engine.staging().pending().unwrap().is_empty());
+    assert!(shipper.is_refused(Class::Bulk));
+    assert!(!shipper.is_refused(Class::Small));
+
+    fs::write(root.join("src/lib.rs"), "pub fn f() { h() }\n").unwrap();
+    let next = snap(&mut engine, Class::Small, 4);
+    assert_eq!(next.n, 2);
+    assert_eq!(
+        next.manifest.manifest.parent.as_deref(),
+        Some(small.manifest.capture_id.as_str())
+    );
+    assert_eq!(shipper.ship_pending().unwrap(), 1);
+    assert_eq!(
+        registrar.head().unwrap().capture_id,
+        next.manifest.capture_id
+    );
+}

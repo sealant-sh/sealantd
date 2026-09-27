@@ -2,7 +2,9 @@
 
 > Status (PR sealantd#71): the cadence is watcher-fed. The small class snaps 2 s after the last
 > change and at most every 10 s while dirty; the bulk class has its own 30 s / 120 s clocks and
-> yields to small snaps at chunk boundaries; turn boundaries, checkpoints, `capture.flush` and the
+> yields to small snaps at chunk boundaries — when it builds, and when it uploads: a small capture
+> is staged, shipped and registered ahead of a bulk capture still uploading (see "Small captures
+> ahead of a bulk upload"); turn boundaries, checkpoints, `capture.flush` and the
 > SIGTERM/SIGINT/`gracefulShutdown` paths force a small snap ahead of the timers. Watch budget not
 > met, `IN_Q_OVERFLOW` or no backend → that class polls at its maximum interval (the stat walk).
 > Still open: the registrar wire shape is provisional (`registrar.rs`).
@@ -116,7 +118,70 @@ a class dirty on every create/modify/remove. Small class: `quiet` (2 s) after th
 over budget (half the sysctl, or `WatchPolicy::budget`) the class polls; `raise_limit` tries the
 sysctl first and never fails boot. `tests/cadence.rs` measures all of it against the real watcher.
 
+## Small captures ahead of a bulk upload (`engine.rs`, `ship.rs`)
+
+The chain is linear: every capture names the one before it as its parent, and the registrar
+takes them in order. A bulk capture carries a dependency tree — on alpha (2026-09-27) a
+`pnpm install` left ≈ 800 MB in ≈ 20k objects, which took the shipper twenty minutes — so every
+small capture staged after it used to name it as its parent and wait for its whole upload. The
+chain head stayed at the capture before the agent's edits, `capture.flush` timed out or answered
+`pending 5`, and every checkpoint the control plane derived read `0 files · +0 −0`. Now:
+
+- **The engine stages a small capture ahead of a queued bulk capture.** While the newest queued
+  capture is a bulk one the shipper is not registering (`Staging::hoistable`), a small snap takes
+  its place on the chain — its `n` and parent — with the bulk section of the manifest the bulk
+  capture was staged on (another bulk section, or `"pending"`), and the bulk capture is staged
+  again on top of it: the same objects, a new manifest whose git and workspace sections are the
+  small capture's. The bulk capture is written at `n + 1` before the small capture overwrites
+  its old slot, so it is never missing from the queue; its old manifest is swept. A small `auto`
+  snap coalesces with the small capture below the bulk one, never into the bulk one, and a bulk
+  snap coalesces only with a bulk capture.
+- **The shipper uploads a bulk capture's objects unclaimed and stops between objects** when the
+  queue changes (a capture was staged ahead of it: it ships that one, then resumes where it
+  stopped), when a flush is waiting, or at the caller's deadline. Its manifest registers once
+  every object is up. One pass runs at a time (`Shipper::pass`).
+- **`capture.flush` returns once every capture ahead of a bulk capture still uploading is
+  registered** (`Shipper::flush_small`): the git pack, the worktree tree and the workspace class,
+  which is what a change or a diff needs. The bulk capture keeps uploading in the worker and
+  registers on top; `capture.status` reports it in `pending` and in `pending_bulk`, so a caller
+  reads `pending == pending_bulk` as flushed. A `final` flush (the daemon is going away, the
+  worker with it) spends what is left of its deadline on the bulk capture too.
+- **Materialize is unchanged.** A head staged ahead of a bulk capture carries the older bulk
+  section or `"pending"`; a materialize from a `"pending"` head neither restores nor sweeps the
+  bulk directories.
+- **Refusals.** A bulk capture refused for the byte quota is dropped alone (it is the newest
+  queued capture); the chain continues from the manifest it was staged on. A refused small
+  capture drops everything after it, the bulk capture included, as before.
+
+`tests/small_ahead_of_bulk.rs` holds it against a sink that spends 40 ms per object on 164 bulk
+objects: a turn capture registers in ≈ 0.2 s and a flush returns in ≈ 0.2 s while the bulk upload
+runs, the head materializes the edit without the dependency tree, and the bulk capture registers
+on top. Before the change the turn capture did not register within 5 s.
+
+### PUT URLs: one pass, reused, and a 429 is transient
+
+The same session ended its flushes on `no url for …/trees/<sha>`. A flush ran its ship pass
+beside the worker's, over the same bulk capture (nothing kept two passes apart, and `claim` does
+not refuse a claimed entry). Each pass took the PUT URLs the other had minted from the shared
+cache, and the one that lost the race minted one key per `upload.urls` call: 161 calls for 164
+objects in `tests/small_ahead_of_bulk.rs`. Against the registrar's call quota (600 an hour at
+Mend) a 20k-object bulk upload runs out, and `RegistrarMinter` reported the 429 as
+`no url for <key>: transport: upload.urls: http 429`, a `SinkError::NoUrl`, which the shipper
+does not retry, so every pass failed until the quota's hour rolled over. Now one pass
+runs at a time; a transport failure of a mint (5xx, 429) is `SinkError::Transport` and retried
+with backoff, and a failed batch mint is retried as a batch instead of falling back to one call
+per key; and `RegistrarMinter::prefetch_put` does not ask again for a key that holds a URL minted
+within `PUT_URL_REUSE` (5 minutes), so a bulk upload that stopped mid-batch resumes on the URLs
+it holds. A key the registrar answers without is still `NoUrl` ("the registrar answered
+upload.urls without this key").
+
 ## Wire additions
+
+### `pending_bulk` on `capture.status` / `capture.flush`
+
+Of `pending`, the bulk captures whose objects are still uploading. Additive (`uint64` field 13 of
+`CaptureStatusReport`; `0` from an older daemon). A control plane that treated `pending == 0` as
+a complete flush reads `pending == pending_bulk` instead.
 
 ### `platform` on `plan.get`
 

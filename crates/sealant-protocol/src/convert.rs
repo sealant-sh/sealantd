@@ -1375,6 +1375,7 @@ impl From<CommandResult> for wire::command_result::Result {
                     .into_iter()
                     .map(enum_i32::<_, wire::CaptureClass>)
                     .collect(),
+                pending_bulk: c.pending_bulk,
             }),
             CommandResult::LeaseEpoch(l) => W::LeaseEpoch(wire::LeaseEpochReport {
                 epoch: l.epoch,
@@ -1481,6 +1482,7 @@ impl TryFrom<wire::command_result::Result> for CommandResult {
                     .into_iter()
                     .map(capture_class)
                     .collect::<Result<_, _>>()?,
+                pending_bulk: c.pending_bulk,
             }),
             W::LeaseEpoch(l) => CommandResult::LeaseEpoch(LeaseEpochReport {
                 epoch: l.epoch,
@@ -1993,6 +1995,7 @@ mod tests {
                 paused: true,
                 last_snap_unix_ms: None,
                 refused: vec![CaptureClass::Bulk],
+                pending_bulk: 1,
             }),
             CommandResult::LeaseEpoch(LeaseEpochReport {
                 epoch: 2,

@@ -921,7 +921,7 @@ pub struct CaptureStatusReport {
     /// Highest registered chain position, when any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub head_n: Option<u64>,
-    /// Captures staged and not yet registered.
+    /// Captures staged and not yet registered (including `pending_bulk`).
     pub pending: u64,
     /// Bytes staged on local disk awaiting upload.
     pub staged_bytes: u64,
@@ -943,6 +943,11 @@ pub struct CaptureStatusReport {
     /// epoch or `capture.replan`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub refused: Vec<CaptureClass>,
+    /// Of `pending`, the bulk captures whose objects are still uploading. `capture.flush`
+    /// returns once every other capture is registered: a small capture is staged ahead of a
+    /// bulk one still uploading, so these register after it, in the background.
+    #[serde(default)]
+    pub pending_bulk: u64,
 }
 
 /// Result of `capture.replan`: the identity the executor now acts under and what the delta

@@ -581,14 +581,32 @@ impl CadenceRunner {
         self.shared.small_snap(kind)
     }
 
-    /// A forced small-class snap of `kind`, then ship and register everything pending, bounded
-    /// by `deadline`. Blocking.
+    /// A forced small-class snap of `kind`, then ship and register it and every capture ahead
+    /// of it, bounded by `deadline`. Blocking. A bulk capture whose objects are still uploading
+    /// does not hold the flush: the snap is staged ahead of it and the flush returns once the
+    /// snap is registered, while the worker keeps uploading the bulk capture (`capture.status`
+    /// counts it in `pending` and `pending_bulk`). A `final` flush — the executor is going away
+    /// and the worker with it — then spends what is left of `deadline` on the bulk capture too.
     ///
     /// # Errors
     /// The engine's error, or the shipper's when shipping stops on a fence or a conflict.
     pub fn flush(&self, kind: CaptureKind, deadline: Duration) -> Result<usize, EngineError> {
         self.snap(kind)?;
-        Ok(self.shared.shipper.flush(deadline)?)
+        let start = Instant::now();
+        let mut shipped = self.shared.shipper.flush_small(deadline)?;
+        let left = deadline.saturating_sub(start.elapsed());
+        if kind == CaptureKind::Final && !left.is_zero() {
+            match self.shared.shipper.flush(left) {
+                Ok(n) => shipped += n,
+                Err(error @ (ShipError::Fenced(_) | ShipError::Conflict(_))) => {
+                    return Err(error.into());
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "bulk capture not shipped before the deadline")
+                }
+            }
+        }
+        Ok(shipped)
     }
 
     /// Ship everything pending now, bounded by `deadline`, without a snap.
