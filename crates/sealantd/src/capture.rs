@@ -545,6 +545,12 @@ impl CaptureRuntime {
             // chain (the flush returned at its deadline before it could stage it): the final
             // flush asked again stages it.
             FinalOutcome::Snapped { .. } if !self.runner.final_sealed() => Some("sealing"),
+            // Complete means current (cross-repo decision 7): a change the watcher delivered
+            // after the flush's first snap, an overflow, a class that polls, a repair asked
+            // for, a bulk build paused mid-way — anything that makes a final flush asked again
+            // snap again — and what is on this disk is no longer all in the store. The same
+            // predicate the repeated final flush decides by; it snaps and answers complete.
+            FinalOutcome::Snapped { .. } if !self.runner.final_is_current() => Some("changed"),
             FinalOutcome::Snapped { .. } => None,
         };
         let reads = self.reads.current();
@@ -801,6 +807,9 @@ mod tests {
         runtime.mark_healthy();
         let capture = CaptureRuntime::new(boot);
         assert!(runtime.install_capture(capture.clone()));
+        // Started, as every boot does: a runner that watches nothing cannot say the disk is
+        // still as its final flush captured it, and never answers complete.
+        capture.start_without_harness(runtime.clone());
 
         let start = Instant::now();
         let report = flush_report(
@@ -1077,6 +1086,9 @@ mod tests {
         runtime.mark_healthy();
         let capture = CaptureRuntime::new(boot);
         assert!(runtime.install_capture(capture.clone()));
+        // Started, as every boot does: a runner that watches nothing cannot say the disk is
+        // still as its final flush captured it, and never answers complete.
+        capture.start_without_harness(runtime.clone());
         let small = |status: &CaptureStatusReport| {
             status
                 .snaps
@@ -1729,6 +1741,9 @@ mod tests {
         runtime.mark_healthy();
         let capture = CaptureRuntime::new(boot);
         assert!(runtime.install_capture(capture.clone()));
+        // Started, as every boot does: a runner that watches nothing cannot say the disk is
+        // still as its final flush captured it, and never answers complete.
+        capture.start_without_harness(runtime.clone());
 
         let flush = |rid: &'static str, deadline_ms| {
             runtime.dispatch(ControlRequest::new(
@@ -1885,7 +1900,10 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_final_flush_stops_every_container_of_the_workspace_docker_daemon() {
         let tmp = tempfile::tempdir().unwrap();
-        let (runtime, _capture, _registrar) = quiet_runtime(tmp.path());
+        let (runtime, capture, _registrar) = quiet_runtime(tmp.path());
+        // Started, as every boot does: a runner that watches nothing cannot say the disk is
+        // still as its final flush captured it, and never answers complete.
+        capture.start_without_harness(runtime.clone());
         let socket = tmp.path().join("docker.sock");
         let docker = fake_docker(&socket, &["c1", "c2"], &[]);
         runtime.set_workspace_docker(Some(crate::docker::DockerEndpoint::Unix(socket)));
@@ -2015,9 +2033,12 @@ mod tests {
 
         let report = runtime.final_flush(None, Some(3_000)).await.unwrap();
         assert!(report.complete, "{report:?}");
+        assert!(capture.status().complete, "current until something changes");
         let after_final = capture.runner().snapshot();
 
         // Something changes after the last snap anyway, in both classes, and the clocks see it.
+        // Nothing snaps on a schedule, and the executor is no longer complete: what changed is
+        // on this disk only (review 2026-09-28 #15: status said complete through all of it).
         std::fs::write(ws.join("after.txt"), "after the final flush\n").unwrap();
         std::fs::write(ws.join("node_modules/pkg/late.js"), "late\n").unwrap();
         for _ in 0..5 {
@@ -2030,7 +2051,8 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(300)).await;
             let status = capture.status();
             assert!(!status.bulk_building, "{status:?}");
-            assert!(status.complete, "{status:?}");
+            assert!(!status.complete, "{status:?}");
+            assert_eq!(status.incomplete_reason.as_deref(), Some("changed"));
         }
         let later = capture.runner().snapshot();
         assert_eq!(
@@ -2064,6 +2086,20 @@ mod tests {
         let again = runtime.final_flush(None, Some(3_000)).await.unwrap();
         assert!(again.complete, "{again:?}");
         assert!(!again.bulk_building, "{again:?}");
+        let saved = capture.runner().snapshot();
+        assert!(
+            saved.small_snaps > after_final.small_snaps,
+            "the final flush asked again snapped what changed: {saved:?}"
+        );
+        assert!(capture.status().complete);
+
+        // An overflow after it (events lost) invalidates it the same way.
+        capture
+            .runner()
+            .signal(sealant_capture::ChangeSignal::Overflow);
+        let status = capture.status();
+        assert!(!status.complete, "{status:?}");
+        assert_eq!(status.incomplete_reason.as_deref(), Some("changed"));
     }
 
     /// A container that is still running after its stop, or a daemon that is known and cannot
