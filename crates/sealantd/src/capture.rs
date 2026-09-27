@@ -1593,14 +1593,38 @@ mod tests {
         running: Vec<String>,
         stubborn: Vec<String>,
         stops: Vec<String>,
+        /// What a container does while it stops ([`ContainerExit`]).
+        exit: Option<ContainerExit>,
+    }
+
+    /// A container that prints `last` into `log` `delay` into its stop (what `docker logs -f`
+    /// would stream) and exits `delay` after that; and a container `late` that starts once `trigger`
+    /// exists (a process started it on its way out).
+    #[derive(Clone)]
+    struct ContainerExit {
+        delay: Duration,
+        log: std::path::PathBuf,
+        last: &'static str,
+        trigger: std::path::PathBuf,
+        late: &'static str,
     }
 
     fn fake_docker(socket: &Path, running: &[&str], stubborn: &[&str]) -> Arc<Mutex<FakeDocker>> {
+        fake_docker_with(socket, running, stubborn, None)
+    }
+
+    fn fake_docker_with(
+        socket: &Path,
+        running: &[&str],
+        stubborn: &[&str],
+        exit: Option<ContainerExit>,
+    ) -> Arc<Mutex<FakeDocker>> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let state = Arc::new(Mutex::new(FakeDocker {
             running: running.iter().map(|s| (*s).to_owned()).collect(),
             stubborn: stubborn.iter().map(|s| (*s).to_owned()).collect(),
             stops: Vec::new(),
+            exit,
         }));
         let listener = tokio::net::UnixListener::bind(socket).unwrap();
         let shared = state.clone();
@@ -1622,8 +1646,30 @@ mod tests {
                     let head = String::from_utf8_lossy(&buf).to_string();
                     let mut words = head.split_whitespace();
                     let (method, path) = (words.next().unwrap_or(""), words.next().unwrap_or(""));
+                    let exit = state.lock().unwrap().exit.clone();
+                    if let Some(exit) = &exit
+                        && method == "POST"
+                        && path.starts_with("/containers/")
+                        && path.split('/').nth(2) != Some(exit.late)
+                    {
+                        tokio::time::sleep(exit.delay).await;
+                        let mut log = std::fs::OpenOptions::new()
+                            .append(true)
+                            .open(&exit.log)
+                            .unwrap();
+                        std::io::Write::write_all(&mut log, exit.last.as_bytes()).unwrap();
+                        // Its last lines out, the container takes a moment more to exit.
+                        tokio::time::sleep(exit.delay).await;
+                    }
                     let (status, body) = {
                         let mut st = state.lock().unwrap();
+                        if let Some(exit) = &exit
+                            && exit.trigger.exists()
+                            && !st.stops.iter().any(|s| s.contains(exit.late))
+                            && !st.running.iter().any(|r| r == exit.late)
+                        {
+                            st.running.push(exit.late.to_owned());
+                        }
                         if method == "GET" && path == "/containers/json" {
                             let list: Vec<_> = st
                                 .running
@@ -1686,6 +1732,71 @@ mod tests {
             stops,
             ["/containers/c1/stop?t=3", "/containers/c2/stop?t=3"],
             "every container, with the flush's grace"
+        );
+        assert!(docker.running.is_empty());
+    }
+
+    /// Docker end to end, round 2: the workspace daemon's containers were stopped at the same
+    /// time as the processes, so what a container printed while it stopped — streamed into the
+    /// worktree by a workspace process (`docker logs -f > file`) — lost its tail: the process
+    /// streaming it was already gone. The containers now stop first (with the grace), then the
+    /// processes, then the containers are checked again: one a process started on its way out
+    /// is stopped too.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn containers_stop_before_the_processes_that_stream_them() {
+        const FOLLOWER: &str = "trap 'touch start-late; exit 0' TERM; \
+                                while true; do cp container.log followed.txt; sleep 0.02; done";
+        let tmp = tempfile::tempdir().unwrap();
+        let (boot, registrar) = boot(tmp.path());
+        let ws = tmp.path().join("ws");
+        std::fs::write(ws.join("container.log"), "first line\n").unwrap();
+        let mut config = RuntimeConfig::new(new_runtime_id());
+        config.workspace_root = ws.clone();
+        let runtime = Runtime::new(config, Arc::new(ShutdownSignal::new(3_000)));
+        runtime.mark_healthy();
+        let capture = CaptureRuntime::new(boot);
+        assert!(runtime.install_capture(capture.clone()));
+        let socket = tmp.path().join("docker.sock");
+        let docker = fake_docker_with(
+            &socket,
+            &["c1"],
+            &[],
+            Some(ContainerExit {
+                delay: Duration::from_millis(300),
+                log: ws.join("container.log"),
+                last: "last line\n",
+                trigger: ws.join("start-late"),
+                late: "late",
+            }),
+        );
+        runtime.set_workspace_docker(Some(crate::docker::DockerEndpoint::Unix(socket)));
+        let harness = runtime
+            .spawn_managed(sh(FOLLOWER, &ws))
+            .expect("spawn the follower");
+        capture.start(runtime.clone(), harness.process_id);
+        let start = Instant::now();
+        while !ws.join("followed.txt").exists() {
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "the follower runs"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let report = runtime.final_flush(None, Some(3_000)).await.unwrap();
+        assert!(report.complete, "{report:?}");
+        let fresh = restore_head(tmp.path(), &registrar, "fresh");
+        assert_eq!(
+            std::fs::read_to_string(fresh.join("followed.txt")).unwrap(),
+            "first line\nlast line\n",
+            "what the container printed as it stopped reached the worktree before its follower \
+             stopped"
+        );
+        let docker = docker.lock().unwrap();
+        assert_eq!(
+            docker.stops,
+            ["/containers/c1/stop?t=3", "/containers/late/stop?t=3"],
+            "the container a process started on its way out is stopped too"
         );
         assert!(docker.running.is_empty());
     }

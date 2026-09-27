@@ -365,7 +365,9 @@ restore, byte for byte, so the user never notices the compute changed.
   `Runtime::final_flush` (`crates/sealantd/src/runtime.rs`), in this order:
   1. admission closes for good: no new process, exec (attached or not), session, SFTP bridge,
      execution, bind or re-plan is accepted, and the boot supervisor launches nothing more;
-  2. every writer is terminated and awaited: SFTP bridges are closed, a process group the
+  2. every writer is terminated and awaited, admission closed throughout, in this order —
+     the workspace's own Docker containers, then the processes, then the containers again
+     (below): SFTP bridges are closed, a process group the
      fence stopped is continued, then `SIGTERM` (`SIGHUP` for sessions), then `SIGKILL` after
      the grace (`grace_ms`, else the shutdown grace; a hard shutdown kills at once) — the
      managed process groups and sessions, and at the same time every process outside them
@@ -392,8 +394,12 @@ restore, byte for byte, so the user never notices the compute changed.
      `SEALANT_WORKSPACE_DOCKER_HOST`, else a `DOCKER_HOST` Core reserves for the workspace's
      own daemon — `unix:///run/docker/docker.sock` (Docker in the MicroVM, the Kubernetes dind
      sidecar) or `tcp://docker:2375` (the Docker adapter's dind sidecar); any other
-     `DOCKER_HOST` (a host daemon) is never touched. A container left running, or a daemon
-     named and not reached, is `processes-remain`;
+     `DOCKER_HOST` (a host daemon) is never touched. The containers stop first, with the
+     grace, while the processes still run: a workspace process can be what carries a
+     container's output into the worktree (`docker logs -f > file`), and stopped at the same
+     time it was gone before the container printed its last lines. After the processes, the
+     containers are checked again and any a process started on its way out is stopped. A
+     container left running, or a daemon named and not reached, is `processes-remain`;
   3. the small class and, forced, the bulk class are snapped (`CadenceRunner::flush_final`),
      both as `final` snaps —
      whatever the bulk clocks say; a scheduled bulk build in progress yields to it at its next
@@ -506,7 +512,9 @@ deadline, a writer's `SIGTERM` handler landing in the head of a final flush and 
 last snap, its `SIGTERM` handler's file in the head;
 `crates/sealantd/tests/final_sweep_control_peer.rs` the relay carrying a final flush over a
 real control socket spared (its reply arrives) while a bystander in the same scope is stopped; `crates/sealantd/src/capture.rs` also the
-containers of a fake Docker daemon stopped (and a stuck one, or no daemon, incomplete), a
+containers of a fake Docker daemon stopped (and a stuck one, or no daemon, incomplete), stopped
+before the process streaming their output into the worktree (its last line in the head) and a
+container a process started on its way out stopped after the processes, a
 daemon without a subreaper incomplete, and a flush past its deadline completing in the
 background and answering `complete` when asked again without a second quiesce;
 `crates/sealantd/src/boot/capture.rs` another platform's dependency tree carried through an

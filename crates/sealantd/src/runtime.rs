@@ -368,14 +368,16 @@ impl Runtime {
         self.capture().is_some_and(|c| !c.status().complete)
     }
 
-    /// Close admission and stop every writer in the workspace: SFTP bridges closed, paused
-    /// processes continued, then `SIGTERM` (or `SIGKILL` on a hard shutdown) to every managed
-    /// process group and `SIGHUP` to every session, `SIGKILL` after `grace`, and awaited; then
-    /// at the same time every process outside those groups ([`crate::sweep`]: the PID namespace
-    /// when sealantd is its PID 1, else sealantd's descendants) the same way.
-    /// Every container of the workspace's own Docker daemon is stopped at the same time. Returns
-    /// why the capture that follows cannot be complete (`processes-remain`,
-    /// `sweep-unavailable`), or `None`.
+    /// Close admission and stop every writer in the workspace, admission closed throughout:
+    /// SFTP bridges closed; every container of the workspace's own Docker daemon stopped
+    /// (`SIGTERM`, `SIGKILL` after `grace`) while the processes that may stream their output
+    /// still run; then paused processes continued, `SIGTERM` (or `SIGKILL` on a hard shutdown)
+    /// to every managed process group and `SIGHUP` to every session, `SIGKILL` after `grace`,
+    /// and awaited, and at the same time every process outside those groups
+    /// ([`crate::sweep`]: the PID namespace when sealantd is its PID 1, else sealantd's
+    /// descendants) the same way; then the containers once more, for one a process started on
+    /// its way out. Returns why the capture that follows cannot be complete
+    /// (`processes-remain`, `sweep-unavailable`), or `None`.
     async fn quiesce(&self, grace: Duration) -> Option<&'static str> {
         self.admission_closed.store(true, Ordering::SeqCst);
         self.quiesces.fetch_add(1, Ordering::Relaxed);
@@ -421,20 +423,35 @@ impl Runtime {
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         let started = Instant::now();
-        // And every container of the workspace's own Docker daemon: a container can bind-mount
-        // the worktree, and its processes are neither in sealantd's groups nor its descendants.
-        let stop_containers = async {
+        // Every container of the workspace's own Docker daemon first: a container can
+        // bind-mount the worktree, and its processes are neither in sealantd's groups nor its
+        // descendants. First, because a workspace process may be what carries a container's
+        // output into the worktree (`docker logs -f > file`): stopped at the same time, it was
+        // gone before the container printed its last lines, and they were lost.
+        let stop_containers = || async {
             match &docker {
                 None => Ok(None),
                 Some(endpoint) => crate::docker::stop_all(endpoint, grace).await.map(Some),
             }
         };
-        let ((), (), (swept, sweep_left), containers) = tokio::join!(
+        let first = stop_containers().await;
+        let ((), (), (swept, sweep_left)) = tokio::join!(
             self.sessions.terminate_all(grace),
             self.processes.terminate_all(signal, grace),
             sweeper.sweep(grace, self.shutdown.is_hard(), &admit, &peers),
-            stop_containers,
         );
+        // Then again: a container a process started on its way out (admission stays closed,
+        // but sealantd does not admit what the daemon runs).
+        let containers = match first {
+            Ok(first) => stop_containers().await.map(|again| match (first, again) {
+                (Some(first), Some(again)) => Some(crate::docker::Stopped {
+                    containers: first.containers + again.containers,
+                    running: again.running,
+                }),
+                (_, again) => again,
+            }),
+            Err(error) => Err(error),
+        };
         let managed_left = self.processes.registry.running().len() + self.sessions.registry.len();
         let (containers_stopped, containers_left) = match &containers {
             Ok(None) => (0, 0),
