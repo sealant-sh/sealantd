@@ -46,8 +46,10 @@
 //! A session has a byte budget. The registrar prices a key once and refuses a call that would
 //! take the session past the budget: `upload.urls` answers 413 before minting anything, and
 //! `capture.register` backstops keys that were never sized with 409 of the same body. Both are
-//! [`RegistrarError::QuotaRefused`] — terminal for that capture, never retried (the shipper drops
-//! the queue entry and its staged bytes, and stops re-snapping that class).
+//! [`RegistrarError::QuotaRefused`]. The shipper drops nothing: the capture is held in the queue
+//! with its staged bytes, its class reported refused in `capture.status`, and asked for again
+//! after a backoff (30 s, doubling, 10 min at most) until the budget allows
+//! ([`crate::ship::HeldCapture`]).
 //!
 //! ```json
 //! ← 413 {"reason":"byte-quota","limit":8589934592,"used":8570000000,"requested":775000000}
@@ -68,6 +70,19 @@
 //! dependency tree built elsewhere; the install runs on the control plane's side instead — and
 //! leaves the plan unchanged when the field is absent (an older executor) or the platforms
 //! match. The materializer treats `"pending"` as "nothing to restore, nothing to sweep".
+//!
+//! # `manifest_format` on `plan.get`
+//!
+//! The answer names the highest section format the registrar reads (`manifest.rs`): what it
+//! walks to presign a plan, HEADs and prices at register, keeps alive in retention. Absent = 1,
+//! one object per directory. At 2 the executor writes a chunked section's dir objects into dir
+//! packs (`dir_packs`, keyed `…/packs/<sha256>` like any pack) and names them by digest; below
+//! it the executor writes format 1 as before, so an executor never writes a capture its
+//! registrar cannot restore. Either way the executor reads both formats.
+//!
+//! ```json
+//! ← {"worktree_id":"wt","epoch":3,"head":{…},"get_urls":{…},"manifest_format":2}
+//! ```
 //!
 //! # Sources beside the worktree
 //!
@@ -109,7 +124,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::manifest::{BulkState, Manifest};
+use crate::manifest::{BulkState, FORMAT_DIR_OBJECTS, MAX_SECTION_FORMAT, Manifest, TreeRef};
 use crate::transport::{ChannelTransport, TransportError};
 
 /// `plan.get`.
@@ -175,6 +190,25 @@ pub struct PlanGetResponse {
     /// means "leave the repository's remotes alone".
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub remotes: Vec<PlanRemote>,
+    /// The highest section format the registrar reads (`manifest.rs`); 1 when absent. At 2 the
+    /// executor writes dir packs ([`crate::manifest::DirFormat::for_registrar`]).
+    #[serde(default = "manifest_format_one")]
+    pub manifest_format: u32,
+}
+
+fn manifest_format_one() -> u32 {
+    FORMAT_DIR_OBJECTS
+}
+
+/// The store keys a chunked section names for its dir objects: the root key in format 1 (the
+/// rest are found by walking it), the dir packs in format 2.
+#[must_use]
+pub fn tree_keys(tree: TreeRef<'_>) -> Vec<String> {
+    if tree.format == FORMAT_DIR_OBJECTS {
+        vec![tree.root.to_owned()]
+    } else {
+        tree.dir_packs.to_vec()
+    }
 }
 
 /// One remote of the worktree's repository: what `git remote add <name> <url>` takes. Nothing
@@ -506,6 +540,8 @@ pub struct InMemoryRegistrar {
     completer: Option<Arc<dyn MultipartCompleter>>,
     /// Bytes this session may hold, and where a register-time price comes from.
     quota: Mutex<Option<ByteQuota>>,
+    /// The `manifest_format` `plan.get` answers.
+    manifest_format: u32,
 }
 
 /// The in-memory registrar's byte budget: keys are priced from the `sizes` of `upload.urls`, and
@@ -552,7 +588,16 @@ impl InMemoryRegistrar {
             url_base,
             multipart: None,
             completer: None,
+            manifest_format: MAX_SECTION_FORMAT,
         }
+    }
+
+    /// Answer `manifest_format` on `plan.get` (default: the highest this build reads). At 1 the
+    /// registrar stands for one that does not read dir packs.
+    #[must_use]
+    pub fn with_manifest_format(mut self, manifest_format: u32) -> Self {
+        self.manifest_format = manifest_format;
+        self
     }
 
     /// Take keys of at least `policy.threshold` bytes as multipart (needs a `url_base`); the
@@ -761,7 +806,7 @@ impl InMemoryRegistrar {
 }
 
 /// Every store key a register names: git packs (and their indexes), the workspace and bulk tree
-/// roots and packs, and the manifest itself.
+/// roots (format 1) or dir packs (format 2) and packs, and the manifest itself.
 fn manifest_keys(req: &RegisterRequest) -> Vec<String> {
     let s = &req.manifest.sections;
     let mut keys: Vec<String> = s
@@ -770,10 +815,10 @@ fn manifest_keys(req: &RegisterRequest) -> Vec<String> {
         .iter()
         .flat_map(|k| [k.clone(), format!("{k}.idx")])
         .collect();
-    keys.push(s.workspace.root.clone());
+    keys.extend(tree_keys(s.workspace.tree()));
     keys.extend(s.workspace.packs.iter().cloned());
     if let Some(bulk) = s.bulk.section() {
-        keys.push(bulk.root.clone());
+        keys.extend(tree_keys(bulk.tree()));
         keys.extend(bulk.packs.iter().cloned());
     }
     keys.push(req.manifest_key.clone());
@@ -809,7 +854,7 @@ impl Registrar for InMemoryRegistrar {
             let bulk_packs: Vec<String> = s
                 .bulk
                 .section()
-                .map(|b| b.packs.clone())
+                .map(|b| b.packs.iter().chain(&b.dir_packs).cloned().collect())
                 .unwrap_or_default();
             let keys = s
                 .git
@@ -817,6 +862,7 @@ impl Registrar for InMemoryRegistrar {
                 .iter()
                 .flat_map(|k| [k.clone(), format!("{k}.idx")])
                 .chain(s.workspace.packs.iter().cloned())
+                .chain(s.workspace.dir_packs.iter().cloned())
                 .chain(bulk_packs)
                 .chain([h.manifest_key.clone()]);
             for k in keys {
@@ -836,6 +882,7 @@ impl Registrar for InMemoryRegistrar {
             get_urls,
             sources,
             remotes: state.remotes.clone(),
+            manifest_format: self.manifest_format,
         })
     }
 
@@ -1404,7 +1451,7 @@ impl<R: Registrar + ?Sized> crate::sink::UrlMinter for RegistrarMinter<R> {
     }
 }
 
-/// A quota refusal stays itself on the way to the sink (terminal, with its numbers); a transient
+/// A quota refusal stays itself on the way to the sink (it holds the capture, with its numbers); a transient
 /// failure of the call (transport, 5xx, the registrar's 429 call quota) stays retryable; anything
 /// else is "no url for this key". A 429 used to become `NoUrl`, which the shipper does not retry,
 /// so one throttled mint failed the whole pass as `no url for <key>: transport: upload.urls: http
@@ -1464,10 +1511,7 @@ mod tests {
                     head: "refs/heads/main".into(),
                     fsck: FsckStatus::Verified,
                 },
-                workspace: WorkspaceSection {
-                    root: "r".into(),
-                    packs: vec![],
-                },
+                workspace: WorkspaceSection::objects("r", vec![]),
                 bulk: BulkState::pending(),
             },
             checkpoint: None,
@@ -1562,6 +1606,8 @@ mod tests {
             root: "captures/wt/1/trees/b".into(),
             packs: vec!["captures/wt/1/packs/bulkpack".into()],
             platform: "linux-x86_64-gnu".into(),
+            format: crate::manifest::FORMAT_DIR_OBJECTS,
+            dir_packs: vec![],
         });
         r.capture_register(&RegisterRequest {
             manifest: m,

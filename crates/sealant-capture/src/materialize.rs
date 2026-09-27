@@ -5,6 +5,15 @@
 //! nothing is known about the disk), chunked classes are reassembled file by file with mode and
 //! mtime restored and hardlink groups linked. Every object read is verified against its sha256.
 //!
+//! # Dir objects
+//!
+//! A section in format 2 lists its dir packs: they are fetched with the content packs (a few
+//! GETs, in parallel, each at most once — a pack already in the cache is not fetched again) and
+//! every dir object is read from them by digest. A section in format 1 has one object per
+//! directory, fetched by its key as the walk reaches it; a head can hold one section of each
+//! (a bulk section an older executor or the control plane wrote, under a workspace section this
+//! build wrote). A format this build does not know is refused before anything is written.
+//!
 //! # Delta
 //!
 //! A file already on disk is skipped when the [`DiskState`] index — the same `(size, mtime,
@@ -33,7 +42,10 @@ use crate::chunk::{ChunkId, sha256_hex};
 use crate::gitpack::{self, GitError, GitRepo};
 use crate::index::{self, DAEMON_DIR, FileStat, IndexedFile, Listing, TreeIndex};
 use crate::keys::key_digest;
-use crate::manifest::{EncodedManifest, FsckStatus, INDEX_TREE_REF, Manifest, WORKTREE_TREE_REF};
+use crate::manifest::{
+    EncodedManifest, FORMAT_DIR_OBJECTS, FORMAT_DIR_PACKS, FsckStatus, INDEX_TREE_REF,
+    MAX_SECTION_FORMAT, Manifest, TreeRef, WORKTREE_TREE_REF,
+};
 use crate::pack::{PackError, PackReader};
 use crate::roots::ClassRoots;
 use crate::sink::{BlobSink, SinkError};
@@ -66,6 +78,19 @@ pub enum MaterializeError {
     /// A chunk was in no listed pack.
     #[error("chunk {0} is in no pack the manifest lists")]
     MissingChunk(ChunkId),
+    /// A format-2 dir object was in no dir pack the section lists.
+    #[error("dir object {0} is in no dir pack the section lists")]
+    MissingDir(String),
+    /// A section in a format this build does not read.
+    #[error(
+        "the {section} section is format {format}; this build reads formats up to {MAX_SECTION_FORMAT}"
+    )]
+    UnsupportedFormat {
+        /// `workspace` or `bulk`.
+        section: &'static str,
+        /// The section's format.
+        format: u32,
+    },
     /// A dir object could not be parsed.
     #[error("dir object {key}: {reason}")]
     BadDir {
@@ -113,8 +138,10 @@ pub struct MaterializeReport {
     pub symlinks: u64,
     /// Hardlinks created.
     pub hardlinks: u64,
-    /// Packs fetched from the sink (cache misses).
+    /// Packs fetched from the sink (cache misses), dir packs included.
     pub packs_fetched: u64,
+    /// Format-1 dir objects fetched one by one.
+    pub dir_objects_fetched: u64,
     /// Git packs installed (not counting the ones already there).
     pub git_packs: u64,
     /// Paths the worktree checkout touched: the tree diff for a delta checkout, `None` for a
@@ -268,9 +295,20 @@ impl std::fmt::Debug for Materializer<'_> {
     }
 }
 
+/// Packs fetched at once while materializing.
+pub const PACK_GETS_IN_FLIGHT: usize = 8;
+
 struct ChunkStore {
     readers: Vec<PackReader>,
     by_chunk: HashMap<ChunkId, usize>,
+}
+
+/// Where a section's dir objects come from.
+enum Dirs {
+    /// Format 1: one object per directory, fetched by key.
+    Objects,
+    /// Format 2: the section's dir packs.
+    Packs(ChunkStore),
 }
 
 impl ChunkStore {
@@ -356,13 +394,31 @@ impl<'a> Materializer<'a> {
         fs::create_dir_all(&self.targets.root)?;
         fs::create_dir_all(&self.targets.cache_dir)?;
         let roots = self.targets.roots();
+        // Every content and dir pack the asked classes need, fetched up front and in parallel;
+        // a format this build does not read is refused before anything is written.
+        let mut packs: Vec<&String> = Vec::new();
+        if matches!(class, MaterializeClass::Workspace | MaterializeClass::All) {
+            let ws = &manifest.sections.workspace;
+            check_format("workspace", ws.format)?;
+            packs.extend(&ws.packs);
+            packs.extend(&ws.dir_packs);
+        }
+        if matches!(class, MaterializeClass::Bulk | MaterializeClass::All)
+            && let Some(bulk) = manifest.sections.bulk.section()
+        {
+            check_format("bulk", bulk.format)?;
+            packs.extend(&bulk.packs);
+            packs.extend(&bulk.dir_packs);
+        }
+        self.fetch_packs(&packs, &mut report)?;
         if matches!(class, MaterializeClass::Git | MaterializeClass::All) {
             self.materialize_git(manifest, state, &mut report)?;
         }
         if matches!(class, MaterializeClass::Workspace | MaterializeClass::All) {
             let ws = &manifest.sections.workspace;
             let store = self.open_packs(&ws.packs, &mut report)?;
-            let root = self.fetch_dir(&ws.root)?;
+            let dirs = self.open_dirs("workspace", ws.tree(), &mut report)?;
+            let root = self.read_dir(&dirs, &ws.root, &mut report)?;
             // A root that is not a repository (the class restored on its own) takes `.git/`
             // literally and is not swept: the sweep needs git's view of what is ignored.
             let repo = GitRepo::open(&self.targets.root).ok();
@@ -385,7 +441,15 @@ impl<'a> Materializer<'a> {
                 let Some(child) = entry.child.as_ref() else {
                     continue;
                 };
-                self.write_dir(&store, child, &target, &entry.name, &mut write, &mut report)?;
+                self.write_dir(
+                    &store,
+                    &dirs,
+                    child,
+                    &target,
+                    &entry.name,
+                    &mut write,
+                    &mut report,
+                )?;
             }
             let resolve = |v: &str| roots.workspace_path(&git_dir, v);
             Self::link_all(&write.links, &resolve, &mut report)?;
@@ -415,6 +479,7 @@ impl<'a> Materializer<'a> {
             && let Some(bulk) = manifest.sections.bulk.section()
         {
             let store = self.open_packs(&bulk.packs, &mut report)?;
+            let dirs = self.open_dirs("bulk", bulk.tree(), &mut report)?;
             let root = self.targets.root.clone();
             let mut write = ClassWrite {
                 index: &mut state.bulk,
@@ -422,7 +487,15 @@ impl<'a> Materializer<'a> {
                 links: Vec::new(),
                 dirs: Vec::new(),
             };
-            self.write_dir(&store, &bulk.root, &root, "", &mut write, &mut report)?;
+            self.write_dir(
+                &store,
+                &dirs,
+                &bulk.root,
+                &root,
+                "",
+                &mut write,
+                &mut report,
+            )?;
             let resolve = |v: &str| Some(root.join(v));
             Self::link_all(&write.links, &resolve, &mut report)?;
             let listing = roots.bulk_listing();
@@ -520,6 +593,77 @@ impl<'a> Materializer<'a> {
         Ok(())
     }
 
+    /// Fetch into the cache every pack of `keys` it does not hold yet, [`PACK_GETS_IN_FLIGHT`]
+    /// at a time; each is verified against its key before it is kept.
+    fn fetch_packs(
+        &self,
+        keys: &[&String],
+        report: &mut MaterializeReport,
+    ) -> Result<(), MaterializeError> {
+        let mut missing: Vec<(&str, &str)> = keys
+            .iter()
+            .filter_map(|key| key_digest(key).map(|sha| (key.as_str(), sha)))
+            .filter(|(_, sha)| !self.targets.cache_dir.join(sha).exists())
+            .collect();
+        missing.sort_unstable();
+        missing.dedup();
+        if missing.is_empty() {
+            return Ok(());
+        }
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let failed: std::sync::Mutex<Option<MaterializeError>> = std::sync::Mutex::new(None);
+        let fetched = std::sync::atomic::AtomicU64::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..PACK_GETS_IN_FLIGHT.min(missing.len()) {
+                scope.spawn(|| {
+                    loop {
+                        let i = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let Some((key, sha)) = missing.get(i) else {
+                            return;
+                        };
+                        if failed
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .is_some()
+                        {
+                            return;
+                        }
+                        match self.fetch_pack(key, sha) {
+                            Ok(()) => {
+                                fetched.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            }
+                            Err(error) => {
+                                failed
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .get_or_insert(error);
+                                return;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        report.packs_fetched += fetched.into_inner();
+        match failed
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    /// GET one pack, verify it and move it into the cache under its digest.
+    fn fetch_pack(&self, key: &str, sha: &str) -> Result<(), MaterializeError> {
+        let bytes = self.sink.get(key)?;
+        verify_key(key, &bytes)?;
+        let tmp = self.targets.cache_dir.join(format!("{sha}.tmp"));
+        fs::write(&tmp, &bytes)?;
+        fs::rename(&tmp, self.targets.cache_dir.join(sha))?;
+        Ok(())
+    }
+
     /// Fetch (or reuse from the cache) every pack and index their chunks.
     fn open_packs(
         &self,
@@ -532,11 +676,7 @@ impl<'a> Materializer<'a> {
             let Some(sha) = key_digest(key) else { continue };
             let cached = self.targets.cache_dir.join(sha);
             if !cached.exists() {
-                let bytes = self.sink.get(key)?;
-                verify_key(key, &bytes)?;
-                let tmp = self.targets.cache_dir.join(format!("{sha}.tmp"));
-                fs::write(&tmp, &bytes)?;
-                fs::rename(&tmp, &cached)?;
+                self.fetch_pack(key, sha)?;
                 report.packs_fetched += 1;
             }
             let reader = PackReader::open(&cached)?;
@@ -549,11 +689,49 @@ impl<'a> Materializer<'a> {
         Ok(ChunkStore { readers, by_chunk })
     }
 
-    fn fetch_dir(&self, key: &str) -> Result<DirObject, MaterializeError> {
-        let bytes = self.sink.get(key)?;
-        verify_key(key, &bytes)?;
+    /// Where a section's dir objects come from: nothing to open in format 1, the (cached) dir
+    /// packs in format 2.
+    fn open_dirs(
+        &self,
+        section: &'static str,
+        tree: TreeRef<'_>,
+        report: &mut MaterializeReport,
+    ) -> Result<Dirs, MaterializeError> {
+        match tree.format {
+            FORMAT_DIR_OBJECTS => Ok(Dirs::Objects),
+            FORMAT_DIR_PACKS => Ok(Dirs::Packs(self.open_packs(tree.dir_packs, report)?)),
+            format => Err(MaterializeError::UnsupportedFormat { section, format }),
+        }
+    }
+
+    /// Read one dir object: by key in format 1, by digest from the dir packs in format 2
+    /// (verified against the digest either way).
+    fn read_dir(
+        &self,
+        dirs: &Dirs,
+        reference: &str,
+        report: &mut MaterializeReport,
+    ) -> Result<DirObject, MaterializeError> {
+        let bytes = match dirs {
+            Dirs::Objects => {
+                let bytes = self.sink.get(reference)?;
+                verify_key(reference, &bytes)?;
+                report.dir_objects_fetched += 1;
+                bytes
+            }
+            Dirs::Packs(store) => {
+                let id = ChunkId::parse(reference)
+                    .ok_or_else(|| MaterializeError::MissingDir(reference.to_owned()))?;
+                store.read(&id).map_err(|error| match error {
+                    MaterializeError::MissingChunk(_) => {
+                        MaterializeError::MissingDir(reference.to_owned())
+                    }
+                    other => other,
+                })?
+            }
+        };
         DirObject::decode(&bytes).map_err(|e| MaterializeError::BadDir {
-            key: key.to_owned(),
+            key: reference.to_owned(),
             reason: e.to_string(),
         })
     }
@@ -581,16 +759,18 @@ impl<'a> Materializer<'a> {
                 .is_some_and(|c| c == known.chunks.as_slice())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn write_dir(
         &self,
         store: &ChunkStore,
+        dirs: &Dirs,
         key: &str,
         dir: &Path,
         vdir: &str,
         write: &mut ClassWrite<'_>,
         report: &mut MaterializeReport,
     ) -> Result<(), MaterializeError> {
-        let obj = self.fetch_dir(key)?;
+        let obj = self.read_dir(dirs, key, report)?;
         if fs::symlink_metadata(dir).is_ok_and(|m| !m.is_dir()) {
             remove_existing(dir)?;
         }
@@ -605,7 +785,7 @@ impl<'a> Materializer<'a> {
             match entry.kind {
                 EntryKind::Dir => {
                     if let Some(child) = &entry.child {
-                        self.write_dir(store, child, &path, &v, write, report)?;
+                        self.write_dir(store, dirs, child, &path, &v, write, report)?;
                         write.dirs.push((path, entry.mode, entry.mtime));
                     }
                 }
@@ -740,6 +920,14 @@ impl<'a> Materializer<'a> {
             }
         }
     }
+}
+
+/// Refuse a section format this build does not read.
+fn check_format(section: &'static str, format: u32) -> Result<(), MaterializeError> {
+    if format == 0 || format > MAX_SECTION_FORMAT {
+        return Err(MaterializeError::UnsupportedFormat { section, format });
+    }
+    Ok(())
 }
 
 fn remove_existing(path: &Path) -> io::Result<()> {

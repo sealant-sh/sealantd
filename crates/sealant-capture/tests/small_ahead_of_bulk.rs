@@ -7,7 +7,10 @@
 //! for PUT URLs until `upload.urls` answered 429, which surfaced as `no url for …/trees/<sha>`.
 //!
 //! Scaled down, same shape: many small ignored files behind a sink that takes its time per
-//! object, and an edit to a tracked file once the bulk upload has started.
+//! object, and an edit to a tracked file once the bulk upload has started. The bulk captures
+//! here are written for a registrar that does not read dir packs (one object per directory,
+//! `DirFormat::Objects`): with dir packs the same tree is a handful of objects
+//! (`tests/dir_packs.rs`), and the many-object upload is what these tests need.
 
 mod common;
 
@@ -18,7 +21,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use sealant_capture::manifest::BulkState;
+use sealant_capture::manifest::{BulkState, DirFormat};
 use sealant_capture::registrar::{
     ChangeSummaryRequest, HeartbeatRequest, HeartbeatResponse, PlanGetRequest, PlanGetResponse,
     RegisterRequest, RegisterResponse, RegistrarMinter, UploadCompleteRequest,
@@ -191,6 +194,7 @@ fn session(delay: Duration) -> (Session, CadenceRunner, u64) {
     config.cadence = quiet_cadence();
     // The shipper's duty cycle is not what this test measures.
     config.cpu_fraction = 1.0;
+    config.dir_format = DirFormat::Objects;
     let mut engine = CaptureEngine::open(config, None).unwrap();
     let sink: Arc<dyn BlobSink> = slow.clone();
     let dyn_registrar: Arc<dyn Registrar> = registrar.clone();
@@ -235,8 +239,8 @@ fn bulk_still_uploading(runner: &CadenceRunner) -> bool {
 /// bulk capture then registers on top of them, and the head carries the edit and the tree.
 #[test]
 fn a_small_capture_registers_while_a_bulk_capture_uploads() {
-    // ≈ 170 objects at 40 ms each: about 7 s of bulk upload.
-    let (s, runner, bulk_objects) = session(Duration::from_millis(40));
+    // ≈ 170 objects at 250 ms each, eight in flight: about 5 s of bulk upload.
+    let (s, runner, bulk_objects) = session(Duration::from_millis(250));
 
     // The agent edits a tracked file; the turn boundary snaps.
     fs::write(s.root.join("src/lib.rs"), "pub fn f() { edited() }\n").unwrap();
@@ -405,6 +409,7 @@ fn a_flush_beside_the_worker_does_not_multiply_url_mints() {
     let (registrar, slow) = presigned(&server, Duration::from_millis(15), 0);
     let mut config = CaptureConfig::new("wt", 1, &root);
     config.cpu_fraction = 1.0;
+    config.dir_format = DirFormat::Objects;
     let mut engine = CaptureEngine::open(config, None).unwrap();
     let sink: Arc<dyn BlobSink> = slow.clone();
     let dyn_registrar: Arc<dyn Registrar> = registrar.clone();

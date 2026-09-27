@@ -37,7 +37,7 @@ pub use materialize::{
     DiskState, MaterializeClass, MaterializeReport, MaterializeTargets, Materializer,
 };
 pub use registrar::{HttpRegistrar, InMemoryRegistrar, Registrar, RegistrarError};
-pub use ship::{MultipartConfig, RefusedCapture, ShipSnapshot, ShipWorker, Shipper, Staging};
+pub use ship::{HeldCapture, MultipartConfig, ShipSnapshot, ShipWorker, Shipper, Staging};
 pub use sink::{BlobSink, LocalDir, PresignedHttp, UrlMinter};
 pub use transport::{ChannelTransport, TransportError};
 pub use watch::{ChangeSignal, Mode as WatchMode, WatchPolicy};

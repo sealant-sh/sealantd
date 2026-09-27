@@ -236,8 +236,11 @@ impl Runtime {
         self.capture.get().cloned()
     }
 
-    /// Flush captures: a final small-class snap, ship and register, bounded by the shutdown
-    /// grace period. A no-op without a capture engine; errors are logged, never fatal.
+    /// Flush captures: a snap of `kind`, ship and register, bounded by the shutdown grace
+    /// period — except a `final` flush, which snaps the bulk class as well and returns only once
+    /// everything staged is registered (or the lease is fenced): the disk goes with the daemon,
+    /// so the process ending is what stops it. A no-op without a capture engine; errors are
+    /// logged, never fatal.
     pub async fn flush_captures(&self, kind: sealant_protocol::CaptureKind) {
         let Some(capture) = self.capture() else {
             return;

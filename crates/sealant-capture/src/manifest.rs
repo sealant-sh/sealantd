@@ -15,6 +15,22 @@
 //!   minus objects, refs, `HEAD` and `packed-refs`), `tree/` (git-ignored files and nested
 //!   repositories under the worktree that are not bulk) and `harness/` (the harness home).
 //! - The bulk dir object's root is the worktree root restricted to bulk directories.
+//!
+//! The chunked sections are versioned one by one (`format`), because a manifest can carry one
+//! of each: a capture staged by this build over a head an older executor or the control plane
+//! wrote keeps that head's bulk section as it is.
+//!
+//! - Format 1 ([`FORMAT_DIR_OBJECTS`], `format` absent): every dir object is its own object at
+//!   `…/trees/<sha256>`; `root` and every `child` are those keys.
+//! - Format 2 ([`FORMAT_DIR_PACKS`]): dir objects travel in dir packs — the CDC pack container
+//!   ([`crate::pack`]), one zstd entry per dir object, the entry hash being the dir object's
+//!   sha256 — keyed `…/packs/<sha256>` like any pack and listed in `dir_packs`. `root` and every
+//!   `child` are dir object digests, so a dir object's bytes do not depend on where it is
+//!   stored, and a reader resolves a digest through the listed packs' trailing indexes.
+//!
+//! The engine writes format 2 only for a registrar whose `plan.get` announces
+//! `manifest_format` ≥ 2 ([`DirFormat::for_registrar`]); a reader refuses a section whose format
+//! is above [`MAX_SECTION_FORMAT`].
 
 use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -98,24 +114,141 @@ pub struct GitSection {
     pub fsck: FsckStatus,
 }
 
+/// Section format 1: every dir object is its own object at `…/trees/<sha256>`, and `root` and
+/// every `child` are those keys. What every capture before dir packs holds, and what a registrar
+/// that does not announce [`FORMAT_DIR_PACKS`] gets.
+pub const FORMAT_DIR_OBJECTS: u32 = 1;
+/// Section format 2: dir objects travel in dir packs (the CDC pack container, one entry per dir
+/// object, keyed by its sha256) listed in `dir_packs`, and `root` and every `child` are dir
+/// object digests, not keys.
+pub const FORMAT_DIR_PACKS: u32 = 2;
+/// The highest section format this build reads and writes.
+pub const MAX_SECTION_FORMAT: u32 = FORMAT_DIR_PACKS;
+
+fn format_dir_objects() -> u32 {
+    FORMAT_DIR_OBJECTS
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)] // serde's `skip_serializing_if` passes a reference.
+fn is_format_dir_objects(format: &u32) -> bool {
+    *format == FORMAT_DIR_OBJECTS
+}
+
+/// How the engine writes a chunked section's dir objects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DirFormat {
+    /// One object per directory ([`FORMAT_DIR_OBJECTS`]).
+    Objects,
+    /// Dir packs ([`FORMAT_DIR_PACKS`]).
+    Packs,
+}
+
+impl DirFormat {
+    /// What to write for a registrar that reads sections up to `manifest_format` (the
+    /// `manifest_format` of its `plan.get` answer; 1 when absent).
+    #[must_use]
+    pub fn for_registrar(manifest_format: u32) -> Self {
+        if manifest_format >= FORMAT_DIR_PACKS {
+            Self::Packs
+        } else {
+            Self::Objects
+        }
+    }
+
+    /// The section `format` this writes.
+    #[must_use]
+    pub fn section_format(self) -> u32 {
+        match self {
+            Self::Objects => FORMAT_DIR_OBJECTS,
+            Self::Packs => FORMAT_DIR_PACKS,
+        }
+    }
+}
+
+/// Where a chunked section's dir objects are: its root, its format and its dir packs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TreeRef<'a> {
+    /// Format 1: the root dir object's key. Format 2: its digest.
+    pub root: &'a str,
+    /// The section format.
+    pub format: u32,
+    /// Format 2: every dir pack the tree needs. Empty in format 1.
+    pub dir_packs: &'a [String],
+}
+
 /// The workspace section.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceSection {
-    /// Root dir object key.
+    /// Root dir object: its key in format 1, its digest in format 2.
     pub root: String,
     /// Every CDC pack key the section needs, across epochs.
     pub packs: Vec<String>,
+    /// Section format ([`FORMAT_DIR_OBJECTS`] when absent, and then not written, so a format-1
+    /// section encodes exactly as before dir packs).
+    #[serde(
+        default = "format_dir_objects",
+        skip_serializing_if = "is_format_dir_objects"
+    )]
+    pub format: u32,
+    /// Format 2: every dir pack the tree needs, across epochs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dir_packs: Vec<String>,
+}
+
+impl WorkspaceSection {
+    /// A format-1 section (one object per directory).
+    #[must_use]
+    pub fn objects(root: impl Into<String>, packs: Vec<String>) -> Self {
+        Self {
+            root: root.into(),
+            packs,
+            format: FORMAT_DIR_OBJECTS,
+            dir_packs: Vec::new(),
+        }
+    }
+
+    /// Where the section's dir objects are.
+    #[must_use]
+    pub fn tree(&self) -> TreeRef<'_> {
+        TreeRef {
+            root: &self.root,
+            format: self.format,
+            dir_packs: &self.dir_packs,
+        }
+    }
 }
 
 /// The bulk section.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BulkSection {
-    /// Root dir object key.
+    /// Root dir object: its key in format 1, its digest in format 2.
     pub root: String,
     /// Every CDC pack key the section needs, across epochs.
     pub packs: Vec<String>,
     /// `<os>-<arch>-<libc>`.
     pub platform: String,
+    /// Section format, as [`WorkspaceSection::format`].
+    #[serde(
+        default = "format_dir_objects",
+        skip_serializing_if = "is_format_dir_objects"
+    )]
+    pub format: u32,
+    /// Format 2: every dir pack the tree needs, across epochs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dir_packs: Vec<String>,
+}
+
+impl BulkSection {
+    /// Where the section's dir objects are.
+    #[must_use]
+    pub fn tree(&self) -> TreeRef<'_> {
+        TreeRef {
+            root: &self.root,
+            format: self.format,
+            dir_packs: &self.dir_packs,
+        }
+    }
 }
 
 /// The literal `"pending"`.
@@ -299,10 +432,7 @@ mod tests {
                     head: "refs/heads/main".into(),
                     fsck: FsckStatus::Verified,
                 },
-                workspace: WorkspaceSection {
-                    root: "captures/wt/1/trees/t".into(),
-                    packs: vec![],
-                },
+                workspace: WorkspaceSection::objects("captures/wt/1/trees/t", vec![]),
                 bulk: BulkState::pending(),
             },
             checkpoint: None,
@@ -331,6 +461,8 @@ mod tests {
             root: "r".into(),
             packs: vec![],
             platform: "linux-x86_64-musl".into(),
+            format: FORMAT_DIR_OBJECTS,
+            dir_packs: vec![],
         });
         m.checkpoint = Some(Checkpoint {
             ordinal: 1,
@@ -340,6 +472,41 @@ mod tests {
         let e = m.clone().encode();
         assert!(String::from_utf8_lossy(&e.bytes).contains("\"ref\":\"refs/mend/checkpoints/1\""));
         assert_eq!(Manifest::decode(&e.bytes).unwrap().manifest, m);
+    }
+
+    /// A format-1 section encodes as it did before dir packs (so its capture id is unchanged);
+    /// a format-2 section names its format and dir packs, and both decode back.
+    #[test]
+    fn section_format_is_written_only_for_dir_packs() {
+        let legacy = sample().encode();
+        let text = String::from_utf8(legacy.bytes.clone()).unwrap();
+        assert!(!text.contains("format"), "{text}");
+        assert!(!text.contains("dir_packs"), "{text}");
+        assert!(text.contains(r#""workspace":{"root":"captures/wt/1/trees/t","packs":[]}"#));
+        let old_bytes = br#"{"worktree_id":"wt","n":0,"parent":null,"epoch":1,"seq":0,"kind":"auto","created_at":"x","sections":{"git":{"packs":[],"refs":{},"head":"refs/heads/main","fsck":"verified"},"workspace":{"root":"captures/wt/1/trees/t","packs":[]},"bulk":{"root":"captures/wt/1/trees/b","packs":[],"platform":"p"}}}"#;
+        let old = Manifest::decode(old_bytes).unwrap();
+        assert_eq!(old.manifest.sections.workspace.format, FORMAT_DIR_OBJECTS);
+        assert_eq!(old.bytes, old_bytes.to_vec());
+
+        let mut m = sample();
+        m.sections.workspace = WorkspaceSection {
+            root: "d".repeat(64),
+            packs: vec![],
+            format: FORMAT_DIR_PACKS,
+            dir_packs: vec!["captures/wt/1/packs/p".into()],
+        };
+        let e = m.clone().encode();
+        let text = String::from_utf8(e.bytes.clone()).unwrap();
+        assert!(
+            text.contains(r#""format":2,"dir_packs":["captures/wt/1/packs/p"]"#),
+            "{text}"
+        );
+        let back = Manifest::decode(&e.bytes).unwrap().manifest;
+        assert_eq!(back, m);
+        assert_eq!(back.sections.workspace.tree().dir_packs.len(), 1);
+        assert_eq!(DirFormat::for_registrar(1), DirFormat::Objects);
+        assert_eq!(DirFormat::for_registrar(2), DirFormat::Packs);
+        assert_eq!(DirFormat::for_registrar(3), DirFormat::Packs);
     }
 
     #[test]

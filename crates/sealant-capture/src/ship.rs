@@ -8,6 +8,8 @@
 //! The shipper is throttled to ≤ 50% of one core as a CPU-time duty cycle from `getrusage`;
 //! objects at or above [`MultipartConfig::threshold`] go up as multipart uploads with several
 //! parts in flight, whose threads' CPU is charged to the same cycle (network waits are not).
+//! Smaller objects go up [`DEFAULT_UPLOADS_IN_FLIGHT`] at a time, a batch of URLs minted in one
+//! channel call ahead of their PUTs; their threads' CPU is charged to the cycle as well.
 
 use std::collections::HashSet;
 use std::fs;
@@ -26,11 +28,34 @@ use crate::manifest::CaptureKind;
 use crate::registrar::{RegisterRequest, Registrar, RegistrarError, opt};
 use crate::sink::{BlobSink, BlobSource, SinkError};
 
+/// Lock, taking the value of a poisoned lock as it is.
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Which slot of [`Shipper::held`] a class uses (an entry without a class is a small one).
+fn class_slot(class: Option<Class>) -> usize {
+    usize::from(class == Some(Class::Bulk))
+}
+
 /// Default shipper CPU budget: half of one core.
 pub const DEFAULT_CPU_FRACTION: f64 = 0.5;
 
 /// Most single-PUT objects whose URLs are minted in one channel call.
 pub const PREFETCH_BATCH: usize = 500;
+
+/// After a byte-quota refusal the shipper asks again after 30 s, doubling per refusal in a row
+/// up to 10 minutes: each ask is one `upload.urls` (or `capture.register`) call against the
+/// registrar's call quota.
+pub const HOLD_BACKOFF: (Duration, Duration) = (Duration::from_secs(30), Duration::from_secs(600));
+
+/// Single-PUT uploads in flight at once. A presigned PUT from a MicroVM to S3 is a round trip of
+/// ≈ 70 ms whatever the object's size (measured on alpha, 2026-09-27: 20,878 objects in 24
+/// minutes one at a time), so the small objects of a capture are latency-bound, not
+/// bandwidth-bound.
+pub const DEFAULT_UPLOADS_IN_FLIGHT: usize = 8;
 
 /// How large objects are uploaded. Measured (R1, 2026-09): one presigned PUT from a sandbox to
 /// R2 runs at 37–47 MB/s, four multipart parts in flight at 63.6 MB/s; AWS single-stream is
@@ -89,18 +114,17 @@ pub struct QueueEntry {
     pub register: RegisterRequest,
 }
 
-/// A capture the registrar refused for the session's byte quota. The shipper dropped it and
-/// every queued capture that descends from it; the engine reads this at its next snap, continues
-/// the chain from the refused capture's parent, and forgets the chunks whose packs went with it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RefusedCapture {
-    /// Chain position the refused capture held.
+/// A capture the registrar refused for the session's byte quota. Nothing is dropped: the capture
+/// stays queued with every staged byte, its class is reported refused in `capture.status`, and
+/// the shipper asks again after a backoff (the budget frees as retention retires packs, or the
+/// control plane raises it). Work product is never discarded for a quota.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct HeldCapture {
+    /// Chain position of the refused capture.
     pub n: u64,
     /// Its capture id.
     pub capture_id: String,
-    /// Its parent (the chain head the executor continues from).
-    pub parent: Option<String>,
-    /// The class that was refused, when the entry names one.
+    /// Its class, when the entry names one.
     pub class: Option<Class>,
     /// The registrar's reason code (`byte-quota`).
     pub reason: String,
@@ -110,8 +134,11 @@ pub struct RefusedCapture {
     pub used: Option<u64>,
     /// Bytes the refused call asked for.
     pub requested: Option<u64>,
-    /// Every object the dropped captures staged.
-    pub uploads: Vec<Upload>,
+    /// Refusals in a row for this class.
+    pub refusals: u32,
+    /// When the shipper asks again.
+    #[serde(skip)]
+    pub retry_at: Instant,
 }
 
 /// Shipping errors.
@@ -123,8 +150,8 @@ pub enum ShipError {
     /// The chain moved under us (another writer with our epoch, or a lost coalesce).
     #[error("chain conflict: {0}")]
     Conflict(RegistrarError),
-    /// The registrar refused this capture's bytes for the session's byte quota. Terminal: the
-    /// entry and its staged bytes are dropped and the class stops.
+    /// The registrar refused this capture's bytes for the session's byte quota. The entry stays
+    /// queued with its staged bytes ([`HeldCapture`]) and is asked for again after a backoff.
     #[error("refused ({reason}): limit {}, used {}, requested {}", opt(.limit), opt(.used), opt(.requested))]
     QuotaRefused {
         /// The registrar's reason code (`byte-quota`).
@@ -177,8 +204,6 @@ pub struct Staging {
     /// it claims an entry: a pending `auto` capture is never coalesced away under a shipper that
     /// has started on it, and never claimed once replaced.
     coalesce: Mutex<()>,
-    /// Captures the registrar refused, for the engine to read at its next snap.
-    refusals: Mutex<Vec<RefusedCapture>>,
     /// Bumped on every queue change (an entry staged, replaced, acked or dropped). A shipper
     /// uploading a bulk capture's objects checks it between objects, so a capture staged ahead
     /// of that bulk capture ships first.
@@ -198,7 +223,6 @@ impl Staging {
             identity: Mutex::new((worktree_id.to_owned(), epoch)),
             in_flight: Mutex::new(None),
             coalesce: Mutex::new(()),
-            refusals: Mutex::new(Vec::new()),
             generation: AtomicU64::new(0),
         };
         fs::create_dir_all(staging.marker_dir())?;
@@ -450,42 +474,6 @@ impl Staging {
             .cloned())
     }
 
-    /// Drop `entry` because the registrar refused it for good, with every queued capture after
-    /// it (they name it as their parent and can never register) and all their staged bytes.
-    /// The refusal is kept for the engine, which continues the chain from `entry`'s parent.
-    pub fn drop_refused(&self, entry: &QueueEntry, refusal: RefusedCapture) -> io::Result<usize> {
-        let _g = self.coalesce_guard();
-        let mut refusal = refusal;
-        let mut dropped = 0;
-        for queued in self.pending()? {
-            if queued.n < entry.n {
-                continue;
-            }
-            fs::remove_file(self.queue_path(queued.n)).ok();
-            refusal.uploads.extend(queued.uploads.iter().cloned());
-            dropped += 1;
-        }
-        self.bump();
-        let uploads = refusal.uploads.clone();
-        self.refusals
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(refusal);
-        self.discard_unreferenced(&uploads)?;
-        Ok(dropped)
-    }
-
-    /// Take the refusals recorded since the last call (the engine applies them).
-    #[must_use]
-    pub fn take_refusals(&self) -> Vec<RefusedCapture> {
-        std::mem::take(
-            &mut *self
-                .refusals
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        )
-    }
-
     /// Remove an entry and every object file no remaining entry references.
     pub fn ack(&self, entry: &QueueEntry) -> io::Result<()> {
         fs::remove_file(self.queue_path(entry.n)).or_else(|e| {
@@ -581,17 +569,28 @@ impl DutyCycle {
 
     /// Sleep if over budget.
     pub fn pace(&mut self) {
-        if self.fraction >= 1.0 {
-            return;
+        let sleep = self.debt(thread_cpu());
+        if !sleep.is_zero() {
+            thread::sleep(sleep);
         }
-        let cpu = (thread_cpu().saturating_sub(self.cpu_start) + self.charged).as_secs_f64();
+    }
+
+    /// The sleep that brings the cycle back under budget (at most half a second), with
+    /// `own_cpu` the owning thread's CPU clock now; counted as slept. A helper thread that
+    /// charged its CPU sleeps this itself, outside any lock, while the owner waits for it.
+    fn debt(&mut self, own_cpu: Duration) -> Duration {
+        if self.fraction >= 1.0 {
+            return Duration::ZERO;
+        }
+        let cpu = (own_cpu.saturating_sub(self.cpu_start) + self.charged).as_secs_f64();
         let wall = self.started.elapsed().as_secs_f64();
         let allowed = wall * self.fraction;
-        if cpu > allowed {
-            let sleep = Duration::from_secs_f64((cpu / self.fraction - wall).min(0.5));
-            thread::sleep(sleep);
-            self.slept += sleep;
+        if cpu <= allowed {
+            return Duration::ZERO;
         }
+        let sleep = Duration::from_secs_f64((cpu / self.fraction - wall).min(0.5));
+        self.slept += sleep;
+        sleep
     }
 }
 
@@ -612,10 +611,11 @@ pub struct ShipStatus {
     pub fenced: AtomicBool,
     /// Failed attempts (uploads and registers).
     pub failures: AtomicU64,
-    /// The small class was refused for the session's byte quota.
+    /// A small capture the registrar refused for the session's byte quota is held: queued with
+    /// its bytes and asked for again after a backoff. Cleared when the class registers.
     pub refused_small: AtomicBool,
-    /// The bulk class was refused for the session's byte quota; no bulk snap runs until the
-    /// next epoch or `capture.replan`.
+    /// A bulk capture is held for the byte quota, as `refused_small`. The class keeps snapping
+    /// (a newer bulk capture replaces the held one) and nothing is dropped.
     pub refused_bulk: AtomicBool,
 }
 
@@ -729,6 +729,8 @@ pub struct Shipper {
     cpu_fraction: f64,
     retry: RetryPolicy,
     multipart: MultipartConfig,
+    /// Single-PUT uploads in flight at once.
+    uploads_in_flight: usize,
     /// Held by a pass. Two passes over one queue raced for the same objects: each consumed PUT
     /// URLs the other had minted, the loser minted one key per call, and the registrar's
     /// `upload.urls` call quota ran out (observed: `no url for …/trees/<sha>` after a flush ran
@@ -736,6 +738,10 @@ pub struct Shipper {
     pass: Mutex<()>,
     /// Flushes waiting for the pass; the worker's bulk upload yields to them.
     waiting: AtomicUsize,
+    /// Per class, the capture held for the byte quota and when to ask again.
+    held: Mutex<[Option<HeldCapture>; 2]>,
+    /// First wait after a byte-quota refusal and its cap; doubles per refusal in a row.
+    hold_backoff: (Duration, Duration),
     /// Counters.
     pub status: Arc<ShipStatus>,
 }
@@ -765,8 +771,11 @@ impl Shipper {
             cpu_fraction: DEFAULT_CPU_FRACTION,
             retry: RetryPolicy::default(),
             multipart: MultipartConfig::DEFAULT,
+            uploads_in_flight: DEFAULT_UPLOADS_IN_FLIGHT,
             pass: Mutex::new(()),
             waiting: AtomicUsize::new(0),
+            held: Mutex::new([None, None]),
+            hold_backoff: HOLD_BACKOFF,
             status,
         }
     }
@@ -775,6 +784,13 @@ impl Shipper {
     #[must_use]
     pub fn with_multipart(mut self, multipart: MultipartConfig) -> Self {
         self.multipart = multipart;
+        self
+    }
+
+    /// Single-PUT uploads in flight at once (1 = one at a time).
+    #[must_use]
+    pub fn with_uploads_in_flight(mut self, uploads: usize) -> Self {
+        self.uploads_in_flight = uploads.max(1);
         self
     }
 
@@ -792,14 +808,35 @@ impl Shipper {
         self
     }
 
+    /// The wait after a byte-quota refusal (`first`, doubling up to `max`); [`HOLD_BACKOFF`].
+    #[must_use]
+    pub fn with_hold_backoff(mut self, first: Duration, max: Duration) -> Self {
+        self.hold_backoff = (first, max);
+        self
+    }
+
+    /// The captures held for the byte quota, per class: queued with their bytes, asked for
+    /// again at `retry_at`.
+    #[must_use]
+    pub fn held(&self) -> Vec<HeldCapture> {
+        lock(&self.held).iter().flatten().cloned().collect()
+    }
+
+    /// Whether `entry`'s class is held for the byte quota and its backoff has not run out.
+    fn held_back(&self, entry: &QueueEntry) -> bool {
+        lock(&self.held)[class_slot(entry.class)]
+            .as_ref()
+            .is_some_and(|h| Instant::now() < h.retry_at)
+    }
+
     /// Whether shipping is fenced.
     #[must_use]
     pub fn is_fenced(&self) -> bool {
         self.status.fenced.load(Ordering::Relaxed)
     }
 
-    /// Whether `class` was refused for the session's byte quota (no snap, no ship until the
-    /// next epoch or a re-plan).
+    /// Whether a capture of `class` is held for the session's byte quota (queued with its bytes,
+    /// asked for again after a backoff).
     #[must_use]
     pub fn is_refused(&self, class: Class) -> bool {
         self.status.refused_flag(class).load(Ordering::Relaxed)
@@ -812,6 +849,7 @@ impl Shipper {
         self.status.fenced.store(false, Ordering::Relaxed);
         self.status.refused_small.store(false, Ordering::Relaxed);
         self.status.refused_bulk.store(false, Ordering::Relaxed);
+        *lock(&self.held) = [None, None];
         self.status
             .head_n
             .store(head_n.unwrap_or(u64::MAX), Ordering::Relaxed);
@@ -822,7 +860,20 @@ impl Shipper {
         (self.retry.backoff * mult).min(self.retry.max_backoff)
     }
 
+    /// Upload one object on this thread, charging the sink's helper threads (multipart parts)
+    /// to `cycle` and pacing after it.
     fn upload_one(&self, u: &Upload, cycle: &mut DutyCycle) -> Result<(), ShipError> {
+        let helper_before = self.sink.helper_cpu();
+        let result = self.put_object(u);
+        cycle.charge(self.sink.helper_cpu().saturating_sub(helper_before));
+        if result.is_ok() {
+            cycle.pace();
+        }
+        result
+    }
+
+    /// Upload one object with retry and ack it; nothing is paced here.
+    fn put_object(&self, u: &Upload) -> Result<(), ShipError> {
         if self.staging.is_uploaded(&u.file) {
             return Ok(());
         }
@@ -847,7 +898,6 @@ impl Shipper {
                     }
                 }
             } else {
-                let helper_before = self.sink.helper_cpu();
                 let result = if u.bytes >= self.multipart.threshold {
                     self.sink.put_multipart(
                         &u.key,
@@ -858,7 +908,6 @@ impl Shipper {
                 } else {
                     self.sink.put_if_absent(&u.key, BlobSource::File(&path))
                 };
-                cycle.charge(self.sink.helper_cpu().saturating_sub(helper_before));
                 match result {
                     Ok(outcome) => {
                         match outcome {
@@ -873,7 +922,6 @@ impl Shipper {
                             }
                         }
                         self.staging.mark_uploaded(&u.file)?;
-                        cycle.pace();
                         return Ok(());
                     }
                     Err(e) if e.is_retryable() => {
@@ -911,24 +959,26 @@ impl Shipper {
         })
     }
 
-    /// Upload `uploads` in order, a batch at a time: the PUT URLs of a batch's single-PUT
-    /// objects are minted in one channel call ahead of the PUTs ([`BlobSink::prefetch_put`]),
-    /// so a capture with thousands of dir objects costs a handful of `upload.urls` calls, not
-    /// one per object (each call still counts every URL against the registrar's quota). A
-    /// batch holds at most [`PREFETCH_BATCH`] objects and ends at an object that is uploaded
-    /// already, missing from staging, or multipart-sized: its parts mint their own URLs, and a
-    /// URL minted ahead of a minutes-long upload could expire before its PUT.
+    /// Upload `uploads`, a batch at a time: the PUT URLs of a batch's single-PUT objects are
+    /// minted in one channel call ahead of the PUTs ([`BlobSink::prefetch_put`]), so a capture
+    /// with thousands of objects costs a handful of `upload.urls` calls, not one per object
+    /// (each call still counts every URL against the registrar's quota), and the batch goes up
+    /// `uploads_in_flight` PUTs at a time. A batch holds at most [`PREFETCH_BATCH`] objects and
+    /// ends at an object that is uploaded already, missing from staging, or multipart-sized: its
+    /// parts mint their own URLs (and are in flight in parallel themselves), and a URL minted
+    /// ahead of a minutes-long upload could expire before its PUT. Order within a batch is not
+    /// kept; nothing depends on it before the register, which follows every object.
     fn upload_all(&self, uploads: &[Upload], cycle: &mut DutyCycle) -> Result<(), ShipError> {
         self.upload_until(uploads, cycle, &|| None).map(|_| ())
     }
 
     /// [`Self::upload_all`], asking `stop` before every object; the reason it gave, or `None`
-    /// once every object is up.
+    /// once every object is up. Objects already in flight when `stop` answers finish first.
     fn upload_until(
         &self,
         uploads: &[Upload],
         cycle: &mut DutyCycle,
-        stop: &dyn Fn() -> Option<Stop>,
+        stop: &(dyn Fn() -> Option<Stop> + Sync),
     ) -> Result<Option<Stop>, ShipError> {
         let objects = self.staging.objects_dir();
         let single_put = |u: &Upload| {
@@ -955,15 +1005,81 @@ impl Shipper {
                 .map(|u| (u.key.clone(), u.bytes))
                 .collect();
             self.prefetch(&keys)?;
-            for u in &uploads[start..end] {
+            if let Some(why) = self.upload_batch(&uploads[start..end], cycle, stop)? {
+                return Ok(Some(why));
+            }
+            start = end;
+        }
+        Ok(None)
+    }
+
+    /// Upload a batch of single-PUT objects, `uploads_in_flight` at a time, asking `stop` before
+    /// each. The first failure stops the batch (objects already in flight finish); a byte-quota
+    /// refusal is reported over any other failure, since it decides what happens to the entry.
+    /// Each worker charges its CPU to `cycle` and sleeps what the cycle owes outside the lock.
+    fn upload_batch(
+        &self,
+        batch: &[Upload],
+        cycle: &mut DutyCycle,
+        stop: &(dyn Fn() -> Option<Stop> + Sync),
+    ) -> Result<Option<Stop>, ShipError> {
+        let workers = self.uploads_in_flight.min(batch.len());
+        if workers <= 1 {
+            for u in batch {
                 if let Some(why) = stop() {
                     return Ok(Some(why));
                 }
                 self.upload_one(u, cycle)?;
             }
-            start = end;
+            return Ok(None);
         }
-        Ok(None)
+        let next = AtomicUsize::new(0);
+        let halt = AtomicBool::new(false);
+        let stopped: Mutex<Option<Stop>> = Mutex::new(None);
+        let failed: Mutex<Option<ShipError>> = Mutex::new(None);
+        // The owner only waits while the workers run: its CPU clock stands still.
+        let own_cpu = thread_cpu();
+        let cycle = Mutex::new(cycle);
+        thread::scope(|scope| {
+            for _ in 0..workers {
+                scope.spawn(|| {
+                    while !halt.load(Ordering::SeqCst) {
+                        if let Some(why) = stop() {
+                            lock(&stopped).get_or_insert(why);
+                            halt.store(true, Ordering::SeqCst);
+                            return;
+                        }
+                        let Some(u) = batch.get(next.fetch_add(1, Ordering::SeqCst)) else {
+                            return;
+                        };
+                        let cpu_before = thread_cpu();
+                        let result = self.put_object(u);
+                        let used = thread_cpu().saturating_sub(cpu_before);
+                        let owed = {
+                            let mut cycle = lock(&cycle);
+                            cycle.charge(used);
+                            cycle.debt(own_cpu)
+                        };
+                        if let Err(error) = result {
+                            let mut first = lock(&failed);
+                            let refusal = matches!(error, ShipError::QuotaRefused { .. });
+                            if first.is_none() || refusal {
+                                *first = Some(error);
+                            }
+                            halt.store(true, Ordering::SeqCst);
+                            return;
+                        }
+                        if !owed.is_zero() {
+                            thread::sleep(owed);
+                        }
+                    }
+                });
+            }
+        });
+        if let Some(error) = lock(&failed).take() {
+            return Err(error);
+        }
+        Ok(lock(&stopped).take())
     }
 
     /// Mint a batch's PUT URLs. A transient failure (transport, 5xx, 429) is retried with
@@ -1109,6 +1225,14 @@ impl Shipper {
                 pass.done = true;
                 return Ok(pass);
             };
+            // A capture held for the byte quota waits out its backoff; nothing behind it can
+            // register first (the chain is ordered), but a small capture is staged ahead of a
+            // held bulk capture as ahead of any queued one.
+            if !self.staging.is_foreign(entry) && self.held_back(entry) {
+                pass.done = scope == Scope::AheadOfBulk
+                    && pending.iter().all(|e| e.class == Some(Class::Bulk));
+                return Ok(pass);
+            }
             if !self.staging.is_foreign(entry) && self.uploading_bulk(entry) {
                 if scope == Scope::AheadOfBulk
                     && pending.iter().all(|e| e.class == Some(Class::Bulk))
@@ -1142,7 +1266,7 @@ impl Shipper {
                         used,
                         requested,
                     }) => {
-                        self.refuse(entry, &reason, limit, used, requested)?;
+                        self.hold(entry, &reason, limit, used, requested);
                         return Ok(pass);
                     }
                     // The entry was coalesced or re-staged under the upload (a later bulk snap
@@ -1179,6 +1303,7 @@ impl Shipper {
                             .refused_flag(class)
                             .store(false, Ordering::Relaxed);
                     }
+                    lock(&self.held)[class_slot(entry.class)] = None;
                     tracing::info!(n = entry.n, capture = %entry.capture_id, kind = ?entry.kind, class = ?entry.class, "capture registered");
                 }
                 Err(ShipError::QuotaRefused {
@@ -1188,7 +1313,7 @@ impl Shipper {
                     requested,
                 }) => {
                     self.staging.release();
-                    self.refuse(entry, &reason, limit, used, requested)?;
+                    self.hold(entry, &reason, limit, used, requested);
                     return Ok(pass);
                 }
                 Err(e) => {
@@ -1202,38 +1327,41 @@ impl Shipper {
         }
     }
 
-    /// The registrar refused `entry` for the session's byte quota: drop it, its staged bytes and
-    /// every queued capture that descends from it, and stop the class. The engine picks the
-    /// refusal up at its next snap and continues the chain from the refused capture's parent; a
-    /// refused bulk class takes no further snap until the next epoch or `capture.replan`, while
-    /// the small class keeps going (its batches are small enough to fit what is left).
-    fn refuse(
+    /// The registrar refused `entry` for the session's byte quota. Nothing is dropped: the entry
+    /// keeps its place and its staged bytes, the class is reported refused, and the shipper asks
+    /// again once the backoff runs out (30 s, doubling per refusal in a row, 10 min at most).
+    /// Before this a refusal dropped the capture with every capture staged after it — a bulk
+    /// capture's dependency tree, or the edits of a small one, discarded for a quota.
+    fn hold(
         &self,
         entry: &QueueEntry,
         reason: &str,
         limit: Option<u64>,
         used: Option<u64>,
         requested: Option<u64>,
-    ) -> Result<(), ShipError> {
-        let dropped = self.staging.drop_refused(
-            entry,
-            RefusedCapture {
-                n: entry.n,
-                capture_id: entry.capture_id.clone(),
-                parent: entry.register.parent.clone(),
-                class: entry.class,
-                reason: reason.to_owned(),
-                limit,
-                used,
-                requested,
-                uploads: entry.uploads.clone(),
-            },
-        )?;
-        if let Some(class) = entry.class {
-            self.status
-                .refused_flag(class)
-                .store(true, Ordering::Relaxed);
-        }
+    ) {
+        let slot = class_slot(entry.class);
+        let mut held = lock(&self.held);
+        let refusals = held[slot].as_ref().map_or(0, |h| h.refusals) + 1;
+        let (first, max) = self.hold_backoff;
+        let wait = first
+            .saturating_mul(1u32 << (refusals - 1).min(16))
+            .min(max);
+        held[slot] = Some(HeldCapture {
+            n: entry.n,
+            capture_id: entry.capture_id.clone(),
+            class: entry.class,
+            reason: reason.to_owned(),
+            limit,
+            used,
+            requested,
+            refusals,
+            retry_at: Instant::now() + wait,
+        });
+        drop(held);
+        self.status
+            .refused_flag(entry.class.unwrap_or(Class::Small))
+            .store(true, Ordering::Relaxed);
         tracing::warn!(
             n = entry.n,
             capture = %entry.capture_id,
@@ -1242,10 +1370,11 @@ impl Shipper {
             limit,
             used,
             requested,
-            dropped,
-            "capture refused; dropped with its staged bytes"
+            refusals,
+            retry_in_secs = wait.as_secs(),
+            staged_bytes = entry.uploads.iter().map(|u| u.bytes).sum::<u64>(),
+            "capture refused for the byte quota; held with its staged bytes and asked for again"
         );
-        Ok(())
     }
 
     /// Ship until the queue is empty or an error is not retryable, bounded by `deadline` (also
@@ -1261,6 +1390,48 @@ impl Shipper {
     /// before it (or `"pending"`).
     pub fn flush_small(&self, deadline: Duration) -> Result<usize, ShipError> {
         self.flush_scope(Scope::AheadOfBulk, deadline)
+    }
+
+    /// Ship and register everything pending, bulk captures included, with no deadline: the
+    /// executor is going away (`final`), and what is staged on its disk goes with it unless it
+    /// is in the store. Returns once the queue is empty; stops early only when nothing can ever
+    /// register — the lease is fenced, or the chain moved under this executor. A transport
+    /// failure is retried with backoff and a capture held for the byte quota is asked for again
+    /// when its backoff runs out, for as long as the process lives.
+    pub fn flush_final(&self) -> Result<usize, ShipError> {
+        let mut total = 0;
+        let mut failures = 0u32;
+        loop {
+            match self.pass(Scope::All, None, true) {
+                Ok(pass) => {
+                    total += pass.shipped;
+                    if pass.done {
+                        return Ok(total);
+                    }
+                    if pass.shipped > 0 {
+                        failures = 0;
+                        continue;
+                    }
+                    // Held for the byte quota, or a claim lost to a coalescing snap: wait for
+                    // the backoff (a second at a time, so a snap staged meanwhile ships).
+                    let wait = self
+                        .held()
+                        .iter()
+                        .map(|h| h.retry_at.saturating_duration_since(Instant::now()))
+                        .min()
+                        .unwrap_or(self.retry.backoff)
+                        .clamp(Duration::from_millis(10), Duration::from_secs(1));
+                    thread::sleep(wait);
+                }
+                Err(e @ (ShipError::Fenced(_) | ShipError::Conflict(_))) => return Err(e),
+                Err(error) => {
+                    failures += 1;
+                    let wait = self.backoff(failures.min(10));
+                    tracing::warn!(%error, failures, "final flush: shipping failed; retrying");
+                    thread::sleep(wait);
+                }
+            }
+        }
     }
 
     fn flush_scope(&self, scope: Scope, deadline: Duration) -> Result<usize, ShipError> {
@@ -1410,10 +1581,10 @@ mod tests {
                             head: "HEAD".into(),
                             fsck: crate::manifest::FsckStatus::Unverified,
                         },
-                        workspace: crate::manifest::WorkspaceSection {
-                            root: String::new(),
-                            packs: Vec::new(),
-                        },
+                        workspace: crate::manifest::WorkspaceSection::objects(
+                            String::new(),
+                            Vec::new(),
+                        ),
                         bulk: crate::manifest::BulkState::pending(),
                     },
                     checkpoint: None,

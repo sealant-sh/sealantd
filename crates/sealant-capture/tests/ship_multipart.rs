@@ -56,10 +56,7 @@ fn entry(n: u64, uploads: Vec<Upload>) -> QueueEntry {
                         head: "HEAD".into(),
                         fsck: FsckStatus::Unverified,
                     },
-                    workspace: WorkspaceSection {
-                        root: String::new(),
-                        packs: Vec::new(),
-                    },
+                    workspace: WorkspaceSection::objects(String::new(), Vec::new()),
                     bulk: BulkState::pending(),
                 },
                 checkpoint: None,

@@ -10,8 +10,9 @@
 //! after the small snap. Forced snaps (turn boundaries, checkpoints, flushes) go through the same
 //! gate. A class that cannot be watched — budget not met, `IN_Q_OVERFLOW`, no backend — polls:
 //! it is snapped at its maximum interval unconditionally (the engine's stat walk stages nothing
-//! when unchanged). A class the registrar refused for the session's byte quota
-//! ([`Shipper::is_refused`]) is not snapped at all until the next epoch or `capture.replan`.
+//! when unchanged). A class the registrar refused for the session's byte quota keeps snapping:
+//! its capture is held in the queue ([`Shipper::held`]) and a newer one replaces it, so what is
+//! on disk is always what goes up once the quota allows.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
@@ -390,13 +391,9 @@ impl Shared {
             let now = Instant::now();
             match due {
                 Some((at, trigger)) if at <= now => {
-                    // A bulk class the registrar refused for the session's byte quota takes no
-                    // further snap: the bytes would be refused again. The next epoch or a
-                    // `capture.replan` lifts it.
-                    if !self.allowed()
-                        || self.shipper.is_fenced()
-                        || self.shipper.is_refused(Class::Bulk)
-                    {
+                    // A bulk class held for the byte quota still snaps: the newer capture
+                    // replaces the held one in the queue, and nothing is dropped.
+                    if !self.allowed() || self.shipper.is_fenced() {
                         let mut st = self.state();
                         st.bulk.clear();
                         st.bulk.last_snap = now;
@@ -585,28 +582,28 @@ impl CadenceRunner {
     /// of it, bounded by `deadline`. Blocking. A bulk capture whose objects are still uploading
     /// does not hold the flush: the snap is staged ahead of it and the flush returns once the
     /// snap is registered, while the worker keeps uploading the bulk capture (`capture.status`
-    /// counts it in `pending` and `pending_bulk`). A `final` flush — the executor is going away
-    /// and the worker with it — then spends what is left of `deadline` on the bulk capture too.
+    /// counts it in `pending` and `pending_bulk`).
+    ///
+    /// A `final` flush — the executor is going away, and its disk with it — takes a bulk snap
+    /// as well (the dependency tree as it is now, whatever the bulk clocks say) and ships and
+    /// registers everything, bulk included, with no deadline ([`Shipper::flush_final`]): it
+    /// returns once the queue is empty, or on a fence or a chain conflict, when nothing staged
+    /// can register any more. `deadline` does not bound it; the process ending does.
     ///
     /// # Errors
     /// The engine's error, or the shipper's when shipping stops on a fence or a conflict.
     pub fn flush(&self, kind: CaptureKind, deadline: Duration) -> Result<usize, EngineError> {
         self.snap(kind)?;
-        let start = Instant::now();
-        let mut shipped = self.shared.shipper.flush_small(deadline)?;
-        let left = deadline.saturating_sub(start.elapsed());
-        if kind == CaptureKind::Final && !left.is_zero() {
-            match self.shared.shipper.flush(left) {
-                Ok(n) => shipped += n,
-                Err(error @ (ShipError::Fenced(_) | ShipError::Conflict(_))) => {
-                    return Err(error.into());
-                }
-                Err(error) => {
-                    tracing::warn!(%error, "bulk capture not shipped before the deadline")
-                }
-            }
+        if kind != CaptureKind::Final {
+            return Ok(self.shared.shipper.flush_small(deadline)?);
         }
-        Ok(shipped)
+        if self.shared.capture_bulk
+            && let Err(error) = self.shared.bulk_snap()
+        {
+            // What the last bulk snap staged still ships; the error is the engine's (I/O).
+            tracing::warn!(%error, "final bulk snap failed");
+        }
+        Ok(self.shared.shipper.flush_final()?)
     }
 
     /// Ship everything pending now, bounded by `deadline`, without a snap.
