@@ -745,6 +745,60 @@ claim) — an older reader takes a format-2 root digest for a key. The daemon re
 ← {"worktree_id":"wt","epoch":3,"head":{…},"get_urls":{…},"manifest_format":2}
 ```
 
+### `manifest_features` and `executor` on `plan.get`
+
+`manifest_format` says how dir objects are stored, not what a manifest means. The request also
+lists every manifest feature this build reads, validates and carries on
+(`registrar::MANIFEST_FEATURES`, `PlanGetRequest::booting`):
+
+```json
+→ {…,"manifest_format":2,
+   "manifest_features":["worktree_meta","symrefs","other_bulk","raw_names","final_seal"]}
+← {…,"manifest_format":2,"manifest_features":[…],"executor":"<executor id>"}
+← 409 {"reason":"manifest-features","message":"…","missing":["final_seal"]}
+```
+
+Mend refuses a head holding a feature the list leaves out, before it claims the lease (409
+`manifest-features`, naming them in `missing`): an executor that ignores one restores less than
+was saved (modes, mtimes, empty directories, hardlinks, symbolic refs, names that are not UTF-8)
+or drops it from the captures it writes next (another platform's dependency tree). A feature is
+held when: `worktree_meta` — the answered workspace section has `worktree_meta`; `symrefs` — the
+git section has a non-empty `symrefs`; `other_bulk` — the stored head has a non-empty
+`other_bulk`, or its ready `bulk` was captured on another platform than the request names;
+`raw_names` — a dir entry of the answered workspace or bulk section carries `raw_name` or
+`raw_target`; `final_seal` — the head carries `final_seal`. The daemon reads a 409
+`manifest-features` as a protocol error naming the missing features and what it reads (never a
+chain conflict, never retried). `InMemoryRegistrar` refuses the same way (raw names aside: it
+does not walk dir objects; `registrar::missing_manifest_features`). A request without the list
+reads none; an answer without it is an older registrar's.
+
+The answer's `executor` is the executor the session token was issued for: what a completed final
+flush's seal names (below). Absent from a registrar that does not say, and the daemon seals under
+`SEALANT_WORKSPACE_ID` instead (`CaptureConfig::executor`; a re-plan that names one takes it).
+
+### `final_seal` in a manifest
+
+Cross-repo decision 1: "saved" is a store-side fact, never only an RPC reply. When a final flush
+completes — every writer stopped (the runtime's quiesce found none left), both classes snapped
+after that, everything staged registered — the runner stages one more capture over the newest
+one, its sections unchanged, `kind: final`, `n` = head + 1, carrying a top-level
+
+```json
+"final_seal": {"complete": true, "epoch": 3, "executor": "<executor id>"}
+```
+
+and ships it (`CaptureEngine::seal_complete`, `CadenceRunner::flush_final_sealing`). `complete`
+is reported only once that register is acknowledged; a register refused and rebuilt in its
+place (which drops the seal) is followed by the seal staged again, at most three times
+(`sealing` otherwise). Absent from every other capture, so a manifest without it encodes exactly
+as before. A final flush asked again over a sealed chain stages nothing; a capture staged after
+it (a turn boundary) carries no seal, so the chain is unsealed until the next final flush seals
+it again. A flush whose quiesce could not stop every writer (`processes-remain`,
+`sweep-unavailable`) seals nothing. Without an executor identity nothing is sealed (logged at
+boot) and `complete` is the reply alone, as before. Mend's register records a seal only when it
+is complete, names the epoch the capture registers under and the executor the token is scoped
+to; `InMemoryRegistrar::with_executor` does the same (`seals()`).
+
 ### `pending_bulk` on `capture.status` / `capture.flush`
 
 Of `pending`, the bulk captures whose objects are still uploading. Additive (`uint64` field 13 of
@@ -785,8 +839,10 @@ pending). `incomplete_reason` says why not: `not-final`, `in-progress` (a final 
 from its first moment — before it stops the writers — to its answer; it read `not-final` for
 the 38 s one ran), `processes-remain`, `snapshot-failed` (a final snap failed, or a class's last
 snap did, whenever: `snaps`), `fenced`, `conflict`, `deadline`, `ship-failed`, `pending`
-(staged, or a bulk capture being built, after the final flush),
-`sweep-unavailable`, `unreadable` or `internal`; absent when `complete`.
+(staged, or a bulk capture being built, after the final flush), `sealing` (everything
+registered, but not the capture that seals the completed flush: the flush returned at its
+deadline before it could stage it — send the final flush again, which seals without a second
+quiesce), `sweep-unavailable`, `unreadable` or `internal`; absent when `complete`.
 
 Once `complete` is said, nothing more is captured. The final flush ends the chain as the disk
 is: when its bulk snap staged a capture and the small snap found tracked or ignored files with
@@ -809,8 +865,9 @@ overflowed — delivered no change since before that flush's first snap
 (`CadenceRunner::final_is_current`): it ships what is left and answers in milliseconds, and
 `complete` holds throughout (each walked the bulk class again for 2.5–3 s, `bulk_building`
 meanwhile). A class that polls, or a change the watcher saw, snaps again. After a flush that
-returned at its deadline (`deadline`, `ship-failed`), `complete` turns true once the worker has
-shipped the rest: poll `capture.status`, or send the final flush again. An older daemon's report decodes with `complete: false`.
+returned at its deadline (`deadline`, `ship-failed`), the worker ships the rest and the status
+turns `sealing` (with an executor identity; `complete` without one): send the final flush again,
+which seals the chain and then says `complete`. An older daemon's report decodes with `complete: false`.
 
 A suspend flush after a complete final one, over the disk it captured, is a status read: it
 snaps nothing and answers the final flush's report (Mend's Stop sent two after a final flush,

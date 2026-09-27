@@ -18,9 +18,9 @@ use crate::index::{
 use crate::io_at::IoAt;
 use crate::keys::KeyPrefix;
 use crate::manifest::{
-    BulkSection, BulkState, CaptureKind, DirFormat, EncodedManifest, FORMAT_DIR_PACKS, GitSection,
-    Manifest, Sections, WORKTREE_META_FORMAT, WORKTREE_TREE_REF, WorkspaceSection, WorktreeMeta,
-    rfc3339_now,
+    BulkSection, BulkState, CaptureKind, DirFormat, EncodedManifest, FORMAT_DIR_PACKS, FinalSeal,
+    GitSection, Manifest, Sections, WORKTREE_META_FORMAT, WORKTREE_TREE_REF, WorkspaceSection,
+    WorktreeMeta, rfc3339_now,
 };
 use crate::materialize::{
     DiskState, MaterializeClass, MaterializeError, MaterializeReport, MaterializeTargets,
@@ -160,6 +160,10 @@ pub struct CaptureConfig {
     /// A file read this close to its last change is read again by the next build rather than
     /// trusted by its stat ([`index::RACY_WINDOW`]; see `index` "When a file is re-read").
     pub racy_window: Duration,
+    /// The executor this engine captures for, as the session token names it: `plan.get`'s
+    /// `executor`, else `SEALANT_WORKSPACE_ID`. A complete final flush seals the chain under
+    /// it ([`crate::manifest::FinalSeal`]); `None` seals nothing.
+    pub executor: Option<String>,
 }
 
 impl CaptureConfig {
@@ -186,6 +190,7 @@ impl CaptureConfig {
             dir_format: DirFormat::Packs,
             uploads_in_flight: crate::ship::DEFAULT_UPLOADS_IN_FLIGHT,
             racy_window: index::RACY_WINDOW,
+            executor: None,
         }
     }
 
@@ -1026,6 +1031,12 @@ impl CaptureEngine {
         self.config.dir_format = format;
     }
 
+    /// The executor this engine seals a completed final flush under (a re-plan names it again:
+    /// a standby claimed for a session). See [`CaptureConfig::executor`].
+    pub fn set_executor(&mut self, executor: Option<String>) {
+        self.config.executor = executor;
+    }
+
     /// Configuration.
     #[must_use]
     pub fn config(&self) -> &CaptureConfig {
@@ -1788,6 +1799,7 @@ impl CaptureEngine {
                 other_bulk: old.sections.other_bulk.clone(),
             },
             checkpoint: None,
+            final_seal: None,
         }
         .encode();
         let manifest_key = self.prefix.manifest(&manifest.capture_id);
@@ -2197,6 +2209,7 @@ impl CaptureEngine {
             created_at: rfc3339_now(),
             sections,
             checkpoint: None,
+            final_seal: None,
         }
         .encode();
         let manifest_key = self.prefix.manifest(&manifest.capture_id);
@@ -2389,12 +2402,78 @@ impl CaptureEngine {
     /// # Errors
     /// Staging I/O.
     pub fn seal_final(&mut self, seq: u64) -> Result<Option<StagedCapture>, EngineError> {
-        let Some(prev) = self.previous.clone() else {
+        let Some(prev) = self.previous.as_ref() else {
             return Ok(None);
         };
         if prev.manifest.kind == CaptureKind::Final {
             return Ok(None);
         }
+        self.stage_over_previous(seq, None).map(Some)
+    }
+
+    /// The seal this engine writes once a final flush completed: complete, its epoch and its
+    /// executor. `None` without an executor.
+    #[must_use]
+    pub fn final_seal(&self) -> Option<FinalSeal> {
+        self.config.executor.as_ref().map(|executor| FinalSeal {
+            complete: true,
+            epoch: self.config.epoch,
+            executor: executor.clone(),
+        })
+    }
+
+    /// Whether the newest capture carries this engine's seal ([`Self::final_seal`]), so a
+    /// complete final flush has nothing left to seal. True without an executor: there is
+    /// nothing it could seal under.
+    #[must_use]
+    pub fn completion_sealed(&self) -> bool {
+        match self.final_seal() {
+            None => true,
+            Some(seal) => self
+                .previous
+                .as_ref()
+                .is_some_and(|p| p.manifest.final_seal.as_ref() == Some(&seal)),
+        }
+    }
+
+    /// Seal a completed final flush on the chain ([`crate::manifest::FinalSeal`]): stage one
+    /// more capture over the newest one — its sections unchanged, `kind: final` — carrying this
+    /// engine's seal. The caller vouches that the flush completed: every writer stopped, both
+    /// classes snapped after that, and everything staged before registered. `None` when the
+    /// newest capture carries the seal already ([`Self::completion_sealed`]), there is no
+    /// capture, or no executor to seal under.
+    ///
+    /// # Errors
+    /// Staging I/O.
+    pub fn seal_complete(&mut self, seq: u64) -> Result<Option<StagedCapture>, EngineError> {
+        let Some(seal) = self.final_seal() else {
+            return Ok(None);
+        };
+        if self.previous.is_none() || self.completion_sealed() {
+            return Ok(None);
+        }
+        let staged = self.stage_over_previous(seq, Some(seal.clone()))?;
+        tracing::info!(
+            n = staged.n,
+            epoch = seal.epoch,
+            executor = %seal.executor,
+            "final seal staged: the final flush completed"
+        );
+        Ok(Some(staged))
+    }
+
+    /// Stage a final capture over the newest one with its sections, carrying `final_seal`.
+    fn stage_over_previous(
+        &mut self,
+        seq: u64,
+        final_seal: Option<FinalSeal>,
+    ) -> Result<StagedCapture, EngineError> {
+        let Some(prev) = self.previous.clone() else {
+            return Err(EngineError::Io(io::Error::other(
+                "no capture to stage a final one over",
+            )));
+        };
+        let sealing = final_seal.is_some();
         let staging = Arc::clone(&self.staging);
         let guard = staging.coalesce_guard();
         let n = prev.manifest.n + 1;
@@ -2408,6 +2487,7 @@ impl CaptureEngine {
             created_at: rfc3339_now(),
             sections: prev.manifest.sections.clone(),
             checkpoint: None,
+            final_seal,
         }
         .encode();
         let manifest_key = self.prefix.manifest(&manifest.capture_id);
@@ -2443,13 +2523,15 @@ impl CaptureEngine {
         drop(guard);
         self.previous = Some(manifest.clone());
         self.persist()?;
-        tracing::info!(
-            n,
-            sealed = prev.manifest.n,
-            sealed_kind = ?prev.manifest.kind,
-            "final capture staged over the newest capture, which the final snaps found current"
-        );
-        Ok(Some(StagedCapture {
+        if !sealing {
+            tracing::info!(
+                n,
+                sealed = prev.manifest.n,
+                sealed_kind = ?prev.manifest.kind,
+                "final capture staged over the newest capture, which the final snaps found current"
+            );
+        }
+        Ok(StagedCapture {
             n,
             manifest,
             manifest_key,
@@ -2457,7 +2539,7 @@ impl CaptureEngine {
             class: Class::Small,
             stats,
             unchanged: false,
-        }))
+        })
     }
 
     /// Final small-class snap, then ship everything pending, bounded by `deadline`.

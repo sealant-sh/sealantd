@@ -224,6 +224,15 @@ pub(crate) fn boot_from(
 
     let mut config = CaptureConfig::new(&worktree_id, epoch, working_directory);
     config.harness_home = source.harness_home.clone();
+    // The executor a completed final flush is sealed under: the one the session token was
+    // issued for, as the plan names it, else the workspace id Core started this daemon as.
+    config.executor = plan.executor.clone().or_else(|| source.executor_id.clone());
+    if config.executor.is_none() {
+        tracing::warn!(
+            "no executor identity (plan.get names none and SEALANT_WORKSPACE_ID is unset): a \
+             completed final flush is not sealed on the chain, only reported"
+        );
+    }
     // Dir packs only for a registrar that reads them; either format materializes here.
     config.dir_format = DirFormat::for_registrar(plan.manifest_format);
     config.watch.raise_limit = source.raise_inotify_limit;
@@ -445,6 +454,7 @@ mod tests {
             ca_file: None,
             object_ca_pem: None,
             object_ca_file: None,
+            executor_id: None,
         }
     }
 
@@ -594,6 +604,7 @@ mod tests {
                 epoch: 0,
                 platform: Some(riscv.to_owned()),
                 manifest_format: Some(sealant_capture::manifest::MAX_SECTION_FORMAT),
+                manifest_features: PlanGetRequest::booting(None).manifest_features,
             })
             .unwrap();
         let answered = plan.head.unwrap().manifest.sections.bulk;

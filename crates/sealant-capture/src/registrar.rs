@@ -122,6 +122,39 @@
 //! ← {"worktree_id":"wt","epoch":3,"head":{…},"get_urls":{…},"manifest_format":2}
 //! ```
 //!
+//! # `manifest_features` on `plan.get`
+//!
+//! `manifest_format` says how dir objects are stored, not what a manifest means. The request
+//! also lists every manifest feature this build reads ([`MANIFEST_FEATURES`]); a registrar
+//! refuses a head holding one the list leaves out (409 `manifest-features`, naming them in
+//! `missing`) before it claims the lease, because an executor that ignores one restores less
+//! than was saved or drops it from the captures it writes next. The answer lists the features
+//! the registrar reads, validates and keeps. A feature is held when: `worktree_meta` — the
+//! answered workspace section has `worktree_meta`; `symrefs` — the git section has a non-empty
+//! `symrefs`; `other_bulk` — the stored head has a non-empty `other_bulk`, or its ready `bulk`
+//! was captured on another platform than the request names; `raw_names` — a dir entry of the
+//! answered workspace or bulk section carries `raw_name` or `raw_target`; `final_seal` — the
+//! head carries `final_seal`.
+//!
+//! ```json
+//! → {"worktree_id":null,"epoch":0,"platform":"linux-x86_64-gnu","manifest_format":2,
+//!    "manifest_features":["worktree_meta","symrefs","other_bulk","raw_names","final_seal"]}
+//! ← 409 {"reason":"manifest-features","message":"…","missing":["final_seal"]}
+//! ```
+//!
+//! # `executor` on `plan.get`, and the final seal
+//!
+//! A final flush that completes registers one more capture carrying `final_seal: {complete:
+//! true, epoch, executor}` ([`crate::manifest::FinalSeal`]) and reports `complete` only once
+//! that register is acknowledged. `executor` is the executor the session token was issued for:
+//! the plan's `executor` when the registrar names it (it knows which one the token is scoped
+//! to), else `SEALANT_WORKSPACE_ID`. The registrar records the seal on the chain only when it
+//! is complete, names the registering epoch and names that executor.
+//!
+//! ```json
+//! ← {"worktree_id":"wt","epoch":3,…,"manifest_features":[…],"executor":"<executor id>"}
+//! ```
+//!
 //! # Sources beside the worktree
 //!
 //! A capture-source workspace mounts nothing from the host, so content the control plane wants
@@ -162,7 +195,19 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::manifest::{BulkState, FORMAT_DIR_OBJECTS, MAX_SECTION_FORMAT, Manifest, TreeRef};
+use crate::manifest::{
+    BulkState, FORMAT_DIR_OBJECTS, FinalSeal, MAX_SECTION_FORMAT, Manifest, TreeRef,
+};
+
+/// Every manifest feature this build reads, validates and carries on (`plan.get`
+/// `manifest_features`): see the module docs.
+pub const MANIFEST_FEATURES: [&str; 5] = [
+    "worktree_meta",
+    "symrefs",
+    "other_bulk",
+    "raw_names",
+    "final_seal",
+];
 use crate::transport::{ChannelTransport, TransportError};
 
 /// `plan.get`.
@@ -184,6 +229,11 @@ pub struct PlanGetRequest {
     /// Absent = 1 (an executor from before format 2).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manifest_format: Option<u32>,
+    /// The manifest features this executor reads ([`MANIFEST_FEATURES`]). The registrar
+    /// refuses (409 `manifest-features`) a head holding one the list leaves out. Absent = none
+    /// (an executor from before the list).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_features: Option<Vec<String>>,
 }
 
 impl PlanGetRequest {
@@ -196,6 +246,7 @@ impl PlanGetRequest {
             epoch: 0,
             platform: Some(crate::engine::default_platform()),
             manifest_format: Some(MAX_SECTION_FORMAT),
+            manifest_features: Some(MANIFEST_FEATURES.iter().map(|f| (*f).to_owned()).collect()),
         }
     }
 }
@@ -241,6 +292,15 @@ pub struct PlanGetResponse {
     /// executor writes dir packs ([`crate::manifest::DirFormat::for_registrar`]).
     #[serde(default = "manifest_format_one")]
     pub manifest_format: u32,
+    /// The manifest features the registrar reads, validates and keeps. Absent from an older
+    /// registrar's answer.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub manifest_features: Vec<String>,
+    /// The executor the session token was issued for: what a completed final flush's seal
+    /// names ([`crate::manifest::FinalSeal`]). Absent from a registrar that does not say, and
+    /// the executor falls back to `SEALANT_WORKSPACE_ID`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executor: Option<String>,
 }
 
 fn manifest_format_one() -> u32 {
@@ -252,6 +312,44 @@ fn manifest_format_one() -> u32 {
 fn plan_format(manifest: &Manifest) -> u32 {
     let bulk = manifest.sections.bulk.section().map_or(0, |b| b.format);
     manifest.sections.workspace.format.max(bulk)
+}
+
+/// The manifest features `planned` (the head as the executor would restore it; `stored` as
+/// registered) holds that `reads` leaves out, as Mend's `missingManifestFeatures` decides them.
+/// `raw_names` needs the dir objects walked, which this does not do: it is decided only when the
+/// caller says (`raw_names`).
+#[must_use]
+pub fn missing_manifest_features(
+    stored: &Manifest,
+    planned: &Manifest,
+    platform: Option<&str>,
+    reads: &[String],
+    raw_names: bool,
+) -> Vec<String> {
+    let stored_bulk_elsewhere = platform.is_some_and(|platform| {
+        stored
+            .sections
+            .bulk
+            .section()
+            .is_some_and(|b| b.platform != platform)
+    });
+    [
+        (
+            "worktree_meta",
+            planned.sections.workspace.worktree_meta.is_some(),
+        ),
+        ("symrefs", !planned.sections.git.symrefs.is_empty()),
+        (
+            "other_bulk",
+            !stored.sections.other_bulk.is_empty() || stored_bulk_elsewhere,
+        ),
+        ("raw_names", raw_names),
+        ("final_seal", planned.final_seal.is_some()),
+    ]
+    .into_iter()
+    .filter(|(feature, held)| *held && !reads.iter().any(|r| r == feature))
+    .map(|(feature, _)| feature.to_owned())
+    .collect()
 }
 
 /// The store keys a chunked section names for its dir objects: the root key in format 1 (the
@@ -598,6 +696,9 @@ struct InMemoryState {
     sources: Vec<PlanSource>,
     /// Remotes the plan names for the worktree's repository.
     remotes: Vec<PlanRemote>,
+    /// Final seals recorded on the chain: the capture's `n` and the seal, as Mend records them
+    /// (complete, the registering epoch, this registrar's executor).
+    seals: Vec<(u64, FinalSeal)>,
 }
 
 /// In-memory registrar: one worktree, one chain, a live epoch, a lease flag.
@@ -611,6 +712,9 @@ pub struct InMemoryRegistrar {
     quota: Mutex<Option<ByteQuota>>,
     /// The `manifest_format` `plan.get` answers.
     manifest_format: u32,
+    /// The executor the token is scoped to: answered on `plan.get`, and the only one whose
+    /// final seal is recorded.
+    executor: Option<String>,
 }
 
 /// The in-memory registrar's byte budget: keys are priced from the `sizes` of `upload.urls`, and
@@ -650,6 +754,7 @@ impl InMemoryRegistrar {
                 uploads: BTreeMap::new(),
                 sources: Vec::new(),
                 remotes: Vec::new(),
+                seals: Vec::new(),
                 completed: BTreeSet::new(),
                 completes: 0,
                 next_upload: 0,
@@ -658,7 +763,22 @@ impl InMemoryRegistrar {
             multipart: None,
             completer: None,
             manifest_format: MAX_SECTION_FORMAT,
+            executor: None,
         }
+    }
+
+    /// Answer `executor` on `plan.get`, and record a final seal only when it names this
+    /// executor (as Mend does).
+    #[must_use]
+    pub fn with_executor(mut self, executor: &str) -> Self {
+        self.executor = Some(executor.to_owned());
+        self
+    }
+
+    /// The final seals recorded on the chain: `(n, seal)`, oldest first.
+    #[must_use]
+    pub fn seals(&self) -> Vec<(u64, FinalSeal)> {
+        self.lock().seals.clone()
     }
 
     /// Answer `manifest_format` on `plan.get` (default: the highest this build reads). At 1 the
@@ -934,6 +1054,24 @@ impl Registrar for InMemoryRegistrar {
                 "plan.get refused: manifest-format (the head holds format {holds}; the executor reads {reads})"
             )));
         }
+        // Mend's feature gate, before the claim: a head holding a manifest feature the
+        // executor does not say it reads (raw names aside: this double does not walk dir
+        // objects).
+        if let (Some(planned), Some(stored)) = (&head, state.chain.last()) {
+            let missing = missing_manifest_features(
+                &stored.manifest,
+                &planned.manifest,
+                req.platform.as_deref(),
+                req.manifest_features.as_deref().unwrap_or_default(),
+                false,
+            );
+            if !missing.is_empty() {
+                return Err(RegistrarError::Protocol(format!(
+                    "plan.get refused: manifest-features (the head holds {})",
+                    missing.join(", ")
+                )));
+            }
+        }
         let mut get_urls = BTreeMap::new();
         if let (Some(h), Some(_)) = (&head, &self.url_base) {
             let s = &h.manifest.sections;
@@ -969,6 +1107,8 @@ impl Registrar for InMemoryRegistrar {
             sources,
             remotes: state.remotes.clone(),
             manifest_format: self.manifest_format.min(reads),
+            manifest_features: MANIFEST_FEATURES.iter().map(|f| (*f).to_owned()).collect(),
+            executor: self.executor.clone(),
         })
     }
 
@@ -1119,6 +1259,21 @@ impl Registrar for InMemoryRegistrar {
                 head_n: head.map_or(0, |h| h.n),
                 head_capture_id: head_id.unwrap_or_default(),
             });
+        }
+        // The seal is recorded with the CAS, only when it holds (Mend's register).
+        if let Some(seal) = &req.manifest.final_seal {
+            if seal.complete
+                && seal.epoch == req.epoch
+                && self.executor.as_deref() == Some(seal.executor.as_str())
+            {
+                state.seals.push((req.n, seal.clone()));
+            } else {
+                tracing::warn!(
+                    n = req.n,
+                    ?seal,
+                    "a final seal that does not hold: registered without it"
+                );
+            }
         }
         state.chain.push(HeadInfo {
             n: req.n,
@@ -1304,6 +1459,18 @@ fn refusal(name: &str, status: u16, bytes: &[u8], epoch: u64) -> RegistrarError 
             } else if c.reason == "manifest-format" {
                 // The head holds a section this build does not read: nothing to retry.
                 RegistrarError::Protocol(format!("{name} refused: manifest-format"))
+            } else if c.reason == "manifest-features" {
+                // The head holds manifest features this build does not say it reads: nothing
+                // to retry; a sealantd that reads them must restore it.
+                RegistrarError::Protocol(format!(
+                    "{name} refused: manifest-features (the head holds {}; this sealantd reads {})",
+                    if c.missing.is_empty() {
+                        "features it does not name".to_owned()
+                    } else {
+                        c.missing.join(", ")
+                    },
+                    MANIFEST_FEATURES.join(", ")
+                ))
             } else if name == "change.summary" {
                 RegistrarError::SummaryRefused(c.reason)
             } else if name == "upload.complete" {
@@ -1647,6 +1814,7 @@ mod tests {
                 other_bulk: BTreeMap::new(),
             },
             checkpoint: None,
+            final_seal: None,
         }
     }
 
@@ -1723,6 +1891,7 @@ mod tests {
                 epoch: 1,
                 platform: None,
                 manifest_format: Some(MAX_SECTION_FORMAT),
+                manifest_features: None,
             })
             .unwrap();
         assert_eq!(plan.head.unwrap().capture_id, "a");
@@ -1753,6 +1922,7 @@ mod tests {
                 epoch: 0,
                 platform: platform.map(str::to_owned),
                 manifest_format: Some(MAX_SECTION_FORMAT),
+                manifest_features: PlanGetRequest::booting(None).manifest_features,
             })
             .unwrap()
         };
@@ -1793,6 +1963,7 @@ mod tests {
             epoch: 1,
             platform: None,
             manifest_format: None,
+            manifest_features: None,
         })
         .unwrap();
         assert!(bare.get("platform").is_none());
@@ -1854,6 +2025,7 @@ mod tests {
             epoch: 0,
             platform: None,
             manifest_format: None,
+            manifest_features: None,
         };
         assert!(
             serde_json::to_value(&bare)
@@ -1890,6 +2062,123 @@ mod tests {
             matches!(&http, RegistrarError::Protocol(m) if m.contains("manifest-format")),
             "{http:?}"
         );
+    }
+
+    /// A booting executor lists every manifest feature it reads (Mend's `manifest_features`,
+    /// PLATFORM-FEEDBACK 2026-09-28); a request without the list reads none. The test double
+    /// refuses, as Mend does, a head holding a feature the list leaves out — before the claim,
+    /// naming the features — and answers the ones it reads; an HTTP 409 `manifest-features` is
+    /// a protocol error naming what is missing, never a chain conflict.
+    #[test]
+    fn plan_get_lists_the_manifest_features_it_reads() {
+        let booting = serde_json::to_value(PlanGetRequest::booting(None)).unwrap();
+        assert_eq!(
+            booting["manifest_features"],
+            serde_json::json!([
+                "worktree_meta",
+                "symrefs",
+                "other_bulk",
+                "raw_names",
+                "final_seal"
+            ])
+        );
+        let bare = PlanGetRequest {
+            worktree_id: None,
+            epoch: 0,
+            platform: None,
+            manifest_format: Some(MAX_SECTION_FORMAT),
+            manifest_features: None,
+        };
+        assert!(
+            serde_json::to_value(&bare)
+                .unwrap()
+                .get("manifest_features")
+                .is_none()
+        );
+
+        let r = InMemoryRegistrar::new("wt", 1, None).with_executor("exec-1");
+        // A head holding no feature is handed to any executor.
+        r.capture_register(&register(0, None, "a", 1)).unwrap();
+        let plan = r.plan_get(&bare).unwrap();
+        assert_eq!(plan.head.unwrap().capture_id, "a");
+        assert_eq!(plan.manifest_features.len(), MANIFEST_FEATURES.len());
+        assert_eq!(plan.executor.as_deref(), Some("exec-1"));
+        // One holding a seal and a symbolic ref is not, and says which.
+        let mut m = manifest(1, Some("a"));
+        m.sections.git.symrefs.insert(
+            "refs/remotes/origin/HEAD".into(),
+            "refs/remotes/origin/main".into(),
+        );
+        m.final_seal = Some(FinalSeal {
+            complete: true,
+            epoch: 1,
+            executor: "exec-1".into(),
+        });
+        r.capture_register(&RegisterRequest {
+            manifest: m,
+            ..register(1, Some("a"), "b", 1)
+        })
+        .unwrap();
+        assert_eq!(r.seals().len(), 1, "the seal is recorded with the CAS");
+        let refused = r.plan_get(&bare).unwrap_err();
+        let text = refused.to_string();
+        assert!(
+            text.contains("manifest-features") && text.contains("symrefs, final_seal"),
+            "{text}"
+        );
+        let only_some = PlanGetRequest {
+            manifest_features: Some(vec!["symrefs".into()]),
+            ..bare.clone()
+        };
+        let text = r.plan_get(&only_some).unwrap_err().to_string();
+        assert!(text.contains("(the head holds final_seal)"), "{text}");
+        let plan = r.plan_get(&PlanGetRequest::booting(None)).unwrap();
+        assert_eq!(plan.head.unwrap().capture_id, "b");
+
+        let http = refusal(
+            "plan.get",
+            409,
+            br#"{"reason":"manifest-features","message":"refused","missing":["final_seal"]}"#,
+            0,
+        );
+        assert!(
+            matches!(&http, RegistrarError::Protocol(m)
+                if m.contains("manifest-features") && m.contains("the head holds final_seal")),
+            "{http:?}"
+        );
+        assert!(!http.is_retryable());
+    }
+
+    /// The feature rules, one by one (Mend's `missingManifestFeatures`).
+    #[test]
+    fn manifest_features_are_held_as_mend_decides_them() {
+        let none: Vec<String> = Vec::new();
+        let plain = manifest(0, None);
+        assert!(missing_manifest_features(&plain, &plain, None, &none, false).is_empty());
+        assert_eq!(
+            missing_manifest_features(&plain, &plain, None, &none, true),
+            vec!["raw_names"]
+        );
+        // A ready bulk section of another platform than the request names: the executor must
+        // carry it into `other_bulk`.
+        let mut stored = manifest(0, None);
+        stored.sections.bulk = BulkState::Ready(crate::manifest::BulkSection {
+            root: "r".into(),
+            packs: vec![],
+            platform: "linux-aarch64-gnu".into(),
+            format: FORMAT_DIR_OBJECTS,
+            dir_packs: vec![],
+        });
+        assert_eq!(
+            missing_manifest_features(&stored, &plain, Some("linux-x86_64-gnu"), &none, false),
+            vec!["other_bulk"]
+        );
+        assert!(
+            missing_manifest_features(&stored, &plain, Some("linux-aarch64-gnu"), &none, false)
+                .is_empty()
+        );
+        let all: Vec<String> = MANIFEST_FEATURES.iter().map(|f| (*f).to_owned()).collect();
+        assert!(missing_manifest_features(&stored, &plain, Some("x"), &all, true).is_empty());
     }
 
     /// Every key of a prefetch batch travels with its size (not only multipart candidates), so
@@ -2028,6 +2317,7 @@ mod tests {
                 epoch: 0,
                 platform: Some(platform.into()),
                 manifest_format: Some(MAX_SECTION_FORMAT),
+                manifest_features: PlanGetRequest::booting(None).manifest_features,
             })
             .unwrap()
         };

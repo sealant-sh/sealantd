@@ -35,7 +35,7 @@ pub use engine::{
     Cadence, CaptureConfig, CaptureEngine, Class, EngineError, ReadReport, ReadReports,
     SnapOutcome, SnapRequest, SnapStats, StagedCapture, UNREADABLE_PATHS_CAP,
 };
-pub use manifest::{CaptureKind, EncodedManifest, FsckStatus, Manifest};
+pub use manifest::{CaptureKind, EncodedManifest, FinalSeal, FsckStatus, Manifest};
 pub use materialize::{
     DiskState, MaterializeClass, MaterializeReport, MaterializeTargets, Materializer,
 };

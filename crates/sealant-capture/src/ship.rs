@@ -2204,6 +2204,7 @@ mod tests {
                         other_bulk: Default::default(),
                     },
                     checkpoint: None,
+                    final_seal: None,
                 },
             },
         }

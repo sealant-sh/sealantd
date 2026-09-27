@@ -230,6 +230,9 @@ pub struct CaptureSourceConfig {
     pub object_ca_pem: Option<String>,
     /// `SEALANT_CAPTURE_OBJECT_CA_FILE`: the same bundle as a file; the inline bundle wins.
     pub object_ca_file: Option<PathBuf>,
+    /// `SEALANT_WORKSPACE_ID`: the executor a completed final flush is sealed under when
+    /// `plan.get` does not name one (`executor`).
+    pub executor_id: Option<String>,
 }
 
 /// How the workspace working directory is provisioned.
@@ -796,6 +799,9 @@ impl BootConfig {
                         .get("SEALANT_CAPTURE_OBJECT_CA_FILE")
                         .filter(|s| !s.trim().is_empty())
                         .map(PathBuf::from),
+                    executor_id: env
+                        .get("SEALANT_WORKSPACE_ID")
+                        .filter(|s| !s.trim().is_empty()),
                 }))
             }
             Some(other) => Err(BootError::config(format!(

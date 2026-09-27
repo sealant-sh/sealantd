@@ -437,6 +437,29 @@ pub struct Manifest {
     /// Checkpoint stamp, when `kind == checkpoint`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkpoint: Option<Checkpoint>,
+    /// The executor's word that its final flush completed ([`FinalSeal`]): only on the sealing
+    /// capture a complete final flush registers last. Absent otherwise, so a manifest without
+    /// one encodes exactly as before, and a capture staged after it carries none (it unseals).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_seal: Option<FinalSeal>,
+}
+
+/// `final_seal` (cross-repo decision 1): a completed final flush as a store-side fact, not only
+/// an RPC reply. When a final flush of this executor completes — every writer stopped, both
+/// classes snapped after that, everything staged registered — it registers one more capture,
+/// the head's sections unchanged, `kind: final`, `n` = head + 1, carrying this; it reports
+/// `complete` only once that register is acknowledged. The registrar records it on the chain
+/// only when `complete` is true, `epoch` is the epoch the capture registers under and
+/// `executor` is the executor the session token was issued for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FinalSeal {
+    /// Always true: an incomplete final flush writes no seal.
+    pub complete: bool,
+    /// The lease epoch the sealing capture registers under.
+    pub epoch: u64,
+    /// The executor sealantd was planned as: `plan.get`'s `executor`, else
+    /// `SEALANT_WORKSPACE_ID`.
+    pub executor: String,
 }
 
 /// A manifest with its canonical bytes and capture id.
@@ -544,6 +567,7 @@ mod tests {
                 other_bulk: BTreeMap::new(),
             },
             checkpoint: None,
+            final_seal: None,
         }
     }
 

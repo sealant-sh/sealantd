@@ -62,6 +62,7 @@ fn entry(n: u64, uploads: Vec<Upload>) -> QueueEntry {
                     other_bulk: Default::default(),
                 },
                 checkpoint: None,
+                final_seal: None,
             },
         },
     }

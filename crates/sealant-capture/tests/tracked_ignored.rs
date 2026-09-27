@@ -144,6 +144,7 @@ fn control_plane_base(
             other_bulk: Default::default(),
         },
         checkpoint: None,
+        final_seal: None,
     }
     .encode();
     let manifest_key = keys.manifest(&manifest.capture_id);
