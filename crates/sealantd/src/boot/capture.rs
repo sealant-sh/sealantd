@@ -170,7 +170,8 @@ pub(crate) fn transport_of(source: &CaptureSourceConfig) -> Result<ChannelTransp
 ///
 /// # Errors
 /// As [`materialize`].
-pub(crate) fn boot_from(
+#[doc(hidden)]
+pub fn boot_from(
     registrar: Arc<dyn Registrar>,
     sink: Option<Arc<dyn BlobSink>>,
     source: &CaptureSourceConfig,

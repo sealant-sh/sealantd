@@ -42,6 +42,14 @@ struct BootArgs {
     /// Tracing log filter (e.g. `info`, `debug`).
     #[arg(long, default_value = "info")]
     log_level: String,
+    /// A recovery boot, as `SEALANT_RECOVERY=1` asks for one: resume this disk's own staging as
+    /// it is — never materialized over — and ship, with no dotfiles, lifecycle step or harness
+    /// and nothing admitted; exit 0 once the final flush (on the stop) is complete, else 75.
+    /// Capture-store workspaces only. What a still-running MicroVM runs after its daemon
+    /// exited, with the same environment and secret environment file as the first boot; refused
+    /// (75, touching nothing) while another sealantd runs on the disk.
+    #[arg(long)]
+    recovery: bool,
 }
 
 /// Flags for the bare (no-subcommand) control-server invocation. Preserved verbatim so the SDK
@@ -157,7 +165,7 @@ fn build_config(cli: &ServeArgs) -> RuntimeConfig {
 pub fn run() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
-        Some(Command::Boot(args)) => crate::boot::run_boot(&args.log_level),
+        Some(Command::Boot(args)) => crate::boot::run_boot(&args.log_level, args.recovery),
         None => run_serve(cli.serve),
     }
 }

@@ -52,6 +52,10 @@ pub enum BootError {
     /// The async runtime could not be built.
     #[error("failed to start async runtime: {0}")]
     Runtime(String),
+
+    /// Another sealantd holds this disk ([`crate::boot::lock::DiskLock`]): nothing was touched.
+    #[error("{0}")]
+    DiskInUse(String),
 }
 
 impl BootError {

@@ -16,6 +16,7 @@ pub mod config;
 mod dotfiles;
 mod error;
 mod git;
+pub mod lock;
 mod mount;
 pub(crate) mod remotes;
 pub(crate) mod sources;
@@ -48,14 +49,24 @@ const BOOT_OWNED_KEYS: &[&str] = &["HOME", "USER", "LOGNAME", "PATH"];
 /// Entry point for the `boot` subcommand. Performs synchronous prep, then enters Tokio to run the
 /// control server and supervise the harness. Returns the process exit code.
 #[must_use]
-pub fn run_boot(log_level: &str) -> ExitCode {
+pub fn run_boot(log_level: &str, recovery: bool) -> ExitCode {
     init_tracing(log_level);
 
-    let config = match BootConfig::from_env() {
+    let config = match BootConfig::from_env().and_then(|config| {
+        if recovery {
+            config.into_recovery()
+        } else {
+            Ok(config)
+        }
+    }) {
         Ok(config) => config,
         Err(error) => {
             tracing::error!(%error, "boot configuration is invalid");
             eprintln!("sealantd boot: {error}");
+            // A recovery asked for and refused has not saved what the disk holds.
+            if recovery {
+                return ExitCode::from(crate::runtime::EXIT_CAPTURE_INCOMPLETE);
+            }
             return ExitCode::FAILURE;
         }
     };
@@ -71,19 +82,21 @@ pub fn run_boot(log_level: &str) -> ExitCode {
             Err(error) => {
                 tracing::error!(%error, "secret environment file is invalid");
                 eprintln!("sealantd boot: {error}");
-                return ExitCode::FAILURE;
+                return boot_failure(&config);
             }
         },
     };
 
-    let capture_boot = match prepare(&config, &secret_env) {
-        Ok(capture_boot) => capture_boot,
+    // Held until this function returns: the process's lifetime.
+    let (capture_boot, _disk_lock) = match prepare(&config, &secret_env) {
+        Ok(prepared) => prepared,
         Err(error) => {
             tracing::error!(%error, "boot preparation failed");
             eprintln!("sealantd boot: {error}");
             // A recovery boot that could not start has not saved what the disk holds: it is
-            // still unsaved work, never a clean exit.
-            if config.recovery {
+            // still unsaved work, never a clean exit. Nor has a capture boot refused beside a
+            // daemon still running on its disk: that disk is the other daemon's to save.
+            if config.recovery || matches!(error, BootError::DiskInUse(_)) {
                 return ExitCode::from(crate::runtime::EXIT_CAPTURE_INCOMPLETE);
             }
             return ExitCode::FAILURE;
@@ -108,7 +121,17 @@ fn init_tracing(log_level: &str) {
 fn prepare(
     config: &BootConfig,
     secret_env: &[(String, String)],
-) -> Result<Option<capture::CaptureBoot>, BootError> {
+) -> Result<(Option<capture::CaptureBoot>, Option<lock::DiskLock>), BootError> {
+    // Step 1b: one daemon per capture disk, before anything is read or written, even the
+    // workspace's own directories: a boot (a recovery reboot on a still-running MicroVM above
+    // all) beside a daemon still running on this disk is refused, touching nothing.
+    let disk_lock = match &config.source {
+        WorkspaceSource::Capture(_) => Some(lock::DiskLock::acquire(
+            &config.workspace.working_directory,
+        )?),
+        _ => None,
+    };
+
     // Step 2: become subreaper BEFORE any fork so double-forked orphans reparent here.
     if cfg!(target_os = "linux") {
         if !sealant_process::platform::set_child_subreaper() {
@@ -177,7 +200,7 @@ fn prepare(
         )?;
     }
 
-    Ok(capture_boot)
+    Ok((capture_boot, disk_lock))
 }
 
 /// The SSH-runtime / credential directory under the workspace root.
@@ -383,7 +406,7 @@ pub fn run_supervised(
     if let Err(error) = runtime_config.validate() {
         tracing::error!(%error, "derived runtime configuration is invalid");
         eprintln!("sealantd boot: invalid runtime configuration: {error}");
-        return ExitCode::FAILURE;
+        return boot_failure(&config);
     }
     let shutdown = Arc::new(ShutdownSignal::new(runtime_config.shutdown_grace_ms));
     let runtime = Runtime::new(runtime_config, shutdown);
@@ -395,7 +418,7 @@ pub fn run_supervised(
         Ok(rt) => rt,
         Err(error) => {
             tracing::error!(%error, "failed to start async runtime");
-            return ExitCode::FAILURE;
+            return boot_failure(&config);
         }
     };
 
@@ -428,7 +451,8 @@ async fn boot_serve(
     if let Err(error) = runtime.binds().apply_initial(&config.initial_binds) {
         tracing::error!(%error, "initial mount bind failed");
         eprintln!("sealantd boot: {error}");
-        return shutdown_before_control(&runtime, ExitCode::FAILURE).await;
+        let code = boot_failure(&config);
+        return shutdown_before_control(&runtime, code).await;
     }
 
     // A recovery boot: nothing is admitted from the start — no exec, session or SFTP bridge
@@ -622,17 +646,28 @@ async fn recover(
         "recovery boot: shipping this disk's staged captures; no lifecycle step or harness runs \
          and nothing is admitted — waiting for the final flush and the stop"
     );
-    let exit_code = tokio::select! {
-        () = runtime.shutdown().wait() => ExitCode::SUCCESS,
+    tokio::select! {
+        () = runtime.shutdown().wait() => {}
         join = &mut control_handle => {
             if let Err(error) = join {
                 tracing::warn!(%error, "control server task ended unexpectedly");
             }
-            ExitCode::FAILURE
         }
     };
-    let exit_code = final_capture(&runtime, exit_code).await;
+    // A recovery boot's exit says one thing: 0 when everything on this disk is registered and
+    // sealed, 75 otherwise.
+    let exit_code = final_capture(&runtime, ExitCode::SUCCESS).await;
     shutdown_with(&runtime, &serve_tx, control_handle, exit_code).await
+}
+
+/// A boot that failed before its capture engine ran: 75 for a recovery boot (what the disk holds
+/// is still not saved — never a plain failure a caller could take for a clean end), else 1.
+fn boot_failure(config: &BootConfig) -> ExitCode {
+    if config.recovery {
+        ExitCode::from(crate::runtime::EXIT_CAPTURE_INCOMPLETE)
+    } else {
+        ExitCode::FAILURE
+    }
 }
 
 /// Step 11c: install the capture engine and start it with no harness (the fence gets the

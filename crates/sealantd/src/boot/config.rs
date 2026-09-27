@@ -736,6 +736,25 @@ impl BootConfig {
         })
     }
 
+    /// This configuration as a recovery boot (`sealantd boot --recovery`, the same as
+    /// `SEALANT_RECOVERY=1`).
+    ///
+    /// # Errors
+    /// [`BootError::Config`] for a workspace that is not a capture store.
+    pub fn into_recovery(mut self) -> Result<Self, BootError> {
+        match &mut self.source {
+            WorkspaceSource::Capture(capture) => capture.recovery = true,
+            _ => {
+                return Err(BootError::config(
+                    "a recovery boot (--recovery) applies to a capture-store workspace only \
+                     (SEALANT_WORKSPACE_SOURCE=capture)",
+                ));
+            }
+        }
+        self.recovery = true;
+        Ok(self)
+    }
+
     /// Resolve the workspace source: `SEALANT_WORKSPACE_SOURCE` selects `clone` (default) or
     /// `mount`. Mount mode requires a caller-owned host path inside the operator-configured
     /// allowlist of store roots, and rejects clone-only configuration; clone mode rejects mount
@@ -1876,6 +1895,20 @@ mod tests {
                 .iter()
                 .any(|(k, _)| k == "SEALANT_RECOVERY")
         );
+
+        // `sealantd boot --recovery` asks for the same thing, and is refused the same way.
+        pairs.retain(|(k, _)| *k != "SEALANT_RECOVERY");
+        let flagged = BootConfig::load(&MapEnv::from_pairs(&pairs))
+            .expect("valid")
+            .into_recovery()
+            .expect("a capture store");
+        assert!(flagged.recovery);
+        assert!(matches!(&flagged.source, WorkspaceSource::Capture(c) if c.recovery));
+        let refused = BootConfig::load(&MapEnv::from_pairs(&base_pairs()))
+            .expect("valid")
+            .into_recovery()
+            .expect_err("a clone source");
+        assert!(refused.to_string().contains("--recovery"), "{refused}");
 
         let mut clone = base_pairs();
         clone.push(("SEALANT_RECOVERY", "1"));
