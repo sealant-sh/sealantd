@@ -169,6 +169,20 @@ fn open_at(path: &Path, flags: OFlag, mode: u32) -> io::Result<File> {
     Ok(File::from(fd))
 }
 
+/// Open the directory at `path`, of any length, as an `O_PATH` descriptor (a symlink at its last
+/// component not followed): `/proc/self/fd/<fd>` then names it, in a few bytes, to a call that
+/// takes only a path (`inotify_add_watch`).
+pub fn open_dir_path(path: &Path) -> io::Result<OwnedFd> {
+    let at = at(path)?;
+    openat(
+        at.dir.fd(),
+        at.name.as_os_str(),
+        OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(nix_err)
+}
+
 /// `fs::symlink_metadata`: the path itself, a symlink not followed.
 pub fn symlink_metadata(path: &Path) -> io::Result<Metadata> {
     if let Some(e) = fault(path) {

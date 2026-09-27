@@ -958,9 +958,11 @@ mod tests {
             "a final flush over a final capture of an unchanged disk stages nothing"
         );
         assert!(capture.status().complete);
+        // Both classes are watched (the bulk class with no bulk directory yet), so the repeat
+        // final flush snaps nothing at all: three forced snaps (turn, suspend, final).
         let snap = capture.runner().snapshot();
-        assert_eq!(snap.forced, 4, "{snap:?}");
-        assert_eq!(snap.small_snaps, 4, "no scheduled snap fired: {snap:?}");
+        assert_eq!(snap.forced, 3, "{snap:?}");
+        assert_eq!(snap.small_snaps, 3, "no scheduled snap fired: {snap:?}");
     }
 
     /// A class the registrar refused for the session's byte quota is named in `capture.status`,
@@ -2563,5 +2565,167 @@ mod tests {
             bulk_snaps,
             "no bulk snap after the small one failed"
         );
+    }
+
+    /// Docker end to end, round 4: a session's first executor boots before its `pnpm install`,
+    /// so there was no bulk directory at boot, the bulk class polled for the executor's life
+    /// (`capture watches registered … bulk=Polled`), and every final flush after a complete one
+    /// walked the dependency tree again (a Stop took 15 s, not 6–7 s). A dependency tree made
+    /// after the watcher started is watched, and a final flush after a complete one snaps
+    /// nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dependency_tree_installed_after_boot_is_watched_and_a_repeat_final_snaps_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (boot, registrar) = boot(tmp.path());
+        let ws = boot.layout.working_directory.clone();
+        std::fs::write(ws.join(".gitignore"), "node_modules/\n").unwrap();
+        let mut config = RuntimeConfig::new(new_runtime_id());
+        config.workspace_root = ws.clone();
+        let runtime = Runtime::new(config, Arc::new(ShutdownSignal::new(3_000)));
+        runtime.mark_healthy();
+        let capture = CaptureRuntime::new(boot);
+        assert!(runtime.install_capture(capture.clone()));
+        let harness = runtime
+            .spawn_managed(sh("exec sleep 3600", &ws))
+            .expect("spawn");
+        capture.start(runtime.clone(), harness.process_id);
+
+        // The install, after boot: a tree made in a staging directory and renamed in, then
+        // more made inside it.
+        let staged = tmp.path().join("install");
+        for p in 0..30 {
+            let dir = staged.join(format!(".pnpm/pkg{p}@1/node_modules/pkg{p}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            for f in 0..10 {
+                std::fs::write(dir.join(format!("m{f}.js")), format!("// {p} {f}\n")).unwrap();
+            }
+        }
+        std::fs::rename(&staged, ws.join("node_modules")).unwrap();
+        std::fs::create_dir_all(ws.join("node_modules/.bin")).unwrap();
+        std::fs::write(ws.join("node_modules/.bin/tool"), "#!/bin/sh\n").unwrap();
+        let start = Instant::now();
+        while !capture.runner().snapshot().bulk_dirty {
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "the watcher sees the install"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let modes = capture.runner().snapshot();
+        assert_eq!(
+            (modes.small_mode, modes.bulk_mode),
+            (
+                sealant_capture::WatchMode::Watched,
+                sealant_capture::WatchMode::Watched
+            ),
+            "both classes are watched"
+        );
+
+        let first = runtime.final_flush(None, Some(3_000)).await.unwrap();
+        assert!(first.complete, "{first:?}");
+        let registered = registrar.chain().len();
+        let before = capture.runner().snapshot();
+
+        let again = runtime.final_flush(None, Some(3_000)).await.unwrap();
+        assert!(again.complete, "{again:?}");
+        let after = capture.runner().snapshot();
+        assert_eq!(
+            (after.small_snaps, after.bulk_snaps),
+            (before.small_snaps, before.bulk_snaps),
+            "a repeat final flush snaps nothing"
+        );
+        assert_eq!(registrar.chain().len(), registered);
+        let fresh = restore_head(tmp.path(), &registrar, "fresh");
+        assert_eq!(
+            std::fs::read_to_string(
+                fresh.join("node_modules/.pnpm/pkg0@1/node_modules/pkg0/m0.js")
+            )
+            .unwrap(),
+            "// 0 0\n"
+        );
+        assert!(fresh.join("node_modules/.bin/tool").exists());
+    }
+
+    /// Docker end to end, round 4: a directory past `PATH_MAX` cannot be named to
+    /// `inotify_add_watch`, so the small class polled and every final flush after a complete one
+    /// snapped it again. It is watched through its descriptor: a repeat final flush snaps
+    /// nothing, and a change in it is still captured by the next.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_directory_past_path_max_is_watched_and_a_repeat_final_snaps_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (boot, registrar) = boot(tmp.path());
+        let ws = boot.layout.working_directory.clone();
+        let mut deep = ws.join("notes");
+        std::fs::create_dir_all(&deep).unwrap();
+        for i in 0..18 {
+            deep = deep.join(format!("d{i:02}{}", "x".repeat(240)));
+            sealant_capture::longpath::create_dir(&deep).unwrap();
+        }
+        let file = deep.join("note.txt");
+        std::io::Write::write_all(
+            &mut sealant_capture::longpath::create(&file).unwrap(),
+            b"one\n",
+        )
+        .unwrap();
+        let mut config = RuntimeConfig::new(new_runtime_id());
+        config.workspace_root = ws.clone();
+        let runtime = Runtime::new(config, Arc::new(ShutdownSignal::new(3_000)));
+        runtime.mark_healthy();
+        let capture = CaptureRuntime::new(boot);
+        assert!(runtime.install_capture(capture.clone()));
+        let harness = runtime
+            .spawn_managed(sh("exec sleep 3600", &ws))
+            .expect("spawn");
+        capture.start(runtime.clone(), harness.process_id);
+        let modes = capture.runner().snapshot();
+        assert_eq!(
+            (modes.small_mode, modes.bulk_mode),
+            (
+                sealant_capture::WatchMode::Watched,
+                sealant_capture::WatchMode::Watched
+            ),
+            "both classes are watched"
+        );
+
+        let first = runtime.final_flush(None, Some(3_000)).await.unwrap();
+        assert!(first.complete, "{first:?}");
+        let registered = registrar.chain().len();
+        let before = capture.runner().snapshot();
+        let again = runtime.final_flush(None, Some(3_000)).await.unwrap();
+        assert!(again.complete, "{again:?}");
+        let after = capture.runner().snapshot();
+        assert_eq!(
+            (after.small_snaps, after.bulk_snaps),
+            (before.small_snaps, before.bulk_snaps),
+            "a repeat final flush snaps nothing"
+        );
+        assert_eq!(registrar.chain().len(), registered);
+
+        // A change down there after all: seen, and captured by the next final flush.
+        std::io::Write::write_all(
+            &mut sealant_capture::longpath::create(&file).unwrap(),
+            b"two\n",
+        )
+        .unwrap();
+        let start = Instant::now();
+        while !capture.runner().snapshot().small_dirty {
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "the watcher sees it"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let last = runtime.final_flush(None, Some(3_000)).await.unwrap();
+        assert!(last.complete, "{last:?}");
+        assert!(registrar.chain().len() > registered);
+        let fresh = restore_head(tmp.path(), &registrar, "fresh");
+        let restored = fresh.join(file.strip_prefix(&ws).unwrap());
+        let mut text = String::new();
+        std::io::Read::read_to_string(
+            &mut sealant_capture::longpath::open(&restored).unwrap(),
+            &mut text,
+        )
+        .unwrap();
+        assert_eq!(text, "two\n");
     }
 }

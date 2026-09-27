@@ -6,11 +6,13 @@
 //! budget: directories are counted before registration, `fs.inotify.max_user_watches` is raised
 //! only when the policy says so, and a class whose watches do not fit polls instead (the stat
 //! walk the engine does anyway). `IN_Q_OVERFLOW` (`need_rescan`) reports an [`ChangeSignal::Overflow`]
-//! and the runner drops to polling.
+//! and the runner drops to polling. Bulk directories that appear after the start get watches
+//! then, within the budget; a directory too long to name is watched through its descriptor.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::mem;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc};
 
@@ -372,32 +374,118 @@ fn pruned_dirs(dir: &Path, prune: &dyn Fn(&Path, &str) -> bool) -> Vec<PathBuf> 
     dirs
 }
 
+/// Where the backend names the directory a watch was registered through, when its own path is
+/// too long to name ([`Registry::watch`]).
+const PROC_FD: &str = "/proc/self/fd";
+
+/// The directories watched, by their paths. `inotify_add_watch` takes a path, and one of
+/// `PATH_MAX` bytes or more cannot be named; such a directory is opened a run of components at a
+/// time ([`longpath::open_dir_path`]) and watched as `/proc/self/fd/<fd>`, which the kernel
+/// resolves to the directory itself. The backend reports its events under that name, and
+/// [`Registry::real`] turns them back into the directory's path. The descriptor is kept while
+/// the watch is, so its number is not reused.
+#[derive(Debug, Default)]
+struct Registry {
+    watched: HashSet<PathBuf>,
+    /// `/proc/self/fd/<fd>` → the directory's path, and the descriptor.
+    by_fd: HashMap<PathBuf, (PathBuf, OwnedFd)>,
+}
+
+impl Registry {
+    fn len(&self) -> usize {
+        self.watched.len()
+    }
+
+    /// Watch the directory `dir`, non-recursively: by its path when that fits in one call,
+    /// else through the opened directory.
+    fn watch(&mut self, watcher: &mut RecommendedWatcher, dir: &Path) -> notify::Result<()> {
+        if longpath::fits(dir) {
+            watcher.watch(dir, RecursiveMode::NonRecursive)?;
+        } else {
+            let fd = longpath::open_dir_path(dir)
+                .map_err(|e| notify::Error::io(e).add_path(dir.to_path_buf()))?;
+            let name = PathBuf::from(format!("{PROC_FD}/{}", fd.as_raw_fd()));
+            watcher.watch(&name, RecursiveMode::NonRecursive)?;
+            self.by_fd.insert(name, (dir.to_path_buf(), fd));
+        }
+        self.watched.insert(dir.to_path_buf());
+        Ok(())
+    }
+
+    /// `path` as an event names it, as a path under the roots: a path under a directory
+    /// watched through its descriptor is that directory's path joined with the rest. `None`
+    /// for a descriptor this registry does not hold.
+    fn real(&self, path: &Path) -> Option<PathBuf> {
+        let Ok(rest) = path.strip_prefix(PROC_FD) else {
+            return Some(path.to_path_buf());
+        };
+        let mut parts = rest.components();
+        let fd = parts.next()?;
+        let (dir, _) = self.by_fd.get(&Path::new(PROC_FD).join(fd))?;
+        let below = parts.as_path();
+        Some(if below.as_os_str().is_empty() {
+            dir.clone()
+        } else {
+            dir.join(below)
+        })
+    }
+
+    /// `dir` is gone: forget it, and release its descriptor (and the backend's watch on it).
+    fn remove(&mut self, watcher: Option<&mut RecommendedWatcher>, dir: &Path) {
+        if !self.watched.remove(dir) {
+            return;
+        }
+        let names: Vec<PathBuf> = self
+            .by_fd
+            .iter()
+            .filter(|(_, (d, _))| d == dir)
+            .map(|(name, _)| name.clone())
+            .collect();
+        if let Some(watcher) = watcher {
+            for name in &names {
+                let _ = watcher.unwatch(name);
+            }
+        }
+        for name in names {
+            self.by_fd.remove(&name);
+        }
+    }
+}
+
 /// Register a non-recursive watch on every directory [`pruned_dirs`] yields under `dir` that is
-/// not already in `watched`: `(registered, failed)`. A failure is logged and counted, never
-/// skipped silently: the caller has the class poll.
+/// not already watched: `(registered, failed)`. A failure is logged and counted, never skipped
+/// silently: the caller has the class poll.
+///
+/// Listed again until a listing finds nothing new: a directory made after the listing and
+/// before its parent's watch existed raised no event (a dependency tree being installed while
+/// its top directory is watched); once every listed directory is watched, anything made in one
+/// of them raises an event.
 fn watch_pruned(
     watcher: &mut RecommendedWatcher,
-    watched: &mut HashSet<PathBuf>,
+    registry: &mut Registry,
     dir: &Path,
     prune: &dyn Fn(&Path, &str) -> bool,
 ) -> (usize, usize) {
     let (mut added, mut failed) = (0, 0);
-    for d in pruned_dirs(dir, prune) {
-        if watched.contains(&d) {
-            continue;
+    loop {
+        let mut new = 0;
+        for d in pruned_dirs(dir, prune) {
+            if registry.watched.contains(&d) {
+                continue;
+            }
+            match registry.watch(watcher, &d) {
+                Ok(()) => new += 1,
+                Err(error) => {
+                    tracing::warn!(dir = %d.display(), %error, "capture: could not watch a directory; its class polls");
+                    failed += 1;
+                }
+            }
         }
-        match watcher.watch(&d, RecursiveMode::NonRecursive) {
-            Ok(()) => {
-                watched.insert(d);
-                added += 1;
-            }
-            Err(error) => {
-                tracing::warn!(dir = %d.display(), %error, "capture: could not watch a directory; its class polls");
-                failed += 1;
-            }
+        added += new;
+        if new == 0 || failed > 0 {
+            return (added, failed);
         }
     }
-    (added, failed)
 }
 
 fn count_dirs(roots: &[PathBuf], prune: &dyn Fn(&Path, &str) -> bool) -> usize {
@@ -460,7 +548,11 @@ pub fn start(
     } else {
         Mode::Polled
     };
-    let bulk = if !bulk_roots.is_empty() && small_dirs + bulk_dirs <= budget {
+    // The bulk class is watched with no bulk directory yet, too: the small class's watches see
+    // one appear (a session's first `pnpm install` runs after this), and the watcher adds its
+    // watches then, within the budget ([`handle_event`]). Before, it polled for the executor's
+    // life, and every final flush walked the dependency tree again.
+    let bulk = if spec.capture_bulk && small_dirs + bulk_dirs <= budget {
         Mode::Watched
     } else {
         Mode::Polled
@@ -491,12 +583,11 @@ pub fn start(
             }
             Err(error) => tracing::warn!(%error, "capture watcher error"),
         })?;
-    let mut watched: HashSet<PathBuf> = HashSet::new();
+    let mut registry = Registry::default();
     let mut small_failed = 0;
     for r in &small_roots {
-        watcher.watch(r, RecursiveMode::NonRecursive)?;
-        watched.insert(r.clone());
-        small_failed += watch_pruned(&mut watcher, &mut watched, r, &small_prune).1;
+        registry.watch(&mut watcher, r)?;
+        small_failed += watch_pruned(&mut watcher, &mut registry, r, &small_prune).1;
     }
     if small_failed > 0 {
         tracing::warn!(
@@ -510,7 +601,7 @@ pub fn start(
     if bulk == Mode::Watched {
         let mut bulk_failed = 0;
         for r in &bulk_roots {
-            bulk_failed += watch_pruned(&mut watcher, &mut watched, r, &bulk_prune).1;
+            bulk_failed += watch_pruned(&mut watcher, &mut registry, r, &bulk_prune).1;
         }
         if bulk_failed > 0 {
             tracing::warn!(
@@ -521,9 +612,11 @@ pub fn start(
             bulk = Mode::Polled;
         }
     }
-    let watches = watched.len();
+    let watches = registry.len();
     tracing::info!(
         watches,
+        through_descriptors = registry.by_fd.len(),
+        bulk_roots = bulk_roots.len(),
         small = ?small,
         bulk = ?bulk,
         "capture watches registered"
@@ -531,20 +624,16 @@ pub fn start(
     *watcher_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(watcher);
 
     let worker_slot = Arc::clone(&watcher_slot);
-    let watch_bulk = bulk == Mode::Watched;
+    let mut state = WatchState {
+        registry,
+        watch_bulk: bulk == Mode::Watched,
+        budget,
+    };
     std::thread::Builder::new()
         .name("capture-watch".to_owned())
         .spawn(move || {
-            let mut watched = watched;
             while let Ok(event) = rx.recv() {
-                handle_event(
-                    &policy,
-                    &worker_slot,
-                    &mut watched,
-                    watch_bulk,
-                    &on_signal,
-                    event,
-                );
+                handle_event(&policy, &worker_slot, &mut state, &on_signal, event);
             }
         })
         .map_err(|e| notify::Error::io(e).add_path(spec.root.clone()))?;
@@ -559,11 +648,19 @@ pub fn start(
     })
 }
 
+/// The watcher thread's state.
+struct WatchState {
+    registry: Registry,
+    /// Bulk directories get watches as they appear; `false` once the bulk class polls.
+    watch_bulk: bool,
+    /// Watches this executor may register.
+    budget: usize,
+}
+
 fn handle_event(
     policy: &Policy,
     watcher_slot: &Mutex<Option<RecommendedWatcher>>,
-    watched: &mut HashSet<PathBuf>,
-    watch_bulk: bool,
+    state: &mut WatchState,
     on_signal: &Arc<dyn Fn(ChangeSignal) + Send + Sync>,
     event: notify::Event,
 ) {
@@ -582,6 +679,11 @@ fn handle_event(
     let mut classes: [bool; 2] = [false, false];
     let written = matches!(event.kind, EventKind::Create(_) | EventKind::Modify(_));
     for path in &event.paths {
+        // A directory watched through its descriptor names its events under that.
+        let Some(path) = state.registry.real(path) else {
+            continue;
+        };
+        let path = path.as_path();
         let Some(class) = policy.classify(path) else {
             continue;
         };
@@ -599,7 +701,7 @@ fn handle_event(
             }
             _ => false,
         };
-        if is_new_dir && (class == Class::Small || watch_bulk) {
+        if is_new_dir && (class == Class::Small || state.watch_bulk) {
             let mut guard = watcher_slot.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(watcher) = guard.as_mut() {
                 let name = path
@@ -608,21 +710,22 @@ fn handle_event(
                     .unwrap_or_default();
                 let bulk_root = policy.bulk_dirs.iter().any(|b| b.as_str() == name);
                 if class == Class::Bulk || bulk_root {
-                    if watch_bulk
-                        && watch_pruned(watcher, watched, path, &|d, n| policy.prune_bulk(d, n)).1
-                            > 0
-                    {
-                        on_signal(ChangeSignal::Unwatched(Class::Bulk));
+                    if state.watch_bulk {
+                        watch_new_bulk(policy, watcher, state, path, on_signal);
                     }
                 } else if !policy.prune_small(path, &name)
-                    && watch_pruned(watcher, watched, path, &|d, n| policy.prune_small(d, n)).1 > 0
+                    && watch_pruned(watcher, &mut state.registry, path, &|d, n| {
+                        policy.prune_small(d, n)
+                    })
+                    .1 > 0
                 {
                     on_signal(ChangeSignal::Unwatched(Class::Small));
                 }
             }
         }
         if matches!(event.kind, EventKind::Remove(_)) {
-            watched.remove(path);
+            let mut guard = watcher_slot.lock().unwrap_or_else(|e| e.into_inner());
+            state.registry.remove(guard.as_mut(), path);
         }
     }
     if classes[0] {
@@ -630,6 +733,41 @@ fn handle_event(
     }
     if classes[1] {
         on_signal(ChangeSignal::Changed(Class::Bulk));
+    }
+}
+
+/// A bulk directory appeared (a dependency tree installed after the watcher started, or a
+/// directory created inside one): watch it and everything below it, within the budget. What
+/// does not fit, or cannot be watched, has the bulk class poll from then on (the small class
+/// keeps what the budget leaves it).
+fn watch_new_bulk(
+    policy: &Policy,
+    watcher: &mut RecommendedWatcher,
+    state: &mut WatchState,
+    dir: &Path,
+    on_signal: &Arc<dyn Fn(ChangeSignal) + Send + Sync>,
+) {
+    let prune = |d: &Path, n: &str| policy.prune_bulk(d, n);
+    let needed = pruned_dirs(dir, &prune)
+        .iter()
+        .filter(|d| !state.registry.watched.contains(*d))
+        .count();
+    if state.registry.len() + needed > state.budget {
+        tracing::info!(
+            dir = %dir.display(),
+            needed,
+            watches = state.registry.len(),
+            budget = state.budget,
+            "bulk directories exceed the watch budget; the bulk class polls at its maximum \
+             interval"
+        );
+        state.watch_bulk = false;
+        on_signal(ChangeSignal::Unwatched(Class::Bulk));
+        return;
+    }
+    if watch_pruned(watcher, &mut state.registry, dir, &prune).1 > 0 {
+        state.watch_bulk = false;
+        on_signal(ChangeSignal::Unwatched(Class::Bulk));
     }
 }
 
@@ -716,38 +854,106 @@ mod tests {
         assert!(policy.prune_small(&root.join(".git/objects"), "objects"));
     }
 
-    /// A directory deeper than `PATH_MAX` cannot be watched (`inotify_add_watch` takes a path):
-    /// it was never even listed, so changes under it went unseen while its class read
-    /// `Watched`. Now the class that holds it polls, at start and when one appears later.
+    /// Every signal until `pred` holds or 5 s pass: whether it held.
+    fn wait_for(rx: &mpsc::Receiver<ChangeSignal>, pred: impl Fn(ChangeSignal) -> bool) -> bool {
+        while let Ok(s) = rx.recv_timeout(std::time::Duration::from_secs(5)) {
+            if pred(s) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Drain what is queued now.
+    fn drain(rx: &mpsc::Receiver<ChangeSignal>) -> Vec<ChangeSignal> {
+        let mut seen = Vec::new();
+        while let Ok(s) = rx.recv_timeout(std::time::Duration::from_millis(300)) {
+            seen.push(s);
+        }
+        seen
+    }
+
+    fn deep(top: &Path) -> PathBuf {
+        let mut p = top.to_path_buf();
+        for i in 0..18 {
+            p = p.join(format!("d{i:02}{}", "x".repeat(240)));
+            longpath::create_dir(&p).unwrap();
+        }
+        p
+    }
+
+    /// A directory deeper than `PATH_MAX` cannot be named to `inotify_add_watch`: it was
+    /// never listed (changes under it unseen while its class read `Watched`), then it made its
+    /// class poll — the small class too, whose every flush then walked the tree again. It is
+    /// watched through its opened descriptor now, at start and when one appears later, and
+    /// its events name its own path.
     #[test]
-    fn a_directory_that_cannot_be_watched_makes_its_class_poll() {
+    fn a_directory_too_long_to_name_is_watched_through_its_descriptor() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("ws");
         fs::create_dir_all(root.join("src")).unwrap();
         fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
-        let deep = |top: &Path| {
-            let mut p = top.to_path_buf();
-            for i in 0..18 {
-                p = p.join(format!("d{i:02}{}", "x".repeat(240)));
-                longpath::create_dir(&p).unwrap();
-            }
-        };
-        // A bulk directory that deep: the bulk class polls, the small class is watched.
-        deep(&root.join("node_modules/pkg"));
-        let started = start(&spec(&root, None), Arc::new(|_| {})).unwrap();
+        let deep_bulk = deep(&root.join("node_modules/pkg"));
+        let deep_small = deep(&root.join("src"));
+        let inv = Arc::new(Invalidations::default());
+        let mut s = spec(&root, None);
+        s.invalidations = Some(Arc::clone(&inv));
+        let (tx, rx) = mpsc::channel();
+        let started = start(
+            &s,
+            Arc::new(move |s| {
+                let _ = tx.send(s);
+            }),
+        )
+        .unwrap();
         assert_eq!(started.small, Mode::Watched);
-        assert_eq!(started.bulk, Mode::Polled);
+        assert_eq!(started.bulk, Mode::Watched);
+
+        let file = deep_small.join("work.rs");
+        let mut f = longpath::create(&file).unwrap();
+        std::io::Write::write_all(&mut f, b"work\n").unwrap();
+        drop(f);
+        assert!(wait_for(&rx, |s| s == ChangeSignal::Changed(Class::Small)));
+        assert!(
+            inv.take(Class::Small).contains(&file),
+            "the write is noted under its own path"
+        );
+        let mut f = longpath::create(&deep_bulk.join("i.js")).unwrap();
+        std::io::Write::write_all(&mut f, b"x").unwrap();
+        drop(f);
+        assert!(wait_for(&rx, |s| s == ChangeSignal::Changed(Class::Bulk)));
+
+        // One moved in after the watcher started: watched too, nothing reported unwatched.
+        let staged = tmp.path().join("staged");
+        fs::create_dir_all(&staged).unwrap();
+        let below = deep(&staged);
+        fs::rename(&staged, root.join("src/moved-in")).unwrap();
+        let seen = drain(&rx);
+        assert!(
+            !seen.contains(&ChangeSignal::Unwatched(Class::Small)),
+            "{seen:?}"
+        );
+        let moved = root
+            .join("src/moved-in")
+            .join(below.strip_prefix(&staged).unwrap());
+        let later = moved.join("later.rs");
+        let mut f = longpath::create(&later).unwrap();
+        std::io::Write::write_all(&mut f, b"later\n").unwrap();
+        drop(f);
+        assert!(wait_for(&rx, |s| s == ChangeSignal::Changed(Class::Small)));
+        assert!(inv.take(Class::Small).contains(&later));
         drop(started);
+    }
 
-        // A worktree directory that deep, there at start: everything polls.
-        deep(&root.join("src"));
-        let started = start(&spec(&root, None), Arc::new(|_| {})).unwrap();
-        assert_eq!(started.small, Mode::Polled);
-        assert!(started.handle.is_none());
-        longpath::remove_dir_all(&root.join("src")).unwrap();
+    /// Docker end to end, round 4: a session's first `pnpm install` runs after sealantd boots,
+    /// so at boot there was no bulk directory, the bulk class polled for the executor's life,
+    /// and every final flush walked the dependency tree again (a Stop took 15 s, not 6–7 s).
+    /// The bulk class is watched with no bulk directory yet, and one made later gets watches.
+    #[test]
+    fn bulk_directories_made_after_start_are_watched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("ws");
         fs::create_dir_all(root.join("src")).unwrap();
-
-        // One made after the watcher started: the class is reported unwatched.
         let (tx, rx) = mpsc::channel();
         let started = start(
             &spec(&root, None),
@@ -757,18 +963,59 @@ mod tests {
         )
         .unwrap();
         assert_eq!(started.small, Mode::Watched);
+        assert_eq!(
+            started.bulk,
+            Mode::Watched,
+            "no bulk directory yet: one appearing is seen"
+        );
+
+        fs::create_dir_all(root.join("node_modules/.pnpm/pkg@1/node_modules/pkg")).unwrap();
+        assert!(wait_for(&rx, |s| s == ChangeSignal::Changed(Class::Bulk)));
+        let seen = drain(&rx);
+        assert!(
+            !seen.contains(&ChangeSignal::Unwatched(Class::Bulk)),
+            "{seen:?}"
+        );
+        // A file written deep inside, in a directory made with the rest: seen.
+        fs::write(
+            root.join("node_modules/.pnpm/pkg@1/node_modules/pkg/index.js"),
+            "x",
+        )
+        .unwrap();
+        assert!(wait_for(&rx, |s| s == ChangeSignal::Changed(Class::Bulk)));
+        drop(started);
+    }
+
+    /// A dependency tree that appears later and does not fit the watch budget has the bulk
+    /// class poll (correctness first); the small class keeps its watches.
+    #[test]
+    fn bulk_directories_past_the_budget_make_the_bulk_class_poll() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("ws");
+        fs::create_dir_all(root.join("src")).unwrap();
+        let mut s = spec(&root, None);
+        s.policy.budget = Some(8);
+        let (tx, rx) = mpsc::channel();
+        let started = start(
+            &s,
+            Arc::new(move |s| {
+                let _ = tx.send(s);
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            (started.small, started.bulk),
+            (Mode::Watched, Mode::Watched)
+        );
         let staged = tmp.path().join("staged");
-        fs::create_dir_all(&staged).unwrap();
-        deep(&staged);
-        fs::rename(&staged, root.join("src/moved-in")).unwrap();
-        let mut unwatched = false;
-        while let Ok(s) = rx.recv_timeout(std::time::Duration::from_secs(5)) {
-            if s == ChangeSignal::Unwatched(Class::Small) {
-                unwatched = true;
-                break;
-            }
+        for i in 0..20 {
+            fs::create_dir_all(staged.join(format!("pkg{i}"))).unwrap();
         }
-        assert!(unwatched, "a directory it could not watch is reported");
+        fs::rename(&staged, root.join("node_modules")).unwrap();
+        assert!(wait_for(&rx, |s| s == ChangeSignal::Unwatched(Class::Bulk)));
+        fs::write(root.join("src/a.rs"), "x").unwrap();
+        assert!(wait_for(&rx, |s| s == ChangeSignal::Changed(Class::Small)));
+        drop(started);
     }
 
     #[test]

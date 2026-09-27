@@ -243,7 +243,13 @@ a class dirty on every create/modify/remove. Small class: `quiet` (2 s) after th
 (120 s), one bulk snap in flight, resumed after every yield without re-reading. Forced snaps
 (`CadenceRunner::snap`, `flush`) preempt a bulk build. Directories are counted before watching;
 over budget (half the sysctl, or `WatchPolicy::budget`) the class polls; `raise_limit` tries the
-sysctl first and never fails boot. `tests/cadence.rs` measures all of it against the real watcher.
+sysctl first and never fails boot. The bulk class is watched with no bulk directory yet (the
+small class's watches see one appear): a bulk directory made after the watcher started (a
+session's first `pnpm install` runs after boot) gets watches then, listed again until a listing
+finds nothing new, within the budget; past it, or where a directory cannot be watched, the bulk
+class polls from then on. Before, it polled for the executor's life, and every final flush after
+a complete one walked the dependency tree again (`final_is_current` needs both classes watched).
+`tests/cadence.rs` measures all of it against the real watcher.
 
 ## Small captures ahead of a bulk upload (`engine.rs`, `ship.rs`)
 
@@ -622,8 +628,11 @@ A capture holds what is on disk, and says so when it cannot.
   still names whole, every untracked directory too long to open) are excluded from the add and
   carried by the workspace class like a nested repository (`tree/<path>`), and restored from
   there; ignored and bulk paths were never git's. A restore writes a file under a short staging
-  name when `.<name>.capture-tmp` would pass `NAME_MAX`. A directory the watcher cannot watch
-  (`inotify_add_watch` takes a path) makes its class poll, at start and when one appears later.
+  name when `.<name>.capture-tmp` would pass `NAME_MAX`. A directory too long to name to
+  `inotify_add_watch` (it takes a path) is opened a run of components at a time and watched as
+  `/proc/self/fd/<fd>`, at start and when one appears later; its events are named by its own
+  path again. Only a directory that cannot be watched that way either makes its class poll (it
+  made the small class poll, and every final flush after a complete one snapped it again).
 - **One path is one path.** Whatever error one path's metadata gives (not only `EACCES`), it is
   that path's: the overlay reports it unreadable and carries its previous entry (and, for a
   directory it cannot list, the directories the previous document held under it); a `final`
