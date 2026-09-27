@@ -41,7 +41,25 @@ pseudo-ref through a two-tree `read-tree --reset -u` (a full `checkout-index` wh
 known about the disk). Files, symlinks and emptied directories the plan no longer names are
 removed, and only inside what a capture would list (`ClassRoots`, the same policy the engine's
 listings use): never the staging directory, excluded names, credentials, or the bulk
-directories of a `"pending"` bulk section. Content and dir packs are fetched up front, eight GETs in flight (`PACK_GETS_IN_FLIGHT`), into
+directories of a `"pending"` bulk section. Each removed path is logged at debug
+(`materialize: removed …`); `removed` in the `capture head materialized` line counts them.
+
+On a fresh executor that count is not zero, and what it counts is `git init`'s template, never
+work product. The materializer creates the repository with a plain `git init`
+(`GitRepo::init`), which writes `.git/hooks/*.sample` (14 with git 2.43, the Ubuntu workspace
+image; 13 with Debian's 2.39), `.git/description`, `.git/config` and `.git/info/exclude`. The
+workspace class lists `.git/` bookkeeping, and no captured disk holds the samples or
+`description` (the first executor's materialize removed them before its first snap), so every
+later fresh boot removes exactly those 15 (`removed=15` in the Docker end to end, from heads 17
+to 67). The executor that boots on a control-plane base capture (an empty workspace root)
+removes 17: `config` and `info/exclude` too, which sealantd writes again right after
+(`info/exclude` with `/.sealantd/`, `config` by `remotes::apply`); the template's `config` holds
+only git's built-in defaults for a non-bare repository. Git never runs a `*.sample` hook, and a
+real hook is captured and restored like any `.git/` file. Nothing in the worktree or the
+harness home is removed on a fresh executor: the disk is empty before the head is laid down
+(`tests/fresh_boot_removals.rs` holds it: `removed` is exactly the template files no capture
+holds, and the worktree and harness home come back whole).
+Content and dir packs are fetched up front, eight GETs in flight (`PACK_GETS_IN_FLIGHT`), into
 the pack cache (`.sealantd/capture/cache/`), and a pack already there is not fetched again.
 `tests/delta.rs` measures it: a head applied over a
 materialized base wrote 9 files / 213 KB where a fresh materialize writes 427 files / 1.7 MB,

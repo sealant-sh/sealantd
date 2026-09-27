@@ -738,6 +738,7 @@ impl<'a> Materializer<'a> {
                 let path = self.targets.root.join(&rel);
                 if fs::symlink_metadata(&path).is_ok_and(|m| !m.is_dir()) {
                     fs::remove_file(&path)?;
+                    tracing::debug!(path = %path.display(), "materialize: removed a file the worktree tree does not name");
                     report.removed += 1;
                 }
             }
@@ -1087,7 +1088,10 @@ impl<'a> Materializer<'a> {
                 fs::remove_dir(&src.abs).ok();
             } else {
                 match fs::remove_file(&src.abs) {
-                    Ok(()) => report.removed += 1,
+                    Ok(()) => {
+                        tracing::debug!(path = %src.abs.display(), "materialize: removed a file the plan does not name");
+                        report.removed += 1;
+                    }
                     Err(e) if e.kind() == io::ErrorKind::NotFound => {}
                     Err(e) => return Err(e.into()),
                 }
