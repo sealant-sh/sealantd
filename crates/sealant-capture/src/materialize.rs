@@ -276,6 +276,27 @@ pub struct DiskState {
     pub worktree_tree: Option<String>,
     /// The index tree the index was last read from.
     pub index_tree: Option<String>,
+    /// The capture the last completed materialize brought the disk to, and under which lease
+    /// epoch and executor ([`MaterializedCapture`]). The caller that knows them records it
+    /// once a materialize completed ([`DiskState::record_capture`]); a materialize clears it
+    /// before it writes anything, so an interrupted one leaves none.
+    pub capture: Option<MaterializedCapture>,
+}
+
+/// What a completed materialize brought the disk to: the capture id, and the lease epoch and
+/// executor (the launch `plan.get` named) it was materialized under. A recovery boot that finds
+/// no staging continuing the head resumes a disk only when this names the plan's head, under
+/// the plan's executor, at an epoch no later than the plan's (review 2026-09-28 #22): equal
+/// worktree trees said nothing of the refs, index, bulk or metadata beside them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MaterializedCapture {
+    /// The capture id.
+    pub capture_id: String,
+    /// The lease epoch.
+    pub epoch: u64,
+    /// The executor `plan.get` named, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executor: Option<String>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -283,6 +304,8 @@ struct MaterializedRecord {
     worktree_tree: Option<String>,
     #[serde(default)]
     index_tree: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    capture: Option<MaterializedCapture>,
 }
 
 impl DiskState {
@@ -298,7 +321,15 @@ impl DiskState {
             bulk: TreeIndex::load(&index_dir.join("bulk.json")),
             worktree_tree: record.worktree_tree,
             index_tree: record.index_tree,
+            capture: record.capture,
         }
+    }
+
+    /// Record in `index_dir` that the disk holds `capture` (a materialize of it completed).
+    pub fn record_capture(index_dir: &Path, capture: MaterializedCapture) -> io::Result<()> {
+        let mut state = Self::load(index_dir);
+        state.capture = Some(capture);
+        state.save(index_dir)
     }
 
     /// Save to `index_dir` (write-then-rename per file).
@@ -313,6 +344,7 @@ impl DiskState {
             serde_json::to_vec(&MaterializedRecord {
                 worktree_tree: self.worktree_tree.clone(),
                 index_tree: self.index_tree.clone(),
+                capture: self.capture.clone(),
             })?,
         )?;
         fs::rename(tmp, path)
@@ -456,6 +488,11 @@ impl<'a> Materializer<'a> {
         state: &mut DiskState,
     ) -> Result<MaterializeReport, MaterializeError> {
         let mut report = MaterializeReport::default();
+        // What the disk held is about to change: until the caller records the capture this
+        // materialize brings it to, it names none.
+        if state.capture.take().is_some() {
+            state.save(&self.targets.index_dir)?;
+        }
         fs::create_dir_all(&self.targets.root).at("mkdir -p", &self.targets.root)?;
         fs::create_dir_all(&self.targets.cache_dir).at("mkdir -p", &self.targets.cache_dir)?;
         let roots = self.targets.roots();

@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use sealant_capture::engine::Pickup;
 use sealant_capture::gitpack::GitRepo;
-use sealant_capture::manifest::{BulkState, DirFormat, Sections, WORKTREE_TREE_REF};
-use sealant_capture::materialize::DiskState;
+use sealant_capture::manifest::{BulkState, DirFormat, Sections};
+use sealant_capture::materialize::{DiskState, MaterializedCapture};
 use sealant_capture::registrar::{PlanGetRequest, RegistrarMinter};
 use sealant_capture::{
     BlobSink, CaptureConfig, CaptureEngine, ChannelTransport, HttpRegistrar, MaterializeClass,
@@ -253,29 +253,48 @@ pub(crate) fn boot_from(
     // A recovery boot restores nothing: the disk holds work no registered capture has, and a
     // materialize would take it back. It resumes this disk as it is when the disk is provably
     // this executor's own continuation of the head — its staging continues the head (above), or
-    // its materialize of the head completed (and every change since is on disk, to be snapped)
-    // — and refuses to boot otherwise, touching nothing.
+    // its materialize of exactly the head's capture completed under this plan's executor at an
+    // epoch no later than the plan's (and every change since is on disk, to be snapped) — and
+    // refuses to boot otherwise, touching nothing. Equal worktree trees are not that proof:
+    // two captures can share one and differ in refs, index, bulk or metadata, and recovering a
+    // stale disk against a head that moved on would register its old state as the successor
+    // (review 2026-09-28 #22).
     if source.recovery && !resumed {
-        let materialized = DiskState::load(&config.staging_dir().join("index")).worktree_tree;
-        let holds_head = match &plan.head {
-            Some(head) => {
-                materialized.is_some()
-                    && materialized.as_ref()
-                        == head.manifest.sections.git.refs.get(WORKTREE_TREE_REF)
+        let materialized = DiskState::load(&config.staging_dir().join("index")).capture;
+        let holds_head = match (&plan.head, &materialized) {
+            (Some(head), Some(disk)) => {
+                let bound = disk.capture_id == head.capture_id
+                    && disk.executor == plan.executor
+                    && disk.epoch <= epoch;
+                if !bound {
+                    tracing::error!(
+                        disk_capture = %disk.capture_id,
+                        disk_epoch = disk.epoch,
+                        disk_executor = ?disk.executor,
+                        head_capture = %head.capture_id,
+                        plan_epoch = epoch,
+                        plan_executor = ?plan.executor,
+                        "recovery: the disk's materialize is not this plan's head under this \
+                         executor and lease"
+                    );
+                }
+                bound
             }
-            None => working_directory.join(".git").exists(),
+            (Some(_), None) => false,
+            (None, _) => working_directory.join(".git").exists(),
         };
         if !holds_head {
             return Err(BootError::config(format!(
                 "recovery: {} is not this executor's continuation of the chain head (no staging \
-                 that continues it, and no completed materialize of it); refusing to \
-                 materialize over it or to capture it — the disk is left as it is",
+                 that continues it, and no completed materialize of exactly that capture under \
+                 this executor and lease); refusing to materialize over it or to capture it — \
+                 the disk is left as it is",
                 working_directory.display()
             )));
         }
         tracing::warn!(
             "recovery: no staging continues the head, but the head's materialize completed on \
-             this disk; resuming it as it is"
+             this disk under this executor and lease; resuming it as it is"
         );
         resumed = true;
     }
@@ -337,6 +356,16 @@ pub(crate) fn boot_from(
                 fsck = ?report.fsck,
                 "capture head materialized"
             );
+            // What a recovery boot on this disk binds to.
+            DiskState::record_capture(
+                &config.staging_dir().join("index"),
+                MaterializedCapture {
+                    capture_id: head.capture_id.clone(),
+                    epoch,
+                    executor: plan.executor.clone(),
+                },
+            )
+            .map_err(|error| BootError::config(format!("capture materialize record: {error}")))?;
             Some(manifest)
         }
         None => {
@@ -1187,5 +1216,72 @@ mod tests {
         )
         .unwrap();
         assert_eq!(boot.engine.config().executor.as_deref(), Some("launch-7"));
+    }
+
+    /// A recovery boot's fallback (no staging continues the head) binds the disk to the exact
+    /// capture its completed materialize wrote (review 2026-09-28 #22), not to a worktree tree
+    /// that happens to be equal: the disk materialized capture A; the chain moved on to capture
+    /// B, whose worktree tree is A's but whose refs are not. Recovering that disk against B
+    /// would snap A's refs over B's and register them as B's successor. Refused, untouched;
+    /// the same disk against A itself is resumed.
+    #[test]
+    fn a_recovery_boot_binds_the_disk_to_the_capture_it_materialized() {
+        let tmp = tempfile::tempdir().unwrap();
+        let registrar = Arc::new(InMemoryRegistrar::new("wt-boot", 1, None));
+        let sink = capture_source(tmp.path(), &registrar);
+        let dyn_sink: Arc<dyn BlobSink> = sink.clone();
+        let a = registrar.head().unwrap();
+        let recovery = CaptureSourceConfig {
+            recovery: true,
+            ..source()
+        };
+        let disk = tmp.path().join("disk");
+        drop(
+            boot_from(
+                registrar.clone(),
+                Some(dyn_sink.clone()),
+                &source(),
+                &disk,
+                tmp.path(),
+            )
+            .unwrap(),
+        );
+        std::fs::write(disk.join("unsaved.rs"), "// written, never snapped\n").unwrap();
+        let _ = std::fs::remove_file(disk.join(".sealantd/capture/index/last.json"));
+
+        // The chain moves on: a branch only, the worktree tree unchanged.
+        let src = tmp.path().join("src");
+        git(&src, &["branch", "side"]);
+        let mut engine = CaptureEngine::open(
+            CaptureConfig::new("wt-boot", 1, &src),
+            Some(a.manifest.clone().encode()),
+        )
+        .unwrap();
+        engine
+            .snap(SnapRequest {
+                kind: CaptureKind::Checkpoint,
+                class: Class::Small,
+                seq: 5,
+            })
+            .unwrap();
+        let dyn_registrar: Arc<dyn Registrar> = registrar.clone();
+        engine
+            .shipper(dyn_sink.clone(), dyn_registrar)
+            .ship_pending()
+            .unwrap();
+        let b = registrar.head().unwrap();
+        assert_ne!(b.capture_id, a.capture_id);
+        let before = tree(&disk);
+        match boot_from(
+            registrar.clone(),
+            Some(dyn_sink.clone()),
+            &recovery,
+            &disk,
+            tmp.path(),
+        ) {
+            Ok(_) => panic!("recovered a disk materialized from another capture than the head"),
+            Err(refused) => assert!(refused.to_string().contains("recovery"), "{refused}"),
+        }
+        assert_eq!(tree(&disk), before, "refused, touched by nothing");
     }
 }

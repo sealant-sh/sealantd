@@ -429,6 +429,16 @@ impl CaptureRuntime {
                         fsck = ?report.fsck,
                         "capture head materialized over the disk"
                     );
+                    // What a recovery boot on this disk binds to.
+                    sealant_capture::materialize::DiskState::record_capture(
+                        &engine.materialize_targets().index_dir,
+                        sealant_capture::materialize::MaterializedCapture {
+                            capture_id: head.capture_id.clone(),
+                            epoch: plan.epoch,
+                            executor: plan.executor.clone(),
+                        },
+                    )
+                    .map_err(|e| internal(&format!("capture materialize record: {e}")))?;
                     (Some(manifest), report)
                 }
                 None => {
