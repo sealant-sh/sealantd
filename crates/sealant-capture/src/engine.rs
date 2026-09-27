@@ -15,6 +15,7 @@ use crate::index::{
     self, BuildStats, ChunkSink, DAEMON_DIR, Listing, Suspects, TreeBuilder, TreeIndex,
     UnreadablePath, UnreadableWork,
 };
+use crate::io_at::IoAt;
 use crate::keys::KeyPrefix;
 use crate::manifest::{
     BulkSection, BulkState, CaptureKind, DirFormat, EncodedManifest, FORMAT_DIR_PACKS, GitSection,
@@ -528,8 +529,9 @@ impl LastStaged {
 
     fn save(&self, index_dir: &Path) -> io::Result<()> {
         let tmp = index_dir.join("last.tmp");
-        fs::write(&tmp, serde_json::to_vec(self)?)?;
-        fs::rename(tmp, index_dir.join("last.json"))
+        fs::write(&tmp, serde_json::to_vec(self)?).at("write", &tmp)?;
+        let path = index_dir.join("last.json");
+        fs::rename(tmp, &path).at("rename into", &path)
     }
 }
 
@@ -1075,15 +1077,17 @@ impl CaptureEngine {
         }
         self.workspace_index.save(&dir.join("workspace.json"))?;
         self.bulk_index.save(&dir.join("bulk.json"))?;
-        let tmp = dir.join("chunks.tmp");
-        fs::write(&tmp, serde_json::to_vec(&self.chunks)?)?;
-        fs::rename(tmp, dir.join("chunks.json"))?;
-        let tmp = dir.join("dirs.tmp");
-        fs::write(&tmp, serde_json::to_vec(&self.dirs)?)?;
-        fs::rename(tmp, dir.join("dirs.json"))?;
-        let tmp = dir.join("git-tips.tmp");
-        fs::write(&tmp, serde_json::to_vec(&self.last_tips)?)?;
-        fs::rename(tmp, dir.join("git-tips.json"))
+        for (name, bytes) in [
+            ("chunks", serde_json::to_vec(&self.chunks)?),
+            ("dirs", serde_json::to_vec(&self.dirs)?),
+            ("git-tips", serde_json::to_vec(&self.last_tips)?),
+        ] {
+            let tmp = dir.join(format!("{name}.tmp"));
+            fs::write(&tmp, bytes).at("write", &tmp)?;
+            let path = dir.join(format!("{name}.json"));
+            fs::rename(&tmp, &path).at("rename into", &path)?;
+        }
+        Ok(())
     }
 
     /// The class roots this engine captures (and a materializer sweeps).
@@ -1341,7 +1345,7 @@ impl CaptureEngine {
                     let file = format!("tree-{sha}");
                     let path = objects.join(&file);
                     if !path.exists() && !self.staging.is_uploaded(&file) {
-                        fs::write(&path, &dir.bytes)?;
+                        fs::write(&path, &dir.bytes).at("write", &path)?;
                         stats.dirs_new += 1;
                     }
                     if !self.staging.is_uploaded(&file) {
@@ -1720,10 +1724,8 @@ impl CaptureEngine {
         .encode();
         let manifest_key = self.prefix.manifest(&manifest.capture_id);
         let manifest_file = format!("manifest-{}", manifest.capture_id);
-        fs::write(
-            self.staging.objects_dir().join(&manifest_file),
-            &manifest.bytes,
-        )?;
+        let manifest_path = self.staging.objects_dir().join(&manifest_file);
+        fs::write(&manifest_path, &manifest.bytes).at("write", &manifest_path)?;
         let mut uploads: Vec<Upload> = bulk
             .uploads
             .iter()
@@ -2128,7 +2130,8 @@ impl CaptureEngine {
         .encode();
         let manifest_key = self.prefix.manifest(&manifest.capture_id);
         let manifest_file = format!("manifest-{}", manifest.capture_id);
-        fs::write(objects.join(&manifest_file), &manifest.bytes)?;
+        let manifest_path = objects.join(&manifest_file);
+        fs::write(&manifest_path, &manifest.bytes).at("write", &manifest_path)?;
         let mut all_uploads: Vec<Upload> = Vec::new();
         if let Some(target) = &repairing {
             // Everything the replaced captures staged but their manifests: this manifest may
@@ -2337,10 +2340,8 @@ impl CaptureEngine {
         .encode();
         let manifest_key = self.prefix.manifest(&manifest.capture_id);
         let manifest_file = format!("manifest-{}", manifest.capture_id);
-        fs::write(
-            self.staging.objects_dir().join(&manifest_file),
-            &manifest.bytes,
-        )?;
+        let manifest_path = self.staging.objects_dir().join(&manifest_file);
+        fs::write(&manifest_path, &manifest.bytes).at("write", &manifest_path)?;
         let uploads = vec![Upload {
             key: manifest_key.clone(),
             file: manifest_file,

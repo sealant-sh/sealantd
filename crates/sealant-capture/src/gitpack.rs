@@ -297,9 +297,9 @@ impl GitRepo {
         if !real_index.exists() {
             return Ok(None);
         }
-        fs::create_dir_all(scratch_dir)?;
+        fs::create_dir_all(scratch_dir).map_err(at("mkdir -p", scratch_dir))?;
         let tmp_index = scratch_dir.join("index-tree");
-        fs::copy(&real_index, &tmp_index)?;
+        fs::copy(&real_index, &tmp_index).map_err(at("copy into", &tmp_index))?;
         let out = git_command(&self.root)
             .env("GIT_INDEX_FILE", &tmp_index)
             .args(["write-tree"])
@@ -606,7 +606,7 @@ impl GitRepo {
             specs.extend_from_slice(p.as_bytes());
             specs.push(0);
         }
-        fs::write(&spec_file, &specs)?;
+        fs::write(&spec_file, &specs).map_err(at("write", &spec_file))?;
         let out = git_command(&self.root)
             .env("GIT_INDEX_FILE", tmp_index)
             .env("LC_ALL", "C")
@@ -649,12 +649,12 @@ impl GitRepo {
         excludes: &[String],
         carry_from: Option<&str>,
     ) -> Result<WorktreeTree, GitError> {
-        fs::create_dir_all(scratch_dir)?;
+        fs::create_dir_all(scratch_dir).map_err(at("mkdir -p", scratch_dir))?;
         let tmp_index = scratch_dir.join("snap-index");
         let real_index = self.git_dir.join("index");
         fs::remove_file(&tmp_index).ok();
         if real_index.exists() {
-            fs::copy(&real_index, &tmp_index)?;
+            fs::copy(&real_index, &tmp_index).map_err(at("copy into", &tmp_index))?;
         } else if let Some(head_tree) = self.head_tree()? {
             let rt = ["read-tree", &head_tree];
             check(
@@ -692,7 +692,7 @@ impl GitRepo {
             // The add died part way: start again from the index it was given.
             fs::remove_file(&tmp_index).ok();
             if real_index.exists() {
-                fs::copy(&real_index, &tmp_index)?;
+                fs::copy(&real_index, &tmp_index).map_err(at("copy into", &tmp_index))?;
             } else if let Some(head_tree) = self.head_tree()? {
                 let rt = ["read-tree", &head_tree];
                 check(
@@ -1102,7 +1102,7 @@ fn pack_once(
         input.push('\n');
     }
     let tmp = out_dir.join(format!(".git-pack-{attempt}.pack"));
-    let file = File::create(&tmp)?;
+    let file = File::create(&tmp).map_err(at("create", &tmp))?;
     let args = ["pack-objects", "--revs", "--stdout", "-q"];
     let mut child = git_command(&repo.root)
         .args(args)
@@ -1133,8 +1133,8 @@ fn pack_once(
     let sha256 = sha256_hex(&bytes);
     let path = out_dir.join(&sha256);
     let idx_path = out_dir.join(format!("{sha256}.idx"));
-    fs::rename(&tmp, &path)?;
-    fs::rename(tmp.with_extension("idx"), &idx_path)?;
+    fs::rename(&tmp, &path).map_err(at("rename into", &path))?;
+    fs::rename(tmp.with_extension("idx"), &idx_path).map_err(at("rename into", &idx_path))?;
     Ok(Some(FinishedGitPack {
         path,
         idx_path,
@@ -1166,7 +1166,7 @@ pub fn build_git_pack_carrying(
     excludes: &[String],
     carry_from: Option<&str>,
 ) -> Result<GitPackResult, GitError> {
-    fs::create_dir_all(out_dir)?;
+    fs::create_dir_all(out_dir).map_err(at("mkdir -p", out_dir))?;
     let negatives = repo.existing(previous_tips)?;
     let mut last: Option<(Option<FinishedGitPack>, Closure)> = None;
     for attempt in 1..=PACK_ATTEMPTS {

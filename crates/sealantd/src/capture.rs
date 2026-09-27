@@ -2524,4 +2524,44 @@ mod tests {
         assert!(capture.status().complete);
         assert_eq!(runtime.quiesce_count(), 1);
     }
+
+    /// Docker end to end, round 4, on a full disk: every snap failed with `No space left on
+    /// device (os error 28)`, which named neither the file nor the step, and every final flush
+    /// of the kept executor, its small snap failed already, walked the bulk class for 2.4 s
+    /// more. The error names what was written and where; a final flush whose small snap failed
+    /// is incomplete without a bulk snap.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_snap_on_a_full_disk_names_the_file_and_the_final_flush_stops_there() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (runtime, capture, _registrar, ws) = watched_runtime(tmp.path()).await;
+        // The first file the snap writes after its objects, made to fail as a full disk does:
+        // a write to /dev/full is ENOSPC, for root too.
+        let full = ws.join(".sealantd/capture/index/last.tmp");
+        std::os::unix::fs::symlink("/dev/full", &full).unwrap();
+
+        let bulk_snaps = capture.runner().snapshot().bulk_snaps;
+        let report = runtime.final_flush(None, Some(3_000)).await.unwrap();
+        assert!(!report.complete, "{report:?}");
+        assert_eq!(
+            report.incomplete_reason.as_deref(),
+            Some("snapshot-failed"),
+            "{report:?}"
+        );
+        let small = report
+            .snaps
+            .iter()
+            .find(|s| s.class == CaptureClass::Small)
+            .expect("the small class's snaps");
+        let error = small.last_snap_error.as_deref().expect("a snap error");
+        let expected = format!("write {}: No space left on device", full.display());
+        assert!(
+            error.starts_with(&expected),
+            "the error names the operation and the path: {error:?}"
+        );
+        assert_eq!(
+            capture.runner().snapshot().bulk_snaps,
+            bulk_snaps,
+            "no bulk snap after the small one failed"
+        );
+    }
 }

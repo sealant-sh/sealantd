@@ -224,9 +224,10 @@ impl TreeIndex {
 
     /// Save as JSON (write-then-rename).
     pub fn save(&self, path: &Path) -> io::Result<()> {
+        use crate::io_at::IoAt;
         let tmp = path.with_extension("tmp");
-        fs::write(&tmp, serde_json::to_vec(self)?)?;
-        fs::rename(tmp, path)
+        fs::write(&tmp, serde_json::to_vec(self)?).at("write", &tmp)?;
+        fs::rename(tmp, path).at("rename into", path)
     }
 }
 

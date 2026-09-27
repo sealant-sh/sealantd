@@ -944,8 +944,9 @@ impl CadenceRunner {
     /// The final flush — the executor is going away, and its disk with it; the caller has
     /// stopped every writer first. A forced small-class snap AND a forced bulk-class snap (the
     /// dependency tree as it is now, whatever the bulk clocks say; a scheduled bulk build in
-    /// progress yields to it and the forced snap resumes its progress), then ship and register
-    /// everything, bulk included ([`Shipper::flush_final`]). Complete only when both snaps
+    /// progress yields to it and the forced snap resumes its progress; not taken when the small
+    /// snap failed, since the flush cannot complete then), then ship and register everything,
+    /// bulk included ([`Shipper::flush_final`]). Complete only when both snaps
     /// succeeded and nothing is left staged: a failed snap no longer passes for success because
     /// older captures drained (a failed bulk snap was logged and ignored), and neither does a
     /// fence, a conflict or the deadline. Whatever fails, what could be staged still ships
@@ -1008,7 +1009,11 @@ impl CadenceRunner {
                 incomplete = Some(Incomplete::from_snap(Class::Small, &error));
             }
             let mut bulk_staged = false;
-            if self.shared.capture_bulk {
+            // The small snap failed: this flush is incomplete whatever the bulk snap does, and
+            // nothing it stages would be read as saved. The bulk class is snapped by the flush
+            // that can complete (a dependency tree is 2.5 s or more to walk; a kept executor
+            // asked again and again spent it every time).
+            if self.shared.capture_bulk && incomplete.is_none() {
                 match self.shared.bulk_snap(true) {
                     Ok(staged) => bulk_staged = !staged.unchanged,
                     Err(error) => {

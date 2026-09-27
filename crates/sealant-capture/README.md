@@ -751,7 +751,12 @@ inside the same flush; and when the newest capture is not a final one (the final
 staged ahead of a scheduled bulk capture still uploading, and the final bulk snap found that
 capture current), a final capture with its sections seals the chain (`seal_final`, its manifest
 only). Before, the flush after the one that said `complete` registered those (8 KB and 19 KB,
-`files_read=0`), and until then the head was of kind `auto` or lacked the links. A final flush
+`files_read=0`), and until then the head was of kind `auto` or lacked the links. A final flush whose small snap
+failed takes no bulk snap: it is incomplete (`snapshot-failed`) whatever that snap does, and on
+a kept executor asked again and again each one walked the dependency tree for 2.4 s. An I/O
+error names what was done and where (`write /…/.sealantd/capture/index/last.tmp: No space left
+on device (os error 28)`, not the bare `No space left on device (os error 28)`), in the flush's
+error and in `snaps[].last_snap_error`. A final flush
 asked again (the drain's, the SIGTERM handler's, the boot's on the harness's exit) snaps
 nothing when the last one snapped every class without an error, snaps are no longer allowed
 (the writers are stopped, admission closed) and the watcher — watching both classes, never

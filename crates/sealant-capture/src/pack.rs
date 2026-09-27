@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::chunk::ChunkId;
+use crate::io_at::IoAt;
 
 /// Trailing magic.
 pub const PACK_MAGIC: [u8; 8] = *b"SLCP0001";
@@ -102,7 +103,7 @@ impl PackWriter {
     /// Start a pack at `path` (a temporary name; [`PackWriter::finish`] renames it beside itself).
     pub fn create(path: &Path, cap: u64) -> io::Result<Self> {
         Ok(Self {
-            file: BufWriter::new(File::create(path)?),
+            file: BufWriter::new(File::create(path).at("create", path)?),
             path: path.to_path_buf(),
             hasher: Sha256::new(),
             offset: 0,
@@ -132,7 +133,7 @@ impl PackWriter {
 
     /// Append an already-compressed chunk.
     pub fn append(&mut self, hash: ChunkId, compressed: &[u8], size: u64) -> io::Result<()> {
-        self.file.write_all(compressed)?;
+        self.file.write_all(compressed).at("write", &self.path)?;
         self.hasher.update(compressed);
         self.entries.push(PackIndexEntry {
             hash,
@@ -147,26 +148,28 @@ impl PackWriter {
     /// Write the trailer, rename the file to its sha256 and return the finished pack.
     pub fn finish(mut self) -> Result<FinishedPack, PackError> {
         let index = serde_json::to_vec(&self.entries)?;
-        self.file.write_all(&index)?;
+        let path = self.path.clone();
+        self.file.write_all(&index).at("write", &path)?;
         self.hasher.update(&index);
         let len = (index.len() as u64).to_le_bytes();
-        self.file.write_all(&len)?;
+        self.file.write_all(&len).at("write", &path)?;
         self.hasher.update(len);
-        self.file.write_all(&PACK_MAGIC)?;
+        self.file.write_all(&PACK_MAGIC).at("write", &path)?;
         self.hasher.update(PACK_MAGIC);
-        self.file.flush()?;
+        self.file.flush().at("write", &path)?;
         let file = self
             .file
             .into_inner()
-            .map_err(io::IntoInnerError::into_error)?;
-        file.sync_data()?;
+            .map_err(io::IntoInnerError::into_error)
+            .at("write", &path)?;
+        file.sync_data().at("sync", &path)?;
         let bytes = self.offset + index.len() as u64 + TRAILER_LEN;
         let sha256 = hex::encode(self.hasher.finalize());
         let final_path = self
             .path
             .parent()
             .map_or_else(|| PathBuf::from(&sha256), |p| p.join(&sha256));
-        fs::rename(&self.path, &final_path)?;
+        fs::rename(&self.path, &final_path).at("rename into", &final_path)?;
         Ok(FinishedPack {
             path: final_path,
             sha256,
