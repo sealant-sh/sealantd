@@ -86,6 +86,9 @@ and empty directories and every tracked mtime were lost.
   and linking would then replace one content with the other. Left unlinked, each name holds
   exactly what its class captured, and the next bulk capture brings them together again. The
   relinked name's new inode goes into its class's index, so a head over itself writes nothing.
+  Relinking (remove the name, link it) moves its directory's mtime, and that directory's class
+  set it already — `node_modules` itself, a pnpm `file:` package's directories (the Docker end
+  to end found 31 wrong): the directory gets back the mtime it had before the relink.
 - **A path it cannot read is not gone.** A tracked path whose metadata cannot be read (a
   directory above it that cannot be searched; git carries its content from the previous capture,
   see "What a snap reads") keeps the previous document's entry in an automatic snap and counts as

@@ -882,3 +882,82 @@ fn hardlinks_across_classes_are_kept() {
         assert_eq!(ino(&last.join(n)), ino(&last.join("shared.txt")), "{n}");
     }
 }
+
+/// Docker end to end, round 2: 31 directory mtimes were not restored — `node_modules` itself
+/// and the directories of a pnpm `file:` package, whose files are hardlinks of tracked files.
+/// Linking the bulk names onto the tracked inode (remove, then link) ran after the bulk class
+/// had set its directories' mtimes, and moved them. Every directory comes back to the
+/// nanosecond: a tracked package hardlinked into a nested `node_modules` package, a tracked
+/// file hardlinked directly under `node_modules`, and a `node_modules/.bin` symlink.
+#[test]
+fn directory_mtimes_survive_cross_class_relinks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("ws");
+    let local = root.join("packages/local");
+    let linked = root.join("node_modules/.pnpm/local@file+packages+local/node_modules/local");
+    fs::create_dir_all(local.join("lib")).unwrap();
+    fs::create_dir_all(linked.join("lib")).unwrap();
+    fs::create_dir_all(root.join("node_modules/.bin")).unwrap();
+    git(&root, &["init", "-q", "-b", "main"]);
+    git(&root, &["config", "user.email", "t@t"]);
+    git(&root, &["config", "user.name", "t"]);
+    fs::write(root.join(".gitignore"), "node_modules/\n").unwrap();
+    fs::write(local.join("package.json"), "{\"name\":\"local\"}\n").unwrap();
+    fs::write(local.join("index.js"), "module.exports = 1;\n").unwrap();
+    fs::write(local.join("lib/util.js"), "module.exports = 2;\n").unwrap();
+    fs::write(root.join("direct.js"), "direct\n").unwrap();
+    for rel in ["package.json", "index.js", "lib/util.js"] {
+        fs::hard_link(local.join(rel), linked.join(rel)).unwrap();
+    }
+    fs::hard_link(root.join("direct.js"), root.join("node_modules/direct.js")).unwrap();
+    std::os::unix::fs::symlink(
+        "../.pnpm/local@file+packages+local/node_modules/local/index.js",
+        root.join("node_modules/.bin/local"),
+    )
+    .unwrap();
+    git(&root, &["add", "-A"]);
+    git(&root, &["commit", "-q", "-m", "a"]);
+    // Distinct mtimes on every directory, deepest first so a parent keeps its own.
+    let mut dirs: Vec<PathBuf> = walkdir::WalkDir::new(&root)
+        .into_iter()
+        .filter_entry(|e| e.file_name() != ".git")
+        .map(Result::unwrap)
+        .filter(|e| e.file_type().is_dir())
+        .map(|e| e.path().to_path_buf())
+        .collect();
+    dirs.sort_by_key(|d| std::cmp::Reverse(d.components().count()));
+    for (i, dir) in dirs.iter().enumerate() {
+        set_mtime(dir, 1_600_000_000_000_000_000 + i as i64 * 1_000_003_007);
+    }
+
+    let sink = Arc::new(LocalDir::new(&tmp.path().join("store")).unwrap());
+    let registrar = Arc::new(InMemoryRegistrar::new("wt-dirs", 1, None));
+    let mut engine = CaptureEngine::open(CaptureConfig::new("wt-dirs", 1, &root), None).unwrap();
+    snap(&mut engine, CaptureKind::Turn, 1);
+    engine
+        .snap(SnapRequest {
+            kind: CaptureKind::Auto,
+            class: Class::Bulk,
+            seq: 2,
+        })
+        .unwrap();
+    snap(&mut engine, CaptureKind::Turn, 3);
+    engine
+        .shipper(sink.clone(), registrar.clone())
+        .ship_pending()
+        .unwrap();
+    let head = registrar.head().unwrap();
+
+    let restored = tmp.path().join("restored");
+    Materializer::new(sink.as_ref(), MaterializeTargets::new(&restored, None))
+        .materialize(&head.manifest, MaterializeClass::All)
+        .unwrap();
+    assert_eq!(
+        fs::metadata(restored.join("node_modules/direct.js"))
+            .unwrap()
+            .ino(),
+        fs::metadata(restored.join("direct.js")).unwrap().ino(),
+        "the bulk name is linked onto the tracked inode"
+    );
+    assert_same(&root, &restored);
+}

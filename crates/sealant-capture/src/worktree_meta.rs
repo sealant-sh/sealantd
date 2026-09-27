@@ -669,8 +669,7 @@ pub fn apply(
             if (meta.dev(), meta.ino()) == (target.dev(), target.ino()) {
                 continue;
             }
-            fs::remove_file(&abs).map_err(io_err(&member))?;
-            fs::hard_link(&canonical, &abs).map_err(io_err(&member))?;
+            relink(&canonical, &abs).map_err(io_err(&member))?;
             applied.changed += 1;
         }
     }
@@ -697,8 +696,7 @@ pub fn apply(
             tracing::debug!(tracked = %link.path, member = %link.member, "shared hardlink: contents differ; left unlinked");
             continue;
         }
-        fs::remove_file(&abs).map_err(io_err(&member))?;
-        fs::hard_link(&canonical, &abs).map_err(io_err(&member))?;
+        relink(&canonical, &abs).map_err(io_err(&member))?;
         relinked.push((link.class, link.member.clone(), abs, member));
         applied.changed += 1;
     }
@@ -728,6 +726,23 @@ pub fn apply(
         applied.relinked.push((class, member, meta));
     }
     Ok(applied)
+}
+
+/// Make `abs` a name of `canonical`'s inode (remove it, link it) and give its directory back
+/// the mtime it had: the unlink and the link move it, and a directory another class restored
+/// (a bulk package's, `node_modules` itself) has its mtime set already — nothing here sets it
+/// again.
+fn relink(canonical: &Path, abs: &Path) -> io::Result<()> {
+    let parent = abs
+        .parent()
+        .map(|dir| fs::symlink_metadata(dir).map(|meta| (dir, mtime_ns(&meta))))
+        .transpose()?;
+    fs::remove_file(abs)?;
+    fs::hard_link(canonical, abs)?;
+    if let Some((dir, mtime)) = parent {
+        set_mtime_nofollow(dir, mtime)?;
+    }
+    Ok(())
 }
 
 /// Set one path's mode and mtime where they differ; whether anything changed.
