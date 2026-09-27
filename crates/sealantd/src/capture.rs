@@ -453,7 +453,8 @@ impl CaptureRuntime {
             sources::apply(self.sink.as_ref(), &plan.sources, &self.layout)
                 .map_err(|e| internal(&format!("capture sources: {e}")))?;
             // Likewise its remotes: the placeholder has none, and the repository here was built
-            // by this executor, never cloned.
+            // by this executor, never cloned. Only the ones it lacks are added: a remote the
+            // materialized head's `.git/config` carries is the user's.
             remotes::apply(&self.layout.working_directory, &plan.remotes)
                 .map_err(|e| internal(&format!("capture remotes: {e}")))?;
             self.runner.shipper().reset_after_replan(head_n);

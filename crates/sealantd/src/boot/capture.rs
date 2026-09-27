@@ -352,8 +352,13 @@ pub(crate) fn boot_from(
     // worktree, so it is laid down after the head and never enters a capture.
     sources::apply(sink.as_ref(), &plan.sources, &layout)?;
 
-    // The repository above was built here, so it has no remotes until the plan names them.
-    remotes::apply(working_directory, &plan.remotes)?;
+    // The plan's remotes the repository lacks (one built here from an empty chain or a base
+    // with no `.git/config` has none). A disk resumed as it is — a restart, a recovery boot —
+    // keeps its configuration byte for byte: the user may have changed a remote since the last
+    // capture, and only the next capture may save it (review 2026-09-28 #13).
+    if !resumed {
+        remotes::apply(working_directory, &plan.remotes)?;
+    }
 
     // A resumed disk's repository holds objects no registered capture carries yet: its tips are
     // not the chain's, and the engine keeps the ones it staged under this identity.
@@ -1001,5 +1006,151 @@ mod tests {
         )
         .unwrap();
         assert_eq!(boot.engine.config().dir_format, DirFormat::Objects);
+    }
+
+    fn origin_of(dir: &Path) -> String {
+        let out = Proc::new("git")
+            .current_dir(dir)
+            .args(["remote", "get-url", "origin"])
+            .output()
+            .unwrap();
+        String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    }
+
+    /// A recovery boot resumes the disk as it is, the user's remotes included (review
+    /// 2026-09-28 #13): a session pointed `origin` at its fork and died before the next
+    /// capture; the recovery boot must not set it back to the plan's URL before the final
+    /// snapshot saves it (it did: `git remote set-url` on every boot).
+    #[test]
+    fn a_recovery_boot_keeps_the_users_changed_origin() {
+        use sealant_capture::registrar::PlanRemote;
+        let tmp = tempfile::tempdir().unwrap();
+        let registrar = Arc::new(InMemoryRegistrar::new("wt-boot", 1, None));
+        let sink = capture_source(tmp.path(), &registrar);
+        registrar.set_remotes(vec![PlanRemote {
+            name: "origin".to_owned(),
+            url: "https://example.invalid/original.git".to_owned(),
+        }]);
+        let disk = tmp.path().join("disk");
+        drop(
+            boot_from(
+                registrar.clone(),
+                Some(sink.clone()),
+                &source(),
+                &disk,
+                tmp.path(),
+            )
+            .unwrap(),
+        );
+        assert_eq!(origin_of(&disk), "https://example.invalid/original.git");
+        git(
+            &disk,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "https://example.invalid/user-fork.git",
+            ],
+        );
+        let recovery = CaptureSourceConfig {
+            recovery: true,
+            ..source()
+        };
+        let boot = boot_from(registrar, Some(sink), &recovery, &disk, tmp.path()).unwrap();
+        assert!(boot.resumed);
+        assert_eq!(origin_of(&disk), "https://example.invalid/user-fork.git");
+    }
+
+    /// The user's remotes travel in the capture (`.git/config` is workspace-class bookkeeping),
+    /// and neither a restart on the same disk nor a fresh executor materializing that capture
+    /// sets them back to the plan's: a plan remote is only added where the repository has none
+    /// of that name (review 2026-09-28 #13).
+    #[test]
+    fn a_captured_remote_change_survives_a_restart_and_a_fresh_materialize() {
+        use sealant_capture::registrar::PlanRemote;
+        let tmp = tempfile::tempdir().unwrap();
+        let registrar = Arc::new(InMemoryRegistrar::new("wt-boot", 1, None));
+        let sink = capture_source(tmp.path(), &registrar);
+        let dyn_sink: Arc<dyn BlobSink> = sink.clone();
+        registrar.set_remotes(vec![
+            PlanRemote {
+                name: "origin".to_owned(),
+                url: "https://example.invalid/original.git".to_owned(),
+            },
+            PlanRemote {
+                name: "upstream".to_owned(),
+                url: "https://example.invalid/upstream.git".to_owned(),
+            },
+        ]);
+        let ws = tmp.path().join("ws");
+        let boot = boot_from(
+            registrar.clone(),
+            Some(dyn_sink.clone()),
+            &source(),
+            &ws,
+            tmp.path(),
+        )
+        .unwrap();
+        git(
+            &ws,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "https://example.invalid/user-fork.git",
+            ],
+        );
+        git(&ws, &["remote", "remove", "upstream"]);
+        let mut engine = boot.engine;
+        engine
+            .snap(SnapRequest {
+                kind: CaptureKind::Turn,
+                class: Class::Small,
+                seq: 3,
+            })
+            .unwrap();
+        // A restart on its own disk (staged, not shipped): resumed as it is.
+        drop(engine);
+        let boot = boot_from(
+            registrar.clone(),
+            Some(dyn_sink.clone()),
+            &source(),
+            &ws,
+            tmp.path(),
+        )
+        .unwrap();
+        assert!(boot.resumed);
+        assert_eq!(origin_of(&ws), "https://example.invalid/user-fork.git");
+        // A resumed disk is left as it is: the remote the user removed stays removed.
+        assert!(
+            !Proc::new("git")
+                .current_dir(&ws)
+                .args(["remote", "get-url", "upstream"])
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        let dyn_registrar: Arc<dyn Registrar> = registrar.clone();
+        boot.engine
+            .shipper(dyn_sink.clone(), dyn_registrar)
+            .ship_pending()
+            .unwrap();
+        drop(boot);
+        // A fresh executor materializes the capture that holds the user's `.git/config`.
+        let fresh = tmp.path().join("fresh");
+        let boot = boot_from(registrar, Some(dyn_sink), &source(), &fresh, tmp.path()).unwrap();
+        assert!(!boot.resumed);
+        assert_eq!(origin_of(&fresh), "https://example.invalid/user-fork.git");
+        // A remote the plan names that a freshly materialized repository does not have is added.
+        assert_eq!(
+            Proc::new("git")
+                .current_dir(&fresh)
+                .args(["remote", "get-url", "upstream"])
+                .output()
+                .map(|o| String::from_utf8(o.stdout).unwrap().trim().to_owned())
+                .unwrap(),
+            "https://example.invalid/upstream.git"
+        );
     }
 }
