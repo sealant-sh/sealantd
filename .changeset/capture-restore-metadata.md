@@ -32,3 +32,7 @@ Chunked-class symlinks get their own mtime back, and a directory mode or mtime, 
 hardlink canonical outside the class roots that cannot be restored fails the materialize instead
 of being skipped. A bulk section older than the worktree tree no longer sweeps or overwrites a
 tracked file under a bulk-named directory such as `build/` or `dist/`.
+
+A tracked path whose metadata cannot be read (under a directory that cannot be searched) keeps
+its previous entry in an automatic capture and is counted in `capture.status`'s `unreadable`; a
+final capture fails on it, as it does on any work it cannot read.

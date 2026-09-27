@@ -512,17 +512,40 @@ pub struct Captured {
     pub doc: MetaDocument,
     /// Tracked files whose inode has names the overlay does not hold.
     pub outside: Vec<OutsideLinks>,
+    /// Paths of the worktree tree whose metadata could not be read (a directory above them
+    /// that cannot be searched): never taken as gone.
+    pub unreadable: Vec<UnreadableMeta>,
+}
+
+/// A path of the worktree tree whose metadata could not be read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnreadableMeta {
+    /// Its key.
+    pub path: String,
+    /// What the filesystem said.
+    pub error: String,
+    /// Its entry was carried from the previous document.
+    pub carried: bool,
 }
 
 /// Read the overlay of the working tree `worktree_tree` (the tree just written from it) plus
 /// every directory in `scope`. A path that changed kind or vanished since the tree was written
-/// is left out: the next capture sees the change. Any other failure to read a path fails.
+/// is left out: the next capture sees the change. A tracked path whose metadata cannot be read
+/// (git carried its content from the previous capture, `gitpack.rs`) is reported in
+/// `unreadable` and keeps its entry of `carry`, the previous document, when it had one — an
+/// automatic snap passes it, a final one passes `None` and fails on the report. Any other
+/// failure to read a path fails.
 pub fn capture(
     repo: &GitRepo,
     worktree_tree: &str,
     scope: &MetaScope,
+    carry: Option<&MetaDocument>,
 ) -> Result<Captured, MetaError> {
     let mut entries: BTreeMap<String, MetaEntry> = BTreeMap::new();
+    let mut unreadable = Vec::new();
+    let carried: HashMap<&str, &MetaEntry> = carry
+        .map(|doc| doc.entries.iter().map(|e| (e.path.as_str(), e)).collect())
+        .unwrap_or_default();
     // (dev, ino) → (key, blob, nlink) of every file with more than one name.
     type Named = (String, Vec<u8>, u64);
     let mut inodes: BTreeMap<(u64, u64), Vec<Named>> = BTreeMap::new();
@@ -530,6 +553,19 @@ pub fn capture(
         let meta = match fs::symlink_metadata(scope.root.join(os(&tp.path))) {
             Ok(meta) => meta,
             Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+                let key = key_of(&tp.path).into_owned();
+                let previous = carried.get(key.as_str()).filter(|p| p.kind == tp.kind);
+                if let Some(previous) = previous {
+                    entries.insert(key.clone(), (*previous).clone());
+                }
+                unreadable.push(UnreadableMeta {
+                    path: key,
+                    error: e.to_string(),
+                    carried: previous.is_some(),
+                });
+                continue;
+            }
             Err(e) => return Err(io_err(&tp.path)(e)),
         };
         if kind_of(&meta) != Some(tp.kind) {
@@ -575,6 +611,7 @@ pub fn capture(
             shared: Vec::new(),
         },
         outside,
+        unreadable,
     })
 }
 

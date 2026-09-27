@@ -44,7 +44,7 @@ fn main() {
     let mut last = None;
     for _ in 0..iterations {
         let start = Instant::now();
-        let captured = worktree_meta::capture(&repo, &tree, &scope).expect("capture");
+        let captured = worktree_meta::capture(&repo, &tree, &scope, None).expect("capture");
         let bytes = captured.doc.encode();
         let chunks = chunk_bytes(&bytes);
         times.push(start.elapsed());

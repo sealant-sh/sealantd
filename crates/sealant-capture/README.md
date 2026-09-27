@@ -75,6 +75,14 @@ and empty directories and every tracked mtime were lost.
   and linking would then replace one content with the other. Left unlinked, each name holds
   exactly what its class captured, and the next bulk capture brings them together again. The
   relinked name's new inode goes into its class's index, so a head over itself writes nothing.
+- **A path it cannot read is not gone.** A tracked path whose metadata cannot be read (a
+  directory above it that cannot be searched; git carries its content from the previous capture,
+  see "What a snap reads") keeps the previous document's entry in an automatic snap and counts as
+  unreadable (`capture.status`'s `unreadable`, `tree/<path>`, once per directory git already
+  reported); a final snap carries nothing and fails on it. The previous document is the daemon's
+  in memory: after a restart such a path's entry is left out until it can be read again. A
+  directory that cannot be listed keeps its own entry, mode `000` included, and a restore brings
+  it back so.
 - **Names that are not UTF-8** are kept byte for byte: a path is written as a *key*, the
   encoding dir objects use for names (bytes as UTF-8 when they are UTF-8 and hold no character of
   `U+10FF80..=U+10FFFF`; otherwise each such byte becomes `U+10FF00 + byte`, a bijection), and an

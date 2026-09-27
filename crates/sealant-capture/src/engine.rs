@@ -520,6 +520,11 @@ pub struct CaptureEngine {
     /// the negatives of the next pack. The manifest only carries refs, so reflog-only history
     /// would otherwise be packed again on every snap.
     last_tips: Vec<String>,
+    /// The worktree metadata overlay the last small snap read, in memory: an automatic snap
+    /// keeps its entry for a tracked path whose metadata it cannot read (git carries the path's
+    /// content). Empty after a restart, when such a path's metadata is left out and the path is
+    /// reported unreadable all the same.
+    last_meta: Option<worktree_meta::MetaDocument>,
     /// The manifest the queued bulk capture was staged on (its parent). A small snap while that
     /// bulk capture's objects upload is staged ahead of it: it takes the bulk capture's place on
     /// the chain with this manifest's bulk section, and the bulk capture moves on top of it. See
@@ -634,6 +639,7 @@ impl CaptureEngine {
             chunks,
             dirs,
             last_tips,
+            last_meta: None,
             below: None,
             invalidations: Arc::new(Invalidations::default()),
             reads: Arc::new(ReadReports::default()),
@@ -788,6 +794,7 @@ impl CaptureEngine {
             self.last_tips.clear();
             self.persist()?;
         }
+        self.last_meta = None;
         self.below = None;
         tracing::info!(
             worktree = worktree_id,
@@ -1462,7 +1469,7 @@ impl CaptureEngine {
                     &excludes,
                     carry_from.as_deref(),
                 )?;
-                let git_unreadable: Vec<UnreadablePath> = git
+                let mut git_unreadable: Vec<UnreadablePath> = git
                     .closure
                     .unreadable
                     .iter()
@@ -1505,7 +1512,28 @@ impl CaptureEngine {
                             &repo,
                             tree,
                             &self.meta_scope(&git.closure.gitlinks),
+                            self.last_meta.as_ref().filter(|_| !strict),
                         )?;
+                        // Metadata the overlay could not read, under no path git already
+                        // reported (a directory counts once): unreadable, never gone.
+                        let meta_unreadable: Vec<UnreadablePath> = captured
+                            .unreadable
+                            .iter()
+                            .map(|u| UnreadablePath {
+                                path: format!("tree/{}", u.path),
+                                error: u.error.clone(),
+                                carried: u.carried,
+                            })
+                            .filter(|u| {
+                                !git_unreadable.iter().any(|g| {
+                                    u.path == g.path
+                                        || u.path
+                                            .strip_prefix(g.path.as_str())
+                                            .is_some_and(|r| r.starts_with('/'))
+                                })
+                            })
+                            .collect();
+                        git_unreadable = merge_unreadable(git_unreadable, meta_unreadable);
                         let mut doc = captured.doc;
                         // A tracked file under a bulk directory is the overlay's own name.
                         let own: HashSet<&str> =
@@ -1567,6 +1595,7 @@ impl CaptureEngine {
                 // pack's negatives: a snap that fails here (a final one that cannot read work)
                 // stages nothing, and its tips would leave objects out of every later pack.
                 self.last_tips = git.closure.tips.clone();
+                self.last_meta.clone_from(&meta_doc);
                 Sections {
                     git: GitSection {
                         packs: git_packs,
