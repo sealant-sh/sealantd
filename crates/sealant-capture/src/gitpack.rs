@@ -16,6 +16,7 @@ use sealant_process::CommandGateExt;
 use crate::chunk::sha256_hex;
 use crate::longpath;
 use crate::manifest::{FsckStatus, INDEX_TREE_REF, PSEUDO_REF_PREFIX, WORKTREE_TREE_REF};
+use crate::tree::{bytes_of, key_of};
 
 /// Bounded attempts when refs move or objects vanish between the read and the pack.
 pub const PACK_ATTEMPTS: u32 = 3;
@@ -130,6 +131,60 @@ fn stdout_string(out: &Output) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_owned()
 }
 
+/// `bytes` without its trailing line end (`\n`, `\r\n`): a ref name or target as git wrote it.
+fn trim_newline(bytes: &[u8]) -> &[u8] {
+    let bytes = bytes.strip_suffix(b"\n").unwrap_or(bytes);
+    bytes.strip_suffix(b"\r").unwrap_or(bytes)
+}
+
+/// Walk `dir` (a `refs/` directory; `name` is its ref name, `refs`) and add every loose
+/// symbolic ref under it (a file reading `ref: <target>`) to `found`, name → target, both keys.
+/// Lock files are git's transient state, not refs.
+fn collect_loose_symrefs(
+    dir: &Path,
+    name: &[u8],
+    found: &mut BTreeMap<String, String>,
+) -> Result<(), GitError> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(at("list", dir)(e)),
+    };
+    for entry in entries {
+        let entry = entry.map_err(at("list", dir))?;
+        let path = entry.path();
+        let file_name = entry.file_name();
+        let mut child = name.to_vec();
+        child.push(b'/');
+        child.extend_from_slice(file_name.as_bytes());
+        let kind = entry.file_type().map_err(at("stat", &path))?;
+        if kind.is_dir() {
+            collect_loose_symrefs(&path, &child, found)?;
+        } else if kind.is_file() && !file_name.as_bytes().ends_with(b".lock") {
+            let bytes = match fs::read(&path) {
+                Ok(bytes) => bytes,
+                // Removed between the listing and the read: a ref that is gone.
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(at("read", &path)(e)),
+            };
+            if let Some(target) = bytes.strip_prefix(b"ref: ") {
+                let target = trim_newline(target);
+                // A name git itself would ignore as broken is not a ref it holds, and one a
+                // restore could not write back must not fail the restore of everything else.
+                if is_safe_ref_name(&child) && is_safe_symref_target(target) {
+                    found.insert(key_of(&child).into_owned(), key_of(target).into_owned());
+                } else {
+                    tracing::warn!(
+                        name = %key_of(&child),
+                        "capture: a loose symbolic ref git would not read is left out"
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 impl GitRepo {
     /// Open the repository whose working tree is `root`.
     pub fn open(root: &Path) -> Result<Self, GitError> {
@@ -233,41 +288,66 @@ impl GitRepo {
         Ok(RemoteChange::Updated)
     }
 
-    /// Ref name → sha for every ref (including `refs/stash`).
+    /// Ref name → sha for every ref (including `refs/stash`). A name is a [`key_of`] key of the
+    /// ref's bytes, so two names that differ only in bytes that are not UTF-8 stay two refs.
     pub fn refs(&self) -> Result<BTreeMap<String, String>, GitError> {
-        let out = self.run(&["for-each-ref", "--format=%(refname) %(objectname)"])?;
-        Ok(stdout_string(&out)
-            .lines()
-            .filter_map(|l| l.split_once(' '))
-            .map(|(r, s)| (r.to_owned(), s.to_owned()))
+        let out = self.run(&["for-each-ref", "--format=%(objectname) %(refname)"])?;
+        // A ref name holds no control byte and no space (`git check-ref-format`): one line per
+        // ref, the sha up to the first space, the name the bytes after it.
+        Ok(out
+            .stdout
+            .split(|b| *b == b'\n')
+            .filter_map(|line| {
+                let space = line.iter().position(|b| *b == b' ')?;
+                let (sha, name) = (&line[..space], &line[space + 1..]);
+                (!name.is_empty() && !sha.is_empty()).then(|| {
+                    (
+                        key_of(name).into_owned(),
+                        String::from_utf8_lossy(sha).into_owned(),
+                    )
+                })
+            })
             .collect())
     }
 
     /// Symbolic refs other than `HEAD` (`refs/remotes/origin/HEAD` → `refs/remotes/origin/main`):
-    /// ref name → the ref it points at. [`Self::refs`] lists them too, by the sha they resolve to.
+    /// ref name → the ref it points at, both [`key_of`] keys of their bytes. [`Self::refs`] lists
+    /// the ones whose target resolves too, by the sha they resolve to.
+    ///
+    /// Read off the loose refs themselves, not `git for-each-ref`: that resolves each one and
+    /// leaves out a symbolic ref whose target does not exist (a dangling
+    /// `refs/remotes/origin/HEAD`), which is still a ref the repository holds. `packed-refs`
+    /// cannot hold a symbolic ref, so the loose files under `refs/` (the common directory's,
+    /// and a linked worktree's own) are all of them.
     pub fn symrefs(&self) -> Result<BTreeMap<String, String>, GitError> {
-        let out = self.run(&["for-each-ref", "--format=%(refname) %(symref)"])?;
-        Ok(stdout_string(&out)
-            .lines()
-            .filter_map(|l| l.split_once(' '))
-            .filter(|(_, target)| !target.is_empty())
-            .map(|(r, t)| (r.to_owned(), t.to_owned()))
-            .collect())
+        let mut found = BTreeMap::new();
+        let mut dirs = vec![&self.common_dir];
+        if self.git_dir != self.common_dir {
+            dirs.push(&self.git_dir);
+        }
+        for dir in dirs {
+            collect_loose_symrefs(&dir.join("refs"), b"refs", &mut found)?;
+        }
+        Ok(found)
     }
 
-    /// `HEAD` as a ref name (symbolic) or a sha (detached).
+    /// `HEAD` as a ref name (symbolic; a [`key_of`] key of its bytes) or a sha (detached).
     pub fn head(&self) -> Result<String, GitError> {
         let out = git_command(&self.root)
             .args(["symbolic-ref", "-q", "HEAD"])
             .output_gated()?;
         if out.status.success() {
-            return Ok(stdout_string(&out));
+            return Ok(key_of(trim_newline(&out.stdout)).into_owned());
         }
         let out = self.run(&["rev-parse", "--verify", "-q", "HEAD"]);
         match out {
             Ok(o) => Ok(stdout_string(&o)),
-            Err(_) => Ok(fs::read_to_string(self.git_dir.join("HEAD"))
-                .map(|s| s.trim().trim_start_matches("ref: ").to_owned())
+            Err(_) => Ok(fs::read(self.git_dir.join("HEAD"))
+                .map(|bytes| {
+                    let text = trim_newline(&bytes);
+                    let text = text.strip_prefix(b"ref: ").unwrap_or(text);
+                    key_of(text).into_owned()
+                })
                 .unwrap_or_else(|_| "refs/heads/main".to_owned())),
         }
     }
@@ -1180,11 +1260,13 @@ pub fn build_git_pack_carrying(
         };
         let refs_after = repo.refs()?;
         let head_after = repo.head()?;
-        let moved = closure
-            .refs
-            .iter()
-            .filter(|(k, _)| !k.starts_with(PSEUDO_REF_PREFIX))
-            .any(|(k, v)| refs_after.get(k) != Some(v))
+        let symrefs_after = repo.symrefs()?;
+        let moved = symrefs_after != closure.symrefs
+            || closure
+                .refs
+                .iter()
+                .filter(|(k, _)| !k.starts_with(PSEUDO_REF_PREFIX))
+                .any(|(k, v)| refs_after.get(k) != Some(v))
             || refs_after.keys().any(|k| !closure.refs.contains_key(k))
             || head_after != closure.head;
         if !moved {
@@ -1265,15 +1347,17 @@ pub fn install_pack(
 /// symbolic: `packed-refs` is written from the direct ones and every loose ref is removed,
 /// whether the manifest names it or not, so a branch, tag, remote-tracking ref or stash the
 /// disk held beyond the manifest does not survive a materialize; then each symbolic ref is
-/// written loose (`packed-refs` cannot hold one) as `ref: <target>`. Directories under `refs/`
-/// a loose ref leaves empty go too, except `refs/heads` and `refs/tags`, which git expects.
+/// written loose (`packed-refs` cannot hold one) as `ref: <target>`, whether its target exists
+/// or not. Directories under `refs/` a loose ref leaves empty go too, except `refs/heads` and
+/// `refs/tags`, which git expects. Names and targets are [`key_of`] keys: each is written as
+/// the bytes it stands for ([`bytes_of`]), so a name that is not UTF-8 comes back exactly.
 pub fn write_packed_refs(
     repo: &GitRepo,
     refs: &BTreeMap<String, String>,
     symrefs: &BTreeMap<String, String>,
 ) -> Result<(), GitError> {
     for (name, target) in symrefs {
-        if !is_safe_ref_name(name) || !is_safe_ref_name(target) {
+        if !is_safe_ref_name(&bytes_of(name)) || !is_safe_symref_target(&bytes_of(target)) {
             return Err(GitError::Command {
                 args: "symbolic-ref".to_owned(),
                 stderr: format!("refusing symbolic ref {name:?} -> {target:?}"),
@@ -1285,15 +1369,26 @@ pub fn write_packed_refs(
     // believe it: `describe` finds no annotated tag, `show-ref -d` and the refs a fetch is
     // offered lose `v1^{}`, and 2.52's `for-each-ref %(*objectname)` fails on "bad tag".
     // Without the trait git peels each tag from its object, on every version.
-    let mut text = String::from("# pack-refs with: sorted \n");
-    for (name, sha) in refs {
-        if name.starts_with(PSEUDO_REF_PREFIX) || symrefs.contains_key(name) {
-            continue;
+    let mut text: Vec<u8> = b"# pack-refs with: sorted \n".to_vec();
+    // Sorted by bytes, as git reads a `sorted` file (the keys' order is not the bytes' order
+    // once one is escaped).
+    let mut direct: Vec<(Vec<u8>, &String)> = refs
+        .iter()
+        .filter(|(name, _)| !name.starts_with(PSEUDO_REF_PREFIX) && !symrefs.contains_key(*name))
+        .map(|(name, sha)| (bytes_of(name).into_owned(), sha))
+        .collect();
+    direct.sort();
+    for (name, sha) in direct {
+        if !is_safe_ref_name(&name) {
+            return Err(GitError::Command {
+                args: "pack-refs".to_owned(),
+                stderr: format!("refusing ref {:?}", key_of(&name)),
+            });
         }
-        text.push_str(sha);
-        text.push(' ');
-        text.push_str(name);
-        text.push('\n');
+        text.extend_from_slice(sha.as_bytes());
+        text.push(b' ');
+        text.extend_from_slice(&name);
+        text.push(b'\n');
     }
     let path = repo.common_dir.join("packed-refs");
     let tmp = repo.common_dir.join("packed-refs.capture-tmp");
@@ -1305,26 +1400,48 @@ pub fn write_packed_refs(
         remove_loose_refs(&dir.join("refs"), 0)?;
     }
     for (name, target) in symrefs {
-        let path = repo.common_dir.join(name);
+        let name = bytes_of(name);
+        // A worktree's own refs live in its git directory, the rest in the common one.
+        let per_worktree = [&b"refs/bisect/"[..], b"refs/worktree/", b"refs/rewritten/"]
+            .iter()
+            .any(|p| name.starts_with(p));
+        let base = if per_worktree {
+            &repo.git_dir
+        } else {
+            &repo.common_dir
+        };
+        let path = base.join(std::ffi::OsStr::from_bytes(&name));
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(at("mkdir -p", parent))?;
         }
-        fs::write(&path, format!("ref: {target}\n")).map_err(at("write", &path))?;
+        let mut line = b"ref: ".to_vec();
+        line.extend_from_slice(&bytes_of(target));
+        line.push(b'\n');
+        fs::write(&path, line).map_err(at("write", &path))?;
     }
     Ok(())
 }
 
+/// A symbolic ref's target that can be written back as the file's one line: not empty, no
+/// control byte. Not required to exist, nor to be under `refs/` (git reads what it reads).
+fn is_safe_symref_target(target: &[u8]) -> bool {
+    !target.is_empty() && !target.iter().any(|b| *b < 0x20 || *b == 0x7f)
+}
+
 /// A ref name that is safe to write as a path under the git dir: `refs/…`, components that
-/// are not empty, `.`/`..`-led, or `.lock`, and no control or special characters.
-fn is_safe_ref_name(name: &str) -> bool {
-    name.starts_with("refs/")
+/// are not empty, `.`/`..`-led, or `.lock`, and no control or special bytes. Bytes of `0x80`
+/// and above (a name that is not UTF-8) are allowed: git allows them.
+fn is_safe_ref_name(name: &[u8]) -> bool {
+    name.starts_with(b"refs/")
         && name
-            .split('/')
-            .all(|c| !c.is_empty() && !c.starts_with('.') && !c.ends_with(".lock"))
-        && !name.contains("..")
-        && !name
-            .chars()
-            .any(|c| c.is_control() || matches!(c, ' ' | '~' | '^' | ':' | '?' | '*' | '[' | '\\'))
+            .split(|b| *b == b'/')
+            .all(|c| !c.is_empty() && !c.starts_with(b".") && !c.ends_with(b".lock"))
+        && !name.windows(2).any(|w| w == b"..")
+        && !name.iter().any(|b| {
+            *b < 0x20
+                || *b == 0x7f
+                || matches!(b, b' ' | b'~' | b'^' | b':' | b'?' | b'*' | b'[' | b'\\')
+        })
 }
 
 /// Remove every file under `dir` (a `refs/` directory) and the directories that empties, but
@@ -1355,13 +1472,14 @@ fn remove_loose_refs(dir: &Path, depth: usize) -> Result<(), GitError> {
     Ok(())
 }
 
-/// Write `HEAD` (a symbolic ref or a detached sha).
+/// Write `HEAD` (a symbolic ref, a [`key_of`] key written as its bytes, or a detached sha).
 pub fn write_head(repo: &GitRepo, head: &str) -> Result<(), GitError> {
-    let text = if head.starts_with("refs/") {
-        format!("ref: {head}\n")
-    } else {
-        format!("{head}\n")
-    };
+    let mut text = Vec::new();
+    if head.starts_with("refs/") {
+        text.extend_from_slice(b"ref: ");
+    }
+    text.extend_from_slice(&bytes_of(head));
+    text.push(b'\n');
     let path = repo.git_dir.join("HEAD");
     fs::write(&path, text).map_err(at("write", &path))?;
     Ok(())

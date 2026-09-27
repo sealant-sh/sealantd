@@ -157,7 +157,21 @@ and empty directories and every tracked mtime were lost.
   to come back as a plain ref to the sha it resolved to. The git section now carries
   `symrefs` (name → target) beside `refs`; a restore writes each as a loose `ref: <target>` (a
   packed ref cannot be symbolic) after the loose refs are cleared, and leaves it out of
-  `packed-refs`. A name or target that is not a plain `refs/…` name fails the materialize.
+  `packed-refs`. A name that is not a plain `refs/…` name, or a target holding a control byte,
+  fails the materialize.
+- **A dangling symbolic ref stays.** `symrefs` is read off the loose ref files (the common
+  directory's `refs/` and a linked worktree's own), not `git for-each-ref`, which resolves each
+  one and leaves out a symbolic ref whose target does not exist (`git symbolic-ref
+  refs/remotes/origin/HEAD refs/remotes/origin/missing`): it vanished from a complete final
+  capture. It is restored as `ref: <target>` like any other, and is not in `refs` (it resolves to
+  nothing). A symbolic ref to a symbolic ref keeps its own target. (`git fsck` reports a dangling
+  symbolic ref as `invalid sha1 pointer`, on the source as on the restore, so such a capture's
+  `fsck` reads `failed`.) A symbolic ref changing during the pack retries it, as a ref moving does.
+- **Ref names are bytes.** A ref name, a symbolic target and `HEAD`'s target are read as bytes
+  and kept as `tree::key_of` keys (see "Dir entries: `raw_name`, `raw_target`, `unread`"), and a
+  restore writes the bytes each key stands for (`packed-refs` sorted by those bytes). Decoded
+  lossily, `refs/heads/caf\xe8` and `refs/heads/caf\xe9` were both `refs/heads/caf\u{fffd}`: one
+  overwrote the other in `refs`, its commit was no pack tip, and a complete final capture lost it.
 
 `tests/restore_metadata.rs` writes a worktree with all of it (modes, ns mtimes of files,
 directories, symlinks and the root, empty directories, a hardlink pair, names that are not UTF-8,
@@ -902,7 +916,16 @@ for byte as before.
 
 `sections.git.symrefs`: symbolic refs other than `HEAD`, name → the ref it points at. Each is
 also in `refs`, by the sha it resolved to at capture, so a reader that knows only `refs` reads
-what it always did. Absent when empty, so a manifest without one encodes exactly as before.
+what it always did. Absent when empty, so a manifest without one encodes exactly as before. A
+symbolic ref whose target does not exist is here and not in `refs`.
+
+Every ref name in `refs` and `symrefs` (keys and targets) and a symbolic `head` is a
+`tree::key_of` key of the name's bytes: the name itself when it is UTF-8 without an escape-range
+character (every name in practice, so no existing manifest changes), otherwise each byte of an
+invalid sequence as `U+10FF00 + byte`. A reader writes `tree::bytes_of(key)` into `packed-refs`,
+the loose symbolic ref and `HEAD`. There is no `raw_name` beside a ref: a key with a character in
+`U+10FF80..=U+10FFFF` is an escaped one. A reader that writes the key's UTF-8 as the name gets a
+different, distinct name (never two refs merged), and the objects are in the packs either way.
 
 ```json
 "git":{"packs":[…],"refs":{"refs/heads/main":"<sha>","refs/remotes/origin/HEAD":"<sha>",…},

@@ -112,16 +112,20 @@ pub enum FsckStatus {
 pub struct GitSection {
     /// Every git pack key the section needs, across epochs.
     pub packs: Vec<String>,
-    /// Ref name → sha, including the pseudo-refs.
+    /// Ref name → sha, including the pseudo-refs. Each name is a [`crate::tree::key_of`] key of
+    /// the ref's bytes (the name itself unless it is not UTF-8), written back as
+    /// [`crate::tree::bytes_of`] — two names that differ only in bytes that are not UTF-8 stay
+    /// two refs.
     pub refs: BTreeMap<String, String>,
-    /// `HEAD`: a ref name or a sha.
+    /// `HEAD`: a ref name (a key, as in `refs`) or a sha.
     pub head: String,
     /// fsck outcome.
     pub fsck: FsckStatus,
     /// Symbolic refs other than `HEAD` (`refs/remotes/origin/HEAD` → `refs/remotes/origin/main`):
-    /// name → the ref it points at. Each is in `refs` as well, by the sha it resolved to, so a
-    /// reader that knows only `refs` reads what it always did. Absent when empty, so a manifest
-    /// without one encodes exactly as before.
+    /// name → the ref it points at, both keys as in `refs`. Each whose target resolves is in
+    /// `refs` as well, by the sha it resolved to, so a reader that knows only `refs` reads what
+    /// it always did; a dangling one (its target does not exist) is here only. Absent when
+    /// empty, so a manifest without one encodes exactly as before.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub symrefs: BTreeMap<String, String>,
 }
