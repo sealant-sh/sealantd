@@ -933,21 +933,45 @@ impl GitRepo {
 
     /// Add `pattern` to the repository's local excludes (`info/exclude` in the common dir) unless
     /// it is there already. The user's `.gitignore` is never touched.
+    ///
+    /// The file is the user's and git reads it as bytes: it is read and kept as bytes, never
+    /// decoded (a legacy-encoded comment is valid), and only a missing file counts as empty. Any
+    /// other read error leaves it alone. Before (review 12 #1), a file that was not UTF-8 read as
+    /// empty and was replaced by the daemon's one line.
     pub fn exclude_locally(&self, pattern: &str) -> Result<(), GitError> {
         let info = self.common_dir.join("info");
         fs::create_dir_all(&info).map_err(at("mkdir -p", &info))?;
         let path = info.join("exclude");
-        let mut text = fs::read_to_string(&path).unwrap_or_default();
-        if text.lines().any(|l| l.trim() == pattern) {
+        let (mut bytes, mode) = match fs::read(&path) {
+            Ok(bytes) => {
+                let mode = fs::metadata(&path).map_err(at("stat", &path))?.mode() & 0o7777;
+                (bytes, Some(mode))
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => (Vec::new(), None),
+            Err(e) => return Err(at("read", &path)(e)),
+        };
+        if bytes
+            .split(|b| *b == b'\n')
+            .any(|l| l.trim_ascii() == pattern.as_bytes())
+        {
             return Ok(());
         }
-        if !text.is_empty() && !text.ends_with('\n') {
-            text.push('\n');
+        if !bytes.is_empty() && !bytes.ends_with(b"\n") {
+            bytes.push(b'\n');
         }
-        text.push_str(pattern);
-        text.push('\n');
+        bytes.extend_from_slice(pattern.as_bytes());
+        bytes.push(b'\n');
         let tmp = info.join("exclude.capture-tmp");
-        fs::write(&tmp, text).map_err(at("write", &tmp))?;
+        {
+            let mut file = File::create(&tmp).map_err(at("create", &tmp))?;
+            file.write_all(&bytes).map_err(at("write", &tmp))?;
+            if let Some(mode) = mode {
+                use std::os::unix::fs::PermissionsExt;
+                file.set_permissions(fs::Permissions::from_mode(mode))
+                    .map_err(at("chmod", &tmp))?;
+            }
+            file.sync_all().map_err(at("fsync", &tmp))?;
+        }
         fs::rename(&tmp, &path).map_err(at("rename into", &path))?;
         Ok(())
     }

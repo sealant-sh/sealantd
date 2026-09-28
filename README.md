@@ -227,7 +227,9 @@ the protocol details live in `crates/sealant-capture/src/registrar.rs` and `mani
   daemon sends the same register again — the registrar answers it as a lost ack, with where the
   seal stands now — up to six times, backing off (≈ 11 s), and still withheld the flush answers
   `incomplete_reason: "sealing"`; a final flush asked again asks again. `refused`, or an answer
-  with no `seal` (a registrar from before this), is `sealing` too: fail closed. The registrar
+  with no `seal` (a registrar from before this), is `sealing` too: fail closed. A final flush
+  asked again over an unchanged disk asks about a refused seal again too, once per flush, so a
+  registrar that has recovered is heard; only `recorded` is kept. The registrar
   answers `seal` whenever the registered capture (`n`, `capture_id`) carries `final_seal`,
   including on the lost-ack path; it is absent otherwise.
 - **Where an answer stands: order evidence by the executor, never by a clock (decision 17).**

@@ -878,6 +878,56 @@ pub struct Applied {
     pub relinked: Vec<(LinkClass, String, Metadata)>,
 }
 
+/// A name the restore made one of a class's own hardlink groups (the bulk class's, the
+/// workspace class's): what [`apply_over`] moves along when another class's link takes one of
+/// the group's names onto a new inode.
+#[derive(Debug, Clone)]
+pub struct RestoredName {
+    /// The class that restored it.
+    pub class: LinkClass,
+    /// Its key in that class's index, when the index holds it (a group's canonical name).
+    pub key: Option<String>,
+    /// Where it is on disk.
+    pub abs: PathBuf,
+}
+
+/// Every hardlink group the restore made inside one class ([`RestoredName`]). A cross-class
+/// link names one member of such a group (the bulk index holds only a group's canonical name):
+/// the rest of the group belongs on the same inode (review 12 #2: pnpm's peer-context copies of
+/// a local package, two bulk names of one tracked file's inode, came back with one of them on
+/// an inode of its own).
+#[derive(Debug, Default)]
+pub struct RestoredGroups {
+    groups: Vec<Vec<RestoredName>>,
+    by_abs: HashMap<PathBuf, usize>,
+}
+
+impl RestoredGroups {
+    /// Add one group (two or more names of one inode, as restored).
+    pub fn add(&mut self, names: Vec<RestoredName>) {
+        if names.len() < 2 {
+            return;
+        }
+        let at = self.groups.len();
+        for name in &names {
+            self.by_abs.insert(name.abs.clone(), at);
+        }
+        self.groups.push(names);
+    }
+
+    /// The group `abs` is a name of (itself included), or nothing.
+    fn group_of(&self, abs: &Path) -> &[RestoredName] {
+        self.by_abs
+            .get(abs)
+            .map_or(&[][..], |&at| self.groups[at].as_slice())
+    }
+
+    /// Every group.
+    fn all(&self) -> impl Iterator<Item = &[RestoredName]> {
+        self.groups.iter().map(Vec::as_slice)
+    }
+}
+
 fn same_bytes(a: &Path, b: &Path) -> io::Result<bool> {
     let (ma, mb) = (longpath::metadata(a)?, longpath::metadata(b)?);
     if ma.len() != mb.len() {
@@ -916,7 +966,7 @@ pub fn apply(
     scope: &MetaScope,
     resolve: &dyn Fn(LinkClass, &[u8]) -> Option<PathBuf>,
 ) -> Result<Applied, MetaError> {
-    apply_with(repo, doc, scope, resolve, false)
+    apply_over(repo, doc, scope, resolve, &RestoredGroups::default(), false)
 }
 
 /// [`apply`] over a capture that promised its links: the classes were captured together (a
@@ -933,14 +983,23 @@ pub fn apply_strict(
     scope: &MetaScope,
     resolve: &dyn Fn(LinkClass, &[u8]) -> Option<PathBuf>,
 ) -> Result<Applied, MetaError> {
-    apply_with(repo, doc, scope, resolve, true)
+    apply_over(repo, doc, scope, resolve, &RestoredGroups::default(), true)
 }
 
-fn apply_with(
+/// [`apply`] (or, `strict`, [`apply_strict`]) over a restore that made `restored`, the classes'
+/// own hardlink groups. Every link across classes moves the whole group of the name it links:
+/// a name of a restored group that leaves its inode for another class's takes every other name
+/// still on that inode along. The links are one topology, made as one: the tracked file's
+/// hardlink group, the other classes' names of it, and each class's own group of any of those
+/// names end on one inode. Once every link is made, a strict apply checks exactly that, and a
+/// connected set of names on the same filesystem left on more than one inode fails with
+/// [`MetaError::LinkUnfulfilled`].
+pub fn apply_over(
     repo: &GitRepo,
     doc: &MetaDocument,
     scope: &MetaScope,
     resolve: &dyn Fn(LinkClass, &[u8]) -> Option<PathBuf>,
+    restored: &RestoredGroups,
     strict: bool,
 ) -> Result<Applied, MetaError> {
     let unfulfilled = |member: &str, reason: &str| -> Result<(), MetaError> {
@@ -1047,7 +1106,7 @@ fn apply_with(
         }
     }
     // Other classes' names of a tracked file's inode.
-    let mut relinked = Vec::new();
+    let mut relinked: Vec<(LinkClass, Option<String>, PathBuf, Vec<u8>)> = Vec::new();
     for link in &doc.shared {
         let tracked = bytes_of(&link.path);
         let canonical = abs_of(root, &tracked);
@@ -1079,9 +1138,11 @@ fn apply_with(
             tracing::debug!(tracked = %link.path, member = %link.member, "shared hardlink: contents differ; left unlinked");
             continue;
         }
+        let old = (meta.dev(), meta.ino());
         relink(&canonical, &abs).map_err(io_err(&member))?;
-        relinked.push((link.class, link.member.clone(), abs, member));
         applied.changed += 1;
+        applied.changed += relink_group(restored, &abs, old, &canonical, &mut relinked)?;
+        relinked.push((link.class, Some(link.member.clone()), abs, member));
     }
     // Inodes the workspace and bulk classes share with no tracked name: every member on the
     // first member's inode, under the same rule as a shared link (a name that is missing, not
@@ -1123,6 +1184,13 @@ fn apply_with(
                 }
                 relink(canonical, abs).map_err(io_err(bytes))?;
                 applied.changed += 1;
+                applied.changed += relink_group(
+                    restored,
+                    abs,
+                    (meta.dev(), meta.ino()),
+                    canonical,
+                    &mut relinked,
+                )?;
                 linked = true;
             }
             on_inode.push(i + 1);
@@ -1130,7 +1198,7 @@ fn apply_with(
         if linked {
             for i in on_inode {
                 let (m, abs, bytes) = &named[i];
-                relinked.push((m.class, m.member.clone(), abs.clone(), bytes.clone()));
+                relinked.push((m.class, Some(m.member.clone()), abs.clone(), bytes.clone()));
             }
         }
     }
@@ -1154,12 +1222,156 @@ fn apply_with(
     for (rel, e) in dirs {
         applied.changed += u64::from(settle(root, rel, e)?);
     }
+    // Every link made: the names the links join are one inode (per filesystem: a class's own
+    // group that spans two was copied across).
+    if let Some((member, reason)) = split_topology(root, doc, resolve, restored)? {
+        if strict {
+            return Err(MetaError::LinkUnfulfilled { member, reason });
+        }
+        tracing::warn!(%member, %reason, "worktree metadata: a hardlink group is split");
+    }
     // Stat relinked names once the shared inode has its final mode and mtime.
     for (class, member, abs, bytes) in relinked {
+        let Some(member) = member else {
+            continue;
+        };
         let meta = longpath::symlink_metadata(&abs).map_err(io_err(&bytes))?;
         applied.relinked.push((class, member, meta));
     }
     Ok(applied)
+}
+
+/// One name `abs` left the inode `old` for `canonical`'s: every other name of its restored
+/// group ([`RestoredGroups`]) still on `old` follows it. How many names moved.
+fn relink_group(
+    restored: &RestoredGroups,
+    abs: &Path,
+    old: (u64, u64),
+    canonical: &Path,
+    relinked: &mut Vec<(LinkClass, Option<String>, PathBuf, Vec<u8>)>,
+) -> Result<u64, MetaError> {
+    let mut moved = 0;
+    for name in restored.group_of(abs) {
+        if name.abs == abs {
+            continue;
+        }
+        let bytes = name.abs.as_os_str().as_bytes().to_vec();
+        let meta = match longpath::symlink_metadata(&name.abs) {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(io_err(&bytes)(e)),
+        };
+        // Only a name still on the inode the linked name left: it holds those very bytes.
+        if !meta.is_file() || (meta.dev(), meta.ino()) != old {
+            continue;
+        }
+        relink(canonical, &name.abs).map_err(io_err(&bytes))?;
+        moved += 1;
+        relinked.push((name.class, name.key.clone(), name.abs.clone(), bytes));
+    }
+    Ok(moved)
+}
+
+/// The first set of names the document and the restore join into one inode — the tracked
+/// hardlink groups, the shared links, the cross-class groups and each class's own groups,
+/// taken together — that is on more than one inode of one filesystem: a member and why.
+/// Names that are missing or not files are the links' own business (they fail or are passed
+/// over there).
+fn split_topology(
+    root: &Path,
+    doc: &MetaDocument,
+    resolve: &dyn Fn(LinkClass, &[u8]) -> Option<PathBuf>,
+    restored: &RestoredGroups,
+) -> Result<Option<(String, String)>, MetaError> {
+    let mut ids: HashMap<PathBuf, usize> = HashMap::new();
+    let mut parent: Vec<usize> = Vec::new();
+    let mut id = |abs: PathBuf, parent: &mut Vec<usize>| -> usize {
+        *ids.entry(abs).or_insert_with(|| {
+            parent.push(parent.len());
+            parent.len() - 1
+        })
+    };
+    fn find(parent: &mut [usize], mut x: usize) -> usize {
+        while parent[x] != x {
+            parent[x] = parent[parent[x]];
+            x = parent[x];
+        }
+        x
+    }
+    let mut join = |names: Vec<PathBuf>, parent: &mut Vec<usize>| {
+        let mut first = None;
+        for abs in names {
+            let at = id(abs, parent);
+            match first {
+                None => first = Some(at),
+                Some(f) => {
+                    let (a, b) = (find(parent, f), find(parent, at));
+                    parent[b] = a;
+                }
+            }
+        }
+    };
+    for group in &doc.hardlinks {
+        join(
+            group.iter().map(|k| abs_of(root, &bytes_of(k))).collect(),
+            &mut parent,
+        );
+    }
+    for link in &doc.shared {
+        let member = bytes_of_pair(&link.member, link.raw_member.as_deref())?;
+        if let Some(abs) = resolve(link.class, &member) {
+            join(vec![abs_of(root, &bytes_of(&link.path)), abs], &mut parent);
+        }
+    }
+    for group in &doc.cross_links {
+        let mut names = Vec::new();
+        for m in group {
+            if let Some(abs) = resolve(m.class, &m.bytes()?) {
+                names.push(abs);
+            }
+        }
+        join(names, &mut parent);
+    }
+    for group in restored.all() {
+        join(group.iter().map(|n| n.abs.clone()).collect(), &mut parent);
+    }
+    let mut components: BTreeMap<usize, Vec<PathBuf>> = BTreeMap::new();
+    let names: Vec<(PathBuf, usize)> = ids.into_iter().collect();
+    for (abs, at) in names {
+        let top = find(&mut parent, at);
+        components.entry(top).or_default().push(abs);
+    }
+    for (_, mut names) in components {
+        names.sort();
+        // (dev) → the inode its first name is on, and that name.
+        let mut seen: HashMap<u64, (u64, &PathBuf)> = HashMap::new();
+        for abs in &names {
+            let meta = match longpath::symlink_metadata(abs) {
+                Ok(meta) if meta.is_file() => meta,
+                Ok(_) => continue,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(io_err(abs.as_os_str().as_bytes())(e)),
+            };
+            match seen.get(&meta.dev()) {
+                None => {
+                    seen.insert(meta.dev(), (meta.ino(), abs));
+                }
+                Some((ino, first)) if *ino != meta.ino() => {
+                    return Ok(Some((
+                        abs.display().to_string(),
+                        format!(
+                            "one inode with {} on the capture, a different one after the \
+                             restore ({} names joined)",
+                            first.display(),
+                            names.len()
+                        ),
+                    )));
+                }
+                Some(_) => {}
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// Make `abs` a name of `canonical`'s inode (remove it, link it) and give its directory back
