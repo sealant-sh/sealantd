@@ -35,9 +35,9 @@ impl ClassRoots {
     }
 
     /// The workspace class listing: `.git/` bookkeeping (minus objects, refs, `HEAD`,
-    /// `packed-refs`, other worktrees' admin directories, and git's transient files — but a
-    /// symbolic ref or `HEAD` git stores as a symlink is carried as that symlink, beside its
-    /// entry in the git section, so a restore stores it as it was), local
+    /// `packed-refs`, other worktrees' admin directories, and git's transient files — but every
+    /// symlink standing for `HEAD` or a ref is carried as that symlink, beside the ref in the
+    /// git section, so a restore stores it as it was), local
     /// git-lfs objects (`.git/lfs/`, which may exist nowhere else), `tree/` (git-ignored files
     /// and the nested repositories in `gitlinks`, [`crate::tree::key_of`] keys of their paths),
     /// `harness/` (the harness home minus credential files).
@@ -50,13 +50,16 @@ impl ClassRoots {
         // Objects and refs travel in the git section; `worktrees/` holds other worktrees'
         // bookkeeping, which is theirs to capture.
         let git_prune = |_: &Path, v: &str, _: &str| v == ".git/objects" || v == ".git/worktrees";
-        // A symbolic ref stored as a symlink (`core.preferSymlinkRefs`) is a ref, and the git
-        // section holds it (`symrefs`, `head`) — as the same ref to git, written back as text.
-        // How the repository stored it is this class's: the symlink itself, its link text
-        // and mtime (review 2026-09-28, seventh pass, #1).
+        // A symlink under `refs/` or at `HEAD` stands for a ref, and the git section holds the
+        // ref (`refs`, `symrefs`, `head`) — as the same ref to git, written back as text. How
+        // the repository stored it is this class's: the symlink itself, its link text and
+        // mtime, whatever that text is — a symbolic ref's name (`core.preferSymlinkRefs`;
+        // review 2026-09-28, seventh pass, #1), or a path git reads through to a ref's file
+        // (`refs/heads/alias -> main`; ninth pass, #2, which the restore makes resolve again,
+        // `gitpack::ground_ref_symlinks`).
         let git_include = |abs: &Path, v: &str, _: &str| {
             if v == ".git/HEAD" || v.starts_with(".git/refs/") {
-                return crate::gitpack::symlinked_symref(abs).is_some();
+                return std::fs::symlink_metadata(abs).is_ok_and(|m| m.file_type().is_symlink());
             }
             !(v == ".git/packed-refs" || v == ".git/commondir" || v == ".git/gitdir")
         };

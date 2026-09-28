@@ -135,12 +135,32 @@ pub fn is_vanished(error: &io::Error) -> bool {
     )
 }
 
-/// Modification time as nanoseconds since the Unix epoch.
+/// Modification time as nanoseconds since the Unix epoch, saturating: what the stat comparisons
+/// that decide whether a file changed use. What a capture records goes through
+/// [`recorded_mtime_ns`], which never saturates.
 #[must_use]
 pub fn mtime_ns(meta: &Metadata) -> i64 {
     meta.mtime()
         .saturating_mul(1_000_000_000)
         .saturating_add(meta.mtime_nsec())
+}
+
+/// Modification time as nanoseconds since the Unix epoch, exactly, or why a capture cannot record
+/// it: signed 64-bit nanoseconds hold 1677-09-21 to 2262-04-11, and a filesystem holds times
+/// past either end (review 2026-09-28, ninth pass, #3 — one in 2286 was recorded as the last
+/// nanosecond of 2262 and restored so, in a sealed capture). A final snap fails naming the path
+/// (`unreadable`); an automatic one carries the path's bytes with the time saturated.
+pub fn recorded_mtime_ns(meta: &Metadata) -> Result<i64, String> {
+    meta.mtime()
+        .checked_mul(1_000_000_000)
+        .and_then(|ns| ns.checked_add(meta.mtime_nsec()))
+        .ok_or_else(|| {
+            format!(
+                "its modification time ({} s since the epoch) is outside what a capture records \
+                 (1677 to 2262)",
+                meta.mtime()
+            )
+        })
 }
 
 /// Status-change time as nanoseconds since the Unix epoch.
@@ -981,6 +1001,16 @@ impl<'a> TreeBuilder<'a> {
             .iter()
             .map(|(v, u)| (v.clone(), u.error.clone()))
             .collect();
+        // A modification time the dir objects cannot record (outside signed 64-bit
+        // nanoseconds): a strict build does not hold that path as it is, and says so (review
+        // 2026-09-28, ninth pass, #3). An automatic one carries the bytes, the time saturated.
+        if self.strict {
+            for (v, src) in &listing.entries {
+                if let Err(why) = recorded_mtime_ns(&src.meta) {
+                    unreadable.push((v.clone(), why));
+                }
+            }
+        }
 
         // Every node: the listing, plus (not strict) what the index last held under a path that
         // could not be read (carried, never dropped), plus the directories those need. A strict

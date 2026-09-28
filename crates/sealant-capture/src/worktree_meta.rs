@@ -697,6 +697,11 @@ pub struct Captured {
     /// a capture that must be the disk (a final one) fails on them (review 2026-09-28, eighth
     /// pass, #3).
     pub linked_symlinks: Vec<String>,
+    /// Paths whose modification time the document cannot record exactly (outside signed 64-bit
+    /// nanoseconds; [`crate::index::recorded_mtime_ns`]), with why. Their entries hold the time
+    /// saturated; a capture that must be the disk (a final one) fails on them (review
+    /// 2026-09-28, ninth pass, #3).
+    pub unrecordable_times: Vec<UnreadableMeta>,
 }
 
 /// A path of the worktree tree whose metadata could not be read.
@@ -735,6 +740,16 @@ pub fn capture(
     let mut inodes: BTreeMap<(u64, u64), Vec<Named>> = BTreeMap::new();
     let mut linked = Vec::new();
     let mut linked_symlinks = Vec::new();
+    let mut unrecordable_times = Vec::new();
+    let mut note_time = |path: &str, meta: &Metadata| {
+        if let Err(error) = crate::index::recorded_mtime_ns(meta) {
+            unrecordable_times.push(UnreadableMeta {
+                path: path.to_owned(),
+                error,
+                carried: false,
+            });
+        }
+    };
     for tp in tree_paths(repo, worktree_tree)? {
         let meta = match longpath::symlink_metadata(&abs_of(&scope.root, &tp.path)) {
             Ok(meta) => meta,
@@ -763,6 +778,7 @@ pub fn capture(
             continue;
         }
         let entry = entry_of(&tp.path, tp.kind, &meta);
+        note_time(&entry.path, &meta);
         if tp.kind == MetaKind::Symlink && meta.nlink() > 1 {
             linked_symlinks.push(entry.path.clone());
         }
@@ -784,6 +800,9 @@ pub fn capture(
     let found = scope.directories(repo)?;
     for (rel, meta) in found.dirs {
         let entry = entry_of(&rel, MetaKind::Dir, &meta);
+        if !entries.contains_key(&entry.path) {
+            note_time(&entry.path, &meta);
+        }
         entries.entry(entry.path.clone()).or_insert(entry);
     }
     // A directory that could not be listed or stat'ed: what the previous document held at and
@@ -839,6 +858,7 @@ pub fn capture(
         changed_kind,
         linked,
         linked_symlinks,
+        unrecordable_times,
     })
 }
 
@@ -995,19 +1015,30 @@ fn apply_with(
             Err(e) => return Err(io_err(&rel)(e)),
         }
     }
-    // Hardlink groups: every member on the first member's inode.
+    // Hardlink groups: every member on the first member's inode — only a member that holds
+    // exactly the first member's bytes. The restore wrote each name from what its class holds
+    // last (a workspace overlay can hold newer bytes for one of them than the tree): relinking
+    // one that differs would write the other's bytes over it. A strict apply refuses such a
+    // capture; a lenient one leaves the two names apart, each with its own bytes (review
+    // 2026-09-28, ninth pass, #7).
     for group in &doc.hardlinks {
         let Some((first, rest)) = group.split_first() else {
             continue;
         };
+        let first_key = first;
         let first = bytes_of(first);
         let canonical = abs_of(root, &first);
         let target = longpath::symlink_metadata(&canonical).map_err(io_err(&first))?;
-        for member in rest {
-            let member = bytes_of(member);
+        for member_key in rest {
+            let member = bytes_of(member_key);
             let abs = abs_of(root, &member);
             let meta = longpath::symlink_metadata(&abs).map_err(io_err(&member))?;
             if (meta.dev(), meta.ino()) == (target.dev(), target.ino()) {
+                continue;
+            }
+            if !same_bytes(&canonical, &abs).map_err(io_err(&member))? {
+                unfulfilled(member_key, &format!("holds other bytes than {first_key}"))?;
+                tracing::warn!(canonical = %first_key, member = %member_key, "hardlink group: contents differ; left unlinked");
                 continue;
             }
             relink(&canonical, &abs).map_err(io_err(&member))?;

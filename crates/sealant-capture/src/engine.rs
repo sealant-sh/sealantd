@@ -217,6 +217,10 @@ pub struct CaptureConfig {
     /// fails without it ([`CaptureEngine::snap`]), and a SHA-1 repository's captures are what
     /// they always were.
     pub reads_object_format: bool,
+    /// The store reads the `ref_format` manifest feature (`plan.get`'s `manifest_features`).
+    /// Only a repository whose refs are not in the files backend needs it: a final snap of one
+    /// fails without it, and a files repository's captures are what they always were.
+    pub reads_ref_format: bool,
 }
 
 impl CaptureConfig {
@@ -247,6 +251,7 @@ impl CaptureConfig {
             git_trees: true,
             unread_features: Vec::new(),
             reads_object_format: true,
+            reads_ref_format: true,
         }
     }
 
@@ -256,11 +261,15 @@ impl CaptureConfig {
     pub fn set_store_features(&mut self, reads: &[String]) {
         self.git_trees = reads.iter().any(|f| f == "git_trees");
         self.reads_object_format = reads.iter().any(|f| f == "object_format");
-        // `object_format` is written only for a repository that is not SHA-1, and decided
-        // there ([`Self::reads_object_format`]).
+        self.reads_ref_format = reads.iter().any(|f| f == "ref_format");
+        // `object_format` is written only for a repository that is not SHA-1, `ref_format`
+        // only for one whose refs are not in the files backend, and each is decided there
+        // ([`Self::reads_object_format`], [`Self::reads_ref_format`]).
         self.unread_features = crate::registrar::MANIFEST_FEATURES
             .iter()
-            .filter(|f| **f != "object_format" && !reads.iter().any(|r| r == *f))
+            .filter(|f| {
+                **f != "object_format" && **f != "ref_format" && !reads.iter().any(|r| r == *f)
+            })
             .map(|f| (*f).to_owned())
             .collect();
     }
@@ -1249,6 +1258,35 @@ impl CaptureEngine {
             tracing::warn!(%gap, "a final flush over this repository is not complete");
         }
         Ok(Some(format))
+    }
+
+    /// The repository's ref backend as the git section names it: `None` for `files`, else the
+    /// backend (review 2026-09-28, ninth pass, #1). One this build does not restore, or one the
+    /// store does not read (`ref_format`), fails a final snap, as [`Self::object_format`] does.
+    fn ref_format(&self, found: &str, strict: bool) -> Result<Option<String>, EngineError> {
+        if found == "files" {
+            return Ok(None);
+        }
+        let gap = if !crate::manifest::REF_FORMATS.contains(&found) {
+            Some(format!(
+                "the repository keeps its refs in the {found} backend, which this build does not \
+                 restore"
+            ))
+        } else if !self.config.reads_ref_format {
+            Some(format!(
+                "the repository keeps its refs in the {found} backend, and the store does not \
+                 read the manifest feature ref_format: what it would restore is not the repository"
+            ))
+        } else {
+            None
+        };
+        if let Some(gap) = gap {
+            if strict {
+                return Err(io::Error::other(gap).into());
+            }
+            tracing::warn!(%gap, "a final flush over this repository is not complete");
+        }
+        Ok(Some(found.to_owned()))
     }
 
     /// Configuration.
@@ -2262,6 +2300,23 @@ impl CaptureEngine {
                          one; a final flush over it is not complete"
                     );
                 }
+                let ref_format = self.ref_format(&git.closure.ref_format, strict)?;
+                // A symlink git reads as `HEAD` or a ref, whose chain a restore cannot make
+                // resolve the same way (it ends outside the repository): the symlink comes back
+                // reaching nothing (review 2026-09-28, ninth pass, #2; decision 23).
+                let unrestorable = &git.closure.unrestorable_ref_links;
+                if !unrestorable.is_empty() {
+                    let gap = format!(
+                        "{} symlink(s) git reads as HEAD or a ref reach what a restore cannot \
+                         bring back (outside the repository, or no ref the capture holds): {}",
+                        unrestorable.len(),
+                        unrestorable.join(", ")
+                    );
+                    if strict {
+                        return Err(io::Error::other(gap).into());
+                    }
+                    tracing::warn!(%gap, "a final flush over them is not complete");
+                }
                 let mut git_unreadable: Vec<UnreadablePath> = git
                     .closure
                     .unreadable
@@ -2378,6 +2433,33 @@ impl CaptureEngine {
                             })
                             .collect();
                         git_unreadable = merge_unreadable(git_unreadable, meta_unreadable);
+                        // A time the overlay cannot record exactly: a final snap does not hold
+                        // that path as it is (review 2026-09-28, ninth pass, #3).
+                        if !captured.unrecordable_times.is_empty() {
+                            if strict {
+                                let times = captured
+                                    .unrecordable_times
+                                    .iter()
+                                    .map(|u| UnreadablePath {
+                                        path: format!("tree/{}", u.path),
+                                        error: u.error.clone(),
+                                        carried: false,
+                                    })
+                                    .collect();
+                                git_unreadable = merge_unreadable(git_unreadable, times);
+                            } else {
+                                tracing::warn!(
+                                    paths = %captured
+                                        .unrecordable_times
+                                        .iter()
+                                        .map(|u| u.path.as_str())
+                                        .collect::<Vec<_>>()
+                                        .join(", "),
+                                    "modification times outside what a capture records are \
+                                     saturated; a final flush over them is not complete"
+                                );
+                            }
+                        }
                         // A symlink inode with more than one name: no class carries one
                         // inode for its names, and a restore would make each its own
                         // symlink. A final snap cannot say it holds the disk (review
@@ -2503,6 +2585,7 @@ impl CaptureEngine {
                         index_tree: closure.index_tree,
                         raw_tree: Some(closure.raw_tree),
                         object_format: object_format.clone(),
+                        ref_format: ref_format.clone(),
                     }
                 } else {
                     // A registrar that does not read `git_trees`: the trees ride `refs` as the
@@ -2537,6 +2620,7 @@ impl CaptureEngine {
                         index_tree: None,
                         raw_tree: None,
                         object_format: object_format.clone(),
+                        ref_format: ref_format.clone(),
                     }
                 };
                 Sections {

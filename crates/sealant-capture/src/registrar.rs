@@ -166,7 +166,14 @@
 //! `symrefs`; `other_bulk` — the stored head has a non-empty `other_bulk`, or its ready `bulk`
 //! was captured on another platform than the request names; `raw_names` — a dir entry of the
 //! answered workspace or bulk section carries `raw_name` or `raw_target`; `final_seal` — the
-//! head carries `final_seal`; `git_trees` — the git section carries `worktree_tree`.
+//! head carries `final_seal`; `git_trees` — the git section carries `worktree_tree`;
+//! `object_format` — the git section carries `object_format` (a repository that is not SHA-1);
+//! `ref_format` — the git section carries `ref_format` (a repository whose refs are not in the
+//! files backend: `reftable`). A registrar that reads `ref_format` restores the repository in
+//! that backend: it initializes it with `git init --ref-format=<ref_format>` and writes the refs,
+//! the symbolic refs and `HEAD` through git (`update-ref`, `symbolic-ref`), never as
+//! `packed-refs` or a `HEAD` file, which that backend does not read. The workspace class carries
+//! the backend's own files (`.git/reftable/`), reflogs included.
 //!
 //! The executor writes `git_trees` only for a registrar whose answer lists it (else the trees
 //! ride `refs` as pseudo-refs, as before): the git section then names `worktree_tree`,
@@ -180,7 +187,8 @@
 //!
 //! ```json
 //! → {"worktree_id":null,"epoch":0,"platform":"linux-x86_64-gnu","manifest_format":2,
-//!    "manifest_features":["worktree_meta","symrefs","other_bulk","raw_names","final_seal","git_trees"]}
+//!    "manifest_features":["worktree_meta","symrefs","other_bulk","raw_names","final_seal","git_trees",
+//!      "object_format","ref_format"]}
 //! ← 409 {"reason":"manifest-features","message":"…","missing":["final_seal"]}
 //! ```
 //!
@@ -249,7 +257,7 @@ use crate::manifest::{
 
 /// Every manifest feature this build reads, validates and carries on (`plan.get`
 /// `manifest_features`): see the module docs.
-pub const MANIFEST_FEATURES: [&str; 7] = [
+pub const MANIFEST_FEATURES: [&str; 8] = [
     "worktree_meta",
     "symrefs",
     "other_bulk",
@@ -257,6 +265,7 @@ pub const MANIFEST_FEATURES: [&str; 7] = [
     "final_seal",
     "git_trees",
     "object_format",
+    "ref_format",
 ];
 use crate::transport::{ChannelTransport, TransportError};
 
@@ -429,6 +438,7 @@ pub fn missing_manifest_features(
             "object_format",
             planned.sections.git.object_format.is_some(),
         ),
+        ("ref_format", planned.sections.git.ref_format.is_some()),
     ]
     .into_iter()
     .filter(|(feature, held)| *held && !reads.iter().any(|r| r == feature))
@@ -2205,6 +2215,7 @@ mod tests {
                     index_tree: None,
                     raw_tree: None,
                     object_format: None,
+                    ref_format: None,
                 },
                 workspace: WorkspaceSection::objects("r", vec![]),
                 bulk: BulkState::pending(),
@@ -2486,7 +2497,8 @@ mod tests {
                 "raw_names",
                 "final_seal",
                 "git_trees",
-                "object_format"
+                "object_format",
+                "ref_format"
             ])
         );
         let bare = PlanGetRequest {

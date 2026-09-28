@@ -161,17 +161,36 @@ pub struct GitSection {
     /// exactly as before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub object_format: Option<String>,
+    /// The backend the repository keeps its refs in (`extensions.refStorage`, the
+    /// `ref_format` manifest feature) when it is not `files`: `reftable`. The capture reads
+    /// `HEAD`, the refs, the reflogs and the root refs through git, in whichever backend; a
+    /// restore initializes its repository with this backend and writes the refs through git,
+    /// and the workspace class then brings the backend's own files back byte for byte (a
+    /// reftable repository's tables, reflogs and all). Absent for `files`, so a files section
+    /// encodes exactly as before (review 2026-09-28, ninth pass, #1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ref_format: Option<String>,
 }
 
 /// The object formats this build captures and restores: `sha1` (a section without
 /// [`GitSection::object_format`]) and `sha256`.
 pub const OBJECT_FORMATS: [&str; 2] = ["sha1", "sha256"];
 
+/// The ref backends this build captures and restores: `files` (a section without
+/// [`GitSection::ref_format`]) and `reftable`.
+pub const REF_FORMATS: [&str; 2] = ["files", "reftable"];
+
 impl GitSection {
     /// The repository's object format: [`Self::object_format`], `sha1` when absent.
     #[must_use]
     pub fn object_format(&self) -> &str {
         self.object_format.as_deref().unwrap_or("sha1")
+    }
+
+    /// The repository's ref backend: [`Self::ref_format`], `files` when absent.
+    #[must_use]
+    pub fn ref_format(&self) -> &str {
+        self.ref_format.as_deref().unwrap_or("files")
     }
 
     /// Whether this section names its trees in their own fields (`git_trees`) rather than as
@@ -704,6 +723,7 @@ mod tests {
                     index_tree: None,
                     raw_tree: None,
                     object_format: None,
+                    ref_format: None,
                 },
                 workspace: WorkspaceSection::objects("captures/wt/1/trees/t", vec![]),
                 bulk: BulkState::pending(),

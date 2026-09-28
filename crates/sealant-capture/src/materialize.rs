@@ -592,6 +592,29 @@ impl<'a> Materializer<'a> {
             report.git_config = write.planned.contains(".git/config");
             let resolve = |v: &str| roots.workspace_path(&git_dir, v);
             Self::link_all(&write.links, &resolve, &mut report)?;
+            // A symlink under `refs/` git read through to a loose ref's file came back
+            // reaching nothing (the refs are packed): that file is written loose again, with
+            // the value the git section holds (review 2026-09-28, ninth pass, #2).
+            if class == MaterializeClass::All
+                && manifest.sections.git.ref_format() == "files"
+                && let Some(repo) = &repo
+            {
+                let left =
+                    gitpack::ground_ref_symlinks(repo, &manifest.sections.git.refs_to_restore())?;
+                if !left.is_empty() {
+                    if manifest.final_seal.is_some() {
+                        return Err(io::Error::other(format!(
+                            "symlinks the capture read as refs resolve to nothing restored: {}",
+                            left.join(", ")
+                        ))
+                        .into());
+                    }
+                    tracing::warn!(
+                        links = %left.join(", "),
+                        "materialize: symlinks read as refs resolve to nothing restored"
+                    );
+                }
+            }
             if let Some(repo) = &repo {
                 let gitlinks = repo.chunked_paths(None)?;
                 let listing = roots.workspace_listing(repo, &gitlinks)?;
@@ -797,7 +820,17 @@ impl<'a> Materializer<'a> {
             ))
             .into());
         }
-        let repo = GitRepo::init_with_format(&self.targets.root, format)?;
+        // The refs go into the capture's backend (review 2026-09-28, ninth pass, #1): a reftable
+        // repository reads none of `packed-refs` and `HEAD`.
+        let ref_format = git.ref_format();
+        if !crate::manifest::REF_FORMATS.contains(&ref_format) {
+            return Err(io::Error::other(format!(
+                "the capture's repository keeps its refs in the {ref_format} backend, which this \
+                 build does not restore"
+            ))
+            .into());
+        }
+        let repo = GitRepo::init_with_formats(&self.targets.root, format, ref_format)?;
         for key in &git.packs {
             let Some(sha) = key_digest(key) else { continue };
             if gitpack::pack_installed(&repo, sha) {
@@ -817,8 +850,17 @@ impl<'a> Materializer<'a> {
         }
         // Every ref the repository held, whatever its name; an older manifest's two pseudo-refs
         // are its trees, not refs.
-        gitpack::write_packed_refs(&repo, &git.refs_to_restore(), &git.symrefs)?;
-        gitpack::write_head(&repo, &git.head)?;
+        if ref_format == "files" {
+            gitpack::write_packed_refs(&repo, &git.refs_to_restore(), &git.symrefs)?;
+            gitpack::write_head(&repo, &git.head)?;
+        } else {
+            gitpack::write_refs_through_git(
+                &repo,
+                &git.refs_to_restore(),
+                &git.symrefs,
+                &git.head,
+            )?;
+        }
         if let Some(tree) = git.checkout_tree_id() {
             let tree = &tree.to_owned();
             let excludes = vec![DAEMON_DIR.to_owned()];
