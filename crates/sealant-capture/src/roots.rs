@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 
 use crate::gitpack::{GitError, GitRepo};
 use crate::index::{self, DAEMON_DIR, Listing, has_component_in, rel_key};
+use crate::longpath;
 use crate::tree::os_of_key;
 
 /// Where the classes live on disk.
@@ -85,12 +86,17 @@ impl ClassRoots {
             if has_component_in(&dir, bulk) || self.is_daemon_path(&abs) {
                 continue;
             }
-            let error = std::fs::read_dir(&abs)
+            let error = longpath::read_dir(&abs)
                 .err()
                 .unwrap_or_else(|| io::Error::other("git could not open it"));
             listing.note_unreadable(format!("tree/{}", rel_key(&dir)), abs, &error);
         }
-        tree_roots.extend(gitlinks.iter().map(|g| (PathBuf::from(g), true)));
+        // Nested repositories, and the paths git cannot reach: a directory, or a file (mounted
+        // as one; a directory mount of a file would take nothing).
+        tree_roots.extend(gitlinks.iter().map(|g| {
+            let is_dir = longpath::symlink_metadata(&root.join(g)).is_ok_and(|m| m.is_dir());
+            (PathBuf::from(g), is_dir)
+        }));
         for (rel, is_dir) in tree_roots {
             let abs = root.join(&rel);
             if has_component_in(&rel, bulk)
@@ -187,9 +193,9 @@ fn unopened_dirs(stderr: &[u8], root: &Path) -> Vec<PathBuf> {
             if rel.is_absolute() || dirs.contains(&rel) {
                 continue;
             }
-            if let Err(error) = std::fs::read_dir(root.join(&rel))
+            if let Err(error) = longpath::read_dir(&root.join(&rel))
                 && !index::is_vanished(&error)
-                && std::fs::symlink_metadata(root.join(&rel)).is_ok_and(|m| m.is_dir())
+                && longpath::symlink_metadata(&root.join(&rel)).is_ok_and(|m| m.is_dir())
             {
                 dirs.push(rel);
             }

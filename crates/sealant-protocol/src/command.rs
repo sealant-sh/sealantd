@@ -990,9 +990,10 @@ pub struct CaptureStatusReport {
     /// `pending == 0` alone does not. `false` from an older daemon.
     #[serde(default)]
     pub complete: bool,
-    /// Why `complete` is false: `not-final`, `processes-remain`, `sweep-unavailable`,
-    /// `snapshot-failed`, `unreadable`, `fenced`, `conflict`, `deadline`, `ship-failed`,
-    /// `pending` or `internal`. Absent when `complete`.
+    /// Why `complete` is false: `not-final`, `in-progress` (a final flush is running),
+    /// `processes-remain`, `sweep-unavailable`, `snapshot-failed` (a final snap failed, or a
+    /// class's last snap did: `snaps`), `unreadable`, `fenced`, `conflict`, `deadline`,
+    /// `ship-failed`, `pending` or `internal`. Absent when `complete`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub incomplete_reason: Option<String>,
     /// Paths the last snap of each class could not read, summed over both classes (a
@@ -1029,6 +1030,27 @@ pub struct CaptureStatusReport {
     /// `pending_bytes` counts what it has staged so far. A drain is not done while this is true.
     #[serde(default)]
     pub bulk_building: bool,
+    /// Each captured class's snaps: how many failed, and the last one's error while it fails.
+    /// `complete` is false while any class's last snap failed. Empty from an older daemon.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub snaps: Vec<CaptureClassSnaps>,
+}
+
+/// One class's snaps (`capture.status`): a snap that fails for any reason, scheduled or forced,
+/// is counted and its error kept until one succeeds.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CaptureClassSnaps {
+    /// The class.
+    pub class: CaptureClass,
+    /// Snaps of this class that failed since the daemon started.
+    pub snaps_failed: u64,
+    /// The last snap's error, while the last snap failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_snap_error: Option<String>,
+    /// When the current run of failed snaps began (Unix ms), while the last snap failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snap_failing_since_unix_ms: Option<u64>,
 }
 
 /// Result of `capture.replan`: the identity the executor now acts under and what the delta

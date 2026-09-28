@@ -17,7 +17,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::engine::{CaptureEngine, Class, EngineError, SnapOutcome, SnapRequest, StagedCapture};
 use crate::manifest::CaptureKind;
@@ -115,6 +115,50 @@ impl FinalFlush {
     }
 }
 
+/// One class's snaps, failed and not ([`CadenceRunner::snap_health`]): a snap that fails for
+/// any reason — scheduled or forced — is counted and its error kept until one succeeds, so a
+/// class that cannot be captured is visible, never only a line in the log.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SnapHealth {
+    /// Snaps of the class that failed since the runner was made.
+    pub failed: u64,
+    /// The last snap's error, while the last snap failed.
+    pub last_error: Option<String>,
+    /// When the current run of failed snaps began, while the last snap failed.
+    pub failing_since: Option<SystemTime>,
+}
+
+impl SnapHealth {
+    /// Whether the class's last snap failed.
+    #[must_use]
+    pub fn failing(&self) -> bool {
+        self.last_error.is_some()
+    }
+
+    fn record(&mut self, class: Class, result: Result<(), String>) {
+        match result {
+            Ok(()) => {
+                if let Some(error) = self.last_error.take() {
+                    tracing::info!(?class, %error, "capture snaps of the class succeed again");
+                }
+                self.failing_since = None;
+            }
+            Err(error) => {
+                self.failed += 1;
+                if self.last_error.is_none() {
+                    tracing::error!(
+                        ?class,
+                        %error,
+                        "capture snaps of the class are failing: what changes is on this disk only"
+                    );
+                    self.failing_since = Some(SystemTime::now());
+                }
+                self.last_error = Some(error);
+            }
+        }
+    }
+}
+
 /// Why a scheduled snap fired.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Trigger {
@@ -203,6 +247,8 @@ struct Counters {
     forced: AtomicU64,
     preemptions: AtomicU64,
     overflows: AtomicU64,
+    /// Directories found unwatchable after the watcher started.
+    unwatched: AtomicU64,
     bulk_running: AtomicBool,
 }
 
@@ -264,9 +310,21 @@ struct Shared {
     started: AtomicBool,
     seq: AtomicU64,
     counters: Counters,
+    /// Each class's snaps, failed and not: small, bulk.
+    health: Mutex<[SnapHealth; 2]>,
+    /// Change signals the watcher delivered (either class), for [`CadenceRunner::final_is_current`].
+    changes: AtomicU64,
+    /// The last final flush snapped every class without an error: the change count before its
+    /// first snap. `None` until one does, and after a final flush whose snaps failed.
+    sealed: Mutex<Option<u64>>,
 }
 
 impl Shared {
+    fn record(&self, class: Class, result: Result<(), String>) {
+        let mut health = self.health.lock().unwrap_or_else(PoisonError::into_inner);
+        health[usize::from(class == Class::Bulk)].record(class, result);
+    }
+
     fn state(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -285,6 +343,9 @@ impl Shared {
 
     fn signal(&self, signal: ChangeSignal) {
         let now = Instant::now();
+        // Every signal counts (a change, an overflow, an unwatched directory): a final flush
+        // after it snaps again.
+        self.changes.fetch_add(1, Ordering::SeqCst);
         let mut st = self.state();
         match signal {
             ChangeSignal::Changed(Class::Small) => st.small.dirty(now),
@@ -303,6 +364,24 @@ impl Shared {
                 // Reconcile now: the next poll is due immediately.
                 st.small.last_snap = now.checked_sub(st.small.max).unwrap_or(now);
                 st.bulk.last_snap = now.checked_sub(st.bulk.max).unwrap_or(now);
+            }
+            ChangeSignal::Unwatched(class) => {
+                self.counters.unwatched.fetch_add(1, Ordering::Relaxed);
+                let st = &mut *st;
+                let (mode, clock) = match class {
+                    Class::Small => (&mut st.small_mode, &mut st.small),
+                    Class::Bulk => (&mut st.bulk_mode, &mut st.bulk),
+                };
+                if *mode == Mode::Watched {
+                    tracing::warn!(
+                        ?class,
+                        "a directory of the class could not be watched; it polls at its \
+                         maximum interval from now on"
+                    );
+                }
+                *mode = Mode::Polled;
+                // What changed there is unseen: the next poll is due now.
+                clock.last_snap = now.checked_sub(clock.max).unwrap_or(now);
             }
         }
         drop(st);
@@ -330,6 +409,10 @@ impl Shared {
         }
         self.state().small.last_snap = Instant::now();
         self.counters.small_snaps.fetch_add(1, Ordering::Relaxed);
+        self.record(
+            Class::Small,
+            result.as_ref().map(|_| ()).map_err(ToString::to_string),
+        );
         if let Ok(staged) = &result
             && !staged.unchanged
         {
@@ -419,6 +502,10 @@ impl Shared {
         self.counters.bulk_running.store(false, Ordering::SeqCst);
         self.state().bulk.last_snap = Instant::now();
         self.counters.bulk_snaps.fetch_add(1, Ordering::Relaxed);
+        self.record(
+            Class::Bulk,
+            result.as_ref().map(|_| ()).map_err(ToString::to_string),
+        );
         if let Ok(staged) = &result
             && !staged.unchanged
         {
@@ -617,6 +704,9 @@ impl CadenceRunner {
                 started: AtomicBool::new(false),
                 seq: AtomicU64::new(0),
                 counters: Counters::default(),
+                health: Mutex::new([SnapHealth::default(), SnapHealth::default()]),
+                changes: AtomicU64::new(0),
+                sealed: Mutex::new(None),
             }),
             threads: Mutex::new(Vec::new()),
         };
@@ -762,6 +852,48 @@ impl CadenceRunner {
             .flush_small(until.map(|u| u.saturating_duration_since(Instant::now())))?)
     }
 
+    /// Whether a final flush now would find the disk as the last one captured it, so it need
+    /// snap nothing: the last final flush snapped every class without an error, snaps are no
+    /// longer allowed (the daemon's hook says so once a final flush stopped every writer and
+    /// admission is closed), and the watcher — watching both classes, never overflowed — has
+    /// delivered no change since before that flush's first snap. Not a guess from "the writers
+    /// are stopped": a class that polls, a change the watcher saw, or a runner without the
+    /// hook answers `false`, and the flush snaps again.
+    #[must_use]
+    pub fn final_is_current(&self) -> bool {
+        let Some(sealed) = *self
+            .shared
+            .sealed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+        else {
+            return false;
+        };
+        if self.shared.allowed() {
+            return false;
+        }
+        {
+            let st = self.shared.state();
+            if st.overflowed
+                || st.repair
+                || st.small_mode != Mode::Watched
+                || (self.shared.capture_bulk && st.bulk_mode != Mode::Watched)
+            {
+                return false;
+            }
+        }
+        if self.shared.changes.load(Ordering::SeqCst) != sealed
+            || self.shared.staging.repair_request().is_some()
+        {
+            return false;
+        }
+        // A bulk build paused mid-way holds progress no capture lists yet.
+        self.shared
+            .engine
+            .try_lock()
+            .is_ok_and(|e| !e.bulk_in_progress())
+    }
+
     /// The final flush — the executor is going away, and its disk with it; the caller has
     /// stopped every writer first. A forced small-class snap AND a forced bulk-class snap (the
     /// dependency tree as it is now, whatever the bulk clocks say; a scheduled bulk build in
@@ -772,19 +904,70 @@ impl CadenceRunner {
     /// fence, a conflict or the deadline. Whatever fails, what could be staged still ships
     /// before this returns (bounded by `deadline`, none: until the process ends), and the rest
     /// stays staged. Blocking.
+    ///
+    /// The chain ends as the disk is: a small snap whose overlay names the bulk class's names
+    /// of tracked files is taken again after a bulk snap that staged a capture
+    /// ([`CaptureEngine::small_depends_on_bulk`]), and a newest capture of another kind is
+    /// sealed with a final one ([`CaptureEngine::seal_final`]) — so once this reports complete,
+    /// a final flush asked again stages nothing. When [`Self::final_is_current`], it snaps
+    /// nothing at all and only ships what is left.
     pub fn flush_final(&self, deadline: Option<Duration>) -> FinalFlush {
         let until = deadline.map(|d| Instant::now() + d);
         let left = || until.map(|u| u.saturating_duration_since(Instant::now()));
         let mut incomplete = None;
-        if let Err(error) = self.snap(CaptureKind::Final) {
-            tracing::error!(%error, "final small-class snap failed");
-            incomplete = Some(Incomplete::from_snap(Class::Small, &error));
-        }
-        if self.shared.capture_bulk
-            && let Err(error) = self.shared.bulk_snap(true)
-        {
-            tracing::error!(%error, "final bulk-class snap failed");
-            incomplete.get_or_insert(Incomplete::from_snap(Class::Bulk, &error));
+        if self.final_is_current() {
+            tracing::info!(
+                "final flush: the disk is as the last final flush captured it (the writers are \
+                 stopped and the watcher saw no change since); nothing to snap"
+            );
+        } else {
+            *self
+                .shared
+                .sealed
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = None;
+            let changes = self.shared.changes.load(Ordering::SeqCst);
+            if let Err(error) = self.snap(CaptureKind::Final) {
+                tracing::error!(%error, "final small-class snap failed");
+                incomplete = Some(Incomplete::from_snap(Class::Small, &error));
+            }
+            let mut bulk_staged = false;
+            if self.shared.capture_bulk {
+                match self.shared.bulk_snap(true) {
+                    Ok(staged) => bulk_staged = !staged.unchanged,
+                    Err(error) => {
+                        tracing::error!(%error, "final bulk-class snap failed");
+                        incomplete.get_or_insert(Incomplete::from_snap(Class::Bulk, &error));
+                    }
+                }
+            }
+            if incomplete.is_none()
+                && bulk_staged
+                && self.shared.engine().small_depends_on_bulk()
+                && let Err(error) = self.shared.small_snap(CaptureKind::Final)
+            {
+                tracing::error!(%error, "final small-class snap after the bulk capture failed");
+                incomplete = Some(Incomplete::from_snap(Class::Small, &error));
+            }
+            if incomplete.is_none() {
+                let seq = self.shared.seq.fetch_add(1, Ordering::Relaxed);
+                let sealed = self.shared.engine().seal_final(seq);
+                match sealed {
+                    Ok(Some(_)) => self.shared.wake_worker(),
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::error!(%error, "staging the final capture failed");
+                        incomplete = Some(Incomplete::from_snap(Class::Small, &error));
+                    }
+                }
+            }
+            if incomplete.is_none() {
+                *self
+                    .shared
+                    .sealed
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) = Some(changes);
+            }
         }
         let mut shipped = 0;
         let mut repairs = 0u32;
@@ -859,6 +1042,23 @@ impl CadenceRunner {
     /// resume where they were once `f` returns.
     pub fn with_engine_mut<R>(&self, f: impl FnOnce(&mut CaptureEngine) -> R) -> R {
         f(&mut self.shared.engine())
+    }
+
+    /// Whether the bulk class is captured at all.
+    #[must_use]
+    pub fn captures_bulk(&self) -> bool {
+        self.shared.capture_bulk
+    }
+
+    /// Each class's snaps, failed and not: `(small, bulk)`.
+    #[must_use]
+    pub fn snap_health(&self) -> (SnapHealth, SnapHealth) {
+        let health = self
+            .shared
+            .health
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        (health[0].clone(), health[1].clone())
     }
 
     /// Counters and modes.

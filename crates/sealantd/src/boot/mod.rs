@@ -186,11 +186,14 @@ fn prepare_workspace(config: &BootConfig) -> Result<(), BootError> {
     let mut dirs: Vec<PathBuf> = vec![
         config.workspace.workspace_root.clone(),
         ssh_runtime_dir(config),
-        PathBuf::from("/root"),
         PathBuf::from("/tmp"),
         PathBuf::from("/run/sealant"),
         config.control.session_journal_dir.clone(),
     ];
+    // Root's home (the harness's `HOME`): a daemon that is not root cannot create it.
+    if nix::unistd::geteuid().is_root() {
+        dirs.push(PathBuf::from("/root"));
+    }
     if let Some(parent) = config.control.socket.parent() {
         dirs.push(parent.to_path_buf());
     }

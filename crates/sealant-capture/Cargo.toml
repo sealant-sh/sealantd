@@ -10,7 +10,6 @@ description = "Session capture store engine (ADR-0015): chunk, pack, ship, mater
 workspace = true
 
 [dependencies]
-sealant-fs = { workspace = true }
 sealant-process = { workspace = true }
 notify = { workspace = true }
 fastcdc = { workspace = true }
@@ -23,7 +22,7 @@ hex = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 walkdir = { workspace = true }
-nix = { workspace = true }
+nix = { workspace = true, features = ["dir"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }

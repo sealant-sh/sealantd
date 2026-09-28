@@ -610,6 +610,10 @@ pub struct CaptureEngine {
     /// content). Empty after a restart, when such a path's metadata is left out and the path is
     /// reported unreadable all the same.
     last_meta: Option<worktree_meta::MetaDocument>,
+    /// The last small snap found tracked files with names outside the worktree (hardlinks
+    /// another class carries): its overlay names the bulk class's names as the bulk index had
+    /// them, so a bulk capture staged after it can change what the next small snap records.
+    shared_outside: bool,
     /// A refused capture being rebuilt in its place ([`CaptureEngine::repair`]): the next
     /// snap takes its `n` and parent and folds the captures staged after it into itself.
     repair_target: Option<RepairTarget>,
@@ -734,6 +738,7 @@ impl CaptureEngine {
             dirs,
             last_tips,
             last_meta: None,
+            shared_outside: false,
             repair_target: None,
             repair_git: None,
             below: None,
@@ -1160,7 +1165,7 @@ impl CaptureEngine {
                 .config
                 .root
                 .join(std::ffi::OsStr::from_bytes(&worktree_meta::bytes_of(v)));
-            let on_disk = fs::symlink_metadata(abs).is_ok_and(|m| {
+            let on_disk = crate::longpath::symlink_metadata(&abs).is_ok_and(|m| {
                 m.is_file() && (m.dev(), m.ino()) == (known.stat.dev, known.stat.ino)
             });
             if on_disk {
@@ -1883,6 +1888,7 @@ impl CaptureEngine {
                             })
                             .collect();
                         git_unreadable = merge_unreadable(git_unreadable, meta_unreadable);
+                        self.shared_outside = !captured.outside.is_empty();
                         let mut doc = captured.doc;
                         // A tracked file under a bulk directory is the overlay's own name.
                         let own: HashSet<&str> =
@@ -2283,6 +2289,102 @@ impl CaptureEngine {
         })))
     }
 
+    /// Whether the last small snap's worktree metadata overlay depends on the bulk index: it
+    /// found tracked files with names another class carries, and records the bulk class's
+    /// names of them as the last bulk snap indexed them. A final flush whose bulk snap staged a
+    /// capture snaps the small class again then, so the chain's last capture records them as
+    /// they are (Docker end to end, round 3: the flush after the one that reported `complete`
+    /// registered a final capture whose only difference was these links).
+    #[must_use]
+    pub fn small_depends_on_bulk(&self) -> bool {
+        self.shared_outside
+    }
+
+    /// End the chain in a final capture: when the newest capture is of another kind, stage a
+    /// final one with its sections — nothing is read, and the capture holds nothing new. A final
+    /// flush calls this after both final snaps, which found the disk as that capture holds it
+    /// (a scheduled bulk capture the final small snap was staged ahead of is the newest one, and
+    /// the final bulk snap found it unchanged). Without it the flush reported `complete` with a
+    /// head of kind `auto`, and the next final flush staged the final capture instead (Docker
+    /// end to end, round 3: two captures registered after `complete: true`). `None` when the
+    /// newest capture is final already, or there is none.
+    ///
+    /// # Errors
+    /// Staging I/O.
+    pub fn seal_final(&mut self, seq: u64) -> Result<Option<StagedCapture>, EngineError> {
+        let Some(prev) = self.previous.clone() else {
+            return Ok(None);
+        };
+        if prev.manifest.kind == CaptureKind::Final {
+            return Ok(None);
+        }
+        let staging = Arc::clone(&self.staging);
+        let guard = staging.coalesce_guard();
+        let n = prev.manifest.n + 1;
+        let manifest = Manifest {
+            worktree_id: self.config.worktree_id.clone(),
+            n,
+            parent: Some(prev.capture_id.clone()),
+            epoch: self.config.epoch,
+            seq,
+            kind: CaptureKind::Final,
+            created_at: rfc3339_now(),
+            sections: prev.manifest.sections.clone(),
+            checkpoint: None,
+        }
+        .encode();
+        let manifest_key = self.prefix.manifest(&manifest.capture_id);
+        let manifest_file = format!("manifest-{}", manifest.capture_id);
+        fs::write(
+            self.staging.objects_dir().join(&manifest_file),
+            &manifest.bytes,
+        )?;
+        let uploads = vec![Upload {
+            key: manifest_key.clone(),
+            file: manifest_file,
+            bytes: manifest.bytes.len() as u64,
+        }];
+        let stats = SnapStats {
+            staged_bytes: manifest.bytes.len() as u64,
+            ..SnapStats::default()
+        };
+        let entry = QueueEntry {
+            n,
+            capture_id: manifest.capture_id.clone(),
+            kind: CaptureKind::Final,
+            class: Some(Class::Small),
+            uploads,
+            register: RegisterRequest {
+                worktree_id: self.config.worktree_id.clone(),
+                epoch: self.config.epoch,
+                n,
+                parent: manifest.manifest.parent.clone(),
+                capture_id: manifest.capture_id.clone(),
+                manifest_key: manifest_key.clone(),
+                manifest: manifest.manifest.clone(),
+            },
+        };
+        self.staging.enqueue(&entry)?;
+        drop(guard);
+        self.previous = Some(manifest.clone());
+        self.persist()?;
+        tracing::info!(
+            n,
+            sealed = prev.manifest.n,
+            sealed_kind = ?prev.manifest.kind,
+            "final capture staged over the newest capture, which the final snaps found current"
+        );
+        Ok(Some(StagedCapture {
+            n,
+            manifest,
+            manifest_key,
+            kind: CaptureKind::Final,
+            class: Class::Small,
+            stats,
+            unchanged: false,
+        }))
+    }
+
     /// Final small-class snap, then ship everything pending, bounded by `deadline`.
     pub fn flush(
         &mut self,
@@ -2308,5 +2410,59 @@ impl CaptureEngine {
         class: MaterializeClass,
     ) -> Result<MaterializeReport, EngineError> {
         Ok(Materializer::new(sink, self.materialize_targets()).materialize(manifest, class)?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn git(root: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .current_dir(root)
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}");
+    }
+
+    /// Finding 1b of the third Docker end to end, through the engine: a path whose metadata
+    /// cannot be read no longer fails the snap. An automatic snap stages the change beside it
+    /// and counts it unreadable (its last capture carried); a final snap fails `unreadable`,
+    /// naming the path, rather than stage a capture that lacks it.
+    #[test]
+    fn a_metadata_error_on_one_path_does_not_stop_the_snap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("ws");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        git(&root, &["init", "-q", "-b", "main"]);
+        git(&root, &["config", "user.email", "t@t"]);
+        git(&root, &["config", "user.name", "t"]);
+        std::fs::write(root.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+        std::fs::write(root.join("notes.txt"), "notes\n").unwrap();
+        git(&root, &["add", "-A"]);
+        git(&root, &["commit", "-q", "-m", "one"]);
+        let mut engine = CaptureEngine::open(CaptureConfig::new("wt", 1, &root), None).unwrap();
+        let req = |kind| SnapRequest {
+            kind,
+            class: Class::Small,
+            seq: 1,
+        };
+        let first = engine.snap(req(CaptureKind::Auto)).unwrap();
+        assert_eq!(first.stats.unreadable, 0);
+
+        crate::longpath::inject_fault(&root.join("notes.txt"), nix::libc::EIO);
+        std::fs::write(root.join("src/lib.rs"), "pub fn f() { g() }\n").unwrap();
+        let second = engine.snap(req(CaptureKind::Auto)).unwrap();
+        assert!(!second.unchanged, "the edit beside it is staged");
+        assert_eq!(second.stats.unreadable, 1, "{:?}", second.stats);
+        assert_eq!(second.stats.carried, 1, "{:?}", second.stats);
+        assert_eq!(second.stats.unreadable_paths, ["tree/notes.txt"]);
+
+        let error = engine.snap(req(CaptureKind::Final)).unwrap_err();
+        let work = error.unreadable().expect("fails as unreadable work");
+        assert_eq!(work.paths.len(), 1, "{work}");
+        assert_eq!(work.paths[0].0, "tree/notes.txt");
     }
 }

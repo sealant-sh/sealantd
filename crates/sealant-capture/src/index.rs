@@ -42,9 +42,9 @@ use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
-use walkdir::WalkDir;
 
 use crate::chunk::{ChunkId, chunk_reader};
+use crate::longpath;
 use crate::tree::{DirEntry, DirObject, EncodedDir, key_of_os};
 
 /// Bounded attempts for a file (or file group) that changes underneath the reader.
@@ -314,7 +314,7 @@ impl Listing {
                 break;
             }
             if !self.entries.contains_key(&v)
-                && let Ok(meta) = fs::symlink_metadata(&abs)
+                && let Ok(meta) = longpath::symlink_metadata(&abs)
             {
                 self.entries.insert(
                     v,
@@ -357,7 +357,7 @@ impl Listing {
             abs_base.join(rel)
         };
         let virtual_root = join_virtual(virtual_base, rel_v);
-        let root_meta = match fs::symlink_metadata(&abs_dir) {
+        let root_meta = match longpath::symlink_metadata(&abs_dir) {
             Ok(meta) => meta,
             Err(error) => {
                 if !is_vanished(&error) {
@@ -371,7 +371,7 @@ impl Listing {
         }
         if !virtual_base.is_empty()
             && !self.entries.contains_key(virtual_base)
-            && let Ok(meta) = fs::symlink_metadata(abs_base)
+            && let Ok(meta) = longpath::symlink_metadata(abs_base)
         {
             self.add(virtual_base.to_owned(), abs_base.to_path_buf(), meta);
         }
@@ -390,96 +390,81 @@ impl Listing {
         };
         // Per-directory name sets, for the `.pack` without `.idx` rule.
         let mut dir_names: HashMap<PathBuf, HashSet<String>> = HashMap::new();
-        let walker = WalkDir::new(&abs_dir)
-            .follow_links(false)
-            .min_depth(1)
-            .sort_by_file_name()
-            .into_iter()
-            .filter_entry(|e| {
-                if e.file_type().is_dir() {
-                    let v = virtual_of(e.path());
-                    !prune(e.path(), &v, &name_of_path(e.path()))
-                } else {
-                    true
-                }
-            });
-        for next in walker {
-            let (entry, meta) = match next {
-                Ok(entry) => match entry.metadata() {
-                    Ok(meta) => (entry, meta),
-                    Err(error) => {
-                        self.walk_error(&error, &virtual_of, &name_of_path, &mut include);
-                        continue;
-                    }
-                },
-                Err(error) => {
-                    self.walk_error(&error, &virtual_of, &name_of_path, &mut include);
-                    continue;
+        // A path of any length: a tree deeper than `PATH_MAX` is walked like any other.
+        longpath::walk(&abs_dir, &mut |visit| {
+            let (path, kind) = match visit {
+                longpath::Visit::Entry { path, kind, .. } => (path, kind),
+                longpath::Visit::Error { path, error, .. } => {
+                    self.walk_error(path, &error, &virtual_of, &name_of_path, &mut include);
+                    return false;
                 }
             };
-            let path = entry.path();
-            if !is_capturable_type(&meta) {
-                continue;
-            }
             let v = virtual_of(path);
             let name = name_of_path(path);
+            if kind == longpath::Kind::Dir && prune(path, &v, &name) {
+                return false;
+            }
+            let meta = match longpath::symlink_metadata(path) {
+                Ok(meta) => meta,
+                Err(error) => {
+                    self.walk_error(path, &error, &virtual_of, &name_of_path, &mut include);
+                    return false;
+                }
+            };
+            if !is_capturable_type(&meta) {
+                return false;
+            }
             if !meta.is_dir() && in_git_dir(&v) {
                 if is_git_transient(&v) {
-                    continue;
+                    return false;
                 }
                 if let Some(stem) = name.strip_suffix(".pack") {
                     let parent = path.parent().map(Path::to_path_buf).unwrap_or_default();
                     let names = dir_names.entry(parent.clone()).or_insert_with(|| {
-                        fs::read_dir(&parent)
-                            .map(|rd| {
-                                rd.flatten()
-                                    .map(|d| key_of_os(&d.file_name()).into_owned())
+                        longpath::read_dir(&parent)
+                            .map(|names| {
+                                names
+                                    .into_iter()
+                                    .map(|(n, _)| key_of_os(&n).into_owned())
                                     .collect()
                             })
                             .unwrap_or_default()
                     });
                     if !names.contains(&format!("{stem}.idx")) {
                         tracing::debug!(path = %path.display(), "skipping .pack without .idx");
-                        continue;
+                        return false;
                     }
                 }
             }
-            if !include(path, &v, &name) {
-                continue;
-            }
-            if self.entries.contains_key(&v) {
-                continue;
+            if !include(path, &v, &name) || self.entries.contains_key(&v) {
+                // A directory is walked all the same: an included descendant brings it in.
+                return true;
             }
             self.ensure_ancestors(&v, &virtual_root, &abs_dir);
             self.add(v, path.to_path_buf(), meta);
-        }
+            true
+        });
     }
 
     /// A walk error: a vanished path is skipped, anything else `include` keeps is unreadable.
     fn walk_error<I>(
         &mut self,
-        error: &walkdir::Error,
+        path: &Path,
+        error: &io::Error,
         virtual_of: &dyn Fn(&Path) -> String,
         name_of_path: &dyn Fn(&Path) -> String,
         include: &mut I,
     ) where
         I: FnMut(&Path, &str, &str) -> bool,
     {
-        let Some(path) = error.path() else {
-            return;
-        };
-        if error.io_error().is_none_or(is_vanished) {
+        if is_vanished(error) {
             return;
         }
         let v = virtual_of(path);
         if is_git_transient(&v) || !include(path, &v, &name_of_path(path)) {
             return;
         }
-        let io = error.io_error().map_or_else(
-            || io::Error::other(error.to_string()),
-            |e| io::Error::new(e.kind(), e.to_string()),
-        );
-        self.note_unreadable(v, path.to_path_buf(), &io);
+        self.note_unreadable(v, path.to_path_buf(), error);
     }
 
     /// Mount a single file at `virtual_path`.
@@ -490,7 +475,7 @@ impl Listing {
         abs_base: &Path,
         abs: &Path,
     ) {
-        let meta = match fs::symlink_metadata(abs) {
+        let meta = match longpath::symlink_metadata(abs) {
             Ok(meta) => meta,
             Err(error) => {
                 if !is_vanished(&error) {
@@ -507,7 +492,7 @@ impl Listing {
         }
         if !virtual_base.is_empty()
             && !self.entries.contains_key(virtual_base)
-            && let Ok(base_meta) = fs::symlink_metadata(abs_base)
+            && let Ok(base_meta) = longpath::symlink_metadata(abs_base)
         {
             self.add(virtual_base.to_owned(), abs_base.to_path_buf(), base_meta);
         }
@@ -812,7 +797,7 @@ impl<'a> TreeBuilder<'a> {
         let started = now_ns();
         let mut last: Option<(Vec<ChunkId>, FileStat)> = None;
         for attempt in 0..=READ_ATTEMPTS {
-            let before = match fs::symlink_metadata(abs) {
+            let before = match longpath::symlink_metadata(abs) {
                 Ok(m) => FileStat::of(&m),
                 Err(e) => return Ok(Read::from_error(e)),
             };
@@ -820,7 +805,7 @@ impl<'a> TreeBuilder<'a> {
                 Ok(read) => read,
                 Err(e) => return Ok(Read::from_error(e)),
             };
-            let after = match fs::symlink_metadata(abs) {
+            let after = match longpath::symlink_metadata(abs) {
                 Ok(m) => FileStat::of(&m),
                 Err(e) => return Ok(Read::from_error(e)),
             };
@@ -869,7 +854,7 @@ impl<'a> TreeBuilder<'a> {
         sink: &mut dyn ChunkSink,
         stats: &mut BuildStats,
     ) -> io::Result<(Vec<ChunkId>, u64)> {
-        let file = fs::File::open(abs)?;
+        let file = longpath::open(abs)?;
         let mut chunks = Vec::new();
         let mut bytes = 0u64;
         for chunk in chunk_reader(io::BufReader::with_capacity(1 << 20, file)) {
@@ -1201,7 +1186,7 @@ impl<'a> TreeBuilder<'a> {
                     }
                     entries.push(e);
                 } else if src.meta.is_symlink() {
-                    match fs::read_link(&src.abs) {
+                    match longpath::read_link(&src.abs) {
                         Ok(target) => {
                             entries.push(DirEntry::symlink(
                                 name,
@@ -1334,8 +1319,8 @@ impl<'a> TreeBuilder<'a> {
     ) -> Result<Option<Vec<(String, &'s Source, Vec<ChunkId>, FileStat, bool)>>, Yielded> {
         let stat_both = || -> Option<(FileStat, FileStat)> {
             Some((
-                FileStat::of(&fs::symlink_metadata(&wal.abs).ok()?),
-                FileStat::of(&fs::symlink_metadata(&db.abs).ok()?),
+                FileStat::of(&longpath::symlink_metadata(&wal.abs).ok()?),
+                FileStat::of(&longpath::symlink_metadata(&db.abs).ok()?),
             ))
         };
         let mut last = None;
