@@ -286,6 +286,21 @@ class polls from then on. Before, it polled for the executor's life, and every f
 a complete one walked the dependency tree again (`final_is_current` needs both classes watched).
 `tests/cadence.rs` measures all of it against the real watcher.
 
+A watch sees a name, and a hardlinked file has others (review 2026-09-28, sixth pass, #2): a
+write through a bulk name of a tracked file dirtied only the bulk class, and one through a name
+outside the workspace dirtied nothing, so the class holding the old bytes was never snapped
+again. `aliases.rs` keeps every multi-link regular file each class's last snap read, by inode.
+An event on one name dirties every class holding another and notes each name for its class's
+next build; an inode with names in both classes, or with more links than names the snaps saw, is
+stat'ed on its class's maximum interval (the `capture-aliases` thread), and one whose size,
+mtime or ctime moved dirties every class holding a name (`CadenceSnapshot::aliases_moved`). A
+stat taken within 2 s of the file's last change is not trusted to show the next one. Behind
+both, a watched class with nothing pending is snapped on its reconcile interval
+(`Cadence::reconcile`, 60 s; `bulk_reconcile`, 600 s; `Trigger::Reconcile`,
+`CadenceSnapshot::reconcile_fired`): the snap reads the class whole and stages nothing when
+nothing changed. `tests/raw_bytes_and_aliases.rs` holds a write through either kind of name to
+twenty maximum intervals.
+
 ## Small captures ahead of a bulk upload (`engine.rs`, `ship.rs`)
 
 The chain is linear: every capture names the one before it as its parent, and the registrar
@@ -471,7 +486,16 @@ restore, byte for byte, so the user never notices the compute changed.
      chunk boundary and the forced snap resumes its progress, re-reading only files whose stat
      key moved or whose last read was racy (see "What a snap reads"); a file or directory it
      cannot read fails the snap (`EngineError::unreadable()`), it never becomes a deletion;
-  4. everything ships, bulk included (`Shipper::flush_final`).
+  4. everything ships, bulk included (`Shipper::flush_final`);
+  5. before the seal, a census (`CadenceRunner::set_census`; the daemon's is
+     `Runtime::census_writers`): every descendant of the daemon's alive now (its own gated
+     `git` spared) is killed, and the classes are snapped again, since it may have written —
+     the seal waits for a round whose census finds none, three rounds at most, and a process
+     found on the last is
+     `Incomplete::ProcessesRemain` (`processes-remain`), no seal. None is expected: no git of
+     the capture's runs a filter or a hook. But a filter driver whose name was not UTF-8 once
+     ran all the same and left a writer behind that wrote after the seal (review 2026-09-28,
+     sixth pass, #1).
 
   Once a final flush stopped every writer, nothing snaps on a schedule any more: its forced
   snaps are the last (a turn snap or another final flush still runs). A scheduled bulk build
