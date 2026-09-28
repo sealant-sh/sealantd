@@ -2646,6 +2646,22 @@ mod tests {
         assert!(fresh.join("node_modules/.bin/tool").exists());
     }
 
+    /// Wait until the watcher delivered a write the test just made. It marks the small class
+    /// dirty on the write's first event, and the write's other events follow: a final flush
+    /// taken before they land reads them as a change after its snaps (`changed`), which on a
+    /// loaded runner it did. So the wait goes on a while after the first one.
+    async fn watcher_saw_small_change(capture: &CaptureRuntime) {
+        let start = Instant::now();
+        while !capture.runner().snapshot().small_dirty {
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "the watcher sees it"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
     /// Docker end to end, round 4: a directory past `PATH_MAX` cannot be named to
     /// `inotify_add_watch`, so the small class polled and every final flush after a complete one
     /// snapped it again. It is watched through its descriptor: a repeat final flush snaps
@@ -2707,14 +2723,7 @@ mod tests {
             b"two\n",
         )
         .unwrap();
-        let start = Instant::now();
-        while !capture.runner().snapshot().small_dirty {
-            assert!(
-                start.elapsed() < Duration::from_secs(10),
-                "the watcher sees it"
-            );
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        watcher_saw_small_change(&capture).await;
         let last = runtime.final_flush(None, Some(3_000)).await.unwrap();
         assert!(last.complete, "{last:?}");
         assert!(registrar.chain().len() > registered);
