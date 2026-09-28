@@ -1762,8 +1762,14 @@ mod tests {
     /// is stopped too.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn containers_stop_before_the_processes_that_stream_them() {
-        const FOLLOWER: &str = "trap 'touch start-late; exit 0' TERM; \
-                                while true; do cp container.log followed.txt; sleep 0.02; done";
+        // The follower replaces its copy whole (a copy into a new file, renamed over it), as a
+        // stream appends: `cp` straight onto it truncated it first, and a stop that landed
+        // between the truncation and the write left it empty. On its way out it copies once
+        // more, as `docker logs -f` drains what the container printed before it exited.
+        const FOLLOWER: &str = "follow() { cp container.log followed.tmp && \
+                                mv followed.tmp followed.txt; }; \
+                                trap 'follow; touch start-late; exit 0' TERM; \
+                                while true; do follow; sleep 0.02; done";
         let tmp = tempfile::tempdir().unwrap();
         let (boot, registrar) = boot(tmp.path());
         let ws = tmp.path().join("ws");
