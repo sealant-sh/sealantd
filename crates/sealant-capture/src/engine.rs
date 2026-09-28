@@ -1994,6 +1994,26 @@ impl CaptureEngine {
                         raw_cache: Some(&raw_cache),
                     },
                 )?;
+                // What an operation in progress needs and git cannot name as one object: an
+                // automatic snap carries what it can; a final one cannot say the capture holds
+                // what the resumed operation needs, and fails (review 2026-09-28, fourth pass,
+                // #3).
+                let unresolved = &git.closure.unresolved_operations;
+                if !unresolved.is_empty() {
+                    if strict {
+                        return Err(io::Error::other(format!(
+                            "an operation in progress names objects git cannot resolve to \
+                             exactly one: {}",
+                            unresolved.join(", ")
+                        ))
+                        .into());
+                    }
+                    tracing::warn!(
+                        unresolved = %unresolved.join(", "),
+                        "an operation in progress names objects git cannot resolve to exactly \
+                         one; a final flush over it is not complete"
+                    );
+                }
                 let mut git_unreadable: Vec<UnreadablePath> = git
                     .closure
                     .unreadable
