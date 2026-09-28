@@ -262,6 +262,12 @@ impl CaptureRuntime {
     /// # Errors
     /// Returns [`ControlError`] when the snap fails or shipping stops on a fence or a conflict.
     pub fn flush_suspend(&self, deadline: Duration) -> Result<CaptureStatusReport, ControlError> {
+        // After a complete final flush, over the disk it captured, a suspend flush is a status
+        // read: it answers the final flush's report and stages nothing (a suspend capture of
+        // the same tree after the final one left the chain's head reading `suspend`).
+        if self.runner.sealed_and_current() {
+            return Ok(self.status());
+        }
         self.runner
             .flush(EngineKind::Suspend, Some(deadline))
             .map_err(|error| ControlError::internal(error.to_string()))?;
@@ -310,13 +316,14 @@ impl CaptureRuntime {
     }
 
     /// A final flush begins ([`Runtime::final_flush`], before it stops the writers):
-    /// `capture.status` reads `in-progress` until it ends — unless the last one completed and
-    /// the disk is as it left it ([`CadenceRunner::final_is_current`]), when this one snaps
-    /// nothing and the status stays `complete` throughout.
+    /// `capture.status` reads `in-progress` until it ends — unless the last one completed, the
+    /// disk is as it left it and the chain still ends on its final capture
+    /// ([`CadenceRunner::sealed_and_current`]), when this one snaps nothing and the status stays
+    /// `complete` throughout.
     pub fn begin_final(&self) {
         let mut outcome = self.final_outcome.lock().unwrap_or_else(|e| e.into_inner());
         let current =
-            matches!(*outcome, FinalOutcome::Snapped { .. }) && self.runner.final_is_current();
+            matches!(*outcome, FinalOutcome::Snapped { .. }) && self.runner.sealed_and_current();
         if !current {
             *outcome = FinalOutcome::Running;
         }
@@ -513,6 +520,9 @@ impl CaptureRuntime {
             FinalOutcome::Snapped { shipping } if pending > 0 => {
                 Some(shipping.unwrap_or("pending"))
             }
+            // A capture staged after the final one (a turn boundary): the chain no longer ends
+            // on the final capture until the next final flush seals it.
+            FinalOutcome::Snapped { .. } if !self.runner.chain_sealed() => Some("pending"),
             // A capture being built after the final one: staged, not queued yet.
             FinalOutcome::Snapped { .. } if bulk_building => Some("pending"),
             FinalOutcome::Snapped { .. } => None,
@@ -948,9 +958,11 @@ mod tests {
             "a final flush over a final capture of an unchanged disk stages nothing"
         );
         assert!(capture.status().complete);
+        // Both classes are watched (the bulk class with no bulk directory yet), so the repeat
+        // final flush snaps nothing at all: three forced snaps (turn, suspend, final).
         let snap = capture.runner().snapshot();
-        assert_eq!(snap.forced, 4, "{snap:?}");
-        assert_eq!(snap.small_snaps, 4, "no scheduled snap fired: {snap:?}");
+        assert_eq!(snap.forced, 3, "{snap:?}");
+        assert_eq!(snap.small_snaps, 3, "no scheduled snap fired: {snap:?}");
     }
 
     /// A class the registrar refused for the session's byte quota is named in `capture.status`,
@@ -2366,5 +2378,363 @@ mod tests {
             "no new capture of an unchanged disk"
         );
         assert!(!runtime.capture_incomplete());
+    }
+
+    /// A runtime over a workspace with a dependency tree (both classes watched) and a harness
+    /// that sleeps: the shape of a Docker end to end's executor.
+    async fn watched_runtime(
+        base: &Path,
+    ) -> (
+        Arc<Runtime>,
+        Arc<CaptureRuntime>,
+        Arc<InMemoryRegistrar>,
+        std::path::PathBuf,
+    ) {
+        let (boot, registrar) = boot(base);
+        let ws = boot.layout.working_directory.clone();
+        std::fs::write(ws.join(".gitignore"), "node_modules/\n").unwrap();
+        for p in 0..20 {
+            let dir = ws.join(format!("node_modules/pkg{p}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            for f in 0..20 {
+                std::fs::write(dir.join(format!("m{f}.js")), format!("// {p} {f}\n")).unwrap();
+            }
+        }
+        let mut config = RuntimeConfig::new(new_runtime_id());
+        config.workspace_root = ws.clone();
+        let runtime = Runtime::new(config, Arc::new(ShutdownSignal::new(3_000)));
+        runtime.mark_healthy();
+        let capture = CaptureRuntime::new(boot);
+        assert!(runtime.install_capture(capture.clone()));
+        let harness = runtime
+            .spawn_managed(sh("exec sleep 3600", &ws))
+            .expect("spawn");
+        capture.start(runtime.clone(), harness.process_id);
+        let modes = capture.runner().snapshot();
+        assert_eq!(
+            (modes.small_mode, modes.bulk_mode),
+            (
+                sealant_capture::WatchMode::Watched,
+                sealant_capture::WatchMode::Watched
+            ),
+            "both classes are watched"
+        );
+        (runtime, capture, registrar, ws)
+    }
+
+    /// Docker end to end, round 4: `sealantctl capture flush --final` inside the executor, then
+    /// Mend's Stop sent two suspend flushes, which staged n=22 and n=23 as `suspend` captures
+    /// of the unchanged disk; the final flush after them took the no-snap path and sealed
+    /// nothing, so the head's kind was `suspend` and Mend concluded the executor was lost. A
+    /// suspend flush after a complete final one, over a disk nothing changed since, stages
+    /// nothing: it reads the final flush's report.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_suspend_flush_after_a_complete_final_one_stages_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (runtime, capture, registrar, _ws) = watched_runtime(tmp.path()).await;
+
+        let first = runtime.final_flush(None, Some(3_000)).await.unwrap();
+        assert!(first.complete, "{first:?}");
+        let chain = registrar.chain();
+        assert_eq!(
+            chain.last().unwrap().manifest.kind,
+            EngineKind::Final,
+            "the final flush ends the chain"
+        );
+        let registered = chain.len();
+
+        for rid in ["s1", "s2"] {
+            let report = flush_report(
+                runtime
+                    .dispatch(ControlRequest::new(
+                        RequestId::new(rid),
+                        Command::CaptureFlush {
+                            kind: CaptureFlushKind::Suspend,
+                            deadline_ms: Some(10_000),
+                            grace_ms: None,
+                        },
+                    ))
+                    .await,
+            );
+            assert!(report.complete, "{report:?}");
+            assert_eq!(report.pending, 0, "{report:?}");
+        }
+        assert_eq!(
+            registrar.chain().len(),
+            registered,
+            "a suspend flush over the final capture of an unchanged disk stages nothing"
+        );
+
+        let last = runtime.final_flush(None, Some(3_000)).await.unwrap();
+        assert!(last.complete, "{last:?}");
+        let chain = registrar.chain();
+        assert_eq!(chain.len(), registered);
+        assert_eq!(chain.last().unwrap().manifest.kind, EngineKind::Final);
+        assert!(capture.status().complete);
+    }
+
+    /// Whatever stages a capture after a complete final flush (a turn boundary here), the chain
+    /// no longer ends on a final capture: `capture.status` stops saying `complete` (`pending`,
+    /// a capture staged after the final flush), and the next final flush seals the chain with
+    /// a final capture before it reports `complete` — even though the disk is as the last one
+    /// captured it and it snaps nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_capture_staged_after_a_final_flush_is_sealed_by_the_next() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (runtime, capture, registrar, _ws) = watched_runtime(tmp.path()).await;
+
+        let first = runtime.final_flush(None, Some(3_000)).await.unwrap();
+        assert!(first.complete, "{first:?}");
+        let registered = registrar.chain().len();
+
+        let resp = runtime
+            .dispatch(ControlRequest::new(
+                RequestId::new("t1"),
+                Command::CaptureNow {
+                    kind: CaptureKind::Turn,
+                },
+            ))
+            .await;
+        let ResponseOutcome::Ok {
+            result: Some(CommandResult::CaptureStaged(staged)),
+        } = resp.outcome
+        else {
+            panic!("capture.now: {:?}", resp.outcome);
+        };
+        assert!(!staged.unchanged, "a turn capture is staged");
+        let chain = wait_chain(&registrar, registered + 1);
+        assert_eq!(chain.last().unwrap().manifest.kind, EngineKind::Turn);
+        let status = capture.status();
+        assert!(!status.complete, "{status:?}");
+        assert_eq!(status.incomplete_reason.as_deref(), Some("pending"));
+
+        let start = Instant::now();
+        let sealed = runtime.final_flush(None, Some(3_000)).await.unwrap();
+        assert!(sealed.complete, "{sealed:?}");
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "nothing to snap: {:?}",
+            start.elapsed()
+        );
+        let chain = registrar.chain();
+        assert_eq!(chain.len(), registered + 2);
+        assert_eq!(
+            chain.last().unwrap().manifest.kind,
+            EngineKind::Final,
+            "the chain ends on a final capture again"
+        );
+        assert!(capture.status().complete);
+        assert_eq!(runtime.quiesce_count(), 1);
+    }
+
+    /// Docker end to end, round 4, on a full disk: every snap failed with `No space left on
+    /// device (os error 28)`, which named neither the file nor the step, and every final flush
+    /// of the kept executor, its small snap failed already, walked the bulk class for 2.4 s
+    /// more. The error names what was written and where; a final flush whose small snap failed
+    /// is incomplete without a bulk snap.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_snap_on_a_full_disk_names_the_file_and_the_final_flush_stops_there() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (runtime, capture, _registrar, ws) = watched_runtime(tmp.path()).await;
+        // The first file the snap writes after its objects, made to fail as a full disk does:
+        // a write to /dev/full is ENOSPC, for root too.
+        let full = ws.join(".sealantd/capture/index/last.tmp");
+        std::os::unix::fs::symlink("/dev/full", &full).unwrap();
+
+        let bulk_snaps = capture.runner().snapshot().bulk_snaps;
+        let report = runtime.final_flush(None, Some(3_000)).await.unwrap();
+        assert!(!report.complete, "{report:?}");
+        assert_eq!(
+            report.incomplete_reason.as_deref(),
+            Some("snapshot-failed"),
+            "{report:?}"
+        );
+        let small = report
+            .snaps
+            .iter()
+            .find(|s| s.class == CaptureClass::Small)
+            .expect("the small class's snaps");
+        let error = small.last_snap_error.as_deref().expect("a snap error");
+        let expected = format!("write {}: No space left on device", full.display());
+        assert!(
+            error.starts_with(&expected),
+            "the error names the operation and the path: {error:?}"
+        );
+        assert_eq!(
+            capture.runner().snapshot().bulk_snaps,
+            bulk_snaps,
+            "no bulk snap after the small one failed"
+        );
+    }
+
+    /// Docker end to end, round 4: a session's first executor boots before its `pnpm install`,
+    /// so there was no bulk directory at boot, the bulk class polled for the executor's life
+    /// (`capture watches registered … bulk=Polled`), and every final flush after a complete one
+    /// walked the dependency tree again (a Stop took 15 s, not 6–7 s). A dependency tree made
+    /// after the watcher started is watched, and a final flush after a complete one snaps
+    /// nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dependency_tree_installed_after_boot_is_watched_and_a_repeat_final_snaps_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (boot, registrar) = boot(tmp.path());
+        let ws = boot.layout.working_directory.clone();
+        std::fs::write(ws.join(".gitignore"), "node_modules/\n").unwrap();
+        let mut config = RuntimeConfig::new(new_runtime_id());
+        config.workspace_root = ws.clone();
+        let runtime = Runtime::new(config, Arc::new(ShutdownSignal::new(3_000)));
+        runtime.mark_healthy();
+        let capture = CaptureRuntime::new(boot);
+        assert!(runtime.install_capture(capture.clone()));
+        let harness = runtime
+            .spawn_managed(sh("exec sleep 3600", &ws))
+            .expect("spawn");
+        capture.start(runtime.clone(), harness.process_id);
+
+        // The install, after boot: a tree made in a staging directory and renamed in, then
+        // more made inside it.
+        let staged = tmp.path().join("install");
+        for p in 0..30 {
+            let dir = staged.join(format!(".pnpm/pkg{p}@1/node_modules/pkg{p}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            for f in 0..10 {
+                std::fs::write(dir.join(format!("m{f}.js")), format!("// {p} {f}\n")).unwrap();
+            }
+        }
+        std::fs::rename(&staged, ws.join("node_modules")).unwrap();
+        std::fs::create_dir_all(ws.join("node_modules/.bin")).unwrap();
+        std::fs::write(ws.join("node_modules/.bin/tool"), "#!/bin/sh\n").unwrap();
+        let start = Instant::now();
+        while !capture.runner().snapshot().bulk_dirty {
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "the watcher sees the install"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let modes = capture.runner().snapshot();
+        assert_eq!(
+            (modes.small_mode, modes.bulk_mode),
+            (
+                sealant_capture::WatchMode::Watched,
+                sealant_capture::WatchMode::Watched
+            ),
+            "both classes are watched"
+        );
+
+        let first = runtime.final_flush(None, Some(3_000)).await.unwrap();
+        assert!(first.complete, "{first:?}");
+        let registered = registrar.chain().len();
+        let before = capture.runner().snapshot();
+
+        let again = runtime.final_flush(None, Some(3_000)).await.unwrap();
+        assert!(again.complete, "{again:?}");
+        let after = capture.runner().snapshot();
+        assert_eq!(
+            (after.small_snaps, after.bulk_snaps),
+            (before.small_snaps, before.bulk_snaps),
+            "a repeat final flush snaps nothing"
+        );
+        assert_eq!(registrar.chain().len(), registered);
+        let fresh = restore_head(tmp.path(), &registrar, "fresh");
+        assert_eq!(
+            std::fs::read_to_string(
+                fresh.join("node_modules/.pnpm/pkg0@1/node_modules/pkg0/m0.js")
+            )
+            .unwrap(),
+            "// 0 0\n"
+        );
+        assert!(fresh.join("node_modules/.bin/tool").exists());
+    }
+
+    /// Wait until the watcher delivered a write the test just made. It marks the small class
+    /// dirty on the write's first event, and the write's other events follow: a final flush
+    /// taken before they land reads them as a change after its snaps (`changed`), which on a
+    /// loaded runner it did. So the wait goes on a while after the first one.
+    async fn watcher_saw_small_change(capture: &CaptureRuntime) {
+        let start = Instant::now();
+        while !capture.runner().snapshot().small_dirty {
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "the watcher sees it"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    /// Docker end to end, round 4: a directory past `PATH_MAX` cannot be named to
+    /// `inotify_add_watch`, so the small class polled and every final flush after a complete one
+    /// snapped it again. It is watched through its descriptor: a repeat final flush snaps
+    /// nothing, and a change in it is still captured by the next.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_directory_past_path_max_is_watched_and_a_repeat_final_snaps_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (boot, registrar) = boot(tmp.path());
+        let ws = boot.layout.working_directory.clone();
+        let mut deep = ws.join("notes");
+        std::fs::create_dir_all(&deep).unwrap();
+        for i in 0..18 {
+            deep = deep.join(format!("d{i:02}{}", "x".repeat(240)));
+            sealant_capture::longpath::create_dir(&deep).unwrap();
+        }
+        let file = deep.join("note.txt");
+        std::io::Write::write_all(
+            &mut sealant_capture::longpath::create(&file).unwrap(),
+            b"one\n",
+        )
+        .unwrap();
+        let mut config = RuntimeConfig::new(new_runtime_id());
+        config.workspace_root = ws.clone();
+        let runtime = Runtime::new(config, Arc::new(ShutdownSignal::new(3_000)));
+        runtime.mark_healthy();
+        let capture = CaptureRuntime::new(boot);
+        assert!(runtime.install_capture(capture.clone()));
+        let harness = runtime
+            .spawn_managed(sh("exec sleep 3600", &ws))
+            .expect("spawn");
+        capture.start(runtime.clone(), harness.process_id);
+        let modes = capture.runner().snapshot();
+        assert_eq!(
+            (modes.small_mode, modes.bulk_mode),
+            (
+                sealant_capture::WatchMode::Watched,
+                sealant_capture::WatchMode::Watched
+            ),
+            "both classes are watched"
+        );
+
+        let first = runtime.final_flush(None, Some(3_000)).await.unwrap();
+        assert!(first.complete, "{first:?}");
+        let registered = registrar.chain().len();
+        let before = capture.runner().snapshot();
+        let again = runtime.final_flush(None, Some(3_000)).await.unwrap();
+        assert!(again.complete, "{again:?}");
+        let after = capture.runner().snapshot();
+        assert_eq!(
+            (after.small_snaps, after.bulk_snaps),
+            (before.small_snaps, before.bulk_snaps),
+            "a repeat final flush snaps nothing"
+        );
+        assert_eq!(registrar.chain().len(), registered);
+
+        // A change down there after all: seen, and captured by the next final flush.
+        std::io::Write::write_all(
+            &mut sealant_capture::longpath::create(&file).unwrap(),
+            b"two\n",
+        )
+        .unwrap();
+        watcher_saw_small_change(&capture).await;
+        let last = runtime.final_flush(None, Some(3_000)).await.unwrap();
+        assert!(last.complete, "{last:?}");
+        assert!(registrar.chain().len() > registered);
+        let fresh = restore_head(tmp.path(), &registrar, "fresh");
+        let restored = fresh.join(file.strip_prefix(&ws).unwrap());
+        let mut text = String::new();
+        std::io::Read::read_to_string(
+            &mut sealant_capture::longpath::open(&restored).unwrap(),
+            &mut text,
+        )
+        .unwrap();
+        assert_eq!(text, "two\n");
     }
 }

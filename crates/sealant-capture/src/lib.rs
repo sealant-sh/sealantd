@@ -15,6 +15,7 @@ mod cpu;
 pub mod engine;
 pub mod gitpack;
 pub mod index;
+pub mod io_at;
 pub mod keys;
 pub mod longpath;
 pub mod manifest;

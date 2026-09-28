@@ -243,7 +243,13 @@ a class dirty on every create/modify/remove. Small class: `quiet` (2 s) after th
 (120 s), one bulk snap in flight, resumed after every yield without re-reading. Forced snaps
 (`CadenceRunner::snap`, `flush`) preempt a bulk build. Directories are counted before watching;
 over budget (half the sysctl, or `WatchPolicy::budget`) the class polls; `raise_limit` tries the
-sysctl first and never fails boot. `tests/cadence.rs` measures all of it against the real watcher.
+sysctl first and never fails boot. The bulk class is watched with no bulk directory yet (the
+small class's watches see one appear): a bulk directory made after the watcher started (a
+session's first `pnpm install` runs after boot) gets watches then, listed again until a listing
+finds nothing new, within the budget; past it, or where a directory cannot be watched, the bulk
+class polls from then on. Before, it polled for the executor's life, and every final flush after
+a complete one walked the dependency tree again (`final_is_current` needs both classes watched).
+`tests/cadence.rs` measures all of it against the real watcher.
 
 ## Small captures ahead of a bulk upload (`engine.rs`, `ship.rs`)
 
@@ -622,8 +628,11 @@ A capture holds what is on disk, and says so when it cannot.
   still names whole, every untracked directory too long to open) are excluded from the add and
   carried by the workspace class like a nested repository (`tree/<path>`), and restored from
   there; ignored and bulk paths were never git's. A restore writes a file under a short staging
-  name when `.<name>.capture-tmp` would pass `NAME_MAX`. A directory the watcher cannot watch
-  (`inotify_add_watch` takes a path) makes its class poll, at start and when one appears later.
+  name when `.<name>.capture-tmp` would pass `NAME_MAX`. A directory too long to name to
+  `inotify_add_watch` (it takes a path) is opened a run of components at a time and watched as
+  `/proc/self/fd/<fd>`, at start and when one appears later; its events are named by its own
+  path again. Only a directory that cannot be watched that way either makes its class poll (it
+  made the small class poll, and every final flush after a complete one snapped it again).
 - **One path is one path.** Whatever error one path's metadata gives (not only `EACCES`), it is
   that path's: the overlay reports it unreadable and carries its previous entry (and, for a
   directory it cannot list, the directories the previous document held under it); a `final`
@@ -751,7 +760,12 @@ inside the same flush; and when the newest capture is not a final one (the final
 staged ahead of a scheduled bulk capture still uploading, and the final bulk snap found that
 capture current), a final capture with its sections seals the chain (`seal_final`, its manifest
 only). Before, the flush after the one that said `complete` registered those (8 KB and 19 KB,
-`files_read=0`), and until then the head was of kind `auto` or lacked the links. A final flush
+`files_read=0`), and until then the head was of kind `auto` or lacked the links. A final flush whose small snap
+failed takes no bulk snap: it is incomplete (`snapshot-failed`) whatever that snap does, and on
+a kept executor asked again and again each one walked the dependency tree for 2.4 s. An I/O
+error names what was done and where (`write /…/.sealantd/capture/index/last.tmp: No space left
+on device (os error 28)`, not the bare `No space left on device (os error 28)`), in the flush's
+error and in `snaps[].last_snap_error`. A final flush
 asked again (the drain's, the SIGTERM handler's, the boot's on the harness's exit) snaps
 nothing when the last one snapped every class without an error, snaps are no longer allowed
 (the writers are stopped, admission closed) and the watcher — watching both classes, never
@@ -761,6 +775,14 @@ overflowed — delivered no change since before that flush's first snap
 meanwhile). A class that polls, or a change the watcher saw, snaps again. After a flush that
 returned at its deadline (`deadline`, `ship-failed`), `complete` turns true once the worker has
 shipped the rest: poll `capture.status`, or send the final flush again. An older daemon's report decodes with `complete: false`.
+
+A suspend flush after a complete final one, over the disk it captured, is a status read: it
+snaps nothing and answers the final flush's report (Mend's Stop sent two after a final flush,
+and each staged a `suspend` capture of the same tree, so the head read `suspend`); the engine
+also stages no suspend capture of an unchanged tree over a final capture. Anything staged after
+the final capture all the same (a turn boundary) turns `complete` false (`pending`), and the
+next final flush seals the chain with a final capture before it says `complete` again, though
+it snaps nothing (`CadenceRunner::chain_sealed`).
 
 ```json
 ← {"pending":0,"pendingBulk":0,"pendingBytes":0,"complete":true}

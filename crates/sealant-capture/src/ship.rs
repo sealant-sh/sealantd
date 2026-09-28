@@ -24,6 +24,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::cpu::thread_cpu;
 use crate::engine::Class;
+use crate::io_at::IoAt;
 use crate::manifest::CaptureKind;
 use crate::registrar::{RegisterRequest, Registrar, RegistrarError, opt};
 use crate::sink::{BlobSink, BlobSource, SinkError};
@@ -295,9 +296,9 @@ pub struct Restage {
 /// Write `bytes` to `path` and flush them to the disk.
 fn write_synced(path: &Path, bytes: &[u8]) -> io::Result<()> {
     use std::io::Write;
-    let mut file = fs::File::create(path)?;
-    file.write_all(bytes)?;
-    file.sync_all()
+    let mut file = fs::File::create(path).at("create", path)?;
+    file.write_all(bytes).at("write", path)?;
+    file.sync_all().at("sync", path)
 }
 
 /// Flush a directory's entries (a rename, a removal) to the disk. Best effort: some
@@ -378,7 +379,7 @@ impl Staging {
         let tmp = path.with_extension("tmp");
         write_synced(&tmp, &serde_json::to_vec(&journal)?)?;
         self.step()?;
-        fs::rename(&tmp, &path)?;
+        fs::rename(&tmp, &path).at("rename into", &path)?;
         sync_dir(&self.dir);
         self.step()?;
         self.apply_restage(&journal)
@@ -420,7 +421,7 @@ impl Staging {
             let path = self.queue_path(entry.n);
             let tmp = path.with_extension("tmp");
             write_synced(&tmp, &serde_json::to_vec(entry)?)?;
-            fs::rename(tmp, path)?;
+            fs::rename(tmp, &path).at("rename into", &path)?;
             self.step()?;
         }
         let written: HashSet<u64> = journal.write.iter().map(|e| e.n).collect();
@@ -588,7 +589,8 @@ impl Staging {
 
     /// Ack an object file.
     pub fn mark_uploaded(&self, file: &str) -> io::Result<()> {
-        fs::write(self.marker_path(file), b"")
+        let path = self.marker_path(file);
+        fs::write(&path, b"").at("write", &path)
     }
 
     /// Drop an object file's ack (the registrar said the store does not hold it): the next
@@ -605,7 +607,7 @@ impl Staging {
         let path = self.dir.join(REPAIR_REQUEST);
         let tmp = path.with_extension("tmp");
         write_synced(&tmp, &serde_json::to_vec(request)?)?;
-        fs::rename(&tmp, &path)?;
+        fs::rename(&tmp, &path).at("rename into", &path)?;
         sync_dir(&self.dir);
         self.bump();
         Ok(())
@@ -635,8 +637,8 @@ impl Staging {
     pub fn enqueue(&self, entry: &QueueEntry) -> io::Result<()> {
         let path = self.queue_path(entry.n);
         let tmp = path.with_extension("tmp");
-        fs::write(&tmp, serde_json::to_vec(entry)?)?;
-        fs::rename(tmp, path)?;
+        fs::write(&tmp, serde_json::to_vec(entry)?).at("write", &tmp)?;
+        fs::rename(tmp, &path).at("rename into", &path)?;
         self.bump();
         Ok(())
     }

@@ -15,6 +15,7 @@ use crate::index::{
     self, BuildStats, ChunkSink, DAEMON_DIR, Listing, Suspects, TreeBuilder, TreeIndex,
     UnreadablePath, UnreadableWork,
 };
+use crate::io_at::IoAt;
 use crate::keys::KeyPrefix;
 use crate::manifest::{
     BulkSection, BulkState, CaptureKind, DirFormat, EncodedManifest, FORMAT_DIR_PACKS, GitSection,
@@ -528,8 +529,9 @@ impl LastStaged {
 
     fn save(&self, index_dir: &Path) -> io::Result<()> {
         let tmp = index_dir.join("last.tmp");
-        fs::write(&tmp, serde_json::to_vec(self)?)?;
-        fs::rename(tmp, index_dir.join("last.json"))
+        fs::write(&tmp, serde_json::to_vec(self)?).at("write", &tmp)?;
+        let path = index_dir.join("last.json");
+        fs::rename(tmp, &path).at("rename into", &path)
     }
 }
 
@@ -1075,15 +1077,17 @@ impl CaptureEngine {
         }
         self.workspace_index.save(&dir.join("workspace.json"))?;
         self.bulk_index.save(&dir.join("bulk.json"))?;
-        let tmp = dir.join("chunks.tmp");
-        fs::write(&tmp, serde_json::to_vec(&self.chunks)?)?;
-        fs::rename(tmp, dir.join("chunks.json"))?;
-        let tmp = dir.join("dirs.tmp");
-        fs::write(&tmp, serde_json::to_vec(&self.dirs)?)?;
-        fs::rename(tmp, dir.join("dirs.json"))?;
-        let tmp = dir.join("git-tips.tmp");
-        fs::write(&tmp, serde_json::to_vec(&self.last_tips)?)?;
-        fs::rename(tmp, dir.join("git-tips.json"))
+        for (name, bytes) in [
+            ("chunks", serde_json::to_vec(&self.chunks)?),
+            ("dirs", serde_json::to_vec(&self.dirs)?),
+            ("git-tips", serde_json::to_vec(&self.last_tips)?),
+        ] {
+            let tmp = dir.join(format!("{name}.tmp"));
+            fs::write(&tmp, bytes).at("write", &tmp)?;
+            let path = dir.join(format!("{name}.json"));
+            fs::rename(&tmp, &path).at("rename into", &path)?;
+        }
+        Ok(())
     }
 
     /// The class roots this engine captures (and a materializer sweeps).
@@ -1341,7 +1345,7 @@ impl CaptureEngine {
                     let file = format!("tree-{sha}");
                     let path = objects.join(&file);
                     if !path.exists() && !self.staging.is_uploaded(&file) {
-                        fs::write(&path, &dir.bytes)?;
+                        fs::write(&path, &dir.bytes).at("write", &path)?;
                         stats.dirs_new += 1;
                     }
                     if !self.staging.is_uploaded(&file) {
@@ -1720,10 +1724,8 @@ impl CaptureEngine {
         .encode();
         let manifest_key = self.prefix.manifest(&manifest.capture_id);
         let manifest_file = format!("manifest-{}", manifest.capture_id);
-        fs::write(
-            self.staging.objects_dir().join(&manifest_file),
-            &manifest.bytes,
-        )?;
+        let manifest_path = self.staging.objects_dir().join(&manifest_file);
+        fs::write(&manifest_path, &manifest.bytes).at("write", &manifest_path)?;
         let mut uploads: Vec<Upload> = bulk
             .uploads
             .iter()
@@ -2051,13 +2053,15 @@ impl CaptureEngine {
         };
 
         // Nothing changed: an `auto` snap stages nothing rather than growing the chain, and nor
-        // does a final flush's bulk snap (its small snap is the capture that marks the end), or
-        // a final snap over a final capture (the same final flush asked again).
+        // does a final flush's bulk snap (its small snap is the capture that marks the end), a
+        // final snap over a final capture (the same final flush asked again), or a suspend snap
+        // over a final capture (a suspend flush after the final one: the chain must end on the
+        // final capture, and a suspend capture of the same tree after it only hid it).
+        let over_final = follows.is_some_and(|p| p.manifest.kind == CaptureKind::Final);
         if repairing.is_none()
             && (req.kind == CaptureKind::Auto
-                || (req.kind == CaptureKind::Final
-                    && (req.class == Class::Bulk
-                        || follows.is_some_and(|p| p.manifest.kind == CaptureKind::Final))))
+                || (req.kind == CaptureKind::Final && (req.class == Class::Bulk || over_final))
+                || (req.kind == CaptureKind::Suspend && over_final))
             && let Some(prev) = follows
             && prev.manifest.sections == sections
         {
@@ -2126,7 +2130,8 @@ impl CaptureEngine {
         .encode();
         let manifest_key = self.prefix.manifest(&manifest.capture_id);
         let manifest_file = format!("manifest-{}", manifest.capture_id);
-        fs::write(objects.join(&manifest_file), &manifest.bytes)?;
+        let manifest_path = objects.join(&manifest_file);
+        fs::write(&manifest_path, &manifest.bytes).at("write", &manifest_path)?;
         let mut all_uploads: Vec<Upload> = Vec::new();
         if let Some(target) = &repairing {
             // Everything the replaced captures staged but their manifests: this manifest may
@@ -2335,10 +2340,8 @@ impl CaptureEngine {
         .encode();
         let manifest_key = self.prefix.manifest(&manifest.capture_id);
         let manifest_file = format!("manifest-{}", manifest.capture_id);
-        fs::write(
-            self.staging.objects_dir().join(&manifest_file),
-            &manifest.bytes,
-        )?;
+        let manifest_path = self.staging.objects_dir().join(&manifest_file);
+        fs::write(&manifest_path, &manifest.bytes).at("write", &manifest_path)?;
         let uploads = vec![Upload {
             key: manifest_key.clone(),
             file: manifest_file,
@@ -2464,5 +2467,45 @@ mod tests {
         let work = error.unreadable().expect("fails as unreadable work");
         assert_eq!(work.paths.len(), 1, "{work}");
         assert_eq!(work.paths[0].0, "tree/notes.txt");
+    }
+
+    /// Docker end to end, round 4: two suspend flushes after a final one staged two `suspend`
+    /// captures of the same tree over the final capture, and the chain's head read `suspend`.
+    /// A suspend snap over a final capture of an unchanged tree stages nothing, whatever the
+    /// watcher says (this is the engine, below it); one over a changed tree still does.
+    #[test]
+    fn a_suspend_snap_over_a_final_capture_of_the_same_tree_stages_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("ws");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        git(&root, &["init", "-q", "-b", "main"]);
+        git(&root, &["config", "user.email", "t@t"]);
+        git(&root, &["config", "user.name", "t"]);
+        std::fs::write(root.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+        git(&root, &["add", "-A"]);
+        git(&root, &["commit", "-q", "-m", "one"]);
+        let mut engine = CaptureEngine::open(CaptureConfig::new("wt", 1, &root), None).unwrap();
+        let req = |kind, seq| SnapRequest {
+            kind,
+            class: Class::Small,
+            seq,
+        };
+        let last = engine.snap(req(CaptureKind::Final, 1)).unwrap();
+        assert!(!last.unchanged);
+        for seq in 2..4 {
+            let again = engine.snap(req(CaptureKind::Suspend, seq)).unwrap();
+            assert!(again.unchanged, "nothing staged over the final capture");
+            assert_eq!(again.n, last.n);
+        }
+        assert_eq!(
+            engine.previous().unwrap().manifest.kind,
+            CaptureKind::Final,
+            "the chain still ends on the final capture"
+        );
+
+        std::fs::write(root.join("src/lib.rs"), "pub fn f() { g() }\n").unwrap();
+        let changed = engine.snap(req(CaptureKind::Suspend, 4)).unwrap();
+        assert!(!changed.unchanged, "a change is staged");
+        assert_eq!(changed.manifest.manifest.kind, CaptureKind::Suspend);
     }
 }
