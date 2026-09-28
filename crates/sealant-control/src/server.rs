@@ -301,18 +301,11 @@ pub async fn serve_unix<S: ControlService>(
                             drop(stream);
                             continue;
                         }
-                        // The process at the far end, recorded until the connection ends (its
-                        // last reply written): the final capture's sweep spares it meanwhile.
-                        let peer = service
-                            .control_peers()
-                            .zip(crate::peer::peer_pid(&stream))
-                            .map(|(peers, pid)| peers.enter(pid));
                         let service = service.clone();
                         let shutdown = shutdown.clone();
                         let (read_half, write_half) = stream.into_split();
                         connections.spawn(async move {
                             handle_connection(service, read_half, write_half, shutdown).await;
-                            drop(peer);
                         });
                     }
                     Err(e) => tracing::warn!(error = %e, "accept failed"),

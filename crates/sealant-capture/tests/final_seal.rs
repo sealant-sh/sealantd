@@ -26,8 +26,9 @@ use std::time::Duration;
 use sealant_capture::manifest::{BulkState, DirFormat};
 use sealant_capture::sink::{BlobSource, PutOutcome, SinkError};
 use sealant_capture::{
-    BlobSink, CadenceRunner, CaptureConfig, CaptureEngine, CaptureKind, Class, InMemoryRegistrar,
-    LocalDir, MaterializeClass, MaterializeTargets, Materializer, Registrar, SnapRequest,
+    BlobSink, CadenceRunner, CaptureConfig, CaptureEngine, CaptureKind, Class, FinalSeal,
+    InMemoryRegistrar, LocalDir, MaterializeClass, MaterializeTargets, Materializer, Registrar,
+    SnapRequest,
 };
 
 fn git(root: &Path, args: &[&str]) {
@@ -219,4 +220,147 @@ fn a_final_flush_records_the_bulk_names_of_a_tracked_inode_it_just_captured() {
         "no capture after the flush that reported complete"
     );
     runner.stop();
+}
+
+/// A runner whose engine seals under `executor`, over a registrar whose token is scoped to
+/// `scoped`.
+fn sealing_runner(
+    fx: &Fixture,
+    executor: &str,
+    scoped: &str,
+) -> (CadenceRunner, Arc<InMemoryRegistrar>) {
+    let registrar = Arc::new(InMemoryRegistrar::new("wt", 1, None).with_executor(scoped));
+    let mut config = CaptureConfig::new("wt", 1, &fx.root);
+    config.executor = Some(executor.to_owned());
+    let engine = CaptureEngine::open(config, None).unwrap();
+    let dyn_registrar: Arc<dyn Registrar> = registrar.clone();
+    let shipper = Arc::new(engine.shipper(fx.store.clone(), dyn_registrar));
+    (CadenceRunner::new(engine, shipper), registrar)
+}
+
+fn seal(executor: &str) -> FinalSeal {
+    FinalSeal {
+        complete: true,
+        epoch: 1,
+        executor: executor.to_owned(),
+    }
+}
+
+/// Cross-repo decision 1: a completed final flush is a store-side fact. Once everything is
+/// registered, the flush registers one more capture — the newest one's sections, `kind: final`
+/// — carrying `final_seal` (complete, its epoch, its executor), and reports complete only once
+/// that register is acknowledged. Asked again, it stages nothing. A capture staged after it (a
+/// turn boundary) unseals the chain; the next final flush seals it again.
+#[test]
+fn a_complete_final_flush_seals_the_chain_and_a_later_capture_unseals_it() {
+    let fx = fixture(2);
+    let (runner, registrar) = sealing_runner(&fx, "exec-1", "exec-1");
+    runner.start(None);
+    let flushed = runner.flush_final(None);
+    assert!(flushed.complete(), "{flushed:?}");
+    let chain = registrar.chain();
+    let head = chain.last().unwrap();
+    assert_eq!(head.manifest.kind, CaptureKind::Final);
+    assert_eq!(head.manifest.final_seal, Some(seal("exec-1")));
+    assert_eq!(
+        head.manifest.sections,
+        chain[chain.len() - 2].manifest.sections,
+        "the sealing capture holds the newest capture's sections"
+    );
+    assert!(
+        chain[..chain.len() - 1]
+            .iter()
+            .all(|h| h.manifest.final_seal.is_none())
+    );
+    assert_eq!(registrar.seals(), vec![(head.n, seal("exec-1"))]);
+    assert!(runner.final_sealed());
+
+    // The drain and the SIGTERM handler ask again: nothing new, the same seal.
+    let registered = chain.len();
+    for _ in 0..2 {
+        assert!(runner.flush_final(None).complete());
+    }
+    assert_eq!(registrar.chain().len(), registered);
+    assert_eq!(registrar.seals().len(), 1);
+
+    // A turn boundary after it: the chain ends on a capture without a seal.
+    fs::write(fx.root.join("src/lib.rs"), "pub fn f() { h() }\n").unwrap();
+    runner.flush(CaptureKind::Auto, None).unwrap();
+    let head = registrar.head().unwrap();
+    assert_eq!(head.manifest.kind, CaptureKind::Auto);
+    assert_eq!(head.manifest.final_seal, None, "a later capture unseals");
+    assert!(!runner.final_sealed());
+
+    // The next final flush seals again.
+    assert!(runner.flush_final(None).complete());
+    let head = registrar.head().unwrap();
+    assert_eq!(head.manifest.final_seal, Some(seal("exec-1")));
+    assert_eq!(registrar.seals().len(), 2);
+    assert_eq!(registrar.seals()[1].0, head.n);
+
+    // The sealed head restores like any other.
+    let out = fx.base.join("restored");
+    Materializer::new(fx.store.as_ref(), MaterializeTargets::new(&out, None))
+        .materialize(&head.manifest, MaterializeClass::All)
+        .unwrap();
+    assert_eq!(
+        fs::read_to_string(out.join("src/lib.rs")).unwrap(),
+        "pub fn f() { h() }\n"
+    );
+    runner.stop();
+}
+
+/// A final flush whose caller cannot vouch that every writer stopped seals nothing, and an
+/// engine with no executor seals nothing: the chain ends as it did before seals.
+#[test]
+fn nothing_is_sealed_unless_the_writers_stopped_and_the_executor_is_known() {
+    let fx = fixture(1);
+    let (runner, registrar) = sealing_runner(&fx, "exec-1", "exec-1");
+    runner.start(None);
+    assert!(runner.flush_final_sealing(None, false).complete());
+    assert!(
+        registrar
+            .chain()
+            .iter()
+            .all(|h| h.manifest.final_seal.is_none())
+    );
+    assert!(registrar.seals().is_empty());
+    assert!(!runner.final_sealed());
+    runner.stop();
+
+    let fx = fixture(1);
+    let runner = runner_with(&fx);
+    runner.start(None);
+    assert!(runner.flush_final(None).complete());
+    assert!(
+        fx.registrar
+            .chain()
+            .iter()
+            .all(|h| h.manifest.final_seal.is_none())
+    );
+    assert!(
+        runner.final_sealed(),
+        "nothing to seal under: sealed as far as it can be"
+    );
+    runner.stop();
+}
+
+/// The registrar records a seal only for the executor its token is scoped to (Mend's rule):
+/// one naming another executor registers as a capture and seals nothing.
+#[test]
+fn a_seal_naming_another_executor_is_registered_but_not_recorded() {
+    let fx = fixture(1);
+    let (runner, registrar) = sealing_runner(&fx, "exec-other", "exec-1");
+    runner.start(None);
+    assert!(runner.flush_final(None).complete());
+    assert_eq!(
+        registrar.head().unwrap().manifest.final_seal,
+        Some(seal("exec-other"))
+    );
+    assert!(registrar.seals().is_empty());
+    runner.stop();
+}
+
+fn runner_with(fx: &Fixture) -> CadenceRunner {
+    runner(CaptureConfig::new("wt", 1, &fx.root), fx.store.clone(), fx)
 }

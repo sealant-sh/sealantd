@@ -109,10 +109,4 @@ pub trait ControlService: Send + Sync + 'static {
 
     /// The configured maximum control-frame size.
     fn max_frame_bytes(&self) -> u32;
-
-    /// Where the Unix socket server records the process at the far end of each live
-    /// connection ([`crate::peer::ControlPeers`]); `None` (the default) records nothing.
-    fn control_peers(&self) -> Option<crate::peer::ControlPeers> {
-        None
-    }
 }

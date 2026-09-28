@@ -18,9 +18,9 @@ use crate::index::{
 use crate::io_at::IoAt;
 use crate::keys::KeyPrefix;
 use crate::manifest::{
-    BulkSection, BulkState, CaptureKind, DirFormat, EncodedManifest, FORMAT_DIR_PACKS, GitSection,
-    Manifest, Sections, WORKTREE_META_FORMAT, WORKTREE_TREE_REF, WorkspaceSection, WorktreeMeta,
-    rfc3339_now,
+    BulkSection, BulkState, CaptureKind, DirFormat, EncodedManifest, FORMAT_DIR_PACKS, FinalSeal,
+    GitSection, Manifest, Sections, WORKTREE_META_FORMAT, WORKTREE_TREE_REF, WorkspaceSection,
+    WorktreeMeta, rfc3339_now,
 };
 use crate::materialize::{
     DiskState, MaterializeClass, MaterializeError, MaterializeReport, MaterializeTargets,
@@ -160,6 +160,10 @@ pub struct CaptureConfig {
     /// A file read this close to its last change is read again by the next build rather than
     /// trusted by its stat ([`index::RACY_WINDOW`]; see `index` "When a file is re-read").
     pub racy_window: Duration,
+    /// The executor this engine captures for, as the session token names it: `plan.get`'s
+    /// `executor`, else `SEALANT_WORKSPACE_ID`. A complete final flush seals the chain under
+    /// it ([`crate::manifest::FinalSeal`]); `None` seals nothing.
+    pub executor: Option<String>,
 }
 
 impl CaptureConfig {
@@ -186,6 +190,7 @@ impl CaptureConfig {
             dir_format: DirFormat::Packs,
             uploads_in_flight: crate::ship::DEFAULT_UPLOADS_IN_FLIGHT,
             racy_window: index::RACY_WINDOW,
+            executor: None,
         }
     }
 
@@ -612,9 +617,11 @@ pub struct CaptureEngine {
     /// content). Empty after a restart, when such a path's metadata is left out and the path is
     /// reported unreadable all the same.
     last_meta: Option<worktree_meta::MetaDocument>,
-    /// The last small snap found tracked files with names outside the worktree (hardlinks
-    /// another class carries): its overlay names the bulk class's names as the bulk index had
-    /// them, so a bulk capture staged after it can change what the next small snap records.
+    /// The last small snap found files with names outside their class — a tracked file's inode
+    /// another class names, or a workspace-class file whose inode has names the workspace
+    /// class does not hold (hardlinks into the bulk class): its overlay names the bulk class's
+    /// names as the bulk index had them, so a bulk capture staged after it can change what the
+    /// next small snap records.
     shared_outside: bool,
     /// A refused capture being rebuilt in its place ([`CaptureEngine::repair`]): the next
     /// snap takes its `n` and parent and folds the captures staged after it into itself.
@@ -1024,6 +1031,12 @@ impl CaptureEngine {
         self.config.dir_format = format;
     }
 
+    /// The executor this engine seals a completed final flush under (a re-plan names it again:
+    /// a standby claimed for a session). See [`CaptureConfig::executor`].
+    pub fn set_executor(&mut self, executor: Option<String>) {
+        self.config.executor = executor;
+    }
+
     /// Configuration.
     #[must_use]
     pub fn config(&self) -> &CaptureConfig {
@@ -1182,6 +1195,72 @@ impl CaptureEngine {
         shared.sort();
         shared.dedup();
         shared
+    }
+
+    /// Inodes the workspace class (`listing`, this snap's) and the bulk class (its index, each
+    /// name checked on disk) both name, none of them tracked: the tracked inodes in `outside`
+    /// are [`Self::shared_links`]' (and a tracked inode none of whose names is outside the
+    /// overlay has no name in either class). Each group lists every name the two classes carry
+    /// of the inode, sorted, workspace names first. Also whether any workspace-class file has
+    /// names the workspace class does not hold: then what this records depends on the bulk
+    /// index (see [`Self::small_depends_on_bulk`]).
+    fn cross_links(
+        &self,
+        outside: &[worktree_meta::OutsideLinks],
+        listing: &Listing,
+    ) -> (Vec<Vec<worktree_meta::LinkMember>>, bool) {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::MetadataExt;
+        let tracked: HashSet<(u64, u64)> = outside.iter().map(|o| (o.dev, o.ino)).collect();
+        let member = |class, v: &str| worktree_meta::LinkMember {
+            class,
+            member: v.to_owned(),
+            raw_member: worktree_meta::raw_of(v),
+        };
+        // (dev, ino) → (link count, the workspace class's names).
+        let mut inodes: HashMap<(u64, u64), (u64, Vec<worktree_meta::LinkMember>)> = HashMap::new();
+        for (v, src) in &listing.entries {
+            let key = (src.meta.dev(), src.meta.ino());
+            if src.meta.is_file() && src.meta.nlink() > 1 && !tracked.contains(&key) {
+                let slot = inodes.entry(key).or_insert((src.meta.nlink(), Vec::new()));
+                slot.1.push(member(worktree_meta::LinkClass::Workspace, v));
+            }
+        }
+        inodes.retain(|_, (nlink, names)| *nlink > names.len() as u64);
+        if inodes.is_empty() {
+            return (Vec::new(), false);
+        }
+        let mut bulk: HashMap<(u64, u64), Vec<worktree_meta::LinkMember>> = HashMap::new();
+        for (v, known) in &self.bulk_index.files {
+            let key = (known.stat.dev, known.stat.ino);
+            if !inodes.contains_key(&key) {
+                continue;
+            }
+            // The index is the last bulk snap's; the inode must still be this one.
+            let abs = self
+                .config
+                .root
+                .join(std::ffi::OsStr::from_bytes(&worktree_meta::bytes_of(v)));
+            let on_disk = crate::longpath::symlink_metadata(&abs)
+                .is_ok_and(|m| m.is_file() && (m.dev(), m.ino()) == key);
+            if on_disk {
+                bulk.entry(key)
+                    .or_default()
+                    .push(member(worktree_meta::LinkClass::Bulk, v));
+            }
+        }
+        let mut groups: Vec<Vec<worktree_meta::LinkMember>> = bulk
+            .into_iter()
+            .filter_map(|(key, bulk_names)| {
+                let (_, mut names) = inodes.remove(&key)?;
+                names.extend(bulk_names);
+                names.sort();
+                names.dedup();
+                Some(names)
+            })
+            .collect();
+        groups.sort();
+        (groups, true)
     }
 
     /// The bulk class listing: every bulk directory under the root.
@@ -1720,6 +1799,7 @@ impl CaptureEngine {
                 other_bulk: old.sections.other_bulk.clone(),
             },
             checkpoint: None,
+            final_seal: None,
         }
         .encode();
         let manifest_key = self.prefix.manifest(&manifest.capture_id);
@@ -1890,8 +1970,11 @@ impl CaptureEngine {
                             })
                             .collect();
                         git_unreadable = merge_unreadable(git_unreadable, meta_unreadable);
-                        self.shared_outside = !captured.outside.is_empty();
+                        let (cross_links, ws_outside) =
+                            self.cross_links(&captured.outside, &listing);
+                        self.shared_outside = !captured.outside.is_empty() || ws_outside;
                         let mut doc = captured.doc;
+                        doc.cross_links = cross_links;
                         // A tracked file under a bulk directory is the overlay's own name.
                         let own: HashSet<&str> =
                             doc.entries.iter().map(|e| e.path.as_str()).collect();
@@ -2126,6 +2209,7 @@ impl CaptureEngine {
             created_at: rfc3339_now(),
             sections,
             checkpoint: None,
+            final_seal: None,
         }
         .encode();
         let manifest_key = self.prefix.manifest(&manifest.capture_id);
@@ -2295,8 +2379,9 @@ impl CaptureEngine {
     }
 
     /// Whether the last small snap's worktree metadata overlay depends on the bulk index: it
-    /// found tracked files with names another class carries, and records the bulk class's
-    /// names of them as the last bulk snap indexed them. A final flush whose bulk snap staged a
+    /// found tracked files with names another class carries, or workspace-class files with
+    /// names the workspace class does not hold, and records the bulk class's names of them as
+    /// the last bulk snap indexed them. A final flush whose bulk snap staged a
     /// capture snaps the small class again then, so the chain's last capture records them as
     /// they are (Docker end to end, round 3: the flush after the one that reported `complete`
     /// registered a final capture whose only difference was these links).
@@ -2317,12 +2402,78 @@ impl CaptureEngine {
     /// # Errors
     /// Staging I/O.
     pub fn seal_final(&mut self, seq: u64) -> Result<Option<StagedCapture>, EngineError> {
-        let Some(prev) = self.previous.clone() else {
+        let Some(prev) = self.previous.as_ref() else {
             return Ok(None);
         };
         if prev.manifest.kind == CaptureKind::Final {
             return Ok(None);
         }
+        self.stage_over_previous(seq, None).map(Some)
+    }
+
+    /// The seal this engine writes once a final flush completed: complete, its epoch and its
+    /// executor. `None` without an executor.
+    #[must_use]
+    pub fn final_seal(&self) -> Option<FinalSeal> {
+        self.config.executor.as_ref().map(|executor| FinalSeal {
+            complete: true,
+            epoch: self.config.epoch,
+            executor: executor.clone(),
+        })
+    }
+
+    /// Whether the newest capture carries this engine's seal ([`Self::final_seal`]), so a
+    /// complete final flush has nothing left to seal. True without an executor: there is
+    /// nothing it could seal under.
+    #[must_use]
+    pub fn completion_sealed(&self) -> bool {
+        match self.final_seal() {
+            None => true,
+            Some(seal) => self
+                .previous
+                .as_ref()
+                .is_some_and(|p| p.manifest.final_seal.as_ref() == Some(&seal)),
+        }
+    }
+
+    /// Seal a completed final flush on the chain ([`crate::manifest::FinalSeal`]): stage one
+    /// more capture over the newest one — its sections unchanged, `kind: final` — carrying this
+    /// engine's seal. The caller vouches that the flush completed: every writer stopped, both
+    /// classes snapped after that, and everything staged before registered. `None` when the
+    /// newest capture carries the seal already ([`Self::completion_sealed`]), there is no
+    /// capture, or no executor to seal under.
+    ///
+    /// # Errors
+    /// Staging I/O.
+    pub fn seal_complete(&mut self, seq: u64) -> Result<Option<StagedCapture>, EngineError> {
+        let Some(seal) = self.final_seal() else {
+            return Ok(None);
+        };
+        if self.previous.is_none() || self.completion_sealed() {
+            return Ok(None);
+        }
+        let staged = self.stage_over_previous(seq, Some(seal.clone()))?;
+        tracing::info!(
+            n = staged.n,
+            epoch = seal.epoch,
+            executor = %seal.executor,
+            "final seal staged: the final flush completed"
+        );
+        Ok(Some(staged))
+    }
+
+    /// Stage a final capture over the newest one with its sections, carrying `final_seal`.
+    fn stage_over_previous(
+        &mut self,
+        seq: u64,
+        final_seal: Option<FinalSeal>,
+    ) -> Result<StagedCapture, EngineError> {
+        let Some(prev) = self.previous.clone() else {
+            return Err(EngineError::Io(io::Error::other(
+                "no capture to stage a final one over",
+            )));
+        };
+        let sealing = final_seal.is_some();
         let staging = Arc::clone(&self.staging);
         let guard = staging.coalesce_guard();
         let n = prev.manifest.n + 1;
@@ -2336,6 +2487,7 @@ impl CaptureEngine {
             created_at: rfc3339_now(),
             sections: prev.manifest.sections.clone(),
             checkpoint: None,
+            final_seal,
         }
         .encode();
         let manifest_key = self.prefix.manifest(&manifest.capture_id);
@@ -2371,13 +2523,15 @@ impl CaptureEngine {
         drop(guard);
         self.previous = Some(manifest.clone());
         self.persist()?;
-        tracing::info!(
-            n,
-            sealed = prev.manifest.n,
-            sealed_kind = ?prev.manifest.kind,
-            "final capture staged over the newest capture, which the final snaps found current"
-        );
-        Ok(Some(StagedCapture {
+        if !sealing {
+            tracing::info!(
+                n,
+                sealed = prev.manifest.n,
+                sealed_kind = ?prev.manifest.kind,
+                "final capture staged over the newest capture, which the final snaps found current"
+            );
+        }
+        Ok(StagedCapture {
             n,
             manifest,
             manifest_key,
@@ -2385,7 +2539,7 @@ impl CaptureEngine {
             class: Class::Small,
             stats,
             unchanged: false,
-        }))
+        })
     }
 
     /// Final small-class snap, then ship everything pending, bounded by `deadline`.

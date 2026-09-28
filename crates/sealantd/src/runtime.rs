@@ -171,9 +171,6 @@ pub struct Runtime {
     /// The workspace's own Docker daemon, whose containers the final capture stops
     /// ([`crate::docker`]). Set by boot; none by default.
     workspace_docker: Mutex<Option<crate::docker::DockerEndpoint>>,
-    /// The processes at the far end of the live control-socket connections, which the final
-    /// capture's sweep spares while their connection is open ([`crate::sweep`]).
-    control_peers: sealant_control::ControlPeers,
 }
 
 impl Runtime {
@@ -266,7 +263,6 @@ impl Runtime {
             pidfd_supported,
             subreaper: AtomicBool::new(subreaper),
             workspace_docker: Mutex::new(None),
-            control_peers: sealant_control::ControlPeers::default(),
         })
     }
 
@@ -419,9 +415,6 @@ impl Runtime {
         };
         let mut sweeper = crate::sweep::Sweeper::this_process();
         sweeper.scope = self.sweep_scope();
-        // The far ends of the live control connections: the one carrying this flush's reply.
-        let control_peers = self.control_peers.clone();
-        let peers = move || control_peers.pids();
         let docker = self
             .workspace_docker
             .lock()
@@ -443,7 +436,7 @@ impl Runtime {
         let ((), (), (swept, sweep_left)) = tokio::join!(
             self.sessions.terminate_all(grace),
             self.processes.terminate_all(signal, grace),
-            sweeper.sweep(grace, self.shutdown.is_hard(), &admit, &peers),
+            sweeper.sweep(grace, self.shutdown.is_hard(), &admit),
         );
         // Then again: a container a process started on its way out (admission stays closed,
         // but sealantd does not admit what the daemon runs).
@@ -573,6 +566,13 @@ impl Runtime {
             *self.quiesced.lock().unwrap_or_else(|e| e.into_inner()),
             Some(None)
         )
+    }
+
+    /// Close admission from the start (a recovery boot, `boot::config::BootConfig::recovery`):
+    /// no exec, session, SFTP bridge or other writer is admitted, exactly as after a final
+    /// flush's quiesce. The final flush and `capture.status` are still served.
+    pub fn close_admission(&self) {
+        self.admission_closed.store(true, Ordering::SeqCst);
     }
 
     /// Whether a final capture flush closed admission (the executor is ending).
@@ -1394,9 +1394,5 @@ impl ControlService for Runtime {
 
     fn max_frame_bytes(&self) -> u32 {
         self.config.limits.max_frame_bytes
-    }
-
-    fn control_peers(&self) -> Option<sealant_control::ControlPeers> {
-        Some(self.control_peers.clone())
     }
 }

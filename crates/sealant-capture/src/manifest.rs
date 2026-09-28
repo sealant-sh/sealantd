@@ -112,16 +112,20 @@ pub enum FsckStatus {
 pub struct GitSection {
     /// Every git pack key the section needs, across epochs.
     pub packs: Vec<String>,
-    /// Ref name → sha, including the pseudo-refs.
+    /// Ref name → sha, including the pseudo-refs. Each name is a [`crate::tree::key_of`] key of
+    /// the ref's bytes (the name itself unless it is not UTF-8), written back as
+    /// [`crate::tree::bytes_of`] — two names that differ only in bytes that are not UTF-8 stay
+    /// two refs.
     pub refs: BTreeMap<String, String>,
-    /// `HEAD`: a ref name or a sha.
+    /// `HEAD`: a ref name (a key, as in `refs`) or a sha.
     pub head: String,
     /// fsck outcome.
     pub fsck: FsckStatus,
     /// Symbolic refs other than `HEAD` (`refs/remotes/origin/HEAD` → `refs/remotes/origin/main`):
-    /// name → the ref it points at. Each is in `refs` as well, by the sha it resolved to, so a
-    /// reader that knows only `refs` reads what it always did. Absent when empty, so a manifest
-    /// without one encodes exactly as before.
+    /// name → the ref it points at, both keys as in `refs`. Each whose target resolves is in
+    /// `refs` as well, by the sha it resolved to, so a reader that knows only `refs` reads what
+    /// it always did; a dangling one (its target does not exist) is here only. Absent when
+    /// empty, so a manifest without one encodes exactly as before.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub symrefs: BTreeMap<String, String>,
 }
@@ -433,6 +437,29 @@ pub struct Manifest {
     /// Checkpoint stamp, when `kind == checkpoint`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkpoint: Option<Checkpoint>,
+    /// The executor's word that its final flush completed ([`FinalSeal`]): only on the sealing
+    /// capture a complete final flush registers last. Absent otherwise, so a manifest without
+    /// one encodes exactly as before, and a capture staged after it carries none (it unseals).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_seal: Option<FinalSeal>,
+}
+
+/// `final_seal` (cross-repo decision 1): a completed final flush as a store-side fact, not only
+/// an RPC reply. When a final flush of this executor completes — every writer stopped, both
+/// classes snapped after that, everything staged registered — it registers one more capture,
+/// the head's sections unchanged, `kind: final`, `n` = head + 1, carrying this; it reports
+/// `complete` only once that register is acknowledged. The registrar records it on the chain
+/// only when `complete` is true, `epoch` is the epoch the capture registers under and
+/// `executor` is the executor the session token was issued for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FinalSeal {
+    /// Always true: an incomplete final flush writes no seal.
+    pub complete: bool,
+    /// The lease epoch the sealing capture registers under.
+    pub epoch: u64,
+    /// The executor sealantd was planned as: `plan.get`'s `executor`, else
+    /// `SEALANT_WORKSPACE_ID`.
+    pub executor: String,
 }
 
 /// A manifest with its canonical bytes and capture id.
@@ -540,6 +567,7 @@ mod tests {
                 other_bulk: BTreeMap::new(),
             },
             checkpoint: None,
+            final_seal: None,
         }
     }
 

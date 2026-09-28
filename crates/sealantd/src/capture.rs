@@ -132,7 +132,16 @@ impl CaptureRuntime {
     /// Start the cadence runner (watcher, class clocks, ship worker) and the heartbeat loop.
     /// `harness` is the process the fence pauses and resumes.
     pub fn start(self: &Arc<Self>, runtime: Arc<Runtime>, harness: ProcessId) {
-        *self.harness.lock().unwrap_or_else(|e| e.into_inner()) = Some(harness);
+        self.start_with(runtime, Some(harness));
+    }
+
+    /// [`Self::start`] with no harness to pause on a fence (a recovery boot runs none).
+    pub fn start_without_harness(self: &Arc<Self>, runtime: Arc<Runtime>) {
+        self.start_with(runtime, None);
+    }
+
+    fn start_with(self: &Arc<Self>, runtime: Arc<Runtime>, harness: Option<ProcessId>) {
+        *self.harness.lock().unwrap_or_else(|e| e.into_inner()) = harness;
         let cadence = self.runner.with_engine(|e| e.config().cadence);
 
         // Scheduled snaps stop once the daemon is hard-stopping, and once a final flush stopped
@@ -289,7 +298,8 @@ impl CaptureRuntime {
         deadline: Option<Duration>,
         quiesce: Option<&'static str>,
     ) -> CaptureStatusReport {
-        let flushed = self.runner.flush_final(deadline);
+        // The chain is sealed ([`sealant_capture::FinalSeal`]) only when every writer stopped.
+        let flushed = self.runner.flush_final_sealing(deadline, quiesce.is_none());
         self.last_snap_unix_ms
             .store(now_unix_ms(), Ordering::Relaxed);
         let outcome = match (quiesce, &flushed.incomplete) {
@@ -322,8 +332,9 @@ impl CaptureRuntime {
     /// `complete` throughout.
     pub fn begin_final(&self) {
         let mut outcome = self.final_outcome.lock().unwrap_or_else(|e| e.into_inner());
-        let current =
-            matches!(*outcome, FinalOutcome::Snapped { .. }) && self.runner.sealed_and_current();
+        let current = matches!(*outcome, FinalOutcome::Snapped { .. })
+            && self.runner.sealed_and_current()
+            && self.runner.final_sealed();
         if !current {
             *outcome = FinalOutcome::Running;
         }
@@ -430,6 +441,10 @@ impl CaptureRuntime {
             engine
                 .rebase(&plan.worktree_id, plan.epoch, previous)
                 .map_err(|e| internal(&format!("capture engine rebase: {e}")))?;
+            // The executor a completed final flush is sealed under, as this plan names it.
+            if let Some(executor) = &plan.executor {
+                engine.set_executor(Some(executor.clone()));
+            }
             // The registrar of the assigned worktree decides whether dir objects travel in
             // dir packs from the next snap on.
             engine.set_dir_format(DirFormat::for_registrar(plan.manifest_format));
@@ -525,6 +540,10 @@ impl CaptureRuntime {
             FinalOutcome::Snapped { .. } if !self.runner.chain_sealed() => Some("pending"),
             // A capture being built after the final one: staged, not queued yet.
             FinalOutcome::Snapped { .. } if bulk_building => Some("pending"),
+            // Everything registered, but not the capture that seals the completed flush on the
+            // chain (the flush returned at its deadline before it could stage it): the final
+            // flush asked again stages it.
+            FinalOutcome::Snapped { .. } if !self.runner.final_sealed() => Some("sealing"),
             FinalOutcome::Snapped { .. } => None,
         };
         let reads = self.reads.current();
@@ -618,6 +637,10 @@ mod tests {
         assert!(out.status.success(), "git {args:?}");
     }
 
+    /// The executor the test registrar's token is scoped to (a test engine seals under it only
+    /// when its configuration names it).
+    const EXECUTOR: &str = "exec-hooks";
+
     fn boot(base: &Path) -> (CaptureBoot, Arc<InMemoryRegistrar>) {
         boot_with(base, |store| store)
     }
@@ -644,7 +667,8 @@ mod tests {
         std::fs::write(root.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
         git(&root, &["add", "-A"]);
         git(&root, &["commit", "-q", "-m", "one"]);
-        let registrar = Arc::new(InMemoryRegistrar::new("wt-hooks", 1, None));
+        let registrar =
+            Arc::new(InMemoryRegistrar::new("wt-hooks", 1, None).with_executor(EXECUTOR));
         let sink = wrap(Arc::new(LocalDir::new(&base.join("store")).unwrap()));
         let mut config = CaptureConfig::new("wt-hooks", 1, &root);
         tune(&mut config);
@@ -1275,6 +1299,8 @@ mod tests {
                 ca_file: None,
                 object_ca_pem: None,
                 object_ca_file: None,
+                executor_id: None,
+                recovery: false,
             },
             &ws,
             tmp.path(),
@@ -2378,6 +2404,186 @@ mod tests {
             "no new capture of an unchanged disk"
         );
         assert!(!runtime.capture_incomplete());
+    }
+
+    /// Cross-repo decision 1: a completed final flush is a store-side fact. The flush that
+    /// completes registers a sealing capture carrying `final_seal` (complete, its epoch, its
+    /// executor) and answers `complete` only once that register is acknowledged. A flush that
+    /// returned at its deadline has not sealed: once the worker has shipped the rest,
+    /// `capture.status` reads `sealing` (never `complete`), and the final flush asked again
+    /// seals without a second quiesce; a third stages nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_complete_final_flush_is_sealed_in_the_store_before_it_says_complete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (boot, registrar) = boot_tuned(
+            tmp.path(),
+            |inner| {
+                Arc::new(Slow {
+                    inner,
+                    delay: Duration::from_millis(150),
+                })
+            },
+            |config| config.executor = Some(EXECUTOR.to_owned()),
+        );
+        let ws = tmp.path().join("ws");
+        let mut config = RuntimeConfig::new(new_runtime_id());
+        config.workspace_root = ws.clone();
+        let runtime = Runtime::new(config, Arc::new(ShutdownSignal::new(3_000)));
+        runtime.mark_healthy();
+        let capture = CaptureRuntime::new(boot);
+        assert!(runtime.install_capture(capture.clone()));
+        let harness = runtime
+            .spawn_managed(sh("exec sleep 600", &ws))
+            .expect("spawn");
+        capture.start(runtime.clone(), harness.process_id);
+        let flush = |rid: &'static str, deadline_ms| {
+            runtime.dispatch(ControlRequest::new(
+                RequestId::new(rid),
+                Command::CaptureFlush {
+                    kind: CaptureFlushKind::Final,
+                    deadline_ms,
+                    grace_ms: Some(2_000),
+                },
+            ))
+        };
+        let report = flush_report(flush("r1", Some(100)).await);
+        assert!(!report.complete, "{report:?}");
+        assert_eq!(report.incomplete_reason.as_deref(), Some("deadline"));
+        // The worker ships the rest; nothing is sealed, so nothing reads complete.
+        let start = Instant::now();
+        let status = loop {
+            let status = capture.status();
+            assert!(
+                !status.complete,
+                "complete before the seal registered: {status:?}"
+            );
+            if status.pending == 0 && status.incomplete_reason.as_deref() == Some("sealing") {
+                break status;
+            }
+            assert!(start.elapsed() < Duration::from_secs(60), "{status:?}");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        assert!(registrar.seals().is_empty(), "{status:?}");
+        assert!(runtime.capture_incomplete());
+
+        // Core, on an empty but unconfirmed queue, asks again: the flush seals and says so.
+        let report = flush_report(flush("r2", Some(30_000)).await);
+        assert!(report.complete, "{report:?}");
+        assert_eq!(runtime.quiesce_count(), 1, "no second quiesce");
+        let chain = registrar.chain();
+        let head = chain.last().unwrap();
+        let seal = sealant_capture::FinalSeal {
+            complete: true,
+            epoch: 1,
+            executor: EXECUTOR.to_owned(),
+        };
+        assert_eq!(head.manifest.final_seal.as_ref(), Some(&seal));
+        assert_eq!(head.manifest.kind, sealant_capture::CaptureKind::Final);
+        assert_eq!(
+            head.manifest.sections,
+            chain[chain.len() - 2].manifest.sections,
+            "the sealing capture holds the newest capture's sections"
+        );
+        assert_eq!(registrar.seals(), vec![(head.n, seal)]);
+        assert_eq!(
+            report.head_n,
+            Some(head.n),
+            "complete after the seal registered"
+        );
+        assert!(capture.status().complete);
+        assert!(!runtime.capture_incomplete());
+
+        // Asked again: nothing staged, the same seal.
+        let registered = chain.len();
+        let report = flush_report(flush("r3", Some(30_000)).await);
+        assert!(report.complete, "{report:?}");
+        assert_eq!(registrar.chain().len(), registered);
+        assert_eq!(registrar.seals().len(), 1);
+    }
+
+    /// A recovery boot (Core restarted a retained executor): admission is closed from the start
+    /// and no harness runs, so nothing but the capture engine touches the disk. An exec is
+    /// refused; the final flush snaps the disk as the executor left it — the work it never
+    /// snapped included — ships, seals, and answers complete.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_recovery_boot_admits_nothing_and_its_final_flush_saves_the_disk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (boot, registrar) = boot_tuned(
+            tmp.path(),
+            |store| store,
+            |config| config.executor = Some(EXECUTOR.to_owned()),
+        );
+        let ws = boot.layout.working_directory.clone();
+        std::fs::write(
+            ws.join("src/unsaved.rs"),
+            "// never snapped before the exit\n",
+        )
+        .unwrap();
+        let mut config = RuntimeConfig::new(new_runtime_id());
+        config.workspace_root = ws.clone();
+        let runtime = Runtime::new(config, Arc::new(ShutdownSignal::new(3_000)));
+        runtime.mark_healthy();
+        runtime.close_admission();
+        let capture = CaptureRuntime::new(boot);
+        assert!(runtime.install_capture(capture.clone()));
+        capture.start_without_harness(runtime.clone());
+
+        let refused = runtime
+            .spawn_managed(sh("echo late > src/late.rs", &ws))
+            .expect_err("nothing is admitted");
+        assert!(
+            format!("{refused:?}").contains("closed admission"),
+            "{refused:?}"
+        );
+        let report = runtime
+            .final_flush(None, Some(1_000))
+            .await
+            .expect("a capture engine");
+        assert!(report.complete, "{report:?}");
+        assert!(!runtime.capture_incomplete());
+        assert_eq!(registrar.seals().len(), 1);
+        let fresh = restore_head(tmp.path(), &registrar, "restored");
+        assert_eq!(
+            std::fs::read_to_string(fresh.join("src/unsaved.rs")).unwrap(),
+            "// never snapped before the exit\n"
+        );
+        assert!(!ws.join("src/late.rs").exists());
+    }
+
+    /// A final flush whose quiesce could not stop every writer (here: no subreaper, so an
+    /// orphan could not be seen) is incomplete, and writes no seal.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_incomplete_quiesce_writes_no_seal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (boot, registrar) = boot_tuned(
+            tmp.path(),
+            |store| store,
+            |config| config.executor = Some(EXECUTOR.to_owned()),
+        );
+        let ws = tmp.path().join("ws");
+        let mut config = RuntimeConfig::new(new_runtime_id());
+        config.workspace_root = ws.clone();
+        let runtime = Runtime::new(config, Arc::new(ShutdownSignal::new(3_000)));
+        runtime.mark_healthy();
+        runtime.set_subreaper_for_test(false);
+        let capture = CaptureRuntime::new(boot);
+        assert!(runtime.install_capture(capture.clone()));
+        let report = runtime
+            .final_flush(None, Some(1_000))
+            .await
+            .expect("a capture engine");
+        assert!(!report.complete, "{report:?}");
+        assert_eq!(
+            report.incomplete_reason.as_deref(),
+            Some("sweep-unavailable")
+        );
+        assert!(
+            registrar
+                .chain()
+                .iter()
+                .all(|h| h.manifest.final_seal.is_none())
+        );
+        assert!(registrar.seals().is_empty());
     }
 
     /// A runtime over a workspace with a dependency tree (both classes watched) and a harness

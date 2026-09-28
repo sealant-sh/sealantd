@@ -20,7 +20,7 @@ use sealant_capture::pack::PackReader;
 use sealant_capture::registrar::HeadInfo;
 use sealant_capture::worktree_meta::MetaDocument;
 use sealant_capture::{
-    CaptureConfig, CaptureEngine, CaptureKind, Class, InMemoryRegistrar, LocalDir,
+    CadenceRunner, CaptureConfig, CaptureEngine, CaptureKind, Class, InMemoryRegistrar, LocalDir,
     MaterializeClass, MaterializeTargets, Materializer, SnapRequest,
 };
 
@@ -960,4 +960,182 @@ fn directory_mtimes_survive_cross_class_relinks() {
         "the bulk name is linked onto the tracked inode"
     );
     assert_same(&root, &restored);
+}
+
+/// A repository whose ignored files are hardlinked into bulk directories: nothing of the inode
+/// is tracked, so the worktree overlay's shared links (which hang off a tracked file) never
+/// named it. Captured by a real final flush.
+struct UntrackedLinks {
+    tmp: tempfile::TempDir,
+    root: PathBuf,
+    sink: Arc<LocalDir>,
+    registrar: Arc<InMemoryRegistrar>,
+}
+
+impl UntrackedLinks {
+    fn new(build: impl FnOnce(&Path)) -> Self {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("ws");
+        fs::create_dir_all(&root).unwrap();
+        git(&root, &["init", "-q", "-b", "main"]);
+        git(&root, &["config", "user.email", "t@t"]);
+        git(&root, &["config", "user.name", "t"]);
+        fs::write(root.join("a"), "base\n").unwrap();
+        fs::write(root.join(".gitignore"), "ignored/\nnode_modules/\ndist/\n").unwrap();
+        git(&root, &["add", "-A"]);
+        git(&root, &["commit", "-q", "-m", "base"]);
+        build(&root);
+        // Distinct mtimes on every directory, deepest first so a parent keeps its own.
+        let mut dirs: Vec<PathBuf> = walkdir::WalkDir::new(&root)
+            .into_iter()
+            .filter_entry(|e| e.file_name() != ".git")
+            .map(Result::unwrap)
+            .filter(|e| e.file_type().is_dir())
+            .map(|e| e.path().to_path_buf())
+            .collect();
+        dirs.sort_by_key(|d| std::cmp::Reverse(d.components().count()));
+        for (i, dir) in dirs.iter().enumerate() {
+            set_mtime(dir, T + i as i64 * 1_000_003_007);
+        }
+        let sink = Arc::new(LocalDir::new(&tmp.path().join("store")).unwrap());
+        let registrar = Arc::new(InMemoryRegistrar::new("wt-untracked", 1, None));
+        let engine =
+            CaptureEngine::open(CaptureConfig::new("wt-untracked", 1, &root), None).unwrap();
+        let shipper = Arc::new(engine.shipper(sink.clone(), registrar.clone()));
+        let flushed = CadenceRunner::new(engine, shipper).flush_final(None);
+        assert!(flushed.complete(), "{flushed:?}");
+        Self {
+            tmp,
+            root,
+            sink,
+            registrar,
+        }
+    }
+
+    fn restore(&self, name: &str) -> PathBuf {
+        let out = self.tmp.path().join(name);
+        Materializer::new(self.sink.as_ref(), MaterializeTargets::new(&out, None))
+            .materialize(
+                &self.registrar.head().unwrap().manifest,
+                MaterializeClass::All,
+            )
+            .unwrap();
+        out
+    }
+}
+
+fn ino(p: &Path) -> u64 {
+    fs::metadata(p).unwrap().ino()
+}
+
+/// Review 2 #10: `ignored/x` (the workspace class) hardlinked to `node_modules/pkg/x` (the bulk
+/// class), neither tracked. Each class carried its own name, nothing recorded that they are one
+/// inode, and a complete final flush restored two files: a write through one name no longer
+/// showed through the other. Now they come back as one inode, directory mtimes and all, and
+/// the head over itself writes nothing.
+#[test]
+fn an_ignored_file_hardlinked_into_bulk_restores_as_one_inode() {
+    let fx = UntrackedLinks::new(|root| {
+        fs::create_dir_all(root.join("ignored")).unwrap();
+        fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
+        fs::write(root.join("ignored/x"), "same bytes\n").unwrap();
+        fs::hard_link(root.join("ignored/x"), root.join("node_modules/pkg/x")).unwrap();
+    });
+    let restored = fx.restore("restored");
+    let head = fx.registrar.head().unwrap();
+    let meta = head
+        .manifest
+        .sections
+        .workspace
+        .worktree_meta
+        .as_ref()
+        .unwrap();
+    let groups: Vec<Vec<String>> = read_doc(&restored, meta)
+        .cross_links
+        .iter()
+        .map(|g| g.iter().map(|m| m.member.clone()).collect())
+        .collect();
+    assert_eq!(
+        groups,
+        vec![vec![
+            "tree/ignored/x".to_owned(),
+            "node_modules/pkg/x".to_owned()
+        ]],
+        "the overlay records the inode, workspace name first"
+    );
+    assert_eq!(
+        ino(&restored.join("ignored/x")),
+        ino(&restored.join("node_modules/pkg/x")),
+        "one inode, as captured"
+    );
+    assert_same(&fx.root, &restored);
+    let m = Materializer::new(fx.sink.as_ref(), MaterializeTargets::new(&restored, None));
+    let again = m
+        .materialize(
+            &fx.registrar.head().unwrap().manifest,
+            MaterializeClass::All,
+        )
+        .unwrap();
+    assert_eq!(
+        (again.files, again.hardlinks, again.worktree_meta),
+        (0, 0, 0),
+        "{again:?}"
+    );
+    fs::write(
+        restored.join("node_modules/pkg/x"),
+        "written through the bulk name\n",
+    )
+    .unwrap();
+    assert_eq!(
+        fs::read_to_string(restored.join("ignored/x")).unwrap(),
+        "written through the bulk name\n"
+    );
+}
+
+/// An inode with three names and no tracked one: two ignored names (the workspace class links
+/// them itself) and one bulk name; and a bulk-only inode across two bulk directories. All come
+/// back as captured.
+#[test]
+fn untracked_inode_groups_across_and_within_classes_are_kept() {
+    let fx = UntrackedLinks::new(|root| {
+        fs::create_dir_all(root.join("ignored/sub")).unwrap();
+        fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
+        fs::create_dir_all(root.join("dist")).unwrap();
+        fs::write(root.join("ignored/one"), "three names\n").unwrap();
+        fs::hard_link(root.join("ignored/one"), root.join("ignored/sub/two")).unwrap();
+        fs::hard_link(
+            root.join("ignored/one"),
+            root.join("node_modules/pkg/three"),
+        )
+        .unwrap();
+        fs::write(root.join("node_modules/pkg/built.js"), "bulk only\n").unwrap();
+        fs::hard_link(
+            root.join("node_modules/pkg/built.js"),
+            root.join("dist/built.js"),
+        )
+        .unwrap();
+    });
+    let restored = fx.restore("restored");
+    let one = ino(&restored.join("ignored/one"));
+    assert_eq!(ino(&restored.join("ignored/sub/two")), one);
+    assert_eq!(ino(&restored.join("node_modules/pkg/three")), one);
+    assert_eq!(
+        fs::metadata(restored.join("ignored/one")).unwrap().nlink(),
+        3
+    );
+    assert_eq!(
+        ino(&restored.join("dist/built.js")),
+        ino(&restored.join("node_modules/pkg/built.js"))
+    );
+    assert_same(&fx.root, &restored);
+    // The git class alone (no other class restored) finds no member to link, and fails nothing.
+    let git_only = fx.tmp.path().join("git-only");
+    Materializer::new(fx.sink.as_ref(), MaterializeTargets::new(&git_only, None))
+        .materialize(
+            &fx.registrar.head().unwrap().manifest,
+            MaterializeClass::Git,
+        )
+        .unwrap();
+    assert!(!git_only.join("ignored/one").exists());
+    assert!(!git_only.join("node_modules/pkg/three").exists());
 }

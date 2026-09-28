@@ -121,6 +121,54 @@ fn fast_bulk(mut cadence: Cadence, quiet_ms: u64, max_ms: u64) -> Cadence {
     cadence
 }
 
+/// The same work as a timer's capture, forced, with no timer and no wake-up: the first capture
+/// of an identical workspace, snapped and shipped on this machine. What a timer's snap, ship
+/// and registration are held to, instead of a wall-clock constant: on a runner with a slow disk
+/// every fsync and git spawn is slower, for both alike.
+fn forced_capture() -> Duration {
+    let twin = Fixture::build();
+    let twin_runner = twin.runner(twin.config(Cadence::default()));
+    fs::write(twin.root.join("src/new.rs"), "fn n() {}\n").unwrap();
+    let t1 = Instant::now();
+    assert!(!twin_runner.snap(CaptureKind::Turn).unwrap().unchanged);
+    twin_runner.ship(Duration::from_secs(30)).unwrap();
+    let forced = t1.elapsed();
+    assert_eq!(twin.chain().len(), 1, "the forced capture registered");
+    twin_runner.stop();
+    forced
+}
+
+/// How long a timer's capture may take to register after the timer fired: three times the same
+/// work forced, and half a second (the worker's wake-up, scheduling).
+fn after_timer_bound(forced: Duration) -> Duration {
+    forced * 3 + Duration::from_millis(500)
+}
+
+/// Wait until the chain holds `n` captures, noting when `fired` (a timer's counter in the
+/// runner's snapshot) first rose above `before`. Both from `t0`; `None` for a registration past
+/// `timeout`.
+fn wait_timer_and_chain(
+    fx: &Fixture,
+    runner: &CadenceRunner,
+    n: usize,
+    t0: Instant,
+    timeout: Duration,
+    fired: impl Fn(&sealant_capture::CadenceSnapshot) -> u64,
+    before: u64,
+) -> (Option<Duration>, Option<Duration>) {
+    let mut fired_at = None;
+    while t0.elapsed() < timeout {
+        if fired_at.is_none() && fired(&runner.snapshot()) > before {
+            fired_at = Some(t0.elapsed());
+        }
+        if fx.chain().len() >= n {
+            return (fired_at.or(Some(t0.elapsed())), Some(t0.elapsed()));
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    (fired_at, None)
+}
+
 /// (a) A change registers within the quiet period (2 s) plus the snap and a local ship.
 ///
 /// The quiet timer is held to the configured period (it does no I/O). What follows it — the
@@ -167,17 +215,8 @@ fn a_change_registers_within_the_quiet_period() {
     assert_eq!(snap.max_fired, 0);
     assert!(!snap.small_dirty, "a snap clears dirty");
 
-    // The same work forced, with no timer and no wake-up: the first capture of an identical
-    // workspace, snapped and shipped on this machine right after.
-    let twin = Fixture::build();
-    let twin_runner = twin.runner(twin.config(Cadence::default()));
-    fs::write(twin.root.join("src/new.rs"), "fn n() {}\n").unwrap();
-    let t1 = Instant::now();
-    assert!(!twin_runner.snap(CaptureKind::Turn).unwrap().unchanged);
-    twin_runner.ship(Duration::from_secs(30)).unwrap();
-    let forced = t1.elapsed();
-    assert_eq!(twin.chain().len(), 1, "the forced capture registered");
-    twin_runner.stop();
+    // The same work forced, right after on this machine.
+    let forced = forced_capture();
     eprintln!(
         "(a) change → quiet timer {fired:?} → registered {after_quiet:?} later; \
          forced snap + ship {forced:?}"
@@ -192,7 +231,7 @@ fn a_change_registers_within_the_quiet_period() {
     // A missed wake-up registers at the worker's next tick, about this long after the timer.
     let tick_after_timer = (started + SHIP_TICK).saturating_duration_since(t0 + fired);
     assert!(
-        after_quiet <= (forced * 3 + Duration::from_millis(500)).max(Duration::from_secs(2)),
+        after_quiet <= after_timer_bound(forced).max(Duration::from_secs(2)),
         "snap + ship after the quiet timer took {after_quiet:?}; forced, the same work took \
          {forced:?}; the worker's next tick was {tick_after_timer:?} after the timer"
     );
@@ -206,72 +245,108 @@ fn a_change_registers_within_the_quiet_period() {
 
 /// (b) Writes every 500 ms for 15 s: captures register at most every `max_interval` (10 s),
 /// never more than one per quiet period, then one more once the writer stops.
+///
+/// The timers are held to the configured periods (they do no I/O); what follows each — the
+/// snap, the worker's wake-up, the ship, the registration — to the same work forced on this
+/// machine ([`after_timer_bound`]), as in (a): on a slow disk a fixed second for it failed.
 #[test]
 fn continuous_writes_register_at_the_max_interval() {
     let fx = Fixture::build();
-    let runner = fx.runner(fx.config(Cadence::default()));
+    let cadence = Cadence::default();
+    let (quiet, max_interval) = (cadence.quiet, cadence.max_interval);
+    let runner = fx.runner(fx.config(cadence));
     let start = Instant::now();
     let mut registered: Vec<Duration> = Vec::new();
+    // When the max-interval timer, and the quiet timer, fired (each time its counter rose).
+    let mut max_fired: Vec<Duration> = Vec::new();
+    let mut quiet_fired: Vec<Duration> = Vec::new();
     let mut seen = 0usize;
+    let mut sample = |registered: &mut Vec<Duration>, seen: &mut usize| {
+        let snap = runner.snapshot();
+        while max_fired.len() < snap.max_fired as usize {
+            max_fired.push(start.elapsed());
+        }
+        while quiet_fired.len() < snap.quiet_fired as usize {
+            quiet_fired.push(start.elapsed());
+        }
+        let n = fx.chain().len();
+        if n > *seen {
+            registered.push(start.elapsed());
+            *seen = n;
+        }
+    };
     let mut i = 0u32;
+    let mut last_write = Duration::ZERO;
     while start.elapsed() < Duration::from_secs(15) {
         fs::write(fx.root.join("src/busy.rs"), format!("// {i}\n")).unwrap();
+        last_write = start.elapsed();
         i += 1;
         let until = start.elapsed() + Duration::from_millis(500);
         while start.elapsed() < until {
-            let n = fx.chain().len();
-            if n > seen {
-                registered.push(start.elapsed());
-                seen = n;
-            }
-            std::thread::sleep(Duration::from_millis(25));
+            sample(&mut registered, &mut seen);
+            std::thread::sleep(Duration::from_millis(5));
         }
     }
     let during = registered.clone();
     // The writer stopped: the quiet timer fires once more.
     let settle = Instant::now();
-    while settle.elapsed() < Duration::from_secs(5) {
-        let n = fx.chain().len();
-        if n > seen {
-            registered.push(start.elapsed());
-            seen = n;
-        }
-        std::thread::sleep(Duration::from_millis(25));
+    while settle.elapsed() < Duration::from_secs(5) || registered.len() == during.len() {
+        sample(&mut registered, &mut seen);
+        assert!(
+            settle.elapsed() < Duration::from_secs(60),
+            "the quiet timer fires once the writer stops: {registered:?}"
+        );
+        std::thread::sleep(Duration::from_millis(5));
     }
-    eprintln!("(b) registrations at {registered:?}");
+    let forced = forced_capture();
+    let bound = after_timer_bound(forced);
+    eprintln!(
+        "(b) registrations at {registered:?}; max timer at {max_fired:?}; quiet timer at \
+         {quiet_fired:?}; last write {last_write:?}; forced snap + ship {forced:?}"
+    );
     assert!(
         (1..=2).contains(&during.len()),
         "one (maybe two) captures while writing: {during:?}"
     );
+    // The first while writing: the max-interval timer, never quiet meanwhile.
+    let first_timer = *max_fired.first().expect("the max-interval timer fired");
     assert!(
-        during[0] <= Duration::from_millis(11_000),
-        "the first at the max interval: {:?}",
-        during[0]
+        first_timer >= max_interval - Duration::from_secs(1),
+        "not before the max interval while never quiet: {first_timer:?}"
     );
     assert!(
-        during[0] >= Duration::from_millis(9_000),
-        "not before the max interval while never quiet: {:?}",
-        during[0]
+        first_timer <= max_interval + Duration::from_secs(1),
+        "the max-interval timer fires at the max interval: {first_timer:?}"
+    );
+    assert!(
+        during[0] >= first_timer && during[0] - first_timer <= bound,
+        "snap + ship after the max-interval timer took {:?}; forced, the same work took \
+         {forced:?}",
+        during[0].saturating_sub(first_timer)
     );
     for w in registered.windows(2) {
         let gap = w[1] - w[0];
         assert!(
-            gap >= Duration::from_secs(2),
+            gap >= quiet,
             "never more than one per quiet period: {gap:?}"
         );
         assert!(
-            gap <= Duration::from_millis(11_000),
-            "≤ max interval: {gap:?}"
+            gap <= max_interval + Duration::from_secs(1) + bound,
+            "≤ max interval (and the capture's own time): {gap:?}"
         );
     }
+    // The last: the quiet timer, the quiet period after the last write.
+    let last_timer = *quiet_fired.last().expect("the quiet timer fired");
     assert!(
-        registered.len() > during.len(),
-        "the quiet timer fires once the writer stops"
+        last_timer >= last_write + quiet
+            && last_timer <= last_write + quiet + Duration::from_secs(1),
+        "quiet timer ≈ {quiet:?} after the last write ({last_write:?}): {last_timer:?}"
     );
     let last = *registered.last().unwrap();
     assert!(
-        last >= Duration::from_millis(16_000) && last <= Duration::from_millis(18_500),
-        "quiet snap ≈ 2 s after the last write (at 14.5–15 s): {last:?}"
+        last >= last_timer && last - last_timer <= bound,
+        "snap + ship after the quiet timer took {:?}; forced, the same work took {forced:?}",
+        last.saturating_sub(last_timer)
     );
     let snap = runner.snapshot();
     assert!(snap.max_fired >= 1, "{snap:?}");
@@ -281,8 +356,13 @@ fn continuous_writes_register_at_the_max_interval() {
 
 /// (c) An overflow drops the watcher: snaps still happen, at the max interval; a budget of 0
 /// polls from the start.
+///
+/// The poll timer is held to the max interval; the reconciliation, and each snap and ship after
+/// a timer, to the same work forced on this machine ([`after_timer_bound`]), as in (a).
 #[test]
 fn overflow_and_a_missing_budget_fall_back_to_polling() {
+    let forced = forced_capture();
+    let bound = after_timer_bound(forced);
     let fx = Fixture::build();
     let cadence = Cadence {
         quiet: Duration::from_millis(500),
@@ -294,7 +374,8 @@ fn overflow_and_a_missing_budget_fall_back_to_polling() {
 
     runner.signal(ChangeSignal::Overflow);
     // The overflow reconciles both classes at once (a small and a bulk snap, which coalesce
-    // into one or two captures depending on who ships first), then polls.
+    // into one or two captures depending on who ships first), then polls. Two snaps and their
+    // ships: held to twice the forced one's bound.
     let settle = Instant::now();
     loop {
         let snap = runner.snapshot();
@@ -302,13 +383,17 @@ fn overflow_and_a_missing_budget_fall_back_to_polling() {
             break;
         }
         assert!(
-            settle.elapsed() < Duration::from_secs(4),
-            "overflow reconciles now: {snap:?}"
+            settle.elapsed() < bound * 2,
+            "overflow reconciles now: {snap:?} after {:?}; forced, one capture took {forced:?}",
+            settle.elapsed()
         );
         std::thread::sleep(Duration::from_millis(10));
     }
-    fx.wait_for_chain(1, Duration::from_secs(4))
-        .expect("the reconciliation registers");
+    let reconciled = fx.wait_for_chain(1, bound * 2);
+    assert!(
+        reconciled.is_some(),
+        "the reconciliation registers; forced, one capture took {forced:?}"
+    );
     let snap = runner.snapshot();
     assert_eq!(snap.small_mode, WatchMode::Polled);
     assert_eq!(snap.bulk_mode, WatchMode::Polled);
@@ -327,9 +412,18 @@ fn overflow_and_a_missing_budget_fall_back_to_polling() {
         "the bulk class was reconciled too"
     );
 
+    let polls = runner.snapshot().poll_fired;
     let t0 = Instant::now();
     fs::write(fx.root.join("src/after.rs"), "fn a() {}\n").unwrap();
-    let took = fx.wait_for_chain(n + 1, Duration::from_secs(8));
+    let (fired, took) = wait_timer_and_chain(
+        &fx,
+        &runner,
+        n + 1,
+        t0,
+        cadence.max_interval + Duration::from_secs(30),
+        |s| s.poll_fired,
+        polls,
+    );
     let Some(took) = took else {
         panic!(
             "polled snap registers the change: {:?} chain {:?}",
@@ -344,16 +438,24 @@ fn overflow_and_a_missing_budget_fall_back_to_polling() {
                 .collect::<Vec<_>>()
         );
     };
-    eprintln!("(c) after overflow: change → registered in {took:?}");
+    let fired = fired.unwrap_or(took);
+    eprintln!(
+        "(c) after overflow: change → poll timer {fired:?} → registered {took:?}; forced \
+         snap + ship {forced:?}"
+    );
     assert!(
         took >= Duration::from_millis(1000),
         "not on the quiet timer (the watcher is gone): {took:?}"
     );
     assert!(
-        took <= Duration::from_millis(4500),
-        "at the max interval: {took:?}"
+        fired <= cadence.max_interval + Duration::from_secs(1),
+        "the poll timer fires at the max interval: {fired:?}"
     );
-    let _ = t0;
+    assert!(
+        took - fired <= bound,
+        "snap + ship after the poll timer took {:?}; forced, the same work took {forced:?}",
+        took - fired
+    );
     runner.stop();
 
     // Budget 0: polled from the start.
@@ -362,12 +464,30 @@ fn overflow_and_a_missing_budget_fall_back_to_polling() {
     config.watch.budget = Some(0);
     let runner = fx.runner(config);
     assert_eq!(runner.snapshot().small_mode, WatchMode::Polled);
+    let t0 = Instant::now();
     fs::write(fx.root.join("src/polled.rs"), "fn p() {}\n").unwrap();
-    let took = fx
-        .wait_for_chain(1, Duration::from_secs(8))
-        .expect("polled snap registers");
-    eprintln!("(c) budget 0: change → registered in {took:?}");
-    assert!(took >= Duration::from_millis(1000) && took <= Duration::from_millis(4500));
+    let (fired, took) = wait_timer_and_chain(
+        &fx,
+        &runner,
+        1,
+        t0,
+        cadence.max_interval + Duration::from_secs(30),
+        |s| s.poll_fired,
+        0,
+    );
+    let took = took.expect("polled snap registers");
+    let fired = fired.unwrap_or(took);
+    eprintln!("(c) budget 0: change → poll timer {fired:?} → registered {took:?}");
+    assert!(took >= Duration::from_millis(1000), "{took:?}");
+    assert!(
+        fired <= cadence.max_interval + Duration::from_secs(1),
+        "the poll timer fires at the max interval: {fired:?}"
+    );
+    assert!(
+        took - fired <= bound,
+        "snap + ship after the poll timer took {:?}; forced, the same work took {forced:?}",
+        took - fired
+    );
     assert!(runner.snapshot().poll_fired >= 1);
     runner.stop();
 }

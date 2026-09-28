@@ -107,6 +107,19 @@ and empty directories and every tracked mtime were lost.
   Relinking (remove the name, link it) moves its directory's mtime, and that directory's class
   set it already — `node_modules` itself, a pnpm `file:` package's directories (the Docker end
   to end found 31 wrong): the directory gets back the mtime it had before the relink.
+- **Hardlinks between untracked names of two classes.** An inode no tracked file names, named
+  by the workspace class (an ignored file, `tree/…`) and by the bulk class (a file under
+  `node_modules/`), is recorded in the document's `cross_links`: every name the two classes carry
+  of it, found from this snap's workspace listing (a file whose link count exceeds the names the
+  workspace class holds) and the bulk class's index (each name checked on disk). Each class
+  still links its own names among themselves; a restore then links every group member to the
+  group's first member under the rule a `shared` name follows (only a name on disk holding
+  exactly the first member's bytes), gives relinked directories their mtimes back, and restates
+  every member in its class's index (a link moves the inode's ctime), so a head over itself
+  writes nothing. Found by review 2 (2026-09-28, #10): `ignored/x` hardlinked to
+  `node_modules/pkg/x` came back as two files after a complete final flush. A small snap that
+  finds such a file depends on the bulk index, so a final flush whose bulk snap staged a capture
+  snaps the small class again, as it does for a tracked file's shared names.
 - **A path it cannot read is not gone.** A tracked path whose metadata cannot be read (a
   directory above it that cannot be searched; git carries its content from the previous capture,
   see "What a snap reads") keeps the previous document's entry in an automatic snap and counts as
@@ -157,7 +170,21 @@ and empty directories and every tracked mtime were lost.
   to come back as a plain ref to the sha it resolved to. The git section now carries
   `symrefs` (name → target) beside `refs`; a restore writes each as a loose `ref: <target>` (a
   packed ref cannot be symbolic) after the loose refs are cleared, and leaves it out of
-  `packed-refs`. A name or target that is not a plain `refs/…` name fails the materialize.
+  `packed-refs`. A name that is not a plain `refs/…` name, or a target holding a control byte,
+  fails the materialize.
+- **A dangling symbolic ref stays.** `symrefs` is read off the loose ref files (the common
+  directory's `refs/` and a linked worktree's own), not `git for-each-ref`, which resolves each
+  one and leaves out a symbolic ref whose target does not exist (`git symbolic-ref
+  refs/remotes/origin/HEAD refs/remotes/origin/missing`): it vanished from a complete final
+  capture. It is restored as `ref: <target>` like any other, and is not in `refs` (it resolves to
+  nothing). A symbolic ref to a symbolic ref keeps its own target. (`git fsck` reports a dangling
+  symbolic ref as `invalid sha1 pointer`, on the source as on the restore, so such a capture's
+  `fsck` reads `failed`.) A symbolic ref changing during the pack retries it, as a ref moving does.
+- **Ref names are bytes.** A ref name, a symbolic target and `HEAD`'s target are read as bytes
+  and kept as `tree::key_of` keys (see "Dir entries: `raw_name`, `raw_target`, `unread`"), and a
+  restore writes the bytes each key stands for (`packed-refs` sorted by those bytes). Decoded
+  lossily, `refs/heads/caf\xe8` and `refs/heads/caf\xe9` were both `refs/heads/caf\u{fffd}`: one
+  overwrote the other in `refs`, its commit was no pack tip, and a complete final capture lost it.
 
 `tests/restore_metadata.rs` writes a worktree with all of it (modes, ns mtimes of files,
 directories, symlinks and the root, empty directories, a hardlink pair, names that are not UTF-8,
@@ -168,9 +195,13 @@ is captured and restored by a delta and a fresh materialize; links a tracked fil
 and a bulk name and checks all three come back as one inode, and apart but byte-exact when the
 bulk section is older. `tests/delta.rs` compares the mtimes of the whole working tree.
 
-Not covered: hardlinks between two names of other classes (an ignored file and a bulk file: each
-class restores its own names), and a directory whose restored mode forbids the owner to write (a
-later delta that writes into it fails, loudly).
+`tests/restore_metadata.rs` also final-flushes an ignored file hardlinked into `node_modules` and
+an inode with two ignored names and one bulk name (plus a bulk-only pair across `node_modules/`
+and `dist/`), and checks one inode per group, every mtime, and a write through one name showing
+through the other.
+
+Not covered: a directory whose restored mode forbids the owner to write (a later delta that
+writes into it fails, loudly).
 
 ## Sources beside the worktree
 
@@ -405,15 +436,18 @@ restore, byte for byte, so the user never notices the compute changed.
      the namespace, `docker exec`'d ones included; otherwise (a Lambda MicroVM, where Core's
      agent is PID 1 and starts `sealantd boot`; `sealantd serve`), every descendant of
      sealantd, which as the child subreaper inherits every orphan of what it started — the
-     VM's agent and its `sealantctl` are never touched. sealantd, its threads, its own helpers
-     (its own process group: the capture engine's `git`), kernel threads and zombies are left
-     alone, and so is the process at the far end of a live control-socket connection
-     (`SO_PEERCRED`) with its ancestors short of PID 1, while that connection is open — when
-     its ancestry leaves the namespace or reaches PID 1 without passing through sealantd: in
-     Docker, Core reaches the socket through `docker exec … socat - UNIX-CONNECT:…`, and
-     stopping that `socat` lost the final flush's own reply ("connection closed" on every
-     stop). A process sealantd started or adopted is swept whatever connection it holds. A
-     daemon that is not PID 1 of its namespace and did not become a child subreaper
+     VM's agent and its `sealantctl` are never touched. sealantd, its threads, kernel threads
+     and zombies are left alone, and so are its own helpers: the pids sealantd spawned itself
+     and has not reaped (the spawn gate, `sealant_process::spawn`) that stayed in its own
+     process group — the capture engine's `git` — with their children still in that group. A
+     process that joined sealantd's process group, or that sealantd only adopted, is swept.
+     Nothing else is spared, the far end of a control connection included: in Docker, Core
+     reaches the socket through `docker exec … socat - UNIX-CONNECT:…`, and that `socat` is
+     swept with the rest (nothing tells a relay from a writer). The reply to the request that
+     ended the executor may be lost with it ("connection closed"); the outcome is not:
+     `capture.status` reads it, and a final flush asked again answers it at once without
+     stopping anything twice. Core, on "connection closed" during a final flush, reads
+     `capture.status` or asks the final flush again. A daemon that is not PID 1 of its namespace and did not become a child subreaper
      cannot see an orphan, so every final flush it runs is incomplete (`sweep-unavailable`,
      logged at boot). And every running container of the workspace's own Docker daemon is
      stopped (`POST /containers/{id}/stop?t=<grace>`, `crates/sealantd/src/docker.rs`) until
@@ -467,6 +501,28 @@ restore, byte for byte, so the user never notices the compute changed.
   SIGINT, `runtime.gracefulShutdown`, the harness exiting on its own), whose final flush has no
   deadline, exits with 75 (`EX_TEMPFAIL`) when it ends incomplete — never 0 — after logging
   `FINAL CAPTURE INCOMPLETE` at error, and leaves the staging directory as it is.
+- **A retained executor boots in recovery mode.** Core keeps an executor that ended without a
+  complete final flush, and recovers it by starting it again on its own disk (Docker:
+  `docker start` of the kept container). That boot must save what the disk holds and add
+  nothing, so it is a recovery boot (`crates/sealantd/src/boot`, `BootConfig::recovery`): the
+  environment says `SEALANT_RECOVERY=1` (an adapter that starts a new container or Pod over the
+  kept disk), or the file `/.sealantd-recovery` exists (a kept Docker container restarts with
+  the environment it was created with: Core writes the marker into the stopped container with
+  `docker cp` before `docker start`; the root of the container's filesystem is outside every
+  capture root). A recovery boot resumes the disk's own staging and never materializes over
+  it: it boots only when its staging continues the chain head, or its materialize of the head
+  completed (`index/materialized.json` names the head's worktree tree; every change since is on
+  the disk, to be snapped), and otherwise refuses to boot and touches nothing. It runs no
+  lifecycle step, no dotfiles and no harness, and closes admission from the start (no exec,
+  session or SFTP bridge); the ship worker uploads what is staged, a scheduled snap captures
+  what changed since the last one, and the final flush — asked over the control socket, or run
+  on the daemon's own stop — snaps both classes, ships, seals the chain and answers `complete`.
+  It exits 0 only after a complete final flush, else 75, and a recovery boot that cannot start
+  (the channel refuses, the disk is not its own, the capture token is gone) exits 75 too:
+  still unsaved work, never a clean exit. Capture-store workspaces only (any other source
+  refuses the flag). The capture token must still be there: a boot reads it from
+  `SEALANT_SECRET_ENV_FILE`, which Core removes once the executor is ready, so Core must stage
+  it again (a token Mend still honours for the session) before it starts a retained executor.
 - **A deadline is the caller's.** The daemon used to clamp every flush's deadline to its
   shutdown grace (10 s, never configured at boot), so a caller that allowed 30 minutes for a
   dependency tree got 10 s. A flush now runs for exactly the `deadline_ms` it was given. A
@@ -541,13 +597,15 @@ the refusals; `tests/restage_crash.rs` the restage; `crates/sealantd/src/capture
 that runs past the 10 s it was once clamped to, the grace bounding a suspend flush without a
 deadline, a writer's `SIGTERM` handler landing in the head of a final flush and of
 `runtime.gracefulShutdown`, and the fenced and cut-short final flushes answering incomplete;
-`crates/sealantd/tests/final_sweep.rs` a `setsid`'d, double-forked writer stopped before the
-last snap, its `SIGTERM` handler's file in the head;
+`crates/sealantd/tests/final_sweep.rs` a `setsid`'d, double-forked writer and a writer that
+joined sealantd's process group stopped before the last snap, their `SIGTERM` handlers' files
+in the head;
 `tests/flush_modes.rs` a preempted scheduled bulk build not resuming after the final flush;
 `crates/sealantd/src/capture.rs` no scheduled snap after a final flush, and a bulk capture
 being built after it reported incomplete;
 `crates/sealantd/tests/final_sweep_control_peer.rs` the relay carrying a final flush over a
-real control socket spared (its reply arrives) while a bystander in the same scope is stopped; `crates/sealantd/src/capture.rs` also the
+real control socket swept with a bystander in the same scope, and the final flush asked again
+answering `complete` (and `capture.status` the same) without a second quiesce; `crates/sealantd/src/capture.rs` also the
 containers of a fake Docker daemon stopped (and a stuck one, or no daemon, incomplete), stopped
 before the process streaming their output into the worktree (its last line in the head) and a
 container a process started on its way out stopped after the processes, a
@@ -709,6 +767,60 @@ claim) — an older reader takes a format-2 root digest for a key. The daemon re
 ← {"worktree_id":"wt","epoch":3,"head":{…},"get_urls":{…},"manifest_format":2}
 ```
 
+### `manifest_features` and `executor` on `plan.get`
+
+`manifest_format` says how dir objects are stored, not what a manifest means. The request also
+lists every manifest feature this build reads, validates and carries on
+(`registrar::MANIFEST_FEATURES`, `PlanGetRequest::booting`):
+
+```json
+→ {…,"manifest_format":2,
+   "manifest_features":["worktree_meta","symrefs","other_bulk","raw_names","final_seal"]}
+← {…,"manifest_format":2,"manifest_features":[…],"executor":"<executor id>"}
+← 409 {"reason":"manifest-features","message":"…","missing":["final_seal"]}
+```
+
+Mend refuses a head holding a feature the list leaves out, before it claims the lease (409
+`manifest-features`, naming them in `missing`): an executor that ignores one restores less than
+was saved (modes, mtimes, empty directories, hardlinks, symbolic refs, names that are not UTF-8)
+or drops it from the captures it writes next (another platform's dependency tree). A feature is
+held when: `worktree_meta` — the answered workspace section has `worktree_meta`; `symrefs` — the
+git section has a non-empty `symrefs`; `other_bulk` — the stored head has a non-empty
+`other_bulk`, or its ready `bulk` was captured on another platform than the request names;
+`raw_names` — a dir entry of the answered workspace or bulk section carries `raw_name` or
+`raw_target`; `final_seal` — the head carries `final_seal`. The daemon reads a 409
+`manifest-features` as a protocol error naming the missing features and what it reads (never a
+chain conflict, never retried). `InMemoryRegistrar` refuses the same way (raw names aside: it
+does not walk dir objects; `registrar::missing_manifest_features`). A request without the list
+reads none; an answer without it is an older registrar's.
+
+The answer's `executor` is the executor the session token was issued for: what a completed final
+flush's seal names (below). Absent from a registrar that does not say, and the daemon seals under
+`SEALANT_WORKSPACE_ID` instead (`CaptureConfig::executor`; a re-plan that names one takes it).
+
+### `final_seal` in a manifest
+
+Cross-repo decision 1: "saved" is a store-side fact, never only an RPC reply. When a final flush
+completes — every writer stopped (the runtime's quiesce found none left), both classes snapped
+after that, everything staged registered — the runner stages one more capture over the newest
+one, its sections unchanged, `kind: final`, `n` = head + 1, carrying a top-level
+
+```json
+"final_seal": {"complete": true, "epoch": 3, "executor": "<executor id>"}
+```
+
+and ships it (`CaptureEngine::seal_complete`, `CadenceRunner::flush_final_sealing`). `complete`
+is reported only once that register is acknowledged; a register refused and rebuilt in its
+place (which drops the seal) is followed by the seal staged again, at most three times
+(`sealing` otherwise). Absent from every other capture, so a manifest without it encodes exactly
+as before. A final flush asked again over a sealed chain stages nothing; a capture staged after
+it (a turn boundary) carries no seal, so the chain is unsealed until the next final flush seals
+it again. A flush whose quiesce could not stop every writer (`processes-remain`,
+`sweep-unavailable`) seals nothing. Without an executor identity nothing is sealed (logged at
+boot) and `complete` is the reply alone, as before. Mend's register records a seal only when it
+is complete, names the epoch the capture registers under and the executor the token is scoped
+to; `InMemoryRegistrar::with_executor` does the same (`seals()`).
+
 ### `pending_bulk` on `capture.status` / `capture.flush`
 
 Of `pending`, the bulk captures whose objects are still uploading. Additive (`uint64` field 13 of
@@ -749,12 +861,14 @@ pending). `incomplete_reason` says why not: `not-final`, `in-progress` (a final 
 from its first moment — before it stops the writers — to its answer; it read `not-final` for
 the 38 s one ran), `processes-remain`, `snapshot-failed` (a final snap failed, or a class's last
 snap did, whenever: `snaps`), `fenced`, `conflict`, `deadline`, `ship-failed`, `pending`
-(staged, or a bulk capture being built, after the final flush),
-`sweep-unavailable`, `unreadable` or `internal`; absent when `complete`.
+(staged, or a bulk capture being built, after the final flush), `sealing` (everything
+registered, but not the capture that seals the completed flush: the flush returned at its
+deadline before it could stage it — send the final flush again, which seals without a second
+quiesce), `sweep-unavailable`, `unreadable` or `internal`; absent when `complete`.
 
 Once `complete` is said, nothing more is captured. The final flush ends the chain as the disk
-is: when its bulk snap staged a capture and the small snap found tracked files with names in
-the bulk class (a pnpm `file:` package hardlinked into `node_modules`: the overlay records those
+is: when its bulk snap staged a capture and the small snap found tracked or ignored files with
+names in the bulk class (a pnpm `file:` package hardlinked into `node_modules`: the overlay records those
 links from the bulk index, empty until the first bulk snap), the small class is snapped again
 inside the same flush; and when the newest capture is not a final one (the final small snap was
 staged ahead of a scheduled bulk capture still uploading, and the final bulk snap found that
@@ -773,8 +887,9 @@ overflowed — delivered no change since before that flush's first snap
 (`CadenceRunner::final_is_current`): it ships what is left and answers in milliseconds, and
 `complete` holds throughout (each walked the bulk class again for 2.5–3 s, `bulk_building`
 meanwhile). A class that polls, or a change the watcher saw, snaps again. After a flush that
-returned at its deadline (`deadline`, `ship-failed`), `complete` turns true once the worker has
-shipped the rest: poll `capture.status`, or send the final flush again. An older daemon's report decodes with `complete: false`.
+returned at its deadline (`deadline`, `ship-failed`), the worker ships the rest and the status
+turns `sealing` (with an executor identity; `complete` without one): send the final flush again,
+which seals the chain and then says `complete`. An older daemon's report decodes with `complete: false`.
 
 A suspend flush after a complete final one, over the disk it captured, is a status read: it
 snaps nothing and answers the final flush's report (Mend's Stop sent two after a final flush,
@@ -868,7 +983,9 @@ for byte as before.
               {"path":"to-secret","kind":"symlink","mtime":1600000007123456838}],
    "hardlinks":[["link.txt","src/twin.txt"]],
    "shared":[{"path":"shared.txt","class":"bulk","member":"node_modules/pkg/shared.txt"},
-             {"path":"shared.txt","class":"workspace","member":"tree/copy.log"}]}
+             {"path":"shared.txt","class":"workspace","member":"tree/copy.log"}],
+   "cross_links":[[{"class":"workspace","member":"tree/ignored/x"},
+                   {"class":"bulk","member":"node_modules/pkg/x"}]]}
   ```
 
   (`\u{10ffe9}` stands for that character, which JSON carries as UTF-8.) `entries` are sorted
@@ -883,12 +1000,18 @@ for byte as before.
   `shared` (absent when empty) lists names another class carries of a tracked file's inode:
   `path` is the tracked file's key, `class` is `workspace` (then `member` is that class's
   virtual path, `tree/…`, `.git/…` or `harness/…`) or `bulk` (then `member` is root-relative),
-  and `raw_member` carries an escaped member's bytes.
+  and `raw_member` carries an escaped member's bytes. `cross_links` (absent when empty; added
+  2026-09-28 within format `1`, so an older reader ignores it and restores each name as its own
+  class captured it, as before) lists inodes no tracked file names that the workspace and bulk
+  classes both name: each group is two or more distinct `{class, member, raw_member?}` (as in
+  `shared`, members plain relative and not empty), sorted, workspace names first; the first is
+  the one the others link to.
 - Applying it (sealantd's `worktree_meta::apply`, after the worktree tree is checked out and every
   other class restored): create each `dir` that is missing; every other path must exist with its
   kind; remove the empty directories in scope that no entry names; link each group's members to
   its first path; link each `shared` member that holds exactly the tracked file's bytes to it
-  (leave it otherwise); set files' and symlinks' mode and mtime (a symlink's own, never
+  (leave it otherwise); link each `cross_links` member on disk that holds exactly the bytes of
+  its group's first member on disk to it (leave it otherwise); set files' and symlinks' mode and mtime (a symlink's own, never
   followed), then directories' deepest first. A reader that only lists or reads a class's files (Mend's
   `listCaptureDir`, `statCaptureEntry`, `readCaptureFile`, `materialize` of the workspace or bulk
   class) is unaffected: the overlay describes the git class's working tree, not a chunked class.
@@ -897,7 +1020,16 @@ for byte as before.
 
 `sections.git.symrefs`: symbolic refs other than `HEAD`, name → the ref it points at. Each is
 also in `refs`, by the sha it resolved to at capture, so a reader that knows only `refs` reads
-what it always did. Absent when empty, so a manifest without one encodes exactly as before.
+what it always did. Absent when empty, so a manifest without one encodes exactly as before. A
+symbolic ref whose target does not exist is here and not in `refs`.
+
+Every ref name in `refs` and `symrefs` (keys and targets) and a symbolic `head` is a
+`tree::key_of` key of the name's bytes: the name itself when it is UTF-8 without an escape-range
+character (every name in practice, so no existing manifest changes), otherwise each byte of an
+invalid sequence as `U+10FF00 + byte`. A reader writes `tree::bytes_of(key)` into `packed-refs`,
+the loose symbolic ref and `HEAD`. There is no `raw_name` beside a ref: a key with a character in
+`U+10FF80..=U+10FFFF` is an escaped one. A reader that writes the key's UTF-8 as the name gets a
+different, distinct name (never two refs merged), and the objects are in the packs either way.
 
 ```json
 "git":{"packs":[…],"refs":{"refs/heads/main":"<sha>","refs/remotes/origin/HEAD":"<sha>",…},

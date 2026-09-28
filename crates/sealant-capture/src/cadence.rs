@@ -53,14 +53,18 @@ pub enum Incomplete {
     /// Shipping kept failing until the deadline.
     #[error("shipping failed: {0}")]
     ShipFailed(String),
+    /// Everything registered, but the capture that seals the completed flush on the chain
+    /// ([`crate::manifest::FinalSeal`]) did not: staging it failed, or it never registered.
+    #[error("the final seal did not register: {0}")]
+    Sealing(String),
     /// A final snap met work it could not read (it would have been left out of the capture).
     #[error("unreadable work: {0}")]
     Unreadable(String),
 }
 
 impl Incomplete {
-    /// The reason code: `snapshot-failed`, `fenced`, `conflict`, `deadline`, `ship-failed` or
-    /// `unreadable`.
+    /// The reason code: `snapshot-failed`, `fenced`, `conflict`, `deadline`, `ship-failed`,
+    /// `unreadable` or `sealing`.
     #[must_use]
     pub fn reason(&self) -> &'static str {
         match self {
@@ -70,6 +74,7 @@ impl Incomplete {
             Self::Deadline { .. } => "deadline",
             Self::ShipFailed(_) => "ship-failed",
             Self::Unreadable(_) => "unreadable",
+            Self::Sealing(_) => "sealing",
         }
     }
 
@@ -323,11 +328,14 @@ struct Shared {
 }
 
 /// What a final flush that snapped every class left: the change count before its first snap,
-/// and the staged count once it had sealed the chain with a final capture.
+/// the staged count once it had sealed the chain with a final capture, and whether the chain's
+/// newest capture carries the executor's final seal, registered
+/// ([`CadenceRunner::final_sealed`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Seal {
     changes: u64,
     staged: u64,
+    completion: bool,
 }
 
 impl Shared {
@@ -960,8 +968,23 @@ impl CadenceRunner {
     /// a final flush asked again stages nothing. When [`Self::final_is_current`], it snaps
     /// nothing at all and only ships what is left.
     pub fn flush_final(&self, deadline: Option<Duration>) -> FinalFlush {
+        self.flush_final_sealing(deadline, true)
+    }
+
+    /// [`Self::flush_final`], sealing the chain ([`crate::manifest::FinalSeal`]) only when
+    /// `writers_stopped`: the caller vouches that every writer was stopped before it. Once both
+    /// snaps succeeded and everything staged registered, one more capture — the newest one's
+    /// sections, `kind: final` — carrying the engine's seal is staged and shipped, and the flush
+    /// is complete only once it registered ([`Incomplete::Sealing`] otherwise). A flush asked
+    /// again over a sealed chain stages nothing more. Without an executor
+    /// ([`crate::engine::CaptureConfig::executor`]) nothing is sealed. When the writers were
+    /// not stopped, nothing is sealed either: the caller reports the flush incomplete.
+    pub fn flush_final_sealing(
+        &self,
+        deadline: Option<Duration>,
+        writers_stopped: bool,
+    ) -> FinalFlush {
         let until = deadline.map(|d| Instant::now() + d);
-        let left = || until.map(|u| u.saturating_duration_since(Instant::now()));
         let mut incomplete = None;
         if self.final_is_current() {
             tracing::info!(
@@ -1053,9 +1076,59 @@ impl CadenceRunner {
                     .unwrap_or_else(PoisonError::into_inner) = Some(Seal {
                     changes,
                     staged: self.shared.staged.load(Ordering::SeqCst),
+                    completion: false,
                 });
             }
         }
+        let mut shipped = self.ship_final(until, &mut incomplete);
+        // Everything registered: seal the completed flush on the chain, and say `complete` only
+        // once the sealing capture registered. Bounded: a register refused and rebuilt in its
+        // place loses the seal, and it is staged once more.
+        let mut attempts = 0;
+        while incomplete.is_none() && writers_stopped && !self.completion_sealed() {
+            attempts += 1;
+            if attempts > 3 {
+                incomplete = Some(Incomplete::Sealing(
+                    "the sealing capture was staged three times and did not register".to_owned(),
+                ));
+                break;
+            }
+            let seq = self.shared.seq.fetch_add(1, Ordering::Relaxed);
+            let staged = self.shared.engine().seal_complete(seq);
+            match staged {
+                Ok(Some(_)) => {
+                    self.shared.staged.fetch_add(1, Ordering::SeqCst);
+                    self.with_seal(|seal| seal.staged = self.shared.staged.load(Ordering::SeqCst));
+                    self.shared.wake_worker();
+                }
+                Ok(None) => break,
+                Err(error) => {
+                    tracing::error!(%error, "staging the final seal failed");
+                    incomplete = Some(Incomplete::Sealing(error.to_string()));
+                    break;
+                }
+            }
+            shipped += self.ship_final(until, &mut incomplete);
+        }
+        // Sealed: nothing to seal under (no executor), or this flush completed with the
+        // writers stopped and the newest capture carries the seal, registered.
+        let sealed = {
+            let engine = self.shared.engine();
+            engine.final_seal().is_none()
+                || (incomplete.is_none() && writers_stopped && engine.completion_sealed())
+        };
+        self.with_seal(|seal| seal.completion = sealed);
+        FinalFlush {
+            shipped,
+            incomplete,
+        }
+    }
+
+    /// Ship and register everything staged ([`Shipper::flush_final`]) until `until`, rebuilding
+    /// a refused capture from disk when the registrar asks for it; the first failure lands in
+    /// `incomplete`. Returns the captures registered.
+    fn ship_final(&self, until: Option<Instant>, incomplete: &mut Option<Incomplete>) -> usize {
+        let left = || until.map(|u| u.saturating_duration_since(Instant::now()));
         let mut shipped = 0;
         let mut repairs = 0u32;
         loop {
@@ -1094,10 +1167,43 @@ impl CadenceRunner {
                 }
             }
         }
-        FinalFlush {
-            shipped,
-            incomplete,
+        shipped
+    }
+
+    /// Whether the chain's newest capture carries this executor's final seal
+    /// ([`CaptureEngine::completion_sealed`]); true when there is no executor to seal under.
+    fn completion_sealed(&self) -> bool {
+        self.shared.engine().completion_sealed()
+    }
+
+    /// Change the last complete final flush's [`Seal`], when there is one.
+    fn with_seal(&self, f: impl FnOnce(&mut Seal)) {
+        if let Some(seal) = self
+            .shared
+            .sealed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_mut()
+        {
+            f(seal);
         }
+    }
+
+    /// Whether the last final flush completed and sealed the chain, and the chain still ends
+    /// on its sealing capture: [`Self::chain_sealed`], and the newest capture carries this
+    /// executor's final seal ([`crate::manifest::FinalSeal`]) and registered (true without an
+    /// executor to seal under). Never waits for the engine: `capture.status` reads it. A final
+    /// flush that returned at its deadline before it could stage the sealing capture is not
+    /// sealed until a final flush is asked again.
+    #[must_use]
+    pub fn final_sealed(&self) -> bool {
+        self.shared
+            .sealed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_some_and(|seal| {
+                seal.completion && seal.staged == self.shared.staged.load(Ordering::SeqCst)
+            })
     }
 
     /// Ship everything pending now, bounded by `deadline`, without a snap.
