@@ -35,7 +35,9 @@ impl ClassRoots {
     }
 
     /// The workspace class listing: `.git/` bookkeeping (minus objects, refs, `HEAD`,
-    /// `packed-refs`, other worktrees' admin directories, and git's transient files), local
+    /// `packed-refs`, other worktrees' admin directories, and git's transient files — but a
+    /// symbolic ref or `HEAD` git stores as a symlink is carried as that symlink, beside its
+    /// entry in the git section, so a restore stores it as it was), local
     /// git-lfs objects (`.git/lfs/`, which may exist nowhere else), `tree/` (git-ignored files
     /// and the nested repositories in `gitlinks`, [`crate::tree::key_of`] keys of their paths),
     /// `harness/` (the harness home minus credential files).
@@ -48,16 +50,22 @@ impl ClassRoots {
         // Objects and refs travel in the git section; `worktrees/` holds other worktrees'
         // bookkeeping, which is theirs to capture.
         let git_prune = |_: &Path, v: &str, _: &str| v == ".git/objects" || v == ".git/worktrees";
-        let git_include = |_: &Path, v: &str, _: &str| {
-            !(v == ".git/HEAD"
-                || v == ".git/packed-refs"
-                || v == ".git/commondir"
-                || v == ".git/gitdir"
-                || v.starts_with(".git/refs/"))
+        // A symbolic ref stored as a symlink (`core.preferSymlinkRefs`) is a ref, and the git
+        // section holds it (`symrefs`, `head`) — as the same ref to git, written back as text.
+        // How the repository stored it is this class's: the symlink itself, its link text
+        // and mtime (review 2026-09-28, seventh pass, #1).
+        let git_include = |abs: &Path, v: &str, _: &str| {
+            if v == ".git/HEAD" || v.starts_with(".git/refs/") {
+                return crate::gitpack::symlinked_symref(abs).is_some();
+            }
+            !(v == ".git/packed-refs" || v == ".git/commondir" || v == ".git/gitdir")
         };
         listing.mount(".git", &repo.git_dir, "", git_prune, git_include);
         if repo.common_dir != repo.git_dir {
-            listing.mount(".git", &repo.common_dir, "", git_prune, git_include);
+            // The common directory's `HEAD` is the main worktree's, not this one's.
+            let common_include =
+                |abs: &Path, v: &str, name: &str| v != ".git/HEAD" && git_include(abs, v, name);
+            listing.mount(".git", &repo.common_dir, "", git_prune, common_include);
         }
 
         let bulk = &self.bulk_dirs;

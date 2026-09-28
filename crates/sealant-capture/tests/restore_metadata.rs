@@ -70,10 +70,23 @@ struct Entry {
     link: Option<PathBuf>,
 }
 
-/// Every path under `root` — the root itself as `""`, directories included — minus `.git` and
-/// the daemon directory, plus the hardlink groups (paths sharing an inode) among its files.
+/// Every path under `root` — the root itself as `""`, directories included — minus what is
+/// under `.git` and the daemon directory, plus the hardlink groups (paths sharing an inode)
+/// among its files. The `.git` directory itself is compared like any directory: its mode and
+/// mtime are the workspace class's to restore (review 2026-09-28, seventh pass, #2).
 fn snapshot(root: &Path) -> (BTreeMap<String, Entry>, BTreeSet<Vec<String>>) {
     let mut out = BTreeMap::new();
+    let git_dir = fs::symlink_metadata(root.join(".git")).unwrap();
+    out.insert(
+        "\".git\" (the directory)".to_owned(),
+        Entry {
+            kind: "dir",
+            mode: git_dir.mode() & 0o7777,
+            mtime: git_dir.mtime() * 1_000_000_000 + git_dir.mtime_nsec(),
+            bytes: Vec::new(),
+            link: None,
+        },
+    );
     let mut inodes: BTreeMap<(u64, u64), Vec<String>> = BTreeMap::new();
     for e in walkdir::WalkDir::new(root)
         .follow_links(false)
@@ -281,6 +294,8 @@ impl Fixture {
     fn stamp_root(&self) {
         chmod(&self.root, 0o750);
         set_mtime(&self.root, T - 999_000_000_001);
+        chmod(&self.root.join(".git"), 0o751);
+        set_mtime(&self.root.join(".git"), T - 888_000_000_003);
     }
 }
 

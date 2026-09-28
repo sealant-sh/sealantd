@@ -476,9 +476,29 @@ fn trim_newline(bytes: &[u8]) -> &[u8] {
     bytes.strip_suffix(b"\r").unwrap_or(bytes)
 }
 
+/// The ref a symlink at `path` names when git reads it as a symbolic ref: git stores one as a
+/// symlink whose link text is the target ref's name (`core.preferSymlinkRefs`), and reads a
+/// symlink under the git directory as a symbolic ref when that text is a ref name (`refs/…`,
+/// well formed). `None` for anything else — not a symlink, or one git follows to the file it
+/// reaches and reads that instead.
+#[must_use]
+pub fn symlinked_symref(path: &Path) -> Option<Vec<u8>> {
+    if !fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+        return None;
+    }
+    let link = fs::read_link(path).ok()?;
+    let link = link.as_os_str().as_bytes();
+    (is_safe_ref_name(link) && !link.windows(2).any(|w| w == b"@{") && !link.ends_with(b"."))
+        .then(|| link.to_vec())
+}
+
 /// Walk `dir` (a `refs/` directory; `name` is its ref name, `refs`) and add every loose
-/// symbolic ref under it (a file reading `ref: <target>`) to `found`, name → target, both keys.
-/// Lock files are git's transient state, not refs.
+/// symbolic ref under it to `found`, name → target, both keys: a file reading `ref: <target>`,
+/// and a symlink git reads as one ([`symlinked_symref`]; review 2026-09-28, seventh pass, #1 —
+/// before, a symlink was passed over, and a symbolic ref stored as one came back direct or,
+/// dangling, not at all). Any other symlink git follows, and so does this: a file it reaches
+/// that reads `ref: <target>` is a symbolic ref, one it cannot reach is no ref. Lock files are
+/// git's transient state, not refs.
 fn collect_loose_symrefs(
     dir: &Path,
     name: &[u8],
@@ -499,26 +519,44 @@ fn collect_loose_symrefs(
         let kind = entry.file_type().map_err(at("stat", &path))?;
         if kind.is_dir() {
             collect_loose_symrefs(&path, &child, found)?;
-        } else if kind.is_file() && !file_name.as_bytes().ends_with(b".lock") {
-            let bytes = match fs::read(&path) {
-                Ok(bytes) => bytes,
-                // Removed between the listing and the read: a ref that is gone.
-                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
-                Err(e) => return Err(at("read", &path)(e)),
-            };
-            if let Some(target) = bytes.strip_prefix(b"ref: ") {
-                let target = trim_newline(target);
-                // A name git itself would ignore as broken is not a ref it holds, and one a
-                // restore could not write back must not fail the restore of everything else.
-                if is_safe_ref_name(&child) && is_safe_symref_target(target) {
-                    found.insert(key_of(&child).into_owned(), key_of(target).into_owned());
-                } else {
-                    tracing::warn!(
-                        name = %key_of(&child),
-                        "capture: a loose symbolic ref git would not read is left out"
-                    );
-                }
+            continue;
+        }
+        if file_name.as_bytes().ends_with(b".lock") || !(kind.is_file() || kind.is_symlink()) {
+            continue;
+        }
+        let target = match symlinked_symref(&path) {
+            Some(target) => target,
+            None => {
+                let bytes = match fs::read(&path) {
+                    Ok(bytes) => bytes,
+                    // Removed between the listing and the read: a ref that is gone.
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                    // A symlink git follows to nothing it can read as a ref: no ref.
+                    Err(e)
+                        if kind.is_symlink()
+                            && (e.kind() == io::ErrorKind::IsADirectory
+                                || e.kind() == io::ErrorKind::NotADirectory
+                                || e.raw_os_error() == Some(nix::libc::ELOOP)) =>
+                    {
+                        continue;
+                    }
+                    Err(e) => return Err(at("read", &path)(e)),
+                };
+                let Some(target) = bytes.strip_prefix(b"ref: ") else {
+                    continue;
+                };
+                trim_newline(target).to_vec()
             }
+        };
+        // A name git itself would ignore as broken is not a ref it holds, and one a restore
+        // could not write back must not fail the restore of everything else.
+        if is_safe_ref_name(&child) && is_safe_symref_target(&target) {
+            found.insert(key_of(&child).into_owned(), key_of(&target).into_owned());
+        } else {
+            tracing::warn!(
+                name = %key_of(&child),
+                "capture: a loose symbolic ref git would not read is left out"
+            );
         }
     }
     Ok(())
@@ -663,8 +701,8 @@ impl GitRepo {
     /// Read off the loose refs themselves, not `git for-each-ref`: that resolves each one and
     /// leaves out a symbolic ref whose target does not exist (a dangling
     /// `refs/remotes/origin/HEAD`), which is still a ref the repository holds. `packed-refs`
-    /// cannot hold a symbolic ref, so the loose files under `refs/` (the common directory's,
-    /// and a linked worktree's own) are all of them.
+    /// cannot hold a symbolic ref, so the loose files and symlinks under `refs/` (the common
+    /// directory's, and a linked worktree's own) are all of them.
     pub fn symrefs(&self) -> Result<BTreeMap<String, String>, GitError> {
         let mut found = BTreeMap::new();
         let mut dirs = vec![&self.common_dir];
@@ -684,6 +722,11 @@ impl GitRepo {
     /// [`Self::symrefs`]). `git symbolic-ref -q HEAD` follows the whole chain, and a restore
     /// then pointed `HEAD` at the branch the chain ended on.
     pub fn head(&self) -> Result<String, GitError> {
+        // A `HEAD` stored as a symlink (`core.preferSymlinkRefs`) names its target in the link
+        // text; reading through it would read the target's file, and skip a link of a chain.
+        if let Some(target) = symlinked_symref(&self.git_dir.join("HEAD")) {
+            return Ok(key_of(&target).into_owned());
+        }
         if let Ok(bytes) = fs::read(self.git_dir.join("HEAD"))
             && let Some(target) = bytes.strip_prefix(b"ref: ")
         {
@@ -2404,6 +2447,10 @@ pub fn install_pack(
 /// or not. Directories under `refs/` a loose ref leaves empty go too, except `refs/heads` and
 /// `refs/tags`, which git expects. Names and targets are [`key_of`] keys: each is written as
 /// the bytes it stands for ([`bytes_of`]), so a name that is not UTF-8 comes back exactly.
+///
+/// A symbolic ref the repository stored as a symlink ([`symlinked_symref`]) is written here as
+/// text like any other — the same ref to git — and the workspace class, which carries that
+/// symlink as it was (`crate::roots`), puts the symlink back in its place afterwards.
 pub fn write_packed_refs(
     repo: &GitRepo,
     refs: &BTreeMap<String, String>,
@@ -2526,6 +2573,9 @@ fn remove_loose_refs(dir: &Path, depth: usize) -> Result<(), GitError> {
 }
 
 /// Write `HEAD` (a symbolic ref, a [`key_of`] key written as its bytes, or a detached sha).
+/// Written beside and renamed over: a `HEAD` stored as a symlink is replaced, never written
+/// through (that would write the file the link reaches — a branch — or fail on a link that
+/// reaches nothing). The workspace class puts a captured symlink back afterwards.
 pub fn write_head(repo: &GitRepo, head: &str) -> Result<(), GitError> {
     let mut text = Vec::new();
     if head.starts_with("refs/") {
@@ -2534,7 +2584,9 @@ pub fn write_head(repo: &GitRepo, head: &str) -> Result<(), GitError> {
     text.extend_from_slice(&bytes_of(head));
     text.push(b'\n');
     let path = repo.git_dir.join("HEAD");
-    fs::write(&path, text).map_err(at("write", &path))?;
+    let tmp = repo.git_dir.join("HEAD.capture-tmp");
+    fs::write(&tmp, text).map_err(at("write", &tmp))?;
+    fs::rename(&tmp, &path).map_err(at("rename into", &path))?;
     Ok(())
 }
 

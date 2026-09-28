@@ -86,6 +86,19 @@ pub enum MetaError {
         /// What was found.
         reason: String,
     },
+    /// A strict apply ([`apply_strict`]) found two names the document says are one inode —
+    /// through a hardlink group, a shared link or a cross-class group — promised different
+    /// modes or mtimes. One inode has one of each: no restore can make both true, so the
+    /// document is refused before anything is changed (review 2026-09-28, seventh pass, #10).
+    #[error("worktree metadata: {first} and {second} are one inode promised {reason}")]
+    InodeConflict {
+        /// One name (a key of the document's entries).
+        first: String,
+        /// Another name of the same inode, promised otherwise.
+        second: String,
+        /// What differs.
+        reason: String,
+    },
 }
 
 fn io_err(path: &[u8]) -> impl FnOnce(io::Error) -> MetaError + '_ {
@@ -279,6 +292,129 @@ impl MetaDocument {
     /// The bytes of an entry's path.
     fn path_bytes(e: &MetaEntry) -> Result<Vec<u8>, MetaError> {
         bytes_of_pair(&e.path, e.raw_path.as_deref())
+    }
+
+    /// The document's inodes: its file entries (indexes into `entries`) grouped by the inode
+    /// the document says they share — connected through `hardlinks`, `shared` (two tracked
+    /// files that share a name in another class are one inode) and `cross_links` — each group
+    /// in entry order. A file of no link is a group of its own and is left out.
+    fn inode_groups(&self) -> Vec<Vec<usize>> {
+        fn root(parent: &mut [usize], mut i: usize) -> usize {
+            while parent[i] != i {
+                parent[i] = parent[parent[i]];
+                i = parent[i];
+            }
+            i
+        }
+        fn union(parent: &mut [usize], a: usize, b: usize) {
+            let (a, b) = (root(parent, a), root(parent, b));
+            if a != b {
+                parent[a.max(b)] = a.min(b);
+            }
+        }
+        let tracked: HashMap<&str, usize> = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.kind == MetaKind::File)
+            .map(|(i, e)| (e.path.as_str(), i))
+            .collect();
+        let mut parent: Vec<usize> = (0..self.entries.len()).collect();
+        let mut members: BTreeMap<(LinkClass, String), usize> = BTreeMap::new();
+        let mut node = |parent: &mut Vec<usize>, class: LinkClass, name: &str| -> usize {
+            // A bulk name that is a tracked path is the tracked file itself.
+            if class == LinkClass::Bulk
+                && let Some(i) = tracked.get(name)
+            {
+                return *i;
+            }
+            *members.entry((class, name.to_owned())).or_insert_with(|| {
+                parent.push(parent.len());
+                parent.len() - 1
+            })
+        };
+        for group in &self.hardlinks {
+            let ids: Vec<usize> = group
+                .iter()
+                .filter_map(|p| tracked.get(p.as_str()).copied())
+                .collect();
+            for pair in ids.windows(2) {
+                union(&mut parent, pair[0], pair[1]);
+            }
+        }
+        for link in &self.shared {
+            if let Some(i) = tracked.get(link.path.as_str()).copied() {
+                let other = node(&mut parent, link.class, &link.member);
+                union(&mut parent, i, other);
+            }
+        }
+        for group in &self.cross_links {
+            let ids: Vec<usize> = group
+                .iter()
+                .map(|m| node(&mut parent, m.class, &m.member))
+                .collect();
+            for pair in ids.windows(2) {
+                union(&mut parent, pair[0], pair[1]);
+            }
+        }
+        let mut groups: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+        for i in tracked.values().copied() {
+            let r = root(&mut parent, i);
+            groups.entry(r).or_default().push(i);
+        }
+        groups
+            .into_values()
+            .filter(|g| g.len() > 1)
+            .map(|mut g| {
+                g.sort_unstable();
+                g
+            })
+            .collect()
+    }
+
+    /// The first pair of names the document says are one inode ([`Self::inode_groups`]) whose
+    /// promises differ — a mode, an mtime — as [`MetaError::InodeConflict`]. One inode has one
+    /// mode and one mtime: a document that promises two cannot be restored as it says.
+    #[must_use]
+    pub fn inode_conflict(&self) -> Option<MetaError> {
+        for group in self.inode_groups() {
+            let first = &self.entries[group[0]];
+            for other in group[1..].iter().map(|i| &self.entries[*i]) {
+                let reason = if first.mode != other.mode {
+                    format!("modes {:?} and {:?}", first.mode, other.mode)
+                } else if first.mtime != other.mtime {
+                    format!("mtimes {} and {}", first.mtime, other.mtime)
+                } else {
+                    continue;
+                };
+                return Some(MetaError::InodeConflict {
+                    first: first.path.clone(),
+                    second: other.path.clone(),
+                    reason,
+                });
+            }
+        }
+        None
+    }
+
+    /// Give every name of one inode the metadata of its first name, where the document's
+    /// promises differ; the names it changed. The capture stats each name on its own, so a
+    /// `chmod` or a write between two stats of one inode reads as two promises — which no
+    /// restore can keep and a strict one refuses. The inode moved while it was read: a change
+    /// the watcher reports, and the next snap takes.
+    pub fn settle_inodes(&mut self) -> Vec<String> {
+        let mut settled = Vec::new();
+        for group in self.inode_groups() {
+            let (mode, mtime) = (self.entries[group[0]].mode, self.entries[group[0]].mtime);
+            for i in &group[1..] {
+                let e = &mut self.entries[*i];
+                if (e.mode, e.mtime) != (mode, mtime) {
+                    (e.mode, e.mtime) = (mode, mtime);
+                    settled.push(e.path.clone());
+                }
+            }
+        }
+        settled
     }
 }
 
@@ -758,7 +894,8 @@ pub fn apply(
 /// (`resolve` says `None`: its class is not restored here) is passed over; one missing, not a
 /// file, or holding other bytes than the rest fails with [`MetaError::LinkUnfulfilled`]
 /// instead of being left unlinked in silence (review 2026-09-28, fifth pass, #11). Neither file
-/// is written over either way.
+/// is written over either way. A document that promises one inode two modes or two mtimes
+/// ([`MetaDocument::inode_conflict`]) is refused before anything is changed.
 pub fn apply_strict(
     repo: &GitRepo,
     doc: &MetaDocument,
@@ -785,6 +922,13 @@ fn apply_with(
             Ok(())
         }
     };
+    // Before anything is changed: one inode promised two modes or two mtimes.
+    if let Some(conflict) = doc.inode_conflict() {
+        if strict {
+            return Err(conflict);
+        }
+        tracing::warn!(%conflict, "worktree metadata: the last promise of the inode stands");
+    }
     let root = &scope.root;
     let mut applied = Applied::default();
     let entries: Vec<(Vec<u8>, &MetaEntry)> = doc
@@ -1229,5 +1373,91 @@ mod tests {
                 "{bad:?}"
             );
         }
+    }
+
+    /// One inode has one mode and one mtime (review 2026-09-28, seventh pass, #10): names the
+    /// document joins — a hardlink group, two tracked files sharing one name of another class,
+    /// a cross-class group reaching a tracked file's shared name — must be promised the same
+    /// ones. `settle_inodes` gives every name the first's, and then there is no conflict.
+    #[test]
+    fn one_inode_is_promised_one_mode_and_one_mtime() {
+        let with_meta = |path: &str, mode: u32, mtime: i64| MetaEntry {
+            mode: Some(mode),
+            mtime,
+            ..file(path)
+        };
+        let shared = |path: &str, class: LinkClass, member: &str| SharedLink {
+            path: path.to_owned(),
+            class,
+            member: member.to_owned(),
+            raw_member: None,
+        };
+        let lm = |class: LinkClass, member: &str| LinkMember {
+            class,
+            member: member.to_owned(),
+            raw_member: None,
+        };
+        let base = MetaDocument {
+            format: 1,
+            entries: vec![
+                with_meta("a", 0o644, 100),
+                with_meta("b", 0o644, 100),
+                with_meta("c", 0o600, 200),
+                with_meta("d", 0o755, 300),
+            ],
+            ..MetaDocument::default()
+        };
+        // Unlinked files promise what each is: no conflict.
+        assert!(base.inode_conflict().is_none());
+        let cases = [
+            MetaDocument {
+                hardlinks: vec![vec!["a".into(), "c".into()]],
+                ..base.clone()
+            },
+            MetaDocument {
+                shared: vec![
+                    shared("a", LinkClass::Workspace, "tree/x"),
+                    shared("d", LinkClass::Workspace, "tree/x"),
+                ],
+                ..base.clone()
+            },
+            MetaDocument {
+                shared: vec![
+                    shared("b", LinkClass::Workspace, "tree/x"),
+                    shared("c", LinkClass::Bulk, "node_modules/y"),
+                ],
+                cross_links: vec![vec![
+                    lm(LinkClass::Workspace, "tree/x"),
+                    lm(LinkClass::Bulk, "node_modules/y"),
+                ]],
+                ..base.clone()
+            },
+            // A bulk name that is a tracked path is that tracked file.
+            MetaDocument {
+                cross_links: vec![vec![
+                    lm(LinkClass::Workspace, "tree/x"),
+                    lm(LinkClass::Bulk, "a"),
+                ]],
+                shared: vec![shared("d", LinkClass::Workspace, "tree/x")],
+                ..base.clone()
+            },
+        ];
+        for case in cases {
+            let conflict = case.inode_conflict();
+            assert!(
+                matches!(conflict, Some(MetaError::InodeConflict { .. })),
+                "{case:?}: {conflict:?}"
+            );
+            let mut settled = case.clone();
+            assert!(!settled.settle_inodes().is_empty());
+            assert!(settled.inode_conflict().is_none(), "{settled:?}");
+        }
+        // Joined names promised the same: no conflict, nothing to settle.
+        let mut same = MetaDocument {
+            hardlinks: vec![vec!["a".into(), "b".into()]],
+            ..base
+        };
+        assert!(same.inode_conflict().is_none());
+        assert!(same.settle_inodes().is_empty());
     }
 }
