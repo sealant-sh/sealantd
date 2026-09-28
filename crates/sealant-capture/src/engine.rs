@@ -222,6 +222,25 @@ impl CaptureConfig {
             .collect();
     }
 
+    /// Why the store cannot hold what a capture holds, when it cannot: the features it does not
+    /// read ([`Self::unread_features`], `git_trees` when [`Self::git_trees`] is off). While this
+    /// is `Some`, no final flush is complete or sealed, and no boot admits user code over it
+    /// (decisions 12 and 16).
+    #[must_use]
+    pub fn fidelity_gap(&self) -> Option<String> {
+        let mut missing = self.unread_features.clone();
+        if !self.git_trees && !missing.iter().any(|f| f == "git_trees") {
+            missing.push("git_trees".to_owned());
+        }
+        (!missing.is_empty()).then(|| {
+            format!(
+                "the store does not read the manifest feature(s) {}: what it would restore is \
+                 less than the capture holds",
+                missing.join(", ")
+            )
+        })
+    }
+
     /// The staging directory in effect.
     #[must_use]
     pub fn staging_dir(&self) -> PathBuf {
@@ -660,6 +679,11 @@ pub struct CaptureEngine {
     /// names as the bulk index had them, so a bulk capture staged after it can change what the
     /// next small snap records.
     shared_outside: bool,
+    /// The last small snap left out a link to a bulk name because the bulk index's stat of it
+    /// is not the disk's (the file changed, or gained a name, since the last bulk snap): the
+    /// bulk class's capture does not hold that name as the link would promise, so the link
+    /// waits for a small snap after a bulk snap ([`CaptureEngine::links_deferred`]).
+    links_deferred: bool,
     /// A refused capture being rebuilt in its place ([`CaptureEngine::repair`]): the next
     /// snap takes its `n` and parent and folds the captures staged after it into itself.
     repair_target: Option<RepairTarget>,
@@ -788,6 +812,7 @@ impl CaptureEngine {
             last_tips,
             last_meta: None,
             shared_outside: false,
+            links_deferred: false,
             repair_target: None,
             repair_git: None,
             below: None,
@@ -1121,17 +1146,7 @@ impl CaptureEngine {
     /// lossy capture never completes).
     #[must_use]
     pub fn fidelity_gap(&self) -> Option<String> {
-        let mut missing = self.config.unread_features.clone();
-        if !self.config.git_trees && !missing.iter().any(|f| f == "git_trees") {
-            missing.push("git_trees".to_owned());
-        }
-        (!missing.is_empty()).then(|| {
-            format!(
-                "the store does not read the manifest feature(s) {}: what it would restore is \
-                 less than the capture holds",
-                missing.join(", ")
-            )
-        })
+        self.config.fidelity_gap()
     }
 
     /// The executor this engine seals a completed final flush under (a re-plan names it again:
@@ -1291,18 +1306,41 @@ impl CaptureEngine {
         }
     }
 
+    /// Whether the bulk class's capture holds its name `v` of the inode `key` as the disk has
+    /// it: `None` when `v` is not that inode on disk any more; `Some(false)` when it is, but
+    /// its stat is not the one the last bulk snap read (the file changed or gained a name
+    /// since, so the bulk capture may hold other bytes); `Some(true)` otherwise. A link names
+    /// only a member the capture holds as it is (review 2026-09-28, fifth pass, #11).
+    fn bulk_member_captured(
+        &self,
+        v: &str,
+        known: &index::IndexedFile,
+        key: (u64, u64),
+    ) -> Option<bool> {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::MetadataExt;
+        let abs = self
+            .config
+            .root
+            .join(std::ffi::OsStr::from_bytes(&worktree_meta::bytes_of(v)));
+        let meta = crate::longpath::symlink_metadata(&abs)
+            .ok()
+            .filter(|m| m.is_file() && (m.dev(), m.ino()) == key)?;
+        Some(index::FileStat::of(&meta) == known.stat)
+    }
+
     /// The names the workspace class (`listing`, this snap's) and the bulk class (its index,
     /// each name checked on disk) carry of the tracked files in `outside`, whose inodes have
-    /// names the overlay does not hold.
+    /// names the overlay does not hold. Also whether a bulk name was left out because the bulk
+    /// capture does not hold it as it is ([`Self::bulk_member_captured`]).
     fn shared_links(
         &self,
         outside: &[worktree_meta::OutsideLinks],
         listing: &Listing,
-    ) -> Vec<worktree_meta::SharedLink> {
-        use std::os::unix::ffi::OsStrExt;
+    ) -> (Vec<worktree_meta::SharedLink>, bool) {
         use std::os::unix::fs::MetadataExt;
         if outside.is_empty() {
-            return Vec::new();
+            return (Vec::new(), false);
         }
         let wanted: HashMap<(u64, u64), &str> = outside
             .iter()
@@ -1322,20 +1360,18 @@ impl CaptureEngine {
                 shared.push(link(path, worktree_meta::LinkClass::Workspace, v));
             }
         }
+        let mut deferred = false;
         for (v, known) in &self.bulk_index.files {
-            let Some(path) = wanted.get(&(known.stat.dev, known.stat.ino)) else {
+            let key = (known.stat.dev, known.stat.ino);
+            let Some(path) = wanted.get(&key) else {
                 continue;
             };
-            // The index is the last bulk snap's; the inode must still be this one.
-            let abs = self
-                .config
-                .root
-                .join(std::ffi::OsStr::from_bytes(&worktree_meta::bytes_of(v)));
-            let on_disk = crate::longpath::symlink_metadata(&abs).is_ok_and(|m| {
-                m.is_file() && (m.dev(), m.ino()) == (known.stat.dev, known.stat.ino)
-            });
-            if on_disk {
-                shared.push(link(path, worktree_meta::LinkClass::Bulk, v));
+            // The index is the last bulk snap's: the inode must still be this one, and the
+            // bulk capture must hold it as it is.
+            match self.bulk_member_captured(v, known, key) {
+                Some(true) => shared.push(link(path, worktree_meta::LinkClass::Bulk, v)),
+                Some(false) => deferred = true,
+                None => {}
             }
         }
         for s in &mut shared {
@@ -1343,7 +1379,7 @@ impl CaptureEngine {
         }
         shared.sort();
         shared.dedup();
-        shared
+        (shared, deferred)
     }
 
     /// Inodes the workspace class (`listing`, this snap's) and the bulk class (its index, each
@@ -1357,8 +1393,7 @@ impl CaptureEngine {
         &self,
         outside: &[worktree_meta::OutsideLinks],
         listing: &Listing,
-    ) -> (Vec<Vec<worktree_meta::LinkMember>>, bool) {
-        use std::os::unix::ffi::OsStrExt;
+    ) -> (Vec<Vec<worktree_meta::LinkMember>>, bool, bool) {
         use std::os::unix::fs::MetadataExt;
         let tracked: HashSet<(u64, u64)> = outside.iter().map(|o| (o.dev, o.ino)).collect();
         let member = |class, v: &str| worktree_meta::LinkMember {
@@ -1377,25 +1412,25 @@ impl CaptureEngine {
         }
         inodes.retain(|_, (nlink, names)| *nlink > names.len() as u64);
         if inodes.is_empty() {
-            return (Vec::new(), false);
+            return (Vec::new(), false, false);
         }
         let mut bulk: HashMap<(u64, u64), Vec<worktree_meta::LinkMember>> = HashMap::new();
+        let mut deferred = false;
         for (v, known) in &self.bulk_index.files {
             let key = (known.stat.dev, known.stat.ino);
             if !inodes.contains_key(&key) {
                 continue;
             }
-            // The index is the last bulk snap's; the inode must still be this one.
-            let abs = self
-                .config
-                .root
-                .join(std::ffi::OsStr::from_bytes(&worktree_meta::bytes_of(v)));
-            let on_disk = crate::longpath::symlink_metadata(&abs)
-                .is_ok_and(|m| m.is_file() && (m.dev(), m.ino()) == key);
-            if on_disk {
-                bulk.entry(key)
+            // The index is the last bulk snap's: the inode must still be this one, and the
+            // bulk capture must hold it as it is. A group never names a member the captures
+            // do not hold as the disk does.
+            match self.bulk_member_captured(v, known, key) {
+                Some(true) => bulk
+                    .entry(key)
                     .or_default()
-                    .push(member(worktree_meta::LinkClass::Bulk, v));
+                    .push(member(worktree_meta::LinkClass::Bulk, v)),
+                Some(false) => deferred = true,
+                None => {}
             }
         }
         let mut groups: Vec<Vec<worktree_meta::LinkMember>> = bulk
@@ -1409,7 +1444,7 @@ impl CaptureEngine {
             })
             .collect();
         groups.sort();
-        (groups, true)
+        (groups, true, deferred)
     }
 
     /// The bulk class listing: every bulk directory under the root.
@@ -2176,6 +2211,25 @@ impl CaptureEngine {
                             &self.meta_scope(&git.closure.gitlinks),
                             self.last_meta.as_ref().filter(|_| !strict),
                         )?;
+                        // A path the tree holds as another kind than the disk does: the tree is
+                        // not the disk there, and the overlay has no entry for it. A final snap
+                        // cannot say it holds the disk (review 2026-09-28, fifth pass, #6).
+                        if !captured.changed_kind.is_empty() {
+                            if strict {
+                                return Err(io::Error::other(format!(
+                                    "{} path(s) of the worktree tree are of another kind on \
+                                     disk: {}",
+                                    captured.changed_kind.len(),
+                                    captured.changed_kind.join(", ")
+                                ))
+                                .into());
+                            }
+                            tracing::warn!(
+                                paths = %captured.changed_kind.join(", "),
+                                "paths changed kind while the worktree tree was written; the \
+                                 next snap takes them"
+                            );
+                        }
                         // Metadata the overlay could not read, under no path git already
                         // reported (a directory counts once): unreadable, never gone.
                         let meta_unreadable: Vec<UnreadablePath> = captured
@@ -2196,7 +2250,7 @@ impl CaptureEngine {
                             })
                             .collect();
                         git_unreadable = merge_unreadable(git_unreadable, meta_unreadable);
-                        let (cross_links, ws_outside) =
+                        let (cross_links, ws_outside, cross_deferred) =
                             self.cross_links(&captured.outside, &listing);
                         self.shared_outside = !captured.outside.is_empty() || ws_outside;
                         let mut doc = captured.doc;
@@ -2204,8 +2258,10 @@ impl CaptureEngine {
                         // A tracked file under a bulk directory is the overlay's own name.
                         let own: HashSet<&str> =
                             doc.entries.iter().map(|e| e.path.as_str()).collect();
-                        let shared = self
-                            .shared_links(&captured.outside, &listing)
+                        let (shared, shared_deferred) =
+                            self.shared_links(&captured.outside, &listing);
+                        self.links_deferred = cross_deferred || shared_deferred;
+                        let shared = shared
                             .into_iter()
                             .filter(|l| {
                                 l.class != worktree_meta::LinkClass::Bulk
@@ -2656,6 +2712,15 @@ impl CaptureEngine {
     #[must_use]
     pub fn small_depends_on_bulk(&self) -> bool {
         self.shared_outside
+    }
+
+    /// Whether the last small snap left a link to a bulk name out because the bulk capture
+    /// does not hold that name as the disk has it (it changed, or gained a name, since the
+    /// last bulk snap): a small snap after the next bulk snap records it. A final flush takes
+    /// that snap, and is not complete while a link is still left out.
+    #[must_use]
+    pub fn links_deferred(&self) -> bool {
+        self.links_deferred
     }
 
     /// End the chain in a final capture: when the newest capture is of another kind, stage a

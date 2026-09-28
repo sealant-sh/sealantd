@@ -27,6 +27,13 @@ use crate::watch::{self, ChangeSignal, Mode, WatchHandle, WatchSpec};
 /// How often the ship worker polls when nothing woke it.
 pub const SHIP_TICK: Duration = Duration::from_secs(5);
 
+/// Rounds of snaps a final flush takes when the disk changed after them, before it gives up
+/// and seals nothing ([`Incomplete::Changed`]).
+const FINAL_ROUNDS: u32 = 3;
+
+/// How long a final flush waits for the watcher's fence ([`WatchHandle::settle`]).
+const SETTLE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Why a final flush is not complete. [`Incomplete::reason`] is the code the daemon reports.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum Incomplete {
@@ -65,11 +72,16 @@ pub enum Incomplete {
     /// sealed, whatever registered.
     #[error("{0}")]
     StoreFidelity(String),
+    /// The disk changed after the flush's snaps (the watcher delivered a change, overflowed,
+    /// or could not be settled), and snapping again did not end on a disk that held still:
+    /// what the captures hold is not the disk, and nothing is sealed.
+    #[error("the disk changed during the final flush: {0}")]
+    Changed(String),
 }
 
 impl Incomplete {
     /// The reason code: `snapshot-failed`, `fenced`, `conflict`, `deadline`, `ship-failed`,
-    /// `unreadable`, `sealing` or `store-fidelity`.
+    /// `unreadable`, `sealing`, `store-fidelity` or `changed`.
     #[must_use]
     pub fn reason(&self) -> &'static str {
         match self {
@@ -81,6 +93,7 @@ impl Incomplete {
             Self::Unreadable(_) => "unreadable",
             Self::Sealing(_) => "sealing",
             Self::StoreFidelity(_) => "store-fidelity",
+            Self::Changed(_) => "changed",
         }
     }
 
@@ -579,6 +592,23 @@ impl Shared {
         }
     }
 
+    /// Wait until the watcher delivered every change made before now
+    /// ([`WatchHandle::settle`]); `Ok` at once without a watcher (every class polls, and a
+    /// snap reads it whole). `Err` says why nothing can be said of what is still queued.
+    fn settle_watcher(&self) -> Result<(), String> {
+        match self
+            .watch
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+        {
+            Some(handle) if !handle.settle(SETTLE_TIMEOUT) => Err(format!(
+                "the watcher did not deliver its fence within {SETTLE_TIMEOUT:?}"
+            )),
+            _ => Ok(()),
+        }
+    }
+
     fn drop_watch(&self) {
         let _ = self
             .watch
@@ -950,6 +980,31 @@ impl CadenceRunner {
     /// that polls.
     #[must_use]
     pub fn final_is_current_as_snapped(&self) -> bool {
+        // A bulk build paused mid-way holds progress no capture lists yet; never waits for the
+        // engine (`capture.status` reads this).
+        !self.shared.allowed()
+            && self.snaps_still_current(
+                self.shared
+                    .engine
+                    .try_lock()
+                    .is_ok_and(|e| !e.bulk_in_progress()),
+            )
+    }
+
+    /// Whether nothing moved since the last final flush's snaps: no change signal since before
+    /// its first snap, no repair still asked for, no bulk build paused mid-way. What a final
+    /// flush checks before it seals, and what [`Self::final_is_current_as_snapped`] reads,
+    /// whether or not the caller's admission hook is installed (decision 15: a seal is written
+    /// under the predicate `complete` is answered by).
+    fn unchanged_since_final_snaps(&self) -> bool {
+        let bulk_idle = !self.shared.engine().bulk_in_progress();
+        self.snaps_still_current(bulk_idle)
+    }
+
+    /// [`Self::unchanged_since_final_snaps`], `bulk_idle` read by the caller. A repair is still
+    /// asked for while the staging holds its request (the worker's wake-up flag for it is only
+    /// that: a final flush's shipping rebuilds a refused capture itself).
+    fn snaps_still_current(&self, bulk_idle: bool) -> bool {
         let Some(sealed) = *self
             .shared
             .sealed
@@ -958,22 +1013,9 @@ impl CadenceRunner {
         else {
             return false;
         };
-        if self.shared.allowed() {
-            return false;
-        }
-        if self.shared.state().repair {
-            return false;
-        }
-        if self.shared.changes.load(Ordering::SeqCst) != sealed.changes
-            || self.shared.staging.repair_request().is_some()
-        {
-            return false;
-        }
-        // A bulk build paused mid-way holds progress no capture lists yet.
-        self.shared
-            .engine
-            .try_lock()
-            .is_ok_and(|e| !e.bulk_in_progress())
+        bulk_idle
+            && self.shared.changes.load(Ordering::SeqCst) == sealed.changes
+            && self.shared.staging.repair_request().is_none()
     }
 
     /// Whether the chain ends on the final capture of the last final flush that snapped every
@@ -1017,20 +1059,12 @@ impl CadenceRunner {
         self.flush_final_sealing(deadline, true)
     }
 
-    /// [`Self::flush_final`], sealing the chain ([`crate::manifest::FinalSeal`]) only when
-    /// `writers_stopped`: the caller vouches that every writer was stopped before it. Once both
-    /// snaps succeeded and everything staged registered, one more capture — the newest one's
-    /// sections, `kind: final` — carrying the engine's seal is staged and shipped, and the flush
-    /// is complete only once it registered ([`Incomplete::Sealing`] otherwise). A flush asked
-    /// again over a sealed chain stages nothing more. Without an executor
-    /// ([`crate::engine::CaptureConfig::executor`]) nothing is sealed. When the writers were
-    /// not stopped, nothing is sealed either: the caller reports the flush incomplete.
-    pub fn flush_final_sealing(
-        &self,
-        deadline: Option<Duration>,
-        writers_stopped: bool,
-    ) -> FinalFlush {
-        let until = deadline.map(|d| Instant::now() + d);
+    /// One round of a final flush's snaps ([`Self::flush_final_sealing`]): nothing when the
+    /// disk is as the last final flush captured it (a newest capture of another kind sealed with
+    /// a final one), else a forced small snap, a forced bulk snap, the small class again when
+    /// its overlay depends on the bulk class, and a final capture sealing the chain. Why the
+    /// flush cannot complete, when it cannot.
+    fn final_snaps(&self) -> Option<Incomplete> {
         let mut incomplete = None;
         if self.final_is_current() {
             tracing::info!(
@@ -1091,13 +1125,25 @@ impl CadenceRunner {
                     }
                 }
             }
+            // A link to a bulk name the first small snap left out (the bulk capture did not
+            // hold it as it is) is recorded by a small snap after the bulk snap, whether or not
+            // that one staged anything.
             if incomplete.is_none()
-                && bulk_staged
+                && (bulk_staged || self.shared.engine().links_deferred())
                 && self.shared.engine().small_depends_on_bulk()
                 && let Err(error) = self.shared.small_snap(CaptureKind::Final)
             {
                 tracing::error!(%error, "final small-class snap after the bulk capture failed");
                 incomplete = Some(Incomplete::from_snap(Class::Small, &error));
+            }
+            // Still left out: the captures do not hold the disk's hardlinks as they are.
+            if incomplete.is_none() && self.shared.engine().links_deferred() {
+                incomplete = Some(Incomplete::SnapshotFailed {
+                    class: Class::Small,
+                    error: "a hardlink the workspace shares with the bulk class is not in the \
+                            bulk capture as it is on disk"
+                        .to_owned(),
+                });
             }
             if incomplete.is_none() {
                 let seq = self.shared.seq.fetch_add(1, Ordering::Relaxed);
@@ -1126,15 +1172,75 @@ impl CadenceRunner {
                 });
             }
         }
-        let mut shipped = self.ship_final(until, &mut incomplete);
-        // A store that cannot hold what was captured: everything shipped all the same (it is
-        // the most the store can take), but nothing is sealed and the flush is not complete.
-        if incomplete.is_none()
-            && let Some(gap) = self.shared.engine().fidelity_gap()
-        {
-            tracing::error!(%gap, "final flush: the store cannot hold what the capture holds");
-            incomplete = Some(Incomplete::StoreFidelity(gap));
-        }
+        incomplete
+    }
+
+    /// [`Self::flush_final`], sealing the chain ([`crate::manifest::FinalSeal`]) only when
+    /// `writers_stopped`: the caller vouches that every writer was stopped before it. Once both
+    /// snaps succeeded and everything staged registered, one more capture — the newest one's
+    /// sections, `kind: final` — carrying the engine's seal is staged and shipped, and the flush
+    /// is complete only once it registered ([`Incomplete::Sealing`] otherwise). A flush asked
+    /// again over a sealed chain stages nothing more. Without an executor
+    /// ([`crate::engine::CaptureConfig::executor`]) nothing is sealed. When the writers were
+    /// not stopped, nothing is sealed either: the caller reports the flush incomplete. Nor when
+    /// the disk changed after the snaps: they are taken again, at most [`FINAL_ROUNDS`] rounds,
+    /// and a disk still changing is [`Incomplete::Changed`] (decision 15).
+    pub fn flush_final_sealing(
+        &self,
+        deadline: Option<Duration>,
+        writers_stopped: bool,
+    ) -> FinalFlush {
+        let until = deadline.map(|d| Instant::now() + d);
+        let mut shipped = 0;
+        let mut round = 0;
+        let mut incomplete = loop {
+            round += 1;
+            // Every change made before the flush was asked for is counted before its snaps take
+            // their baseline: a write the snaps read, delivered only after them, would read as a
+            // change since and cost a round.
+            if let Err(error) = self.shared.settle_watcher() {
+                tracing::warn!(%error, "final flush: the watcher could not be settled");
+            }
+            let mut incomplete = self.final_snaps();
+            shipped += self.ship_final(until, &mut incomplete);
+            // A store that cannot hold what was captured: everything shipped all the same (it
+            // is the most the store can take), but nothing is sealed and the flush is not
+            // complete.
+            if incomplete.is_none()
+                && let Some(gap) = self.shared.engine().fidelity_gap()
+            {
+                tracing::error!(%gap, "final flush: the store cannot hold what the capture holds");
+                incomplete = Some(Incomplete::StoreFidelity(gap));
+            }
+            // Complete means current, and so does a seal (decision 15): the flush's snaps must be
+            // the disk as it is now. Every change the watcher saw happen before now is counted
+            // first (a fence through its event stream); one counted since the first snap (a
+            // write that raced the snaps, an overflow) and the classes are snapped again,
+            // bounded; still changing, and the flush is incomplete and nothing is sealed.
+            // Nothing the flush runs changes the disk (no filter or hook of the user's runs in a
+            // capture's git), so with the writers stopped the second round holds still.
+            if incomplete.is_none() && writers_stopped {
+                let changed = match self.shared.settle_watcher() {
+                    Ok(()) => (!self.unchanged_since_final_snaps())
+                        .then(|| "the watcher saw a change after the final snaps".to_owned()),
+                    Err(error) => Some(error),
+                };
+                if let Some(change) = changed {
+                    let time_left = until.is_none_or(|u| Instant::now() < u);
+                    if round < FINAL_ROUNDS && time_left {
+                        tracing::warn!(
+                            round,
+                            %change,
+                            "final flush: the disk changed after its snaps; snapping again"
+                        );
+                        continue;
+                    }
+                    tracing::error!(%change, "final flush: the disk kept changing; no seal");
+                    incomplete = Some(Incomplete::Changed(change));
+                }
+            }
+            break incomplete;
+        };
         // Everything registered: seal the completed flush on the chain, and say `complete` only
         // once the sealing capture registered. Bounded: a register refused and rebuilt in its
         // place loses the seal, and it is staged once more.
