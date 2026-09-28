@@ -683,7 +683,17 @@ impl<'a> Materializer<'a> {
                         }
                     }
                 };
-                let applied = worktree_meta::apply(&repo, doc, &scope, &resolve)?;
+                // A sealed final capture with every class restored (its bulk section ready)
+                // promised its links: one it names that the restored names cannot make fails
+                // the materialize instead of passing in silence.
+                let strict = manifest.final_seal.is_some()
+                    && class == MaterializeClass::All
+                    && manifest.sections.bulk.section().is_some();
+                let applied = if strict {
+                    worktree_meta::apply_strict(&repo, doc, &scope, &resolve)?
+                } else {
+                    worktree_meta::apply(&repo, doc, &scope, &resolve)?
+                };
                 report.worktree_meta = applied.changed;
                 // A relinked name has a new inode: the class's index must say so, or the next
                 // delta would take it for changed and write it again.
@@ -797,6 +807,10 @@ impl<'a> Materializer<'a> {
                 repo.existing(std::slice::from_ref(t))
                     .is_ok_and(|e| !e.is_empty())
             });
+            // A raw tree's blobs are the captured bytes, written as they are: no filter of the
+            // user's runs. A capture from before it holds only the cleaned bytes, which its
+            // smudge filters turn back into what was on disk.
+            let smudge = git.raw_tree.is_none();
             let written = match from {
                 Some(from) => {
                     let changed = gitpack::checkout_tree_changing(
@@ -804,12 +818,13 @@ impl<'a> Materializer<'a> {
                         &from,
                         tree,
                         &self.targets.scratch_dir,
+                        smudge,
                     )?;
                     report.git_paths_changed = Some(changed.len() as u64);
                     Some(changed)
                 }
                 None => {
-                    gitpack::checkout_tree(&repo, tree, &self.targets.scratch_dir)?;
+                    gitpack::checkout_tree(&repo, tree, &self.targets.scratch_dir, smudge)?;
                     None
                 }
             };

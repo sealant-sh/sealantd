@@ -268,19 +268,27 @@ pub struct GitRepo {
 /// #2): case-sensitive names and ignore rules (`core.ignorecase=true` left on a repository
 /// moved to a case-sensitive disk made `git add` take a distinct `A` for a tracked `a`, and
 /// drop it); no file-system monitor and no untracked cache (a stale answer from either leaves a
-/// change unseen); every stat field compared, `ctime` included. Passed as `GIT_CONFIG_COUNT`
-/// entries: the repository's `.git/config` is never written, and a restore gets the user's
-/// configuration back byte for byte.
-const CAPTURE_VIEW: [(&str, &str); 5] = [
+/// change unseen); every stat field compared, `ctime` included. Symlinks are symlinks
+/// (`core.symlinks=false`, a setting carried from a file system without them, had `git add`
+/// keep a tracked symlink's mode over the regular file that replaced it, its bytes taken for
+/// the link's target, and a sealed capture restored the file as a symlink: review 2026-09-28,
+/// fifth pass, #6). No hook runs (`post-index-change` fires on every index git writes), and a
+/// line-end conversion git cannot reverse is converted all the same instead of failing the snap
+/// (`core.safecrlf`). Passed as `GIT_CONFIG_COUNT` entries: the repository's `.git/config` is
+/// never written, and a restore gets the user's configuration back byte for byte.
+const CAPTURE_VIEW: [(&str, &str); 8] = [
     ("core.ignorecase", "false"),
     ("core.fsmonitor", "false"),
     ("core.untrackedCache", "false"),
     ("core.checkStat", "default"),
     ("core.trustctime", "true"),
+    ("core.symlinks", "true"),
+    ("core.hooksPath", "/dev/null"),
+    ("core.safecrlf", "false"),
 ];
 
 /// Run git with a clean environment (no inherited `GIT_DIR`/`GIT_INDEX_FILE`/`GIT_WORK_TREE`),
-/// under [`CAPTURE_VIEW`].
+/// under [`CAPTURE_VIEW`], with no filter driver of the user's ([`without_filters`]).
 ///
 /// Every child started from this command must be spawned through the process-wide spawn gate
 /// (`sealant_process::CommandGateExt`: `output_gated`/`spawn_gated`, never `output`/`spawn`).
@@ -288,6 +296,18 @@ const CAPTURE_VIEW: [(&str, &str); 5] = [
 /// spawn — an ungated `git` that exits mid-sweep is reaped out from under us and the `wait()`
 /// here fails with `ECHILD` ("No child process"), which is how a `capture.flush` died under load.
 fn git_command(cwd: &Path) -> Command {
+    git_command_with(cwd, &without_filters(cwd))
+}
+
+/// [`git_command`] with the user's filter drivers left as they are: only for a checkout that
+/// must smudge (a capture from before the raw tree, whose worktree tree holds the cleaned
+/// bytes and nothing else).
+fn git_command_filtering(cwd: &Path) -> Command {
+    git_command_with(cwd, &[])
+}
+
+/// [`git_command`] with `extra` configuration after [`CAPTURE_VIEW`] (a later entry wins).
+fn git_command_with(cwd: &Path, extra: &[(String, String)]) -> Command {
     let mut c = Command::new("git");
     c.current_dir(cwd)
         .env_remove("GIT_DIR")
@@ -295,13 +315,72 @@ fn git_command(cwd: &Path) -> Command {
         .env_remove("GIT_INDEX_FILE")
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_CONFIG_COUNT", CAPTURE_VIEW.len().to_string())
+        .env(
+            "GIT_CONFIG_COUNT",
+            (CAPTURE_VIEW.len() + extra.len()).to_string(),
+        )
         .stdin(Stdio::null());
-    for (i, (key, value)) in CAPTURE_VIEW.iter().enumerate() {
+    let entries = CAPTURE_VIEW
+        .iter()
+        .map(|(k, v)| (*k, *v))
+        .chain(extra.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+    for (i, (key, value)) in entries.enumerate() {
         c.env(format!("GIT_CONFIG_KEY_{i}"), key)
             .env(format!("GIT_CONFIG_VALUE_{i}"), value);
     }
     c
+}
+
+/// Every filter driver git's configuration defines (`filter.<driver>.clean`, `.smudge`,
+/// `.process`, `.required`, at any level), by name.
+fn filter_drivers(cwd: &Path) -> Result<BTreeSet<String>, GitError> {
+    let args = ["config", "-z", "--name-only", "--get-regexp", r"^filter\."];
+    let out = git_command_filtering(cwd).args(args).output_gated()?;
+    // 1: no such key.
+    if out.status.code() == Some(1) {
+        return Ok(BTreeSet::new());
+    }
+    let out = check(&args, out)?;
+    Ok(out
+        .stdout
+        .split(|b| *b == 0)
+        .filter_map(|key| key.strip_prefix(b"filter."))
+        .filter_map(|rest| rsplit_once(rest, b"."))
+        .filter(|(_, var)| matches!(*var, b"clean" | b"smudge" | b"process" | b"required"))
+        .map(|(driver, _)| String::from_utf8_lossy(driver).into_owned())
+        .collect())
+}
+
+/// Configuration that empties every filter driver the configuration at `cwd` defines
+/// (`clean`, `smudge` and `process` empty, `required` off), so no git a capture runs executes
+/// one. A filter is the user's code, and git runs a clean filter wherever it hashes a file:
+/// in `git add`, and in any command that writes an index (a racily clean entry is checked
+/// against the file). One that wrote a file git had already indexed changed the disk under a
+/// final flush that went on to seal it (review 2026-09-28, fifth pass, #2); nothing a capture
+/// runs may change the disk. A path a filter's attribute names is read as it is on disk, and
+/// the raw tree holds its bytes as ever; git's own conversions (line ends, `ident`, encodings)
+/// run no user code and still apply to the worktree tree. The configuration git would read
+/// here unreadable: nothing is added, and the command itself fails reading it the same way.
+fn without_filters(cwd: &Path) -> Vec<(String, String)> {
+    let drivers = match filter_drivers(cwd) {
+        Ok(drivers) => drivers,
+        Err(error) => {
+            tracing::debug!(%error, cwd = %cwd.display(), "git config: filter drivers unread");
+            BTreeSet::new()
+        }
+    };
+    let mut extra = Vec::new();
+    for driver in drivers {
+        for (var, value) in [
+            ("clean", ""),
+            ("smudge", ""),
+            ("process", ""),
+            ("required", "false"),
+        ] {
+            extra.push((format!("filter.{driver}.{var}"), value.to_owned()));
+        }
+    }
+    extra
 }
 
 fn check(args: &[&str], out: Output) -> Result<Output, GitError> {
@@ -1108,6 +1187,7 @@ impl GitRepo {
     /// Run `git add` as [`AddArgs`] says against `tmp_index`, its pathspecs from a file beside
     /// it, untranslated (what could not be read is read off the messages).
     fn run_add(&self, tmp_index: &Path, add: &AddArgs) -> Result<Output, GitError> {
+        let mut command = git_command(&self.root);
         let spec_file = tmp_index.with_extension("pathspecs");
         let mut specs: Vec<u8> = Vec::new();
         for p in &add.pathspecs {
@@ -1115,7 +1195,7 @@ impl GitRepo {
             specs.push(0);
         }
         fs::write(&spec_file, &specs).map_err(at("write", &spec_file))?;
-        let out = git_command(&self.root)
+        let out = command
             .env("GIT_INDEX_FILE", tmp_index)
             .env("LC_ALL", "C")
             .args(&add.args)
@@ -2448,14 +2528,30 @@ pub fn write_head(repo: &GitRepo, head: &str) -> Result<(), GitError> {
     Ok(())
 }
 
+/// The git a checkout runs: the user's filters smudge only when `smudge` (a tree whose blobs
+/// hold cleaned bytes and no raw tree beside it); a raw tree's blobs are the bytes to write.
+fn checkout_command(repo: &GitRepo, smudge: bool) -> Command {
+    if smudge {
+        git_command_filtering(&repo.root)
+    } else {
+        git_command(&repo.root)
+    }
+}
+
 /// Check `tree` out into the working tree through a throwaway index: every file of the tree
-/// is written (nothing is removed). See [`checkout_tree_from`] for the delta form.
-pub fn checkout_tree(repo: &GitRepo, tree: &str, scratch_dir: &Path) -> Result<(), GitError> {
+/// is written (nothing is removed). The user's smudge filters run only when `smudge`. See
+/// [`checkout_tree_from`] for the delta form.
+pub fn checkout_tree(
+    repo: &GitRepo,
+    tree: &str,
+    scratch_dir: &Path,
+    smudge: bool,
+) -> Result<(), GitError> {
     let tmp_index = scratch_index(scratch_dir)?;
     let rt = ["read-tree", tree];
     check(
         &rt,
-        git_command(&repo.root)
+        checkout_command(repo, smudge)
             .env("GIT_INDEX_FILE", &tmp_index)
             .args(rt)
             .output_gated()?,
@@ -2463,7 +2559,7 @@ pub fn checkout_tree(repo: &GitRepo, tree: &str, scratch_dir: &Path) -> Result<(
     let co = ["checkout-index", "-a", "-f", "-q"];
     check(
         &co,
-        git_command(&repo.root)
+        checkout_command(repo, smudge)
             .env("GIT_INDEX_FILE", &tmp_index)
             .args(co)
             .output_gated()?,
@@ -2476,14 +2572,15 @@ pub fn checkout_tree(repo: &GitRepo, tree: &str, scratch_dir: &Path) -> Result<(
 /// `read-tree --reset -u`, which writes the paths that differ between the trees, deletes the
 /// ones `to` dropped and leaves the rest untouched (the index is trusted for them, so the
 /// caller vouches that the working tree still holds `from`). Returns the number of paths the
-/// tree diff names.
+/// tree diff names. The user's smudge filters run only when `smudge`.
 pub fn checkout_tree_from(
     repo: &GitRepo,
     from: &str,
     to: &str,
     scratch_dir: &Path,
+    smudge: bool,
 ) -> Result<u64, GitError> {
-    Ok(checkout_tree_changing(repo, from, to, scratch_dir)?.len() as u64)
+    Ok(checkout_tree_changing(repo, from, to, scratch_dir, smudge)?.len() as u64)
 }
 
 /// [`checkout_tree_from`], returning the paths the tree diff names (root-relative bytes).
@@ -2492,6 +2589,7 @@ pub fn checkout_tree_changing(
     from: &str,
     to: &str,
     scratch_dir: &Path,
+    smudge: bool,
 ) -> Result<Vec<Vec<u8>>, GitError> {
     if from == to {
         return Ok(Vec::new());
@@ -2500,7 +2598,7 @@ pub fn checkout_tree_changing(
     let seed = ["read-tree", from];
     check(
         &seed,
-        git_command(&repo.root)
+        checkout_command(repo, smudge)
             .env("GIT_INDEX_FILE", &tmp_index)
             .args(seed)
             .output_gated()?,
@@ -2508,7 +2606,7 @@ pub fn checkout_tree_changing(
     let merge = ["read-tree", "--reset", "-u", from, to];
     check(
         &merge,
-        git_command(&repo.root)
+        checkout_command(repo, smudge)
             .env("GIT_INDEX_FILE", &tmp_index)
             .args(merge)
             .output_gated()?,
@@ -2831,7 +2929,7 @@ mod tests {
         install_pack(&fresh, &pack.sha256, &bytes, None).unwrap();
         write_packed_refs(&fresh, &r.closure.refs, &r.closure.symrefs).unwrap();
         write_head(&fresh, &r.closure.head).unwrap();
-        checkout_tree(&fresh, &r.closure.worktree_tree, &scratch).unwrap();
+        checkout_tree(&fresh, &r.closure.worktree_tree, &scratch, true).unwrap();
         read_tree_into_index(&fresh, r.closure.index_tree.as_ref().unwrap()).unwrap();
         assert_eq!(
             fs::read_to_string(fresh.root.join("b")).unwrap(),

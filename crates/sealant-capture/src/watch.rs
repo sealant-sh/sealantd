@@ -14,7 +14,9 @@ use std::fs;
 use std::mem;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, mpsc};
+use std::time::{Duration, Instant};
 
 use notify::event::{CreateKind, ModifyKind, RenameMode};
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
@@ -149,6 +151,92 @@ pub struct WatchStart {
 /// Keeps the backend watcher and its worker thread alive; dropping it stops both.
 pub struct WatchHandle {
     watcher: Arc<Mutex<Option<RecommendedWatcher>>>,
+    fence: Arc<Fence>,
+}
+
+/// The directory under the staging directory a [`WatchHandle::settle`] fence is written in.
+const FENCE_DIR: &str = "watch-fence";
+
+/// A barrier through the watcher's event stream ([`WatchHandle::settle`]): a file created in a
+/// directory of its own, watched by the same watcher as the roots. The kernel queues every
+/// event of one watcher in the order it happened, and the worker handles them in that order,
+/// so once the worker has handled the fence's event it has delivered every change made before
+/// the fence was written.
+#[derive(Debug)]
+struct Fence {
+    dir: PathBuf,
+    next: AtomicU64,
+    seen: Mutex<u64>,
+    cv: Condvar,
+}
+
+impl Fence {
+    /// The fence number `path` names, when it is a fence file.
+    fn number(&self, path: &Path) -> Option<u64> {
+        if path.parent() != Some(self.dir.as_path()) {
+            return None;
+        }
+        path.file_name()?.to_str()?.strip_prefix("f-")?.parse().ok()
+    }
+
+    fn passed(&self, n: u64) {
+        let mut seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
+        if n > *seen {
+            *seen = n;
+        }
+        drop(seen);
+        self.cv.notify_all();
+    }
+}
+
+impl WatchHandle {
+    /// Wait until the watcher has delivered every change made before this call (to the signal
+    /// hook, synchronously): a fence file is written in a directory the watcher watches, and
+    /// this returns once the worker has handled its event. Whatever the watcher saw happen
+    /// before now has been counted then. `false` when the fence could not be written, or its
+    /// event did not come back within `timeout`: nothing can be said of what is still in the
+    /// queue.
+    #[must_use]
+    pub fn settle(&self, timeout: Duration) -> bool {
+        let fence = &self.fence;
+        // The directory is watched again (a no-op while it is): the staging directory may have
+        // been cleared since the start.
+        if fs::create_dir_all(&fence.dir).is_err() {
+            return false;
+        }
+        {
+            let mut guard = self.watcher.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(watcher) = guard.as_mut() else {
+                return false;
+            };
+            if watcher
+                .watch(&fence.dir, RecursiveMode::NonRecursive)
+                .is_err()
+            {
+                return false;
+            }
+        }
+        let n = fence.next.fetch_add(1, Ordering::SeqCst) + 1;
+        let file = fence.dir.join(format!("f-{n}"));
+        if fs::write(&file, b"").is_err() {
+            return false;
+        }
+        let _ = fs::remove_file(&file);
+        let until = Instant::now() + timeout;
+        let mut seen = fence.seen.lock().unwrap_or_else(|e| e.into_inner());
+        while *seen < n {
+            let left = until.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return false;
+            }
+            seen = fence
+                .cv
+                .wait_timeout(seen, left)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+        true
+    }
 }
 
 impl std::fmt::Debug for WatchHandle {
@@ -674,6 +762,13 @@ pub fn start(
     );
     *watcher_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(watcher);
 
+    let fence = Arc::new(Fence {
+        dir: spec.staging_dir.join(FENCE_DIR),
+        next: AtomicU64::new(0),
+        seen: Mutex::new(0),
+        cv: Condvar::new(),
+    });
+    let worker_fence = Arc::clone(&fence);
     let worker_slot = Arc::clone(&watcher_slot);
     let watch_bulk = spec.capture_bulk && (bulk == Mode::Watched || unwatched.has(Class::Bulk));
     let mut state = WatchState {
@@ -688,6 +783,15 @@ pub fn start(
         .spawn(move || {
             loop {
                 match rx.recv_timeout(state.retry.tick()) {
+                    // A fence ([`WatchHandle::settle`]): every event before it was handled.
+                    Ok(event)
+                        if matches!(event.kind, EventKind::Create(_))
+                            && event.paths.iter().any(|p| worker_fence.number(p).is_some()) =>
+                    {
+                        for n in event.paths.iter().filter_map(|p| worker_fence.number(p)) {
+                            worker_fence.passed(n);
+                        }
+                    }
                     Ok(event) => handle_event(&policy, &worker_slot, &mut state, &on_signal, event),
                     Err(mpsc::RecvTimeoutError::Timeout) => {}
                     Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -703,6 +807,7 @@ pub fn start(
         watches,
         handle: Some(WatchHandle {
             watcher: watcher_slot,
+            fence,
         }),
     })
 }

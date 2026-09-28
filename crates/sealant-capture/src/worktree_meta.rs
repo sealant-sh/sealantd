@@ -76,6 +76,16 @@ pub enum MetaError {
     /// The document is malformed.
     #[error("worktree metadata document: {0}")]
     BadDocument(String),
+    /// A strict apply ([`apply_strict`]) found a hardlink the document names across classes
+    /// that the restored names cannot make: a member missing, not a file, or holding other
+    /// bytes than the rest. The capture promised an inode the restore cannot give back.
+    #[error("worktree metadata: the hardlink of {member} is not restorable: {reason}")]
+    LinkUnfulfilled {
+        /// The member (its class's key).
+        member: String,
+        /// What was found.
+        reason: String,
+    },
 }
 
 fn io_err(path: &[u8]) -> impl FnOnce(io::Error) -> MetaError + '_ {
@@ -538,6 +548,11 @@ pub struct Captured {
     /// Paths of the worktree tree whose metadata could not be read (a directory above them
     /// that cannot be searched): never taken as gone.
     pub unreadable: Vec<UnreadableMeta>,
+    /// Paths of the worktree tree that are of another kind on disk (a file the tree holds as a
+    /// symlink, a directory it holds as a file), as keys. Left out of the document: the tree
+    /// does not hold what the disk does, so a capture that must be the disk (a final one) fails
+    /// on them; an automatic one leaves them to the next snap.
+    pub changed_kind: Vec<String>,
 }
 
 /// A path of the worktree tree whose metadata could not be read.
@@ -552,9 +567,10 @@ pub struct UnreadableMeta {
 }
 
 /// Read the overlay of the working tree `worktree_tree` (the tree just written from it) plus
-/// every directory in `scope`. A path that changed kind or vanished since the tree was written
-/// is left out: the next capture sees the change. A tracked path whose metadata cannot be read
-/// (git carried its content from the previous capture, `gitpack.rs`) is reported in
+/// every directory in `scope`. A path that vanished since the tree was written is left out: the
+/// next capture sees the change. One whose kind on disk is not the tree's is left out too, and
+/// named in [`Captured::changed_kind`]: never silently. A tracked path whose metadata cannot be
+/// read (git carried its content from the previous capture, `gitpack.rs`) is reported in
 /// `unreadable` and keeps its entry of `carry`, the previous document, when it had one — an
 /// automatic snap passes it, a final one passes `None` and fails on the report. Any other
 /// failure to read a path fails.
@@ -566,6 +582,7 @@ pub fn capture(
 ) -> Result<Captured, MetaError> {
     let mut entries: BTreeMap<String, MetaEntry> = BTreeMap::new();
     let mut unreadable = Vec::new();
+    let mut changed_kind = Vec::new();
     let carried: HashMap<&str, &MetaEntry> = carry
         .map(|doc| doc.entries.iter().map(|e| (e.path.as_str(), e)).collect())
         .unwrap_or_default();
@@ -592,6 +609,11 @@ pub fn capture(
             }
         };
         if kind_of(&meta) != Some(tp.kind) {
+            // A path the chunked class carries (a nested repository, a path git could not
+            // index) is on disk as that class holds it, whatever the tree kept for it.
+            if !under(&tp.path, &scope.nested) {
+                changed_kind.push(key_of(&tp.path).into_owned());
+            }
             continue;
         }
         let entry = entry_of(&tp.path, tp.kind, &meta);
@@ -659,6 +681,7 @@ pub fn capture(
         },
         outside,
         unreadable,
+        changed_kind,
     })
 }
 
@@ -715,6 +738,42 @@ pub fn apply(
     scope: &MetaScope,
     resolve: &dyn Fn(LinkClass, &[u8]) -> Option<PathBuf>,
 ) -> Result<Applied, MetaError> {
+    apply_with(repo, doc, scope, resolve, false)
+}
+
+/// [`apply`] over a capture that promised its links: the classes were captured together (a
+/// sealed final capture, every class restored), so every link it names across classes — a
+/// shared link, a cross-class group — must be made. A member the restore placed nowhere
+/// (`resolve` says `None`: its class is not restored here) is passed over; one missing, not a
+/// file, or holding other bytes than the rest fails with [`MetaError::LinkUnfulfilled`]
+/// instead of being left unlinked in silence (review 2026-09-28, fifth pass, #11). Neither file
+/// is written over either way.
+pub fn apply_strict(
+    repo: &GitRepo,
+    doc: &MetaDocument,
+    scope: &MetaScope,
+    resolve: &dyn Fn(LinkClass, &[u8]) -> Option<PathBuf>,
+) -> Result<Applied, MetaError> {
+    apply_with(repo, doc, scope, resolve, true)
+}
+
+fn apply_with(
+    repo: &GitRepo,
+    doc: &MetaDocument,
+    scope: &MetaScope,
+    resolve: &dyn Fn(LinkClass, &[u8]) -> Option<PathBuf>,
+    strict: bool,
+) -> Result<Applied, MetaError> {
+    let unfulfilled = |member: &str, reason: &str| -> Result<(), MetaError> {
+        if strict {
+            Err(MetaError::LinkUnfulfilled {
+                member: member.to_owned(),
+                reason: reason.to_owned(),
+            })
+        } else {
+            Ok(())
+        }
+    };
     let root = &scope.root;
     let mut applied = Applied::default();
     let entries: Vec<(Vec<u8>, &MetaEntry)> = doc
@@ -802,14 +861,24 @@ pub fn apply(
         let target = longpath::symlink_metadata(&canonical).map_err(io_err(&tracked))?;
         let meta = match longpath::symlink_metadata(&abs) {
             Ok(meta) if meta.is_file() => meta,
-            Ok(_) => continue,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Ok(_) => {
+                unfulfilled(&link.member, "not a file")?;
+                continue;
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                unfulfilled(&link.member, "missing")?;
+                continue;
+            }
             Err(e) => return Err(io_err(&member)(e)),
         };
         if (meta.dev(), meta.ino()) == (target.dev(), target.ino()) {
             continue;
         }
         if !same_bytes(&canonical, &abs).map_err(io_err(&member))? {
+            unfulfilled(
+                &link.member,
+                &format!("holds other bytes than {}", link.path),
+            )?;
             tracing::debug!(tracked = %link.path, member = %link.member, "shared hardlink: contents differ; left unlinked");
             continue;
         }
@@ -831,8 +900,10 @@ pub fn apply(
             };
             match longpath::symlink_metadata(&abs) {
                 Ok(meta) if meta.is_file() => named.push((m, abs, bytes)),
-                Ok(_) => {}
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Ok(_) => unfulfilled(&m.member, "not a file")?,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    unfulfilled(&m.member, "missing")?;
+                }
                 Err(e) => return Err(io_err(&bytes)(e)),
             }
         }
@@ -846,6 +917,10 @@ pub fn apply(
             let meta = longpath::symlink_metadata(abs).map_err(io_err(bytes))?;
             if (meta.dev(), meta.ino()) != (target.dev(), target.ino()) {
                 if !same_bytes(canonical, abs).map_err(io_err(bytes))? {
+                    unfulfilled(
+                        &m.member,
+                        &format!("holds other bytes than {}", head.member),
+                    )?;
                     tracing::debug!(canonical = %head.member, member = %m.member, "cross-class hardlink: contents differ; left unlinked");
                     continue;
                 }
