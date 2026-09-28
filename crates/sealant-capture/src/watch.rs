@@ -402,7 +402,11 @@ impl Policy {
     fn small_roots(&self) -> Vec<PathBuf> {
         let mut roots = vec![self.root.clone()];
         for g in &self.git_dirs {
-            if !g.starts_with(&self.root) && g.is_dir() {
+            // A git dir inside the worktree that is a symlink (`.git` moved aside and linked
+            // back) is not walked from the worktree: watched as a root of its own, through the
+            // link, as the capture reads it (review 2026-09-28, eighth pass, #1).
+            let linked = longpath::symlink_metadata(g).is_ok_and(|m| m.is_symlink());
+            if (!g.starts_with(&self.root) || linked) && g.is_dir() {
                 roots.push(g.clone());
             }
         }

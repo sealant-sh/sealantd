@@ -249,13 +249,14 @@ use crate::manifest::{
 
 /// Every manifest feature this build reads, validates and carries on (`plan.get`
 /// `manifest_features`): see the module docs.
-pub const MANIFEST_FEATURES: [&str; 6] = [
+pub const MANIFEST_FEATURES: [&str; 7] = [
     "worktree_meta",
     "symrefs",
     "other_bulk",
     "raw_names",
     "final_seal",
     "git_trees",
+    "object_format",
 ];
 use crate::transport::{ChannelTransport, TransportError};
 
@@ -424,6 +425,10 @@ pub fn missing_manifest_features(
         ("raw_names", raw_names),
         ("final_seal", planned.final_seal.is_some()),
         ("git_trees", planned.sections.git.has_tree_fields()),
+        (
+            "object_format",
+            planned.sections.git.object_format.is_some(),
+        ),
     ]
     .into_iter()
     .filter(|(feature, held)| *held && !reads.iter().any(|r| r == feature))
@@ -591,6 +596,63 @@ pub struct RegisterResponse {
     pub head_n: u64,
     /// Head capture id after the call.
     pub head_capture_id: String,
+    /// What the registrar did with the final seal the registered capture carries
+    /// ([`crate::manifest::FinalSeal`]; cross-repo decision 22): answered whenever the capture
+    /// (`n`, `capture_id`) carries one, on a lost-ack answer (the chain already at `n` with
+    /// this id) too. Absent when the capture carries none — and from a registrar that does not
+    /// say, which an executor takes as a seal that does not stand (fail closed, decision 9).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seal: Option<SealAnswer>,
+}
+
+/// What a registrar did with a registered capture's final seal (`capture.register`'s `seal`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SealAnswer {
+    /// `recorded`, `withheld` or `refused`.
+    pub state: SealState,
+    /// Why, for `withheld` and `refused`: a short code (`verifying`, `write-authority`,
+    /// `executor`, …), for logs and the flush's report.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// Where a registered final seal stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SealState {
+    /// Recorded, and standing now: the registrar attests this executor's completion on it
+    /// (its plans and stop attestations may name it). The only answer a final flush is
+    /// complete on.
+    Recorded,
+    /// The capture registered, but the seal does not stand yet (the registrar is still
+    /// verifying what it names, or write authority it issued over those objects is still
+    /// outstanding). The executor asks again by sending the same register (a lost-ack answer
+    /// that says where the seal stands now); until the answer is `recorded` the final flush is
+    /// incomplete (`sealing`).
+    Withheld,
+    /// The registrar will not record this seal (it names another executor or epoch, or what
+    /// it names does not restore). The final flush is incomplete (`sealing`).
+    Refused,
+}
+
+impl SealAnswer {
+    /// A `recorded` answer.
+    #[must_use]
+    pub fn recorded() -> Self {
+        Self {
+            state: SealState::Recorded,
+            reason: None,
+        }
+    }
+
+    /// A `withheld` or `refused` answer with its reason.
+    #[must_use]
+    pub fn not_standing(state: SealState, reason: &str) -> Self {
+        Self {
+            state,
+            reason: Some(reason.to_owned()),
+        }
+    }
 }
 
 /// `lease.heartbeat`.
@@ -790,6 +852,11 @@ struct InMemoryState {
     seals: Vec<(u64, FinalSeal)>,
     /// Every `plan.get` asked, oldest first.
     plan_requests: Vec<PlanGetRequest>,
+    /// Registers of a sealing capture still to answer `withheld` (the seal is recorded, and
+    /// answered `recorded`, at the first one after these).
+    seals_withheld: usize,
+    /// Answer no `seal` on `capture.register`, as a registrar from before decision 22.
+    seal_answers_off: bool,
     /// `plan.get`s still to refuse with 409 `worktree-leased` (another launch holds the lease).
     leased_plans: usize,
 }
@@ -851,6 +918,8 @@ impl InMemoryRegistrar {
                 remotes: Vec::new(),
                 seals: Vec::new(),
                 plan_requests: Vec::new(),
+                seals_withheld: 0,
+                seal_answers_off: false,
                 leased_plans: 0,
                 completed: BTreeSet::new(),
                 completes: 0,
@@ -877,6 +946,49 @@ impl InMemoryRegistrar {
     #[must_use]
     pub fn seals(&self) -> Vec<(u64, FinalSeal)> {
         self.lock().seals.clone()
+    }
+
+    /// Answer the next `count` registers of a sealing capture (a lost-ack register asking
+    /// again included) `withheld`, recording nothing: a registrar still verifying what the
+    /// seal names (decision 22). The one after them records the seal.
+    pub fn withhold_seals(&self, count: usize) {
+        self.lock().seals_withheld = count;
+    }
+
+    /// Answer no `seal` on `capture.register`, as a registrar from before decision 22 (seals
+    /// are recorded as before).
+    pub fn without_seal_answers(&self) {
+        self.lock().seal_answers_off = true;
+    }
+
+    /// Where the final seal `seal` of the capture at `n`, registered under `epoch`, stands —
+    /// recording it when it holds and is no longer withheld (Mend's register, decision 22).
+    fn answer_seal(
+        &self,
+        state: &mut InMemoryState,
+        n: u64,
+        epoch: u64,
+        seal: &FinalSeal,
+    ) -> Option<SealAnswer> {
+        let answer = if !seal.complete {
+            SealAnswer::not_standing(SealState::Refused, "incomplete")
+        } else if seal.epoch != epoch {
+            SealAnswer::not_standing(SealState::Refused, "epoch")
+        } else if self.executor.as_deref() != Some(seal.executor.as_str()) {
+            SealAnswer::not_standing(SealState::Refused, "executor")
+        } else if state.seals_withheld > 0 {
+            state.seals_withheld -= 1;
+            SealAnswer::not_standing(SealState::Withheld, "verifying")
+        } else {
+            if !state.seals.iter().any(|(sealed, _)| *sealed == n) {
+                state.seals.push((n, seal.clone()));
+            }
+            SealAnswer::recorded()
+        };
+        if answer.state != SealState::Recorded {
+            tracing::warn!(n, ?seal, ?answer, "a final seal that does not stand");
+        }
+        (!state.seal_answers_off).then_some(answer)
     }
 
     /// Refuse the next `count` `plan.get`s as Mend does while another launch holds the lease
@@ -1379,14 +1491,20 @@ impl Registrar for InMemoryRegistrar {
             .collect();
         self.price(&mut state, unsized_keys)?;
         let head = state.chain.last();
-        // Lost ack: the chain is already at n with this id.
+        // Lost ack: the chain is already at n with this id — and where its seal stands now.
         if let Some(h) = head
             && h.n == req.n
             && h.capture_id == req.capture_id
         {
+            let (head_n, head_capture_id) = (h.n, h.capture_id.clone());
+            let seal = h.manifest.final_seal.clone();
+            let registered_epoch = h.manifest.epoch;
+            let seal =
+                seal.and_then(|seal| self.answer_seal(&mut state, head_n, registered_epoch, &seal));
             return Ok(RegisterResponse {
-                head_n: h.n,
-                head_capture_id: h.capture_id.clone(),
+                head_n,
+                head_capture_id,
+                seal,
             });
         }
         let head_id = head.map(|h| h.capture_id.clone());
@@ -1397,21 +1515,13 @@ impl Registrar for InMemoryRegistrar {
                 head_capture_id: head_id.unwrap_or_default(),
             });
         }
-        // The seal is recorded with the CAS, only when it holds (Mend's register).
-        if let Some(seal) = &req.manifest.final_seal {
-            if seal.complete
-                && seal.epoch == req.epoch
-                && self.executor.as_deref() == Some(seal.executor.as_str())
-            {
-                state.seals.push((req.n, seal.clone()));
-            } else {
-                tracing::warn!(
-                    n = req.n,
-                    ?seal,
-                    "a final seal that does not hold: registered without it"
-                );
-            }
-        }
+        // The seal is recorded with the CAS, only when it holds (Mend's register), and the
+        // answer says where it stands (decision 22).
+        let seal = req
+            .manifest
+            .final_seal
+            .as_ref()
+            .and_then(|seal| self.answer_seal(&mut state, req.n, req.epoch, seal));
         state.chain.push(HeadInfo {
             n: req.n,
             capture_id: req.capture_id.clone(),
@@ -1421,6 +1531,7 @@ impl Registrar for InMemoryRegistrar {
         Ok(RegisterResponse {
             head_n: req.n,
             head_capture_id: req.capture_id.clone(),
+            seal,
         })
     }
 
@@ -2093,6 +2204,7 @@ mod tests {
                     worktree_tree: None,
                     index_tree: None,
                     raw_tree: None,
+                    object_format: None,
                 },
                 workspace: WorkspaceSection::objects("r", vec![]),
                 bulk: BulkState::pending(),
@@ -2373,7 +2485,8 @@ mod tests {
                 "other_bulk",
                 "raw_names",
                 "final_seal",
-                "git_trees"
+                "git_trees",
+                "object_format"
             ])
         );
         let bare = PlanGetRequest {

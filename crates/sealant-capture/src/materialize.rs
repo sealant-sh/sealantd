@@ -786,8 +786,18 @@ impl<'a> Materializer<'a> {
         state: &mut DiskState,
         report: &mut MaterializeReport,
     ) -> Result<(), MaterializeError> {
-        let repo = GitRepo::init(&self.targets.root)?;
         let git = &manifest.sections.git;
+        // The repository is made in the capture's object format before a pack goes in: a SHA-1
+        // repository cannot read a SHA-256 pack (review 2026-09-28, eighth pass, #10).
+        let format = git.object_format();
+        if !crate::manifest::OBJECT_FORMATS.contains(&format) {
+            return Err(io::Error::other(format!(
+                "the capture's repository has object format {format}, which this build does not \
+                 restore"
+            ))
+            .into());
+        }
+        let repo = GitRepo::init_with_format(&self.targets.root, format)?;
         for key in &git.packs {
             let Some(sha) = key_digest(key) else { continue };
             if gitpack::pack_installed(&repo, sha) {
