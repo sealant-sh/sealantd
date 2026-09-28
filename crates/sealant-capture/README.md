@@ -54,7 +54,11 @@ later fresh boot removes exactly those 15 (`removed=15` in the Docker end to end
 to 67). The executor that boots on a control-plane base capture (an empty workspace root)
 removes 17: `config` and `info/exclude` too, which sealantd writes again right after
 (`info/exclude` with `/.sealantd/`, `config` by `remotes::apply`); the template's `config` holds
-only git's built-in defaults for a non-bare repository. Git never runs a `*.sample` hook, and a
+only git's built-in defaults for a non-bare repository. `GitRepo::exclude_locally` appends its
+rule to `info/exclude` as bytes, never decoding the user's file (a legacy-encoded comment is
+valid to git), keeps its mode, and replaces it atomically; only a missing file reads as empty,
+and any other read error leaves the file alone (before, review 12 #1, a file that was not UTF-8
+read as empty and lost every user rule when the engine opened). Git never runs a `*.sample` hook, and a
 real hook is captured and restored like any `.git/` file. Nothing in the worktree or the
 harness home is removed on a fresh executor: the disk is empty before the head is laid down
 (`tests/fresh_boot_removals.rs` holds it: `removed` is exactly the template files no capture
@@ -1025,7 +1029,10 @@ never past the flush's deadline or the shutdown cutoff; still withheld, the flus
 asked again asks again, without a new snap or seal when the disk is as it was — a daemon that
 restarted over a sealed chain asks too (`CaptureEngine::sealing_register`). `refused`, and an
 answer with no `seal` (a registrar from before this: decision 9, fail closed), are `sealing`
-at once. `InMemoryRegistrar` answers as Mend does (`withhold_seals`, `without_seal_answers`
+at once. Only `recorded` outlives the final flush that heard it: a final flush over an unchanged
+disk that an earlier one heard refused or withheld sends the sealing register again, at once —
+one register per final flush for a registrar that keeps refusing — so a registrar that refused
+while it could not read the objects, and has recovered, is heard (review 12 #4). `InMemoryRegistrar` answers as Mend does (`withhold_seals`, `without_seal_answers`
 stand in for a registrar still verifying and one from before).
 
 ### `root_links` in a manifest
@@ -1259,7 +1266,13 @@ for byte as before.
   kind; remove the empty directories in scope that no entry names; link each group's members to
   its first path; link each `shared` member that holds exactly the tracked file's bytes to it
   (leave it otherwise); link each `cross_links` member on disk that holds exactly the bytes of
-  its group's first member on disk to it (leave it otherwise); set files' and symlinks' mode and mtime (a symlink's own, never
+  its group's first member on disk to it (leave it otherwise). A linked member takes every other
+  name of its class's own hardlink group along (`worktree_meta::apply_over`, `RestoredGroups`):
+  the bulk index holds one name per group, so `shared` and `cross_links` name only that one, and
+  pnpm's peer-context copies of a local package (two bulk names of a tracked file's inode) came
+  back split, one of them on an inode of its own (review 12 #2). Once every link is made, a
+  strict apply checks that the names the document and the restored groups join are one inode
+  per filesystem (`MetaError::LinkUnfulfilled` otherwise). Then set files' and symlinks' mode and mtime (a symlink's own, never
   followed), then directories' deepest first. A sealed final capture restored whole (every
   class, its bulk section ready) promised its links: the materialize applies it strictly
   (`worktree_meta::apply_strict`), and a `shared` or `cross_links` member that is missing, not a
