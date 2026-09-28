@@ -158,6 +158,12 @@ and empty directories and every tracked mtime were lost.
   does). Chunked-class symlinks get their own mtime back (`utimensat` without following them),
   on a delta too.
 - **A capture without it** (every capture before this) restores as it always did.
+- **The `.git` and harness roots** (review 2026-09-28, seventh pass, #2). The workspace class's
+  root object names `.git`, `tree` and `harness` with their modes and mtimes, but the materialize
+  restored only what is under them: both came back `0777` under the umask with the time of the
+  restore. `.git`'s and the harness home's are now set last of all, after the refs, the index,
+  every class, `info/exclude` and the overlay's relinks (`tree`, the worktree root, is the
+  overlay's). `tests/restore_metadata.rs` compares `.git`'s own mode and mtime with the rest.
 - **Tracked files are the git class's.** A tracked file under a bulk-named directory (`build/`,
   `dist/`) is in both the worktree tree and the bulk section. A bulk section older than the
   worktree tree used to sweep a tracked file it never saw and write its older bytes back over one
@@ -180,6 +186,23 @@ and empty directories and every tracked mtime were lost.
   nothing). A symbolic ref to a symbolic ref keeps its own target. (`git fsck` reports a dangling
   symbolic ref as `invalid sha1 pointer`, on the source as on the restore, so such a capture's
   `fsck` reads `failed`.) A symbolic ref changing during the pack retries it, as a ref moving does.
+- **A symbolic ref stored as a symlink stays one** (review 2026-09-28, seventh pass, #1). With
+  `core.preferSymlinkRefs=true` git stores a symbolic ref, `HEAD` included, as a symlink whose
+  link text is the target's name, and reads a symlink under the git directory whose text is a
+  well-formed `refs/…` name as a symbolic ref (any other symlink it follows, and reads the file
+  it reaches). The scan took regular files only, the workspace class leaves `refs/` and `HEAD`
+  to the git section, and `for-each-ref` resolves such a ref (git 2.52) or skips it (2.55): a
+  sealed restore brought `refs/heads/alias -> refs/heads/main` back as a direct ref and a
+  dangling one not at all. `gitpack::symlinked_symref` reads git's rule; `symrefs` now holds every
+  symlinked symbolic ref by its link text (dangling and chained ones, names that are not UTF-8),
+  and `HEAD` is its link text. **How the ref was stored is kept too**: git reads a `ref:` file and
+  a symlink alike, but they are not the same bytes, and `for-each-ref` of git 2.55 lists one and
+  not the other. The workspace class carries each symlinked symbolic ref and a symlinked `HEAD` as
+  the symlink it is — link text and mtime — beside its entry in the git section; the git class
+  writes it as text first (`write_head` renames over a symlinked `HEAD`, never writing through it
+  into the branch it names), and the workspace class puts the symlink back. A reader that knows
+  only the git section reads the same refs, stored as text. Loose versus packed is still not
+  kept: every direct ref is restored packed, as before.
 - **Ref names are bytes.** A ref name, a symbolic target and `HEAD`'s target are read as bytes
   and kept as `tree::key_of` keys (see "Dir entries: `raw_name`, `raw_target`, `unread`"), and a
   restore writes the bytes each key stands for (`packed-refs` sorted by those bytes). Decoded
@@ -837,6 +860,23 @@ refuses the boot right after `plan.get`, before the materialize, and exits 78, a
 standby's re-plan onto it (the repository README has the contract). Only a recovery boot, which
 admits no writer, runs over it.
 
+### `upload_answers` on `plan.get`
+
+The request lists the `upload.urls` answer shapes this build reads beyond a URL
+(`registrar::UPLOAD_ANSWERS`, `PlanGetRequest::booting`): today `present`, a key the bucket
+already holds, taken as uploaded (cross-repo decision 20; review 2026-09-28, seventh pass, #7).
+
+```json
+→ {…,"manifest_format":2,"manifest_features":[…],"upload_answers":["present"]}
+```
+
+A registrar answers `present` only to an executor whose `plan.get` listed it, and binds what was
+listed to the launch that sent it. To an executor that did not (the field absent: every daemon
+before this one, including the binary on a retained disk a recovery boots), it mints a URL as
+before, conditional (`If-None-Match: *`): the PUT meets the store's 412, which every executor
+takes as already uploaded. An executor from before `present` failed on it (`no url for <key>`) on
+every retry, and its staged capture could not finish.
+
 The answer's `executor` is the executor the session token was issued for: what a completed final
 flush's seal names (below). Absent from a registrar that does not say, and the daemon seals under
 `SEALANT_WORKSPACE_ID` instead (`CaptureConfig::executor`; a re-plan that names one takes it).
@@ -1099,7 +1139,14 @@ for byte as before.
   class, its bulk section ready) promised its links: the materialize applies it strictly
   (`worktree_meta::apply_strict`), and a `shared` or `cross_links` member that is missing, not a
   file, or holds other bytes fails it with `MetaError::LinkUnfulfilled`, neither file written
-  over. A member whose class this restore does not place is passed over. A reader that only lists or reads a class's files (Mend's
+  over. One inode has one mode and one mtime: names the document joins — a hardlink group, two
+  tracked files sharing one name of another class, a cross-class group reaching a tracked file —
+  promised different ones fail a strict apply with `MetaError::InodeConflict` before anything is
+  changed (review 2026-09-28, seventh pass, #10; `MetaDocument::inode_conflict`). The writer
+  never emits one: each name is stat'ed on its own, so an inode that moved between two stats
+  reads as two promises — a final snap fails (`snapshot-failed`, no seal), any other snap gives
+  every name the first name's (`MetaDocument::settle_inodes`) and the next snap takes the change.
+  A registrar can refuse the same document before it seals. A member whose class this restore does not place is passed over. A reader that only lists or reads a class's files (Mend's
   `listCaptureDir`, `statCaptureEntry`, `readCaptureFile`, `materialize` of the workspace or bulk
   class) is unaffected: the overlay describes the git class's working tree, not a chunked class.
 
@@ -1108,7 +1155,9 @@ for byte as before.
 `sections.git.symrefs`: symbolic refs other than `HEAD`, name → the ref it points at. Each is
 also in `refs`, by the sha it resolved to at capture, so a reader that knows only `refs` reads
 what it always did. Absent when empty, so a manifest without one encodes exactly as before. A
-symbolic ref whose target does not exist is here and not in `refs`.
+symbolic ref whose target does not exist is here and not in `refs`. A symbolic ref the repository
+stored as a symlink is here like any other (its link text is its target); the symlink itself
+rides the workspace class (`.git/refs/…`, `.git/HEAD`), so a restore stores it as it was.
 
 Every ref name in `refs` and `symrefs` (keys and targets) and a symbolic `head` is a
 `tree::key_of` key of the name's bytes: the name itself when it is UTF-8 without an escape-range
