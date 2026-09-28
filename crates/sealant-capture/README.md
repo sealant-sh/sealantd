@@ -71,6 +71,27 @@ the two trees compare identical (bytes, modes, mtimes, links — tracked files' 
 worktree metadata overlay), and the head over itself writes and changes nothing. This is what lets a standby executor pre-materialize the project base and apply the
 claimed worktree's head over it (`capture.replan`).
 
+**A reused file keeps no link the capture does not hold.** A skipped file keeps its inode, and
+with it every other name that inode has on this disk: a standby's setup (`pnpm install
+--package-import-method=hardlink` of a `file:` package) links a tracked file into
+`node_modules`, and a head whose source replaced the tracked file with its own copy since, or
+split two tracked aliases, has the same bytes, so nothing is written and the old link stayed
+(review 15 #2). An edit to the restored tracked file then reached the installed copy, and
+setting the tracked file's mtime moved the copy's. A whole restore (`MaterializeClass::All`)
+now builds the inodes the capture holds (`worktree_meta::DesiredInodes`): every restored
+regular file — each tracked path, each file of the workspace and bulk classes — in one group
+with the names the overlay's `hardlinks`, `shared` and `cross_links` and each class's own
+hardlink groups join it to, every other name a group of its own. Before any link is made or any
+mtime set, an inode holding names of more than one group is split: the group with the most
+names on it keeps the inode, every other group's names move to a copy (same bytes, mode and
+mtime; the directory keeps its mtime) and get their class's mode and mtime back. Only
+multiply-linked files are looked at and only mixed ones rewritten, so the delta stays a delta;
+a name outside the restore (pnpm's store) is no group's and stays where it is. A sealed final
+capture restored whole checks both directions once every link is made: each group is one inode
+per filesystem (`MetaError::LinkUnfulfilled`), and no inode holds names of two groups
+(`MetaError::ForeignLink`). `tests/review15_delta_links.rs` holds it with pnpm's layout by hand
+and, when `node` and `pnpm` are on `PATH`, a real install.
+
 **The next capture is incremental too.** A restored executor learns where the head's chunks are:
 at open (and at a re-plan) the engine maps the chunks of every workspace and bulk pack the
 registered head names that the materializer left in the pack cache (and, writing dir packs, the

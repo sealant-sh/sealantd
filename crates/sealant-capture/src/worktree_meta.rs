@@ -99,6 +99,18 @@ pub enum MetaError {
         /// What differs.
         reason: String,
     },
+    /// A strict restore found one inode holding names of two groups the capture keeps apart
+    /// ([`DesiredInodes`]): an edit through one would reach the other, which on the captured
+    /// disk it did not (review 2026-09-28, fifteenth pass, #2).
+    #[error(
+        "worktree metadata: {member} shares an inode with {other}, which the capture holds apart"
+    )]
+    ForeignLink {
+        /// One name, on disk.
+        member: String,
+        /// A name of another group on the same inode.
+        other: String,
+    },
 }
 
 fn io_err(path: &[u8]) -> impl FnOnce(io::Error) -> MetaError + '_ {
@@ -1224,7 +1236,9 @@ pub fn apply_over(
     }
     // Every link made: the names the links join are one inode (per filesystem: a class's own
     // group that spans two was copied across).
-    if let Some((member, reason)) = split_topology(root, doc, resolve, restored)? {
+    if let Some((member, reason)) =
+        DesiredInodes::of(root, Some(doc), resolve, restored)?.split_group()?
+    {
         if strict {
             return Err(MetaError::LinkUnfulfilled { member, reason });
         }
@@ -1272,106 +1286,265 @@ fn relink_group(
     Ok(moved)
 }
 
-/// The first set of names the document and the restore join into one inode — the tracked
-/// hardlink groups, the shared links, the cross-class groups and each class's own groups,
-/// taken together — that is on more than one inode of one filesystem: a member and why.
-/// Names that are missing or not files are the links' own business (they fail or are passed
-/// over there).
-fn split_topology(
-    root: &Path,
-    doc: &MetaDocument,
-    resolve: &dyn Fn(LinkClass, &[u8]) -> Option<PathBuf>,
-    restored: &RestoredGroups,
-) -> Result<Option<(String, String)>, MetaError> {
-    let mut ids: HashMap<PathBuf, usize> = HashMap::new();
-    let mut parent: Vec<usize> = Vec::new();
-    let mut id = |abs: PathBuf, parent: &mut Vec<usize>| -> usize {
-        *ids.entry(abs).or_insert_with(|| {
-            parent.push(parent.len());
-            parent.len() - 1
-        })
-    };
-    fn find(parent: &mut [usize], mut x: usize) -> usize {
-        while parent[x] != x {
-            parent[x] = parent[parent[x]];
-            x = parent[x];
+/// The inodes a restore leaves: every regular-file name it restored, each in one group of the
+/// names the capture says share an inode — joined through the tracked hardlink groups, the
+/// shared links, the cross-class groups and each class's own groups — and every other name a
+/// group of its own (review 2026-09-28, fifteenth pass, #2). A delta restore reuses a file whose
+/// bytes it already has, and with it every name its inode had: names of two groups can end on
+/// one inode that the capture held apart (pnpm's link of a tracked file its own copy replaced
+/// since, two tracked aliases split since). [`Self::separate`] gives each group an inode of its
+/// own before anything is linked; [`Self::split_group`] and [`Self::shared_inode`] check the
+/// two directions once every link is made. A name outside the restore (pnpm's store, beyond
+/// the worktree) is no group's and is left alone.
+#[derive(Debug, Default)]
+pub struct DesiredInodes {
+    ids: HashMap<PathBuf, usize>,
+    names: Vec<PathBuf>,
+    parent: Vec<usize>,
+    /// Whether a name was only added ([`Self::name`]) or joined to others too: only a joined
+    /// name belongs to a group [`Self::split_group`] checks.
+    joined: Vec<bool>,
+}
+
+/// One inode holding names of more than one group: each group's names on it, sorted.
+type Mixed = Vec<Vec<PathBuf>>;
+
+impl DesiredInodes {
+    /// The groups `doc` (when there is one) and `restored` join, their names resolved as
+    /// [`apply_over`] resolves them.
+    pub fn of(
+        root: &Path,
+        doc: Option<&MetaDocument>,
+        resolve: &dyn Fn(LinkClass, &[u8]) -> Option<PathBuf>,
+        restored: &RestoredGroups,
+    ) -> Result<Self, MetaError> {
+        let mut desired = Self::default();
+        if let Some(doc) = doc {
+            for group in &doc.hardlinks {
+                desired.join(group.iter().map(|k| abs_of(root, &bytes_of(k))));
+            }
+            for link in &doc.shared {
+                let member = bytes_of_pair(&link.member, link.raw_member.as_deref())?;
+                if let Some(abs) = resolve(link.class, &member) {
+                    desired.join([abs_of(root, &bytes_of(&link.path)), abs]);
+                }
+            }
+            for group in &doc.cross_links {
+                let mut names = Vec::new();
+                for m in group {
+                    if let Some(abs) = resolve(m.class, &m.bytes()?) {
+                        names.push(abs);
+                    }
+                }
+                desired.join(names);
+            }
         }
-        x
+        for group in restored.all() {
+            desired.join(group.iter().map(|n| n.abs.clone()));
+        }
+        Ok(desired)
     }
-    let mut join = |names: Vec<PathBuf>, parent: &mut Vec<usize>| {
+
+    /// A restored name: in the group it was joined to, else a group of its own.
+    pub fn name(&mut self, abs: PathBuf) -> usize {
+        if let Some(&at) = self.ids.get(&abs) {
+            return at;
+        }
+        let at = self.names.len();
+        self.ids.insert(abs.clone(), at);
+        self.names.push(abs);
+        self.parent.push(at);
+        self.joined.push(false);
+        at
+    }
+
+    fn join(&mut self, names: impl IntoIterator<Item = PathBuf>) {
         let mut first = None;
         for abs in names {
-            let at = id(abs, parent);
+            let at = self.name(abs);
+            self.joined[at] = true;
             match first {
                 None => first = Some(at),
                 Some(f) => {
-                    let (a, b) = (find(parent, f), find(parent, at));
-                    parent[b] = a;
+                    let (a, b) = (self.find(f), self.find(at));
+                    self.parent[b] = a;
                 }
             }
         }
-    };
-    for group in &doc.hardlinks {
-        join(
-            group.iter().map(|k| abs_of(root, &bytes_of(k))).collect(),
-            &mut parent,
-        );
     }
-    for link in &doc.shared {
-        let member = bytes_of_pair(&link.member, link.raw_member.as_deref())?;
-        if let Some(abs) = resolve(link.class, &member) {
-            join(vec![abs_of(root, &bytes_of(&link.path)), abs], &mut parent);
+
+    fn find(&mut self, mut x: usize) -> usize {
+        while self.parent[x] != x {
+            self.parent[x] = self.parent[self.parent[x]];
+            x = self.parent[x];
+        }
+        x
+    }
+
+    /// A name's metadata when it is a regular file; `None` when it is missing or something
+    /// else (the links' own business: they fail or are passed over there).
+    fn file_meta(abs: &Path) -> Result<Option<Metadata>, MetaError> {
+        match longpath::symlink_metadata(abs) {
+            Ok(meta) if meta.is_file() => Ok(Some(meta)),
+            Ok(_) => Ok(None),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(io_err(abs.as_os_str().as_bytes())(e)),
         }
     }
-    for group in &doc.cross_links {
-        let mut names = Vec::new();
-        for m in group {
-            if let Some(abs) = resolve(m.class, &m.bytes()?) {
-                names.push(abs);
+
+    /// The first group of joined names on more than one inode of one filesystem: a member and
+    /// why (per filesystem: a class's own group that spans two was copied across).
+    pub fn split_group(&mut self) -> Result<Option<(String, String)>, MetaError> {
+        let mut components: BTreeMap<usize, Vec<PathBuf>> = BTreeMap::new();
+        for at in 0..self.names.len() {
+            if !self.joined[at] {
+                continue;
+            }
+            let top = self.find(at);
+            components
+                .entry(top)
+                .or_default()
+                .push(self.names[at].clone());
+        }
+        for (_, mut names) in components {
+            names.sort();
+            // (dev) → the inode its first name is on, and that name.
+            let mut seen: HashMap<u64, (u64, &PathBuf)> = HashMap::new();
+            for abs in &names {
+                let Some(meta) = Self::file_meta(abs)? else {
+                    continue;
+                };
+                match seen.get(&meta.dev()) {
+                    None => {
+                        seen.insert(meta.dev(), (meta.ino(), abs));
+                    }
+                    Some((ino, first)) if *ino != meta.ino() => {
+                        return Ok(Some((
+                            abs.display().to_string(),
+                            format!(
+                                "one inode with {} on the capture, a different one after the \
+                                 restore ({} names joined)",
+                                first.display(),
+                                names.len()
+                            ),
+                        )));
+                    }
+                    Some(_) => {}
+                }
             }
         }
-        join(names, &mut parent);
+        Ok(None)
     }
-    for group in restored.all() {
-        join(group.iter().map(|n| n.abs.clone()).collect(), &mut parent);
-    }
-    let mut components: BTreeMap<usize, Vec<PathBuf>> = BTreeMap::new();
-    let names: Vec<(PathBuf, usize)> = ids.into_iter().collect();
-    for (abs, at) in names {
-        let top = find(&mut parent, at);
-        components.entry(top).or_default().push(abs);
-    }
-    for (_, mut names) in components {
-        names.sort();
-        // (dev) → the inode its first name is on, and that name.
-        let mut seen: HashMap<u64, (u64, &PathBuf)> = HashMap::new();
-        for abs in &names {
-            let meta = match longpath::symlink_metadata(abs) {
-                Ok(meta) if meta.is_file() => meta,
-                Ok(_) => continue,
-                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
-                Err(e) => return Err(io_err(abs.as_os_str().as_bytes())(e)),
+
+    /// Every inode holding names of more than one group, as each group's names on it; in the
+    /// order of their first names. Only a name with more than one link can share its inode.
+    fn mixed(&mut self) -> Result<Vec<Mixed>, MetaError> {
+        let mut inodes: HashMap<(u64, u64), BTreeMap<usize, Vec<PathBuf>>> = HashMap::new();
+        for at in 0..self.names.len() {
+            let Some(meta) = Self::file_meta(&self.names[at])? else {
+                continue;
             };
-            match seen.get(&meta.dev()) {
-                None => {
-                    seen.insert(meta.dev(), (meta.ino(), abs));
+            if meta.nlink() < 2 {
+                continue;
+            }
+            let group = self.find(at);
+            inodes
+                .entry((meta.dev(), meta.ino()))
+                .or_default()
+                .entry(group)
+                .or_default()
+                .push(self.names[at].clone());
+        }
+        let mut mixed: Vec<Mixed> = inodes
+            .into_values()
+            .filter(|groups| groups.len() > 1)
+            .map(|groups| {
+                let mut groups: Mixed = groups
+                    .into_values()
+                    .map(|mut names| {
+                        names.sort();
+                        names
+                    })
+                    .collect();
+                groups.sort();
+                groups
+            })
+            .collect();
+        mixed.sort();
+        Ok(mixed)
+    }
+
+    /// Give every group an inode of its own where one inode holds names of several: the group
+    /// with the most names on it (the first name breaking a tie) keeps the inode; every other
+    /// group's first name becomes a copy (the same bytes, mode and mtime, on a new inode) and
+    /// its other names on that inode link to the copy. A directory a name is written in keeps
+    /// its mtime. Every name on such an inode, kept or moved (each one's ctime moved).
+    pub fn separate(&mut self) -> Result<Vec<PathBuf>, MetaError> {
+        let mut touched = Vec::new();
+        for mut groups in self.mixed()? {
+            groups.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a[0].cmp(&b[0])));
+            let Some((kept, moved)) = groups.split_first() else {
+                continue;
+            };
+            touched.extend(kept.iter().cloned());
+            for names in moved {
+                let Some((first, others)) = names.split_first() else {
+                    continue;
+                };
+                let bytes = first.as_os_str().as_bytes();
+                copy_apart(first).map_err(io_err(bytes))?;
+                for other in others {
+                    relink(first, other).map_err(io_err(other.as_os_str().as_bytes()))?;
                 }
-                Some((ino, first)) if *ino != meta.ino() => {
-                    return Ok(Some((
-                        abs.display().to_string(),
-                        format!(
-                            "one inode with {} on the capture, a different one after the \
-                             restore ({} names joined)",
-                            first.display(),
-                            names.len()
-                        ),
-                    )));
-                }
-                Some(_) => {}
+                tracing::debug!(name = %first.display(), kept = %kept[0].display(), "materialize: a reused inode held names the capture holds apart; copied");
+                touched.extend(names.iter().cloned());
             }
         }
+        Ok(touched)
     }
-    Ok(None)
+
+    /// The first inode holding names of two groups, as [`MetaError::ForeignLink`].
+    pub fn shared_inode(&mut self) -> Result<Option<MetaError>, MetaError> {
+        Ok(self
+            .mixed()?
+            .into_iter()
+            .next()
+            .map(|groups| MetaError::ForeignLink {
+                member: groups[1][0].display().to_string(),
+                other: groups[0][0].display().to_string(),
+            }))
+    }
+}
+
+/// Put `abs` on an inode of its own: a copy of its bytes, mode and mtime written beside it and
+/// renamed over it. The directory it is in keeps its mtime.
+fn copy_apart(abs: &Path) -> io::Result<()> {
+    let meta = longpath::symlink_metadata(abs)?;
+    let dir = abs
+        .parent()
+        .ok_or_else(|| io::Error::other("a name with no directory"))?;
+    let dir_mtime = mtime_ns(&longpath::symlink_metadata(dir)?);
+    let name = abs.file_name().unwrap_or_default().as_bytes();
+    let tmp = if name.len() + ".capture-apart".len() < 255 {
+        let mut tmp = b".".to_vec();
+        tmp.extend_from_slice(name);
+        tmp.extend_from_slice(b".capture-apart");
+        dir.join(OsStr::from_bytes(&tmp))
+    } else {
+        dir.join(format!(
+            ".capture-apart-{}",
+            &crate::chunk::sha256_hex(name)[..32]
+        ))
+    };
+    let written = longpath::copy(abs, &tmp)
+        .and_then(|_| longpath::set_mode(&tmp, meta.mode() & 0o7777))
+        .and_then(|()| set_mtime_nofollow(&tmp, mtime_ns(&meta)))
+        .and_then(|()| longpath::rename(&tmp, abs));
+    if let Err(e) = written {
+        longpath::remove_file(&tmp).ok();
+        return Err(e);
+    }
+    set_mtime_nofollow(dir, dir_mtime)
 }
 
 /// Make `abs` a name of `canonical`'s inode (remove it, link it) and give its directory back
@@ -1713,5 +1886,72 @@ mod tests {
         };
         assert!(same.inode_conflict().is_none());
         assert!(same.settle_inodes().is_empty());
+    }
+
+    /// Names the capture holds apart that share an inode on disk: [`DesiredInodes::shared_inode`]
+    /// names them, [`DesiredInodes::separate`] gives each group its own inode with the same
+    /// bytes, mode and mtime (the directory's mtime kept), a group's own names stay one inode,
+    /// and a name outside every group (a store beyond the restore) is left where it was.
+    #[test]
+    fn names_the_capture_holds_apart_get_inodes_of_their_own() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("ws");
+        fs::create_dir_all(root.join("sub")).unwrap();
+        let (a, b, c, d) = (
+            root.join("a"),
+            root.join("sub/b"),
+            root.join("sub/c"),
+            root.join("sub/d"),
+        );
+        let outside = dir.path().join("store-file");
+        fs::write(&a, b"same bytes\n").unwrap();
+        for name in [&b, &c, &d, &outside] {
+            fs::hard_link(&a, name).unwrap();
+        }
+        fs::set_permissions(&a, fs::Permissions::from_mode(0o640)).unwrap();
+        set_mtime_nofollow(&a, 1_600_000_000_123_456_789).unwrap();
+        set_mtime_nofollow(&root.join("sub"), 1_500_000_000_000_000_001).unwrap();
+        let ino = |p: &Path| fs::metadata(p).unwrap().ino();
+        // {sub/b, sub/c} one group, `a` and `d` groups of their own.
+        let desired = |d_: &Path| {
+            let mut inodes = DesiredInodes::default();
+            inodes.join([b.clone(), c.clone()]);
+            inodes.name(a.clone());
+            inodes.name(d_.to_path_buf());
+            inodes
+        };
+        let mut inodes = desired(&d);
+        let shared = inodes.shared_inode().unwrap();
+        assert!(
+            matches!(shared, Some(MetaError::ForeignLink { .. })),
+            "{shared:?}"
+        );
+        let touched = inodes.separate().unwrap();
+        assert_eq!(touched.len(), 4, "{touched:?}");
+        assert!(inodes.shared_inode().unwrap().is_none());
+        assert!(inodes.split_group().unwrap().is_none());
+        assert_eq!(ino(&b), ino(&c), "a group stays one inode");
+        let all = [ino(&a), ino(&b), ino(&d)];
+        assert!(
+            all[0] != all[1] && all[1] != all[2] && all[0] != all[2],
+            "{all:?}"
+        );
+        // The group with the most names kept the inode, with the name outside every group.
+        assert_eq!(ino(&b), ino(&outside));
+        for name in [&a, &b, &c, &d] {
+            let meta = fs::symlink_metadata(name).unwrap();
+            assert_eq!(fs::read(name).unwrap(), b"same bytes\n");
+            assert_eq!(meta.mode() & 0o7777, 0o640);
+            assert_eq!(mtime_ns(&meta), 1_600_000_000_123_456_789);
+        }
+        assert_eq!(
+            mtime_ns(&fs::symlink_metadata(root.join("sub")).unwrap()),
+            1_500_000_000_000_000_001,
+            "the directory keeps its mtime"
+        );
+        // Nothing left to separate: a second pass touches nothing.
+        assert!(desired(&d).separate().unwrap().is_empty());
     }
 }

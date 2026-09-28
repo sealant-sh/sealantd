@@ -27,7 +27,10 @@
 //! outside the roots are never touched; nor is `.git/index`, which the git class rebuilds from
 //! the index pseudo-ref and owns whenever the workspace class carries none. A standby executor
 //! materializes the project base at boot and applies the head over it at claim
-//! (`capture.replan`).
+//! (`capture.replan`). A reused file keeps its inode, and every other name that inode has on the
+//! disk: before a whole restore links anything, each group of names the capture joins (a single
+//! name included) is put on an inode of its own ([`worktree_meta::DesiredInodes`]), and a sealed
+//! one checks that no inode holds names of two groups.
 //!
 //! # Worktree metadata and refs
 //!
@@ -454,7 +457,13 @@ struct ClassWrite<'i> {
     links: Vec<(String, PathBuf, u32)>,
     /// (directory on disk, mode, mtime).
     dirs: Vec<(PathBuf, u32, i128)>,
+    /// Every file the class restored, written or reused: (virtual path, path on disk, the mode
+    /// and mtime it has; `None` for a hardlink member, which has its canonical's).
+    files: Vec<ClassFile>,
 }
+
+/// A file a chunked class restored: see [`ClassWrite::files`].
+type ClassFile = (String, PathBuf, Option<(u32, i128)>);
 
 fn join_virtual(prefix: &str, name: &str) -> String {
     if prefix.is_empty() {
@@ -559,6 +568,9 @@ impl<'a> Materializer<'a> {
         // Each class's own hardlink groups, as restored: the worktree metadata's links across
         // classes move a whole group, never one name of it (review 12 #2).
         let mut restored = worktree_meta::RestoredGroups::default();
+        // Every file the chunked classes restored, by class: each is a name of the inodes the
+        // restore must leave (review 15 #2).
+        let mut restored_files: Vec<(LinkClass, ClassFile)> = Vec::new();
         // Read before anything is written: a document that does not verify or decode fails
         // the materialize with the disk untouched.
         let meta = match meta {
@@ -586,6 +598,7 @@ impl<'a> Materializer<'a> {
                 planned: BTreeSet::new(),
                 links: Vec::new(),
                 dirs: Vec::new(),
+                files: Vec::new(),
             };
             for entry in &root.entries {
                 let Some(target) = roots.workspace_path(&git_dir, &entry.name) else {
@@ -662,23 +675,39 @@ impl<'a> Materializer<'a> {
             }
             refresh_linked(write.index, &write.links, &resolve);
             Self::restore_dirs(&write.dirs)?;
+            restored_files.extend(
+                std::mem::take(&mut write.files)
+                    .into_iter()
+                    .map(|f| (LinkClass::Workspace, f)),
+            );
         }
-        if matches!(class, MaterializeClass::Bulk | MaterializeClass::All)
-            && let Some(bulk) = manifest.sections.bulk.section()
-        {
+        // Every path of the worktree tree: a tracked file under a bulk-named directory
+        // (`build/`, `dist/`) is the git class's, and every tracked file is a name of the
+        // inodes a whole restore must leave.
+        let bulk_section = manifest
+            .sections
+            .bulk
+            .section()
+            .filter(|_| matches!(class, MaterializeClass::Bulk | MaterializeClass::All));
+        let tracked = if class == MaterializeClass::All || bulk_section.is_some() {
+            self.tracked_paths(manifest)?
+        } else {
+            BTreeSet::new()
+        };
+        if let Some(bulk) = bulk_section {
             let store = self.open_packs(&bulk.packs, &mut report)?;
             let dirs = self.open_dirs("bulk", bulk.tree(), &mut report)?;
             let root = self.targets.root.clone();
-            // A tracked file under a bulk-named directory (`build/`, `dist/`) is the git class's:
-            // a bulk section older than the worktree tree must neither write its older bytes
-            // over it nor sweep one it never saw.
-            let tracked = self.tracked_paths(manifest)?;
+            // A tracked file under a bulk-named directory is the git class's: a bulk section
+            // older than the worktree tree must neither write its older bytes over it nor sweep
+            // one it never saw.
             let mut write = ClassWrite {
                 index: &mut state.bulk,
                 tracked: &tracked,
                 planned: BTreeSet::new(),
                 links: Vec::new(),
                 dirs: Vec::new(),
+                files: Vec::new(),
             };
             self.write_dir(
                 &store,
@@ -712,6 +741,11 @@ impl<'a> Materializer<'a> {
             )?;
             refresh_linked(write.index, &write.links, &resolve);
             Self::restore_dirs(&write.dirs)?;
+            restored_files.extend(
+                std::mem::take(&mut write.files)
+                    .into_iter()
+                    .map(|f| (LinkClass::Bulk, f)),
+            );
         }
         // After every class (the workspace class restores `.git/info/exclude` as captured):
         // the daemon directory stays out of the restored tree's index before anything runs in it.
@@ -723,35 +757,68 @@ impl<'a> Materializer<'a> {
             let git = &manifest.sections.git;
             repo.assert_formats(git.object_format(), git.ref_format())?;
             repo.exclude_locally(&format!("/{DAEMON_DIR}/"))?;
+            let git_dir = repo.git_dir.clone();
+            let resolve = |class: LinkClass, member: &[u8]| -> Option<PathBuf> {
+                let member = Path::new(OsStr::from_bytes(member));
+                match class {
+                    LinkClass::Bulk => Some(self.targets.root.join(member)),
+                    LinkClass::Workspace => {
+                        let mut parts = member.components();
+                        let head = parts.next()?.as_os_str().to_str()?.to_owned();
+                        let rest = parts.as_path();
+                        let base = match head.as_str() {
+                            ".git" => git_dir.clone(),
+                            "tree" => self.targets.root.clone(),
+                            "harness" => self.targets.harness_home.clone()?,
+                            _ => return None,
+                        };
+                        Some(base.join(rest))
+                    }
+                }
+            };
+            // A sealed final capture with every class restored (its bulk section ready)
+            // promised its links: one it names that the restored names cannot make, or one the
+            // restore left that it does not name, fails the materialize instead of passing in
+            // silence.
+            let strict = manifest.final_seal.is_some()
+                && class == MaterializeClass::All
+                && manifest.sections.bulk.section().is_some();
+            // Before any link is made or any mtime set: a reused file keeps its inode, and with
+            // it every name that inode had on this disk. Each group of names the capture joins
+            // (a single name included) gets an inode of its own (review 15 #2).
+            let mut desired = None;
+            let mut apart: Vec<(LinkClass, String, PathBuf)> = Vec::new();
+            if class == MaterializeClass::All {
+                let mut inodes = worktree_meta::DesiredInodes::of(
+                    &self.targets.root,
+                    meta.as_ref(),
+                    &resolve,
+                    &restored,
+                )?;
+                for key in &tracked {
+                    inodes.name(self.targets.root.join(crate::tree::os_of_key(key)));
+                }
+                for (_, (_, abs, _)) in &restored_files {
+                    inodes.name(abs.clone());
+                }
+                let touched: BTreeSet<PathBuf> = inodes.separate()?.into_iter().collect();
+                // A name that shared its inode with another class's may hold that class's
+                // mode: each class's names get their own back.
+                for (class, (key, abs, wanted)) in &restored_files {
+                    if !touched.contains(abs) {
+                        continue;
+                    }
+                    if let Some((mode, mtime)) = wanted {
+                        Self::restore_file_meta(abs, *mode, *mtime)?;
+                    }
+                    apart.push((*class, key.clone(), abs.clone()));
+                }
+                desired = Some(inodes);
+            }
             // Last of all: restoring the other classes moved the mtimes of the directories they
             // wrote into.
             if let Some(doc) = &meta {
                 let scope = self.meta_scope(&repo)?;
-                let git_dir = repo.git_dir.clone();
-                let resolve = |class: LinkClass, member: &[u8]| -> Option<PathBuf> {
-                    let member = Path::new(OsStr::from_bytes(member));
-                    match class {
-                        LinkClass::Bulk => Some(self.targets.root.join(member)),
-                        LinkClass::Workspace => {
-                            let mut parts = member.components();
-                            let head = parts.next()?.as_os_str().to_str()?.to_owned();
-                            let rest = parts.as_path();
-                            let base = match head.as_str() {
-                                ".git" => git_dir.clone(),
-                                "tree" => self.targets.root.clone(),
-                                "harness" => self.targets.harness_home.clone()?,
-                                _ => return None,
-                            };
-                            Some(base.join(rest))
-                        }
-                    }
-                };
-                // A sealed final capture with every class restored (its bulk section ready)
-                // promised its links: one it names that the restored names cannot make fails
-                // the materialize instead of passing in silence.
-                let strict = manifest.final_seal.is_some()
-                    && class == MaterializeClass::All
-                    && manifest.sections.bulk.section().is_some();
                 let applied =
                     worktree_meta::apply_over(&repo, doc, &scope, &resolve, &restored, strict)?;
                 report.worktree_meta = applied.changed;
@@ -765,6 +832,29 @@ impl<'a> Materializer<'a> {
                     if let Some(known) = index.files.get_mut(&member) {
                         known.stat = FileStat::of(&meta);
                     }
+                }
+            }
+            if strict
+                && let Some(inodes) = &mut desired
+                && let Some(shared) = inodes.shared_inode()?
+            {
+                return Err(shared.into());
+            }
+            // A name given an inode of its own, or left on one that lost names, holds the same
+            // bytes under a new inode or ctime: the class's index says so while the size and
+            // mtime it knows still hold.
+            for (class, key, abs) in apart {
+                let index = match class {
+                    LinkClass::Workspace => &mut state.workspace,
+                    LinkClass::Bulk => &mut state.bulk,
+                };
+                if let Some(known) = index.files.get_mut(&key)
+                    && let Ok(meta) = longpath::symlink_metadata(&abs)
+                    && meta.is_file()
+                    && meta.len() == known.stat.size
+                    && index::mtime_ns(&meta) == known.stat.mtime
+                {
+                    known.stat = FileStat::of(&meta);
                 }
             }
         }
@@ -1160,6 +1250,9 @@ impl<'a> Materializer<'a> {
                     }
                 }
                 EntryKind::File => {
+                    write
+                        .files
+                        .push((v.clone(), path.clone(), Some((entry.mode, entry.mtime))));
                     if Self::file_matches(&v, entry, &path, write.index) {
                         report.files_skipped += 1;
                         report.bytes_skipped += entry.size;
@@ -1211,6 +1304,7 @@ impl<'a> Materializer<'a> {
                 }
                 EntryKind::HardlinkGroup => {
                     if let Some(canonical) = &entry.target {
+                        write.files.push((v.clone(), path.clone(), None));
                         write.links.push((canonical.clone(), path, entry.mode));
                     }
                 }
@@ -1311,6 +1405,22 @@ impl<'a> Materializer<'a> {
             }
         }
         index.files.retain(|v, _| planned.contains(v));
+        Ok(())
+    }
+
+    /// Give `path` the mode and mtime its class restored it with, where they differ.
+    fn restore_file_meta(path: &Path, mode: u32, mtime: i128) -> Result<(), MaterializeError> {
+        let failed = |what: &str, e: io::Error| MaterializeError::Metadata {
+            path: path.display().to_string(),
+            reason: format!("{what}: {e}"),
+        };
+        let meta = longpath::symlink_metadata(path).map_err(|e| failed("stat", e))?;
+        if meta.mode() & 0o7777 != mode {
+            longpath::set_mode(path, mode).map_err(|e| failed("chmod", e))?;
+        }
+        if index::mtime_ns(&meta) != mtime {
+            worktree_meta::set_mtime_nofollow(path, mtime).map_err(|e| failed("mtime", e))?;
+        }
         Ok(())
     }
 
