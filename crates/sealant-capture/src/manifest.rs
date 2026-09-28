@@ -540,6 +540,29 @@ pub struct FinalSeal {
     /// The executor sealantd was planned as: `plan.get`'s `executor` (the launch the session
     /// token was issued for), and nothing else.
     pub executor: String,
+    /// Where the seal stands in the executor's own order ([`crate::position`], decision 17):
+    /// the daemon process that sealed. Absent from an older daemon (then the seal is ordered
+    /// against no answer by position).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boot_id: Option<String>,
+    /// The boots of the disk, the sealing one included (0: not persisted).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boot_generation: Option<u64>,
+    /// The sealing boot's observation number when the seal was staged: every answer the boot
+    /// gave after it has a higher one, every answer before it a lower one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observation: Option<u64>,
+}
+
+impl FinalSeal {
+    /// Whether `other` seals for the same executor: complete, the same epoch and launch,
+    /// wherever either stands in that executor's order.
+    #[must_use]
+    pub fn same_executor(&self, other: &Self) -> bool {
+        self.complete == other.complete
+            && self.epoch == other.epoch
+            && self.executor == other.executor
+    }
 }
 
 /// A manifest with its canonical bytes and capture id.

@@ -64,12 +64,9 @@ pub(crate) fn boot(
     )
 }
 
-/// The daemon's final flush over `boot`, the capture running as it does after the harness
-/// started (the watcher included).
-pub(crate) async fn final_flush(
-    ws: &Path,
-    boot: CaptureBoot,
-) -> sealant_protocol::CaptureStatusReport {
+/// A daemon runtime over `boot`, the capture running as it does after the harness started (the
+/// watcher included).
+pub(crate) fn start(ws: &Path, boot: CaptureBoot) -> Arc<Runtime> {
     let mut config = RuntimeConfig::new(new_runtime_id());
     config.workspace_root = ws.to_path_buf();
     let runtime = Runtime::new(config, Arc::new(ShutdownSignal::new(5_000)));
@@ -77,7 +74,19 @@ pub(crate) async fn final_flush(
     let capture = CaptureRuntime::new(boot);
     assert!(runtime.install_capture(capture.clone()));
     capture.start_without_harness(runtime.clone());
-    runtime.final_flush(None, Some(50)).await.unwrap()
+    runtime
+}
+
+/// The daemon's final flush over `boot` ([`start`]).
+#[allow(
+    dead_code,
+    reason = "not every test binary takes its final flush this way"
+)]
+pub(crate) async fn final_flush(
+    ws: &Path,
+    boot: CaptureBoot,
+) -> sealant_protocol::CaptureStatusReport {
+    start(ws, boot).final_flush(None, Some(50)).await.unwrap()
 }
 
 /// A fresh restore of the chain head.

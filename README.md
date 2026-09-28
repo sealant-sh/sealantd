@@ -72,7 +72,11 @@ the protocol details live in `crates/sealant-capture/src/registrar.rs` and `mani
   names `worktree_tree` (the working tree as `git add -A` stages it: what a review diffs),
   `index_tree` and `raw_tree` in their own fields. `raw_tree` holds every file's bytes as they are
   on disk, before any clean filter, end-of-line or `working-tree-encoding` conversion; a restore
-  checks it out and writes those bytes back unsmudged. `refs` is then the repository's refs,
+  checks it out and writes those bytes back unsmudged. Every regular file is hashed raw (`git
+  hash-object --no-filters`, cached by stat), not only the ones an attribute file among the index
+  entries seems to name: git also reads a `.gitattributes` the index does not hold, an ignored
+  one included, and a CRLF file under such a `*.txt text` was sealed and restored as LF.
+  `refs` is then the repository's refs,
   whatever their names. Without the feature the two trees ride `refs` as
   `refs/sealant/capture/worktree` and `…/index`, as before. `HEAD` is its immediate target (a
   symbolic ref chain is kept link by link), and every object `FETCH_HEAD`, `ORIG_HEAD`,
@@ -87,7 +91,17 @@ the protocol details live in `crates/sealant-capture/src/registrar.rs` and `mani
 - **A capture runs none of the user's code.** Every git a capture runs has each filter driver the
   configuration defines emptied (`filter.<driver>.clean`, `.smudge`, `.process` empty,
   `.required=false`), `core.hooksPath=/dev/null` (no `post-index-change` hook), no fsmonitor,
-  `core.symlinks=true` and `core.safecrlf=false`. A path a filter's attribute names is read as
+  `core.symlinks=true` and `core.safecrlf=false`. A driver's name is its bytes (a subsection name
+  need not be UTF-8: read lossily, `raw\xff` became another driver and the user's still ran), and
+  git is asked again under the overrides: a driver left with a command or `required` on, or a
+  configuration that cannot be read, fails the git before it runs (a final flush over it is
+  `snapshot-failed`). A final flush also takes a census before it seals: a descendant of the
+  daemon alive after the writers stopped (what a git of the capture's would have started: every
+  orphan of the daemon's comes back to it; its own gated `git` is spared) is killed and the
+  classes are snapped again; one found on the last of three rounds answers `incomplete_reason:
+  "processes-remain"` with no seal. A control plane's relay into the namespace (`docker exec …
+  socat`, asking for the status meanwhile) is not the daemon's descendant and is left alone. A
+  path a filter's attribute names is read as
   its bytes on disk (in `worktree_tree` too: a review of a changed LFS file diffs its content,
   not a pointer); git's own line-end, `ident` and encoding conversions still apply to
   `worktree_tree`, and `raw_tree` holds the bytes. A restore of a capture without `raw_tree` is
@@ -123,6 +137,24 @@ the protocol details live in `crates/sealant-capture/src/registrar.rs` and `mani
   heartbeat under the same identity succeeds.
 - **The final seal** (`final_seal.executor`) is `plan.get`'s `executor`, the launch the session
   token was issued for, and nothing else. A plan that names no executor gets no seal.
+- **Where an answer stands: order evidence by the executor, never by a clock (decision 17).**
+  Every `capture.status` answer and every final `capture.flush` answer carries, beside `epoch`
+  and `head_n`, `CaptureStatusReport` fields 27–30: `launch` (optional string: `plan.get`'s
+  `executor`), `boot_id` (optional string: 32 hex, random per daemon process),
+  `boot_generation` (optional uint64: the daemon processes that opened this disk's staging
+  directory, this one included, persisted in `<staging>/boot-generation` and fsynced before the
+  first answer; 0 when it could not be) and `observation` (optional uint64: strictly increasing
+  within one boot, over every answer and every seal). Every final seal carries the same in the
+  manifest: `final_seal.boot_id`, `.boot_generation`, `.observation` (optional, absent from an
+  older daemon), its chain position being the manifest's `n`. An answer's content is computed
+  under the number it takes, so a higher number never describes an older state; the answer to
+  the final flush that sealed has a higher number than its seal. Ordering: same `(epoch, launch,
+  boot_id)` — by `observation`; same `(epoch, launch)`, different boot ids, both generations
+  above 0 and different — by `(boot_generation, observation)` (a recovery boot of the same disk
+  counts up). Anything else — a field absent, a generation of 0, one generation under two boot
+  ids, another epoch or launch — is incomparable. Core and Mend supersede evidence only by this,
+  keep wall-clock times for display, and treat incomparable or contradictory evidence as unknown:
+  no deletion, no "saved".
 - **`complete` means current.** `capture.status` says `complete` only while the disk is as the
   last final flush captured it. After any later change the watcher reports it answers
   `incomplete_reason: "changed"` until a final flush is asked again. While a class polls (a
@@ -148,6 +180,11 @@ the protocol details live in `crates/sealant-capture/src/registrar.rs` and `mani
   time between `SIGTERM` and `SIGKILL`) less a margin of at least 5 s**, so the daemon reports
   "not saved" itself instead of being killed mid-upload. A final flush after the harness exits
   on its own is not bounded by it, unless a shutdown begins meanwhile.
+- **Keys the bucket already holds (decision 19).** `upload.urls` may answer a key in `present`
+  (the registrar verified the stored bytes against the key and minted no URL): the executor
+  takes it as uploaded, sends nothing, and goes on. Every PUT carries `If-None-Match: *`, and a
+  412 is the same answer. A key the executor asked for that comes back in none of `urls`,
+  `multipart` and `present` is an error (`no url for <key>`), never an upload taken as done.
 - **Uploads while the store or the registrar refuses.** A URL minted for a key is used again
   until that key's upload settles (stored, already there, or the URL refused) or it is five
   minutes old, and a multipart upload resumes under the same upload and part URLs. A pass that
@@ -158,6 +195,15 @@ the protocol details live in `crates/sealant-capture/src/registrar.rs` and `mani
   reason (the watch limit, the budget, a permission) has its class poll, the rest of the class
   staying watched, and is tried again (2 s, doubling to 60 s): once it is watched, or gone, the
   class is watched again.
+- **A write through another name of a file.** Watches follow directories, and a write through a
+  hardlink's other name is an event on that name only. An event on any name of a multi-link file
+  the snaps read dirties every class holding one of its names; a multi-link file with names in
+  both classes, or names neither holds (linked into `/tmp`, a package store), is stat'ed on its
+  class's maximum interval (10 s small, 120 s bulk), and one whose size, mtime or ctime moved
+  dirties every class holding a name. Whatever that misses, a watched class is read whole on its
+  reconcile interval (`Cadence::reconcile`, 60 s small, 600 s bulk) with no event at all; a snap
+  that finds nothing changed stages nothing. A hard crash can lose at most that much of such a
+  write, never an unbounded amount.
 - **Remotes.** Plan remotes seed a base only: a repository built from an empty chain or from a
   capture without `.git/config` (Mend's capture 0) gets each one it lacks. A capture that carries
   `.git/config` is authoritative — a remote the user removed stays removed on a fresh executor —

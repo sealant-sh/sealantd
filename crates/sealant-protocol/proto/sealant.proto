@@ -686,6 +686,28 @@ message CaptureStatusReport {
   // snap that fails stages nothing: what changed since the last capture is on this disk only).
   // `complete` is false while any class's last snap failed. Absent from an older daemon.
   repeated CaptureClassSnaps snaps = 26;
+  // Where this answer stands in the executor's own order (cross-repo decision 17). Control
+  // planes order and supersede capture evidence by it, never by their own wall clocks. The
+  // position is (epoch, launch, boot_id, boot_generation, observation), with `head_n` beside it.
+  // `launch` is the executor `plan.get` named (the launch the session token was issued for),
+  // absent when the plan named none: answers of different epochs or launches are different
+  // executors' and are never ordered against each other. `boot_id` is random per daemon
+  // process. `boot_generation` counts the daemon processes that opened this disk's staging
+  // directory, this one included (persisted and fsynced there before the first answer): a
+  // recovery boot of the same disk has a higher one; 0 when it could not be persisted.
+  // `observation` is strictly increasing within one boot over every answer and every final seal
+  // (the seal's manifest carries its own); an answer's content is computed under the number it
+  // takes, so a higher number never describes an older state.
+  //
+  // Same (epoch, launch, boot_id): order by `observation`. Same (epoch, launch), different boot
+  // ids, both generations above 0 and different: order by (boot_generation, observation).
+  // Anything else (a field absent from an older daemon, a generation of 0, two boot ids under
+  // one generation) is incomparable, and incomparable or contradictory evidence fails closed:
+  // no deletion, no "saved".
+  optional string launch = 27;
+  optional string boot_id = 28;
+  optional uint64 boot_generation = 29;
+  optional uint64 observation = 30;
 }
 message LeaseEpochReport { uint64 epoch = 1; string worktree_id = 2; bool fenced = 3; }
 message CaptureReplanned {

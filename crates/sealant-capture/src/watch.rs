@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 use notify::event::{CreateKind, ModifyKind, RenameMode};
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 
+use crate::aliases::Aliases;
 use crate::engine::Class;
 use crate::gitpack::GitRepo;
 use crate::index::{CREDENTIAL_FILES, DAEMON_DIR, Suspects, has_component_in, is_git_transient};
@@ -133,6 +134,9 @@ pub struct WatchSpec {
     pub policy: WatchPolicy,
     /// Where written paths are noted for the engine; `None` notes nothing.
     pub invalidations: Option<Arc<Invalidations>>,
+    /// The multi-link files the classes hold ([`crate::aliases`]): an event on one name dirties
+    /// every class holding another, and notes each for its class. `None`: names only their own.
+    pub aliases: Option<Arc<Aliases>>,
 }
 
 /// The result of starting the watcher: which class is watched and the handle keeping it alive.
@@ -287,6 +291,7 @@ struct Policy {
     bulk_dirs: Vec<String>,
     capture_bulk: bool,
     invalidations: Option<Arc<Invalidations>>,
+    aliases: Option<Arc<Aliases>>,
 }
 
 impl Policy {
@@ -315,6 +320,7 @@ impl Policy {
             bulk_dirs: spec.bulk_dirs.clone(),
             capture_bulk: spec.capture_bulk,
             invalidations: spec.invalidations.clone(),
+            aliases: spec.aliases.clone(),
         }
     }
 
@@ -987,6 +993,17 @@ fn handle_event(
         if written && let Some(inv) = &policy.invalidations {
             inv.note(class, path);
         }
+        // Another name of the same inode is written too, whichever class holds it (review
+        // 2026-09-28, sixth pass, #2: a write through a bulk name of a tracked file left the
+        // small class clean for good).
+        if let Some(aliases) = &policy.aliases {
+            for (other, name) in aliases.others(path) {
+                classes[usize::from(other == Class::Bulk)] = true;
+                if let Some(inv) = &policy.invalidations {
+                    inv.note(other, &name);
+                }
+            }
+        }
         // A directory created or renamed in needs watches like the initial set (files created
         // inside it before its watch existed are caught by the snap's stat walk).
         let is_new_dir = match &event.kind {
@@ -1087,6 +1104,7 @@ mod tests {
             capture_bulk: true,
             policy: WatchPolicy::default(),
             invalidations: None,
+            aliases: None,
         }
     }
 

@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
+use crate::aliases::{Aliases, LinkedName};
 use crate::chunk::{Chunk, ChunkId, chunk_bytes, sha256_hex};
 use crate::gitpack::{self, GitError, GitRepo};
 use crate::index::{
@@ -28,6 +29,7 @@ use crate::materialize::{
     Materializer,
 };
 use crate::pack::{MAX_PACK_BYTES, PackBuilder, PackError, PackReader};
+use crate::position::Observer;
 use crate::registrar::RegisterRequest;
 use crate::registrar::Registrar;
 use crate::roots::ClassRoots;
@@ -51,6 +53,14 @@ pub struct Cadence {
     /// Longest interval between bulk-class snaps while the bulk tree stays dirty (and the
     /// polling interval when bulk is not watched).
     pub bulk_max_interval: Duration,
+    /// Longest interval between small-class snaps while the class is watched and nothing
+    /// dirtied it: a snap that reads the class whole (a stat walk; nothing is staged when nothing
+    /// changed), for a change no event reported. Watches follow names, and a write can reach a
+    /// file through a name no watch sees (review 2026-09-28, sixth pass, #2): the loss window of
+    /// such a write is bounded by this, never by the next event.
+    pub reconcile: Duration,
+    /// [`Cadence::reconcile`] for the bulk class.
+    pub bulk_reconcile: Duration,
     /// Lease heartbeat interval.
     pub heartbeat: Duration,
     /// Lease TTL: pause the agent once this elapses without a successful heartbeat.
@@ -64,6 +74,8 @@ impl Default for Cadence {
             max_interval: Duration::from_secs(10),
             bulk_quiet: Duration::from_secs(30),
             bulk_max_interval: Duration::from_secs(120),
+            reconcile: Duration::from_secs(60),
+            bulk_reconcile: Duration::from_secs(600),
             heartbeat: Duration::from_secs(10),
             lease_ttl: Duration::from_secs(30),
         }
@@ -262,13 +274,24 @@ impl CaptureConfig {
 }
 
 /// Which class to snap.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Class {
     /// Git pack, `.git` bookkeeping, harness home.
     Small,
     /// Dependencies and build outputs.
     Bulk,
+}
+
+impl Class {
+    /// The other class.
+    #[must_use]
+    pub fn other(self) -> Self {
+        match self {
+            Self::Small => Self::Bulk,
+            Self::Bulk => Self::Small,
+        }
+    }
 }
 
 /// Engine errors.
@@ -699,6 +722,13 @@ pub struct CaptureEngine {
     invalidations: Arc<Invalidations>,
     /// What each class's last snap could not read.
     reads: Arc<ReadReports>,
+    /// Every multi-link file each class's last snap read ([`crate::aliases`]).
+    aliases: Arc<Aliases>,
+    /// Where each answer and seal of this boot stands ([`crate::position`]).
+    observer: Arc<Observer>,
+    /// The multi-link files the snap in progress read, recorded in [`Self::aliases`] once it
+    /// staged (or found nothing changed).
+    linked: Option<(Class, Vec<LinkedName>)>,
 }
 
 impl std::fmt::Debug for CaptureEngine {
@@ -748,6 +778,8 @@ impl CaptureEngine {
             &config.worktree_id,
             config.epoch,
         )?);
+        // One more boot of this disk (decision 17): counted before any answer is given.
+        let observer = Arc::new(Observer::open(&config.staging_dir()));
         // Staging sits inside the worktree: keep it out of the user's index (an agent's or a
         // checkpoint's `git add -A`) through the repository's local excludes, never the user's
         // `.gitignore`. A root that is not a repository yet gets the entry when materialized.
@@ -818,6 +850,9 @@ impl CaptureEngine {
             below: None,
             invalidations: Arc::new(Invalidations::default()),
             reads: Arc::new(ReadReports::default()),
+            aliases: Arc::new(Aliases::default()),
+            linked: None,
+            observer,
         };
         // Captures staged under another identity (a lease that moved to a new epoch while the
         // daemon was down) can never register; left queued, a snap would coalesce with one and
@@ -1166,6 +1201,21 @@ impl CaptureEngine {
     #[must_use]
     pub fn invalidations(&self) -> Arc<Invalidations> {
         Arc::clone(&self.invalidations)
+    }
+
+    /// Where this boot's answers and seals stand ([`crate::position`]): `capture.status` takes
+    /// its answers' positions here, so they and the seals share one order.
+    #[must_use]
+    pub fn observer(&self) -> Arc<Observer> {
+        Arc::clone(&self.observer)
+    }
+
+    /// The multi-link files each class's last snap read, shared with the watcher (an event on
+    /// one name dirties every class holding another) and the cadence's poll
+    /// ([`crate::aliases`]).
+    #[must_use]
+    pub fn aliases(&self) -> Arc<Aliases> {
+        Arc::clone(&self.aliases)
     }
 
     /// What each class's last snap could not read (`capture.status` reports it).
@@ -2045,6 +2095,22 @@ impl CaptureEngine {
         req: SnapRequest,
         preempt: &dyn Fn() -> bool,
     ) -> Result<SnapOutcome, EngineError> {
+        self.linked = None;
+        let outcome = self.snap_staging(req, preempt);
+        // The multi-link files a snap read stand for its class once it staged, or found the
+        // class as its last capture holds it.
+        if let (Ok(SnapOutcome::Staged(_)), Some((class, names))) = (&outcome, self.linked.take()) {
+            self.aliases.record(class, names);
+        }
+        outcome
+    }
+
+    /// [`Self::snap_preemptible`], but for the multi-link files it read.
+    fn snap_staging(
+        &mut self,
+        req: SnapRequest,
+        preempt: &dyn Fn() -> bool,
+    ) -> Result<SnapOutcome, EngineError> {
         // A restage this process did not finish (an I/O error after its journal was committed)
         // is finished before this snap takes a chain position.
         {
@@ -2250,6 +2316,14 @@ impl CaptureEngine {
                             })
                             .collect();
                         git_unreadable = merge_unreadable(git_unreadable, meta_unreadable);
+                        let mut linked = captured.linked.clone();
+                        linked.extend(
+                            listing
+                                .entries
+                                .values()
+                                .filter_map(|src| LinkedName::of(&src.abs, &src.meta)),
+                        );
+                        self.linked = Some((Class::Small, linked));
                         let (cross_links, ws_outside, cross_deferred) =
                             self.cross_links(&captured.outside, &listing);
                         self.shared_outside = !captured.outside.is_empty() || ws_outside;
@@ -2388,6 +2462,14 @@ impl CaptureEngine {
             }
             Class::Bulk => {
                 let listing = self.bulk_listing();
+                self.linked = Some((
+                    Class::Bulk,
+                    listing
+                        .entries
+                        .values()
+                        .filter_map(|src| LinkedName::of(&src.abs, &src.meta))
+                        .collect(),
+                ));
                 let Some(built) = self.build_class(
                     &listing,
                     Class::Bulk,
@@ -2752,6 +2834,9 @@ impl CaptureEngine {
             complete: true,
             epoch: self.config.epoch,
             executor: executor.clone(),
+            boot_id: None,
+            boot_generation: None,
+            observation: None,
         })
     }
 
@@ -2762,10 +2847,12 @@ impl CaptureEngine {
     pub fn completion_sealed(&self) -> bool {
         match self.final_seal() {
             None => true,
-            Some(seal) => self
-                .previous
-                .as_ref()
-                .is_some_and(|p| p.manifest.final_seal.as_ref() == Some(&seal)),
+            Some(seal) => self.previous.as_ref().is_some_and(|p| {
+                p.manifest
+                    .final_seal
+                    .as_ref()
+                    .is_some_and(|s| s.same_executor(&seal))
+            }),
         }
     }
 
@@ -2785,11 +2872,21 @@ impl CaptureEngine {
         if self.previous.is_none() || self.completion_sealed() {
             return Ok(None);
         }
+        // Where the seal stands in this executor's order (decision 17): after every answer
+        // given before it, before every answer given after.
+        let seal = self.observer.observe(|at| FinalSeal {
+            boot_id: Some(at.boot_id),
+            boot_generation: Some(at.boot_generation),
+            observation: Some(at.observation),
+            ..seal
+        });
         let staged = self.stage_over_previous(seq, Some(seal.clone()))?;
         tracing::info!(
             n = staged.n,
             epoch = seal.epoch,
             executor = %seal.executor,
+            boot_generation = ?seal.boot_generation,
+            observation = ?seal.observation,
             "final seal staged: the final flush completed"
         );
         Ok(Some(staged))

@@ -333,6 +333,16 @@ impl BlobSink for LocalDir {
     }
 }
 
+/// Where a key's bytes go ([`UrlMinter::put_target`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PutTarget {
+    /// PUT them to this presigned URL (write-once: `If-None-Match: *`).
+    Url(String),
+    /// Nowhere: the store holds the key already, with the bytes its name says (the registrar
+    /// verified them and minted no URL). The upload is done.
+    Present,
+}
+
 /// Mints presigned URLs for one key at a time (the Registrar's `upload.urls` / `plan.get` behind
 /// a cache) and completes multipart uploads through the registrar. The crate never sees
 /// credentials, only URLs.
@@ -341,6 +351,12 @@ pub trait UrlMinter: Send + Sync {
     /// may bind the signature to that exact content length, so it is the length the PUT then
     /// sends, and never a guess or a zero stand-in.
     fn put_url(&self, key: &str, size: u64) -> Result<String, SinkError>;
+    /// Where `key`'s bytes go: a PUT URL ([`UrlMinter::put_url`]), or nowhere when the registrar
+    /// answered the key `present` (the bucket holds it; no URL is minted for a stored object). A
+    /// key the registrar answered in neither way is an error. The default asks `put_url`.
+    fn put_target(&self, key: &str, size: u64) -> Result<PutTarget, SinkError> {
+        self.put_url(key, size).map(PutTarget::Url)
+    }
     /// Mint PUT URLs for `keys` (each `(key, bytes)`) ahead of their [`UrlMinter::put_url`]
     /// calls, in one channel call carrying every size. The default mints nothing (every
     /// `put_url` then mints its own).
@@ -385,6 +401,10 @@ pub trait UrlMinter: Send + Sync {
 impl<M: UrlMinter + ?Sized> UrlMinter for Arc<M> {
     fn put_url(&self, key: &str, size: u64) -> Result<String, SinkError> {
         (**self).put_url(key, size)
+    }
+
+    fn put_target(&self, key: &str, size: u64) -> Result<PutTarget, SinkError> {
+        (**self).put_target(key, size)
     }
 
     fn prefetch_put(&self, keys: &[(String, u64)]) -> Result<(), SinkError> {
@@ -437,6 +457,13 @@ impl UrlMinter for CheckedMinter {
     fn put_url(&self, key: &str, size: u64) -> Result<String, SinkError> {
         let url = self.inner.put_url(key, size)?;
         self.checked(key, url)
+    }
+
+    fn put_target(&self, key: &str, size: u64) -> Result<PutTarget, SinkError> {
+        match self.inner.put_target(key, size)? {
+            PutTarget::Url(url) => self.checked(key, url).map(PutTarget::Url),
+            PutTarget::Present => Ok(PutTarget::Present),
+        }
     }
 
     fn prefetch_put(&self, keys: &[(String, u64)]) -> Result<(), SinkError> {
@@ -693,13 +720,21 @@ impl BlobSink for PresignedHttp {
     fn put_if_absent(&self, key: &str, source: BlobSource<'_>) -> Result<PutOutcome, SinkError> {
         // The length before the URL: it is what the mint declares and what the PUT sends.
         let len = source.len()?;
-        let url = self.minter.put_url(key, len)?;
+        let url = match self.minter.put_target(key, len)? {
+            PutTarget::Url(url) => url,
+            // The bucket holds the key, verified by the registrar: nothing to send.
+            PutTarget::Present => {
+                self.minter.settled(key);
+                return Ok(PutOutcome::AlreadyPresent);
+            }
+        };
         let req = self
             .agent
             .put(&url)
             .header("Content-Type", "application/octet-stream")
             .header("Content-Length", len.to_string())
-            // Stores that honour conditional writes (S3, R2) refuse an overwrite with 412.
+            // Write-once: a store that honours it (S3, R2, MinIO) refuses an overwrite with 412,
+            // which is the object already there — keys are content-addressed.
             .header("If-None-Match", "*");
         let resp = match source {
             BlobSource::Bytes(b) => req.send(b),

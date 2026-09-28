@@ -9,6 +9,7 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 #![forbid(unsafe_code)]
 
+pub mod aliases;
 pub mod cadence;
 pub mod chunk;
 mod cpu;
@@ -21,6 +22,7 @@ pub mod longpath;
 pub mod manifest;
 pub mod materialize;
 pub mod pack;
+pub mod position;
 pub mod registrar;
 pub mod roots;
 pub mod ship;
@@ -30,7 +32,7 @@ pub mod tree;
 pub mod watch;
 pub mod worktree_meta;
 
-pub use cadence::{CadenceRunner, CadenceSnapshot, FinalFlush, Incomplete, SnapHealth};
+pub use cadence::{CadenceRunner, CadenceSnapshot, Census, FinalFlush, Incomplete, SnapHealth};
 pub use engine::{
     Cadence, CaptureConfig, CaptureEngine, Class, EngineError, ReadReport, ReadReports,
     SnapOutcome, SnapRequest, SnapStats, StagedCapture, UNREADABLE_PATHS_CAP,
@@ -41,6 +43,6 @@ pub use materialize::{
 };
 pub use registrar::{HttpRegistrar, InMemoryRegistrar, Registrar, RegistrarError};
 pub use ship::{HeldCapture, MultipartConfig, ShipSnapshot, ShipWorker, Shipper, Staging};
-pub use sink::{BlobSink, LocalDir, PresignedHttp, UrlMinter};
+pub use sink::{BlobSink, LocalDir, PresignedHttp, PutTarget, UrlMinter};
 pub use transport::{ChannelTransport, TransportError};
 pub use watch::{ChangeSignal, Mode as WatchMode, WatchPolicy};

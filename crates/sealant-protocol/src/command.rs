@@ -1039,6 +1039,26 @@ pub struct CaptureStatusReport {
     /// `complete` is false while any class's last snap failed. Empty from an older daemon.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub snaps: Vec<CaptureClassSnaps>,
+    /// The executor `plan.get` named (the launch), when it named one: with `epoch`, whose
+    /// evidence this is (cross-repo decision 17). `None` from an older daemon, or when the plan
+    /// named none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch: Option<String>,
+    /// Random per daemon process. `None` from an older daemon: the answer is ordered against no
+    /// other by position.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boot_id: Option<String>,
+    /// The daemon processes that opened this disk's staging directory, this one included; `0`
+    /// when it could not be persisted (then this boot is ordered against no other).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boot_generation: Option<u64>,
+    /// Strictly increasing within one boot over every answer and every final seal; the content
+    /// is computed under it, so a higher one never describes an older state. Same
+    /// `(epoch, launch, boot_id)`: order by this; same `(epoch, launch)` and different boots
+    /// with generations above 0: by `(boot_generation, observation)`; anything else is
+    /// incomparable, and fails closed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observation: Option<u64>,
 }
 
 /// One class's snaps (`capture.status`): a snap that fails for any reason, scheduled or forced,

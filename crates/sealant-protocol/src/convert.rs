@@ -1433,6 +1433,10 @@ impl From<CommandResult> for wire::command_result::Result {
                             snap_failing_since_unix_ms: s.snap_failing_since_unix_ms,
                         })
                         .collect(),
+                    launch: c.launch,
+                    boot_id: c.boot_id,
+                    boot_generation: c.boot_generation,
+                    observation: c.observation,
                 }))
             }
             CommandResult::LeaseEpoch(l) => W::LeaseEpoch(wire::LeaseEpochReport {
@@ -1565,6 +1569,10 @@ impl TryFrom<wire::command_result::Result> for CommandResult {
                         })
                     })
                     .collect::<Result<_, _>>()?,
+                launch: c.launch,
+                boot_id: c.boot_id,
+                boot_generation: c.boot_generation,
+                observation: c.observation,
             })),
             W::LeaseEpoch(l) => CommandResult::LeaseEpoch(LeaseEpochReport {
                 epoch: l.epoch,
@@ -2171,6 +2179,10 @@ mod tests {
                         snap_failing_since_unix_ms: None,
                     },
                 ],
+                launch: Some("launch-1".to_owned()),
+                boot_id: Some("0123456789abcdef0123456789abcdef".to_owned()),
+                boot_generation: Some(2),
+                observation: Some(41),
             })),
             CommandResult::CaptureStatus(Box::new(CaptureStatusReport {
                 epoch: 2,
@@ -2199,6 +2211,10 @@ mod tests {
                 repairing: false,
                 bulk_building: false,
                 snaps: vec![],
+                launch: None,
+                boot_id: None,
+                boot_generation: None,
+                observation: None,
             })),
             CommandResult::LeaseEpoch(LeaseEpochReport {
                 epoch: 2,

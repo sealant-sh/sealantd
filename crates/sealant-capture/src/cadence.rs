@@ -19,10 +19,11 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
+use crate::aliases::Aliases;
 use crate::engine::{CaptureEngine, Class, EngineError, SnapOutcome, SnapRequest, StagedCapture};
 use crate::manifest::CaptureKind;
 use crate::ship::{ShipError, ShipWorker, Shipper, Staging};
-use crate::watch::{self, ChangeSignal, Mode, WatchHandle, WatchSpec};
+use crate::watch::{self, ChangeSignal, Invalidations, Mode, WatchHandle, WatchSpec};
 
 /// How often the ship worker polls when nothing woke it.
 pub const SHIP_TICK: Duration = Duration::from_secs(5);
@@ -77,11 +78,16 @@ pub enum Incomplete {
     /// what the captures hold is not the disk, and nothing is sealed.
     #[error("the disk changed during the final flush: {0}")]
     Changed(String),
+    /// A process was alive after the writers stopped, when the final flush was about to seal
+    /// ([`CadenceRunner::set_census`]): the caller stopped it, but a round of snaps after that
+    /// still met one. Whatever it wrote may be past the snaps, and nothing is sealed.
+    #[error("a process was alive after the writers stopped: {0}")]
+    ProcessesRemain(String),
 }
 
 impl Incomplete {
     /// The reason code: `snapshot-failed`, `fenced`, `conflict`, `deadline`, `ship-failed`,
-    /// `unreadable`, `sealing`, `store-fidelity` or `changed`.
+    /// `unreadable`, `sealing`, `store-fidelity`, `changed` or `processes-remain`.
     #[must_use]
     pub fn reason(&self) -> &'static str {
         match self {
@@ -94,6 +100,7 @@ impl Incomplete {
             Self::Sealing(_) => "sealing",
             Self::StoreFidelity(_) => "store-fidelity",
             Self::Changed(_) => "changed",
+            Self::ProcessesRemain(_) => "processes-remain",
         }
     }
 
@@ -192,6 +199,9 @@ pub enum Trigger {
     MaxInterval,
     /// The class polls; its interval elapsed.
     Poll,
+    /// The class is watched and nothing dirtied it for its reconcile interval
+    /// ([`crate::engine::Cadence::reconcile`]).
+    Reconcile,
 }
 
 /// One class's clock.
@@ -202,16 +212,18 @@ struct Clock {
     last_snap: Instant,
     quiet: Duration,
     max: Duration,
+    reconcile: Duration,
 }
 
 impl Clock {
-    fn new(quiet: Duration, max: Duration) -> Self {
+    fn new(quiet: Duration, max: Duration, reconcile: Duration) -> Self {
         Self {
             first_change: None,
             last_change: None,
             last_snap: Instant::now(),
             quiet,
             max,
+            reconcile,
         }
     }
 
@@ -238,14 +250,23 @@ impl Clock {
                 })
             }
             Mode::Watched => {
-                let first = self.first_change?;
+                // Nothing reported: the class is read whole on its reconcile interval anyway.
+                let reconcile = (self.last_snap + self.reconcile, Trigger::Reconcile);
+                let Some(first) = self.first_change else {
+                    return Some(reconcile);
+                };
                 let last = self.last_change.unwrap_or(first);
                 let quiet_at = last + self.quiet;
                 let max_at = first + self.max;
-                Some(if quiet_at <= max_at {
+                let seen = if quiet_at <= max_at {
                     (quiet_at, Trigger::Quiet)
                 } else {
                     (max_at, Trigger::MaxInterval)
+                };
+                Some(if reconcile.0 < seen.0 {
+                    reconcile
+                } else {
+                    seen
                 })
             }
         }
@@ -276,6 +297,8 @@ struct Counters {
     quiet_fired: AtomicU64,
     max_fired: AtomicU64,
     poll_fired: AtomicU64,
+    reconcile_fired: AtomicU64,
+    aliases_moved: AtomicU64,
     forced: AtomicU64,
     preemptions: AtomicU64,
     overflows: AtomicU64,
@@ -305,6 +328,11 @@ pub struct CadenceSnapshot {
     pub max_fired: u64,
     /// Scheduled snaps fired by polling.
     pub poll_fired: u64,
+    /// Scheduled snaps fired by the reconcile interval of a watched class.
+    pub reconcile_fired: u64,
+    /// Writes through a name no watch saw, found by stat'ing multi-link files
+    /// ([`crate::aliases::Aliases::poll`]): each dirtied every class holding a name.
+    pub aliases_moved: u64,
     /// Forced snaps (turn, checkpoint, flush).
     pub forced: u64,
     /// Times a bulk build yielded to a small-class snap.
@@ -338,6 +366,15 @@ struct Shared {
     watch: Mutex<Option<WatchHandle>>,
     /// `false` while snaps must not be taken (the daemon is hard-stopping).
     allow: Mutex<Option<Arc<dyn Fn() -> bool + Send + Sync>>>,
+    /// The caller's census of the processes alive once the writers stopped
+    /// ([`CadenceRunner::set_census`]).
+    census: Mutex<Option<Census>>,
+    /// The engine's multi-link files ([`crate::aliases`]), polled by the alias thread.
+    aliases: Arc<Aliases>,
+    /// The engine's invalidations: a name the alias thread found moved is read again.
+    invalidations: Arc<Invalidations>,
+    /// Each class's maximum interval: small, bulk (how often its polled aliases are stat'ed).
+    alias_every: [Duration; 2],
     capture_bulk: bool,
     started: AtomicBool,
     seq: AtomicU64,
@@ -353,6 +390,10 @@ struct Shared {
     /// after a final flush whose snaps failed.
     sealed: Mutex<Option<Seal>>,
 }
+
+/// A census of the processes that could still write ([`CadenceRunner::set_census`]): `Ok` when
+/// there is none, else what was found (and stopped, when it could be).
+pub type Census = Arc<dyn Fn() -> Result<(), String> + Send + Sync>;
 
 /// What a final flush that snapped every class left: the change count before its first snap,
 /// the staged count once it had sealed the chain with a final capture, and whether the chain's
@@ -657,6 +698,7 @@ impl Shared {
                         Trigger::Quiet => &self.counters.quiet_fired,
                         Trigger::MaxInterval => &self.counters.max_fired,
                         Trigger::Poll => &self.counters.poll_fired,
+                        Trigger::Reconcile => &self.counters.reconcile_fired,
                     }
                     .fetch_add(1, Ordering::Relaxed);
                     match self.small_snap(CaptureKind::Auto) {
@@ -687,6 +729,56 @@ impl Shared {
         }
     }
 
+    /// The alias loop ([`crate::aliases`]): on each class's maximum interval, stat the
+    /// multi-link files no watch covers whole (names in both classes, or names outside them);
+    /// one whose stat moved is a write through a name no watch saw, and every class holding a
+    /// name is dirtied, each name noted for its class's next build. Runs whatever the caller
+    /// allows (it snaps nothing): a change after a final flush makes its status not current.
+    fn run_aliases(&self) {
+        let now = Instant::now();
+        let mut next = [now + self.alias_every[0], now + self.alias_every[1]];
+        loop {
+            let now = Instant::now();
+            let due = [next[0] <= now, next[1] <= now];
+            if due.iter().any(|d| *d) {
+                let moved = self.aliases.poll(due);
+                if !moved.is_empty() {
+                    let mut classes = [false, false];
+                    for (class, path) in &moved {
+                        classes[usize::from(*class == Class::Bulk)] = true;
+                        self.invalidations.note(*class, path);
+                    }
+                    self.counters.aliases_moved.fetch_add(1, Ordering::Relaxed);
+                    tracing::info!(
+                        names = moved.len(),
+                        "capture: a hardlinked file changed through a name no watch sees; its \
+                         classes are dirty"
+                    );
+                    for (i, class) in [Class::Small, Class::Bulk].into_iter().enumerate() {
+                        if classes[i] {
+                            self.signal(ChangeSignal::Changed(class));
+                        }
+                    }
+                }
+                for (i, d) in due.iter().enumerate() {
+                    if *d {
+                        next[i] = now + self.alias_every[i];
+                    }
+                }
+            }
+            let at = next[0].min(next[1]);
+            let st = self.state();
+            if st.stop {
+                return;
+            }
+            drop(
+                self.cv
+                    .wait_timeout(st, at.saturating_duration_since(Instant::now()))
+                    .unwrap_or_else(PoisonError::into_inner),
+            );
+        }
+    }
+
     /// The bulk-class loop.
     fn run_bulk(&self) {
         loop {
@@ -708,6 +800,11 @@ impl Shared {
                         st.bulk.last_snap = now;
                         drop(st);
                         continue;
+                    }
+                    if trigger == Trigger::Reconcile {
+                        self.counters
+                            .reconcile_fired
+                            .fetch_add(1, Ordering::Relaxed);
                     }
                     match self.bulk_snap(false) {
                         Ok(staged) if !staged.unchanged => {
@@ -760,6 +857,8 @@ impl CadenceRunner {
         let cadence = config.cadence;
         let capture_bulk = config.capture_bulk;
         let staging = engine.staging();
+        let aliases = engine.aliases();
+        let invalidations = engine.invalidations();
         let runner = Self {
             shared: Arc::new(Shared {
                 engine: Mutex::new(engine),
@@ -767,8 +866,12 @@ impl CadenceRunner {
                 shipper,
                 worker: Mutex::new(None),
                 state: Mutex::new(State {
-                    small: Clock::new(cadence.quiet, cadence.max_interval),
-                    bulk: Clock::new(cadence.bulk_quiet, cadence.bulk_max_interval),
+                    small: Clock::new(cadence.quiet, cadence.max_interval, cadence.reconcile),
+                    bulk: Clock::new(
+                        cadence.bulk_quiet,
+                        cadence.bulk_max_interval,
+                        cadence.bulk_reconcile,
+                    ),
                     small_mode: Mode::Polled,
                     bulk_mode: Mode::Polled,
                     overflowed: false,
@@ -782,6 +885,10 @@ impl CadenceRunner {
                 yield_cv: Condvar::new(),
                 watch: Mutex::new(None),
                 allow: Mutex::new(None),
+                census: Mutex::new(None),
+                aliases,
+                invalidations,
+                alias_every: [cadence.max_interval, cadence.bulk_max_interval],
                 capture_bulk,
                 started: AtomicBool::new(false),
                 seq: AtomicU64::new(0),
@@ -803,6 +910,21 @@ impl CadenceRunner {
             }
         }));
         runner
+    }
+
+    /// The census a final flush takes before it seals, with the writers stopped: every process
+    /// that could still write, which `census` stops and reports (`Err`). A final flush's own git
+    /// runs none of the user's code (no filter driver, no hook), but nothing else may have
+    /// started one either: a process alive at the seal would write past it (review 2026-09-28,
+    /// sixth pass, #1). One found and stopped, the flush snaps again (the process may have
+    /// written), bounded; still one on the last round, and the flush is
+    /// [`Incomplete::ProcessesRemain`] and nothing is sealed. None (the default): no census.
+    pub fn set_census(&self, census: Option<Census>) {
+        *self
+            .shared
+            .census
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = census;
     }
 
     /// Start the watcher, the ship worker and the class loops. `allow` is asked before every
@@ -839,6 +961,7 @@ impl CadenceRunner {
                 capture_bulk: config.capture_bulk,
                 policy: config.watch.clone(),
                 invalidations: Some(engine.invalidations()),
+                aliases: Some(engine.aliases()),
             }
         };
         let weak: Weak<Shared> = Arc::downgrade(&self.shared);
@@ -886,6 +1009,13 @@ impl CadenceRunner {
             {
                 threads.push(h);
             }
+        }
+        let shared = Arc::clone(&self.shared);
+        if let Ok(h) = thread::Builder::new()
+            .name("capture-aliases".into())
+            .spawn(move || shared.run_aliases())
+        {
+            threads.push(h);
         }
     }
 
@@ -1220,6 +1350,30 @@ impl CadenceRunner {
             // Nothing the flush runs changes the disk (no filter or hook of the user's runs in a
             // capture's git), so with the writers stopped the second round holds still.
             if incomplete.is_none() && writers_stopped {
+                // No process may be alive at the seal: one the caller's census finds is stopped
+                // there, and the classes are snapped again (what it wrote before it stopped is
+                // on the disk, and the watcher may not have delivered it yet).
+                let census = self
+                    .shared
+                    .census
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone();
+                if let Some(Err(found)) = census.map(|census| census()) {
+                    let time_left = until.is_none_or(|u| Instant::now() < u);
+                    if round < FINAL_ROUNDS && time_left {
+                        tracing::warn!(
+                            round,
+                            %found,
+                            "final flush: a process was alive after the writers stopped; \
+                             snapping again"
+                        );
+                        continue;
+                    }
+                    tracing::error!(%found, "final flush: processes kept appearing; no seal");
+                    incomplete = Some(Incomplete::ProcessesRemain(found));
+                    break incomplete;
+                }
                 let changed = match self.shared.settle_watcher() {
                     Ok(()) => (!self.unchanged_since_final_snaps())
                         .then(|| "the watcher saw a change after the final snaps".to_owned()),
@@ -1435,6 +1589,8 @@ impl CadenceRunner {
             quiet_fired: c.quiet_fired.load(Ordering::Relaxed),
             max_fired: c.max_fired.load(Ordering::Relaxed),
             poll_fired: c.poll_fired.load(Ordering::Relaxed),
+            reconcile_fired: c.reconcile_fired.load(Ordering::Relaxed),
+            aliases_moved: c.aliases_moved.load(Ordering::Relaxed),
             forced: c.forced.load(Ordering::Relaxed),
             preemptions: c.preemptions.load(Ordering::Relaxed),
             overflows: c.overflows.load(Ordering::Relaxed),

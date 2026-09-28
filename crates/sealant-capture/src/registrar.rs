@@ -35,6 +35,21 @@
 //! ← {"size":150000000}          |  409 {"reason":"exists"}
 //! ```
 //!
+//! # Keys the bucket already holds: `present`
+//!
+//! Stored objects are write-once (cross-repo decision 19). `upload.urls` mints no URL for a key
+//! the bucket already holds: the registrar verifies the stored bytes against what the key names
+//! and answers the key in `present`, in neither `urls` nor `multipart`. The executor takes such
+//! a key as uploaded (`PutOutcome::AlreadyPresent`) and moves on. Every presigned PUT carries
+//! `If-None-Match: *`; a 412 on it (the object landed since the mint) is the same answer. A key
+//! the executor asked for that comes back in none of the three is an error, never an upload
+//! skipped.
+//!
+//! ```json
+//! ← {"urls":{"captures/wt/3/packs/<a>":"https://…"},"multipart":{},
+//!    "present":["captures/wt/3/packs/<b>"]}
+//! ```
+//!
 //! ETags travel verbatim as the store returned them (quotes included). Part URLs are minted
 //! only while the lease predicate holds, like PUT URLs, and count against the same URL quota.
 //! A multipart upload the executor abandons (it dies, or a part fails past its retries and the
@@ -164,7 +179,11 @@
 //! session token was issued for (cross-repo decision 5) — and nothing else: a plan that names
 //! none gets no seal, and a re-plan replaces it (a seal never carries over to another launch).
 //! The registrar records the seal on the chain only when it is complete, names the registering
-//! epoch and names that executor.
+//! epoch and names that executor. The seal also says where it stands in that executor's own
+//! order (cross-repo decision 17, [`crate::position`]): `boot_id`, `boot_generation` and
+//! `observation`, beside the manifest's `n`, in the same order as every `capture.status` and
+//! final `capture.flush` answer's position (`CaptureStatusReport` fields 27–30). A registrar
+//! that does not read them ignores them; none of them is part of whose seal it is.
 //!
 //! ```json
 //! ← {"worktree_id":"wt","epoch":3,…,"manifest_features":[…],"executor":"<executor id>"}
@@ -481,6 +500,11 @@ pub struct UploadUrlsResponse {
     /// Key → multipart upload, for keys the registrar takes as multipart (absent from `urls`).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub multipart: BTreeMap<String, MultipartUrls>,
+    /// Keys the bucket already holds, with the bytes their names say (the registrar verified
+    /// them): no URL is minted for them, and the executor takes each as uploaded. Absent from an
+    /// older registrar.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub present: Vec<String>,
 }
 
 /// One uploaded part, as reported on `upload.complete`.
@@ -1250,7 +1274,11 @@ impl Registrar for InMemoryRegistrar {
                 }
             }
         }
-        Ok(UploadUrlsResponse { urls, multipart })
+        Ok(UploadUrlsResponse {
+            urls,
+            multipart,
+            present: Vec::new(),
+        })
     }
 
     fn upload_complete(
@@ -1644,6 +1672,9 @@ pub struct RegistrarMinter<R: Registrar + ?Sized> {
     /// Multipart uploads created and not settled yet, with when: a multipart upload that failed
     /// on the store's side resumes under the same upload and part URLs.
     multipart_cache: Mutex<BTreeMap<String, (MultipartUrls, std::time::Instant)>>,
+    /// Keys `upload.urls` answered `present` (the bucket holds them, verified) and whose upload
+    /// has not settled yet: nothing is PUT for them ([`crate::sink::PutTarget::Present`]).
+    present: Mutex<BTreeSet<String>>,
     get_urls: Mutex<BTreeMap<String, String>>,
 }
 
@@ -1667,6 +1698,7 @@ impl<R: Registrar + ?Sized> RegistrarMinter<R> {
             identity: Mutex::new((worktree_id.to_owned(), epoch)),
             put_cache: Mutex::new(BTreeMap::new()),
             multipart_cache: Mutex::new(BTreeMap::new()),
+            present: Mutex::new(BTreeSet::new()),
             get_urls: Mutex::new(get_urls),
         }
     }
@@ -1695,6 +1727,10 @@ impl<R: Registrar + ?Sized> RegistrarMinter<R> {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clear();
+        self.present
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
         *self
             .get_urls
             .lock()
@@ -1712,8 +1748,12 @@ impl<R: Registrar + ?Sized> RegistrarMinter<R> {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             cache.retain(|_, (_, at)| at.elapsed() < PUT_URL_REUSE);
+            let present = self
+                .present
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             keys.iter()
-                .filter(|(k, _)| !cache.contains_key(k))
+                .filter(|(k, _)| !cache.contains_key(k) && !present.contains(k))
                 .cloned()
                 .collect()
         };
@@ -1728,8 +1768,47 @@ impl<R: Registrar + ?Sized> RegistrarMinter<R> {
         );
         req.sizes = wanted.into_iter().collect();
         let resp = self.registrar.upload_urls(&req)?;
+        self.note_present(&req.keys, resp.present);
         self.cache_puts(resp.urls);
         Ok(())
+    }
+
+    /// Record the keys of `asked` the registrar answered `present`. A key it names that was not
+    /// asked for is ignored: `present` vouches only for what this call asked about.
+    fn note_present(&self, asked: &[String], present: Vec<String>) {
+        if present.is_empty() {
+            return;
+        }
+        let asked: BTreeSet<&String> = asked.iter().collect();
+        let mut known = self
+            .present
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for key in present {
+            if asked.contains(&key) {
+                known.insert(key);
+            } else {
+                tracing::warn!(%key, "upload.urls answered present a key it was not asked for; ignored");
+            }
+        }
+    }
+
+    fn is_present(&self, key: &str) -> bool {
+        self.present
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(key)
+    }
+
+    /// Where `key`'s bytes go: a fresh cached PUT URL, nowhere when the bucket holds the key
+    /// (`present`), else one more `upload.urls` for it. `None` when that call answered the key
+    /// in neither.
+    fn target(&self, key: &str) -> Option<crate::sink::PutTarget> {
+        if let Some(url) = self.take_put(key) {
+            return Some(crate::sink::PutTarget::Url(url));
+        }
+        self.is_present(key)
+            .then_some(crate::sink::PutTarget::Present)
     }
 
     fn cache_puts(&self, urls: BTreeMap<String, String>) {
@@ -1766,21 +1845,43 @@ impl<R: Registrar + ?Sized> crate::sink::UrlMinter for RegistrarMinter<R> {
     }
 
     fn put_url(&self, key: &str, size: u64) -> Result<String, crate::sink::SinkError> {
-        if let Some(u) = self.take_put(key) {
-            return Ok(u);
+        match self.put_target(key, size)? {
+            crate::sink::PutTarget::Url(url) => Ok(url),
+            crate::sink::PutTarget::Present => Err(crate::sink::SinkError::NoUrl {
+                key: key.to_owned(),
+                reason: "the bucket holds this key already (upload.urls answered it present)"
+                    .to_owned(),
+            }),
+        }
+    }
+
+    fn put_target(
+        &self,
+        key: &str,
+        size: u64,
+    ) -> Result<crate::sink::PutTarget, crate::sink::SinkError> {
+        if let Some(target) = self.target(key) {
+            return Ok(target);
         }
         // The fallback for a key no batch minted, and it declares that key's real length: a
         // registrar may sign the URL for exactly those bytes (Mend's upload length binding), so
         // a stand-in size would mint a URL the PUT cannot use.
         Self::prefetch_put(self, &[(key.to_owned(), size)]).map_err(|e| mint_error(key, e))?;
-        self.take_put(key)
+        // Neither minted nor present: an error, never an upload taken as done.
+        self.target(key)
             .ok_or_else(|| crate::sink::SinkError::NoUrl {
                 key: key.to_owned(),
-                reason: "the registrar answered upload.urls without this key".to_owned(),
+                reason: "the registrar answered upload.urls with neither a URL nor `present` \
+                         for this key"
+                    .to_owned(),
             })
     }
 
     fn settled(&self, key: &str) {
+        self.present
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(key);
         self.put_cache
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1808,6 +1909,10 @@ impl<R: Registrar + ?Sized> crate::sink::UrlMinter for RegistrarMinter<R> {
         key: &str,
         size: u64,
     ) -> Result<Option<MultipartUrls>, crate::sink::SinkError> {
+        // The bucket holds it: no upload to open (the single-PUT path answers it present).
+        if self.is_present(key) {
+            return Ok(None);
+        }
         if let Some(plan) = self
             .multipart_cache
             .lock()
@@ -1825,6 +1930,7 @@ impl<R: Registrar + ?Sized> crate::sink::UrlMinter for RegistrarMinter<R> {
             .registrar
             .upload_urls(&req)
             .map_err(|e| mint_error(key, e))?;
+        self.note_present(&req.keys, std::mem::take(&mut resp.present));
         let multipart = resp.multipart.remove(key);
         if let Some(plan) = &multipart {
             self.multipart_cache
@@ -1921,6 +2027,24 @@ fn keys_label(keys: &[(String, u64)]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Mend's `upload.urls` answer names the keys the bucket holds in `present` (decision 19);
+    /// an older registrar's answer has none.
+    #[test]
+    fn upload_urls_answers_present_keys() {
+        let resp: UploadUrlsResponse = serde_json::from_str(
+            r#"{"urls":{"captures/wt/3/packs/a":"https://s/a"},"multipart":{},
+                "present":["captures/wt/3/packs/b"]}"#,
+        )
+        .unwrap();
+        assert_eq!(resp.present, vec!["captures/wt/3/packs/b".to_owned()]);
+        let old: UploadUrlsResponse = serde_json::from_str(r#"{"urls":{}}"#).unwrap();
+        assert!(old.present.is_empty());
+        assert!(
+            !serde_json::to_string(&old).unwrap().contains("present"),
+            "an empty list is not sent"
+        );
+    }
     use crate::manifest::{
         BulkSection, BulkState, CaptureKind, FsckStatus, GitSection, Sections, WorkspaceSection,
     };
@@ -2255,6 +2379,9 @@ mod tests {
             complete: true,
             epoch: 1,
             executor: "exec-1".into(),
+            boot_id: None,
+            boot_generation: None,
+            observation: None,
         });
         r.capture_register(&RegisterRequest {
             manifest: m,

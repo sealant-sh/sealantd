@@ -429,6 +429,52 @@ impl Sweeper {
     }
 }
 
+impl Sweeper {
+    /// The census a final flush takes before it seals
+    /// ([`crate::runtime::Runtime::census_writers`], which asks it of sealantd's descendants):
+    /// every process [`Sweeper::select_sparing`] finds now, with the writers already stopped.
+    /// Each is killed at once (`SIGCONT`, `SIGKILL`: the grace was the quiesce's), re-scanning
+    /// up to [`KILL_WAIT`] for one started meanwhile. Returns every pid found and how many are
+    /// still alive. Blocking (a final flush's capture runs on a blocking thread).
+    #[must_use]
+    pub fn census_blocking(
+        &self,
+        admit: &dyn Fn(i32) -> bool,
+        exempt: &Exempt,
+    ) -> (Vec<i32>, usize) {
+        use nix::sys::signal::{Signal, kill};
+        use nix::unistd::Pid;
+        let proc_root = Path::new("/proc");
+        // Copied out: the gate is the orphan reaper's lock, never held across a scan.
+        let helpers = || sealant_process::spawn::lock_gate().clone();
+        let scan = || self.select_sparing(&read_proc(proc_root), admit, &helpers(), exempt);
+        let mut found: Vec<i32> = Vec::new();
+        let until = Instant::now() + KILL_WAIT;
+        loop {
+            let targets = scan();
+            if targets.is_empty() {
+                return (found, 0);
+            }
+            for &pid in &targets {
+                if !found.contains(&pid) {
+                    found.push(pid);
+                    tracing::warn!(
+                        pid,
+                        "final capture census: a process is alive after the writers stopped; \
+                         killing it"
+                    );
+                }
+                let _ = kill(Pid::from_raw(pid), Signal::SIGCONT);
+                let _ = kill(Pid::from_raw(pid), Signal::SIGKILL);
+            }
+            if Instant::now() >= until {
+                return (found, targets.len());
+            }
+            std::thread::sleep(POLL);
+        }
+    }
+}
+
 /// Whether `pid`'s environment holds `key=value` exactly (a test narrows a sweep to the
 /// processes it started, which inherit the entry).
 #[must_use]
