@@ -94,6 +94,31 @@ fn orphan(dir: &Path, name: &str, mark: &str, nap: u32, target: &Path) -> String
     }
 }
 
+/// A marked process like [`orphan`]'s that starts no process of its own: the agent's helper.
+/// (One whose loop started a `sleep` every 20 ms had children the list does not spare — it names
+/// the helper alone — and a final flush that met one alive at its seal was, rightly, never
+/// complete.)
+fn idle_orphan(dir: &Path, name: &str, mark: &str) -> String {
+    let script = format!("( setsid sh -c 'echo $$ > {name}.pid; exec sleep 600' & )");
+    let status = Proc::new("sh")
+        .args(["-c", &script])
+        .current_dir(dir)
+        .env("SEALANTD_SWEEP_MARK", mark)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let start = Instant::now();
+    loop {
+        if let Ok(pid) = std::fs::read_to_string(dir.join(format!("{name}.pid")))
+            && !pid.trim().is_empty()
+        {
+            return pid.trim().to_owned();
+        }
+        assert!(start.elapsed() < Duration::from_secs(10), "{name} starts");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 fn stat_fields(pid: &str) -> Option<Vec<String>> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     Some(
@@ -153,9 +178,9 @@ async fn a_recovery_final_flush_covers_writers_the_agent_adopted() {
     let _reap = Reap(vec![pids.join("writer.pid"), pids.join("helper.pid")]);
     // Before any `Runtime`: this process is no subreaper yet, so both are re-parented away. The
     // writer sleeps through the flushes and would then write the worktree; the helper (the
-    // agent's) writes outside it.
+    // agent's) idles.
     let writer = orphan(&pids, "writer", &mark, 60, &ws.join("late-write.txt"));
-    let helper = orphan(&pids, "helper", &mark, 0, &pids.join("helper.txt"));
+    let helper = idle_orphan(&pids, "helper", &mark);
     assert!(
         !descends_from_me(&writer),
         "the writer is a sibling, not a descendant"
@@ -249,7 +274,7 @@ async fn a_recovery_final_flush_covers_writers_the_agent_adopted() {
         &std::collections::HashSet::new(),
         &stale,
     );
-    // (The helper and, perhaps, the `sleep` its loop is in: marked too, and never listed.)
+    // (The helper, marked too, and listed under a start time that is not its own.)
     assert!(
         picked.contains(&helper.parse::<i32>().unwrap()),
         "{picked:?}"

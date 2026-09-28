@@ -660,6 +660,55 @@ impl Runtime {
         None
     }
 
+    /// The census a final flush's capture takes before it seals (review 2026-09-28, sixth pass,
+    /// #1): sealantd's descendants alive now that every writer was stopped — a process the
+    /// capture's own git started, however it detached (sealantd is a child subreaper, or PID 1:
+    /// every orphan of its own comes back to it) — its own helpers (the spawn gate) spared, the
+    /// narrowing a test gave kept. None is expected: admission is closed, and the capture's git
+    /// runs no filter driver or hook. One found anyway is killed, and the answer is `Err` naming
+    /// it: the capture snaps again, and seals only once a census finds none
+    /// ([`sealant_capture::CadenceRunner::set_census`]). Only descendants: a control plane's
+    /// relay into the namespace (`docker exec … socat`, one per request, asking for the status
+    /// while the flush runs) is none of the capture's, and killing it would only cost the answer.
+    /// Blocking.
+    ///
+    /// # Errors
+    /// What was found, and whether it outlived `SIGKILL`.
+    pub fn census_writers(&self) -> Result<(), String> {
+        let mark = self
+            .sweep_mark
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let admit = move |pid: i32| {
+            mark.as_deref()
+                .is_none_or(|m| crate::sweep::has_env_entry(pid, SWEEP_MARK_ENV, m))
+        };
+        let mut sweeper = crate::sweep::Sweeper::this_process();
+        sweeper.scope = crate::sweep::Scope::Descendants;
+        let (found, left) = sweeper.census_blocking(&admit, &crate::sweep::Exempt::default());
+        if found.is_empty() {
+            return Ok(());
+        }
+        let pids = found
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        Err(if left == 0 {
+            format!(
+                "{} process(es) of the daemon's alive after the writers stopped, killed: {pids}",
+                found.len()
+            )
+        } else {
+            format!(
+                "{} process(es) of the daemon's alive after the writers stopped ({pids}); {left} \
+                 outlived SIGKILL",
+                found.len()
+            )
+        })
+    }
+
     /// Whether the final capture's sweep cannot guarantee it sees every writer: outside a PID
     /// namespace of its own, and with no helper list from the host's agent, it takes sealantd's
     /// descendants — and without `PR_SET_CHILD_SUBREAPER` an orphan is re-parented away from

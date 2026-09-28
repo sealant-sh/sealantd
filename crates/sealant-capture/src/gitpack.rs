@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
 use std::io::{self, Write};
-use std::os::unix::ffi::OsStrExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -227,6 +227,10 @@ pub enum GitError {
         /// What the filesystem said.
         source: io::Error,
     },
+    /// A git the capture would run could execute the user's code (a filter driver whose
+    /// command the capture's configuration could not be shown to empty): nothing is run.
+    #[error("{0}")]
+    UserCode(String),
     /// I/O.
     #[error(transparent)]
     Io(#[from] io::Error),
@@ -287,16 +291,18 @@ const CAPTURE_VIEW: [(&str, &str); 8] = [
     ("core.safecrlf", "false"),
 ];
 
-/// Run git with a clean environment (no inherited `GIT_DIR`/`GIT_INDEX_FILE`/`GIT_WORK_TREE`),
-/// under [`CAPTURE_VIEW`], with no filter driver of the user's ([`without_filters`]).
+/// Run git with a clean environment (no inherited `GIT_DIR`/`GIT_WORK_TREE`/`GIT_INDEX_FILE`),
+/// under [`CAPTURE_VIEW`], with no filter driver of the user's ([`without_filters`]). An error
+/// when the filter drivers cannot be read, or cannot be shown to be off: then no git runs at
+/// all, rather than one that might run the user's code (review 2026-09-28, sixth pass, #1).
 ///
 /// Every child started from this command must be spawned through the process-wide spawn gate
 /// (`sealant_process::CommandGateExt`: `output_gated`/`spawn_gated`, never `output`/`spawn`).
 /// sealantd is PID 1 in the workspace and its orphan reaper reaps any waitable child it did not
 /// spawn — an ungated `git` that exits mid-sweep is reaped out from under us and the `wait()`
 /// here fails with `ECHILD` ("No child process"), which is how a `capture.flush` died under load.
-fn git_command(cwd: &Path) -> Command {
-    git_command_with(cwd, &without_filters(cwd))
+fn git_command(cwd: &Path) -> Result<Command, GitError> {
+    Ok(git_command_with(cwd, &without_filters(cwd)?))
 }
 
 /// [`git_command`] with the user's filter drivers left as they are: only for a checkout that
@@ -306,8 +312,9 @@ fn git_command_filtering(cwd: &Path) -> Command {
     git_command_with(cwd, &[])
 }
 
-/// [`git_command`] with `extra` configuration after [`CAPTURE_VIEW`] (a later entry wins).
-fn git_command_with(cwd: &Path, extra: &[(String, String)]) -> Command {
+/// [`git_command`] with `extra` configuration after [`CAPTURE_VIEW`] (a later entry wins). Keys
+/// and values are bytes: a filter driver's name need not be UTF-8.
+fn git_command_with(cwd: &Path, extra: &[(OsString, OsString)]) -> Command {
     let mut c = Command::new("git");
     c.current_dir(cwd)
         .env_remove("GIT_DIR")
@@ -322,8 +329,8 @@ fn git_command_with(cwd: &Path, extra: &[(String, String)]) -> Command {
         .stdin(Stdio::null());
     let entries = CAPTURE_VIEW
         .iter()
-        .map(|(k, v)| (*k, *v))
-        .chain(extra.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+        .map(|(k, v)| (OsStr::new(k), OsStr::new(v)))
+        .chain(extra.iter().map(|(k, v)| (k.as_os_str(), v.as_os_str())));
     for (i, (key, value)) in entries.enumerate() {
         c.env(format!("GIT_CONFIG_KEY_{i}"), key)
             .env(format!("GIT_CONFIG_VALUE_{i}"), value);
@@ -331,24 +338,49 @@ fn git_command_with(cwd: &Path, extra: &[(String, String)]) -> Command {
     c
 }
 
-/// Every filter driver git's configuration defines (`filter.<driver>.clean`, `.smudge`,
-/// `.process`, `.required`, at any level), by name.
-fn filter_drivers(cwd: &Path) -> Result<BTreeSet<String>, GitError> {
-    let args = ["config", "-z", "--name-only", "--get-regexp", r"^filter\."];
-    let out = git_command_filtering(cwd).args(args).output_gated()?;
+/// The variables of a filter driver that run a command (`clean`, `smudge`, `process`) or make
+/// git refuse to go on without one (`required`).
+const FILTER_VARS: [&[u8]; 4] = [b"clean", b"smudge", b"process", b"required"];
+
+/// One filter driver variable as git reads it: the driver's name (bytes), the variable, and the
+/// value (`None`: a key given with no `=`).
+type FilterEntry = (Vec<u8>, Vec<u8>, Option<Vec<u8>>);
+
+/// A filter driver variable's key: the driver's name (bytes) and the variable.
+type FilterKey = (Vec<u8>, Vec<u8>);
+
+/// `git config -z --get-regexp '^filter\.'` as `(driver, variable, value)`, in the order git
+/// reads them (the last one of a key is the one git uses). The driver is the subsection's bytes
+/// exactly as git has them: a subsection name may hold any byte but a newline and NUL, and one
+/// that is not UTF-8 is a driver like any other (read lossily, `raw\xff` became a different
+/// driver, and the user's `raw\xff` still ran). `None` for a value: a key given with no `=`.
+fn filter_config(command: Command) -> Result<Vec<FilterEntry>, GitError> {
+    let args = ["config", "-z", "--get-regexp", r"^filter\."];
+    let mut command = command;
+    let out = command.args(args).output_gated()?;
     // 1: no such key.
     if out.status.code() == Some(1) {
-        return Ok(BTreeSet::new());
+        return Ok(Vec::new());
     }
     let out = check(&args, out)?;
-    Ok(out
-        .stdout
-        .split(|b| *b == 0)
-        .filter_map(|key| key.strip_prefix(b"filter."))
-        .filter_map(|rest| rsplit_once(rest, b"."))
-        .filter(|(_, var)| matches!(*var, b"clean" | b"smudge" | b"process" | b"required"))
-        .map(|(driver, _)| String::from_utf8_lossy(driver).into_owned())
-        .collect())
+    let mut found = Vec::new();
+    for record in out.stdout.split(|b| *b == 0).filter(|r| !r.is_empty()) {
+        let (key, value) = match record.iter().position(|b| *b == b'\n') {
+            Some(nl) => (&record[..nl], Some(record[nl + 1..].to_vec())),
+            None => (record, None),
+        };
+        let Some(rest) = key.strip_prefix(b"filter.") else {
+            continue;
+        };
+        // `filter.<var>` (no subsection) names no driver.
+        let Some((driver, var)) = rsplit_once(rest, b".") else {
+            continue;
+        };
+        if FILTER_VARS.contains(&var) {
+            found.push((driver.to_vec(), var.to_vec(), value));
+        }
+    }
+    Ok(found)
 }
 
 /// Configuration that empties every filter driver the configuration at `cwd` defines
@@ -356,31 +388,71 @@ fn filter_drivers(cwd: &Path) -> Result<BTreeSet<String>, GitError> {
 /// one. A filter is the user's code, and git runs a clean filter wherever it hashes a file:
 /// in `git add`, and in any command that writes an index (a racily clean entry is checked
 /// against the file). One that wrote a file git had already indexed changed the disk under a
-/// final flush that went on to seal it (review 2026-09-28, fifth pass, #2); nothing a capture
-/// runs may change the disk. A path a filter's attribute names is read as it is on disk, and
-/// the raw tree holds its bytes as ever; git's own conversions (line ends, `ident`, encodings)
-/// run no user code and still apply to the worktree tree. The configuration git would read
-/// here unreadable: nothing is added, and the command itself fails reading it the same way.
-fn without_filters(cwd: &Path) -> Vec<(String, String)> {
-    let drivers = match filter_drivers(cwd) {
-        Ok(drivers) => drivers,
-        Err(error) => {
-            tracing::debug!(%error, cwd = %cwd.display(), "git config: filter drivers unread");
-            BTreeSet::new()
-        }
-    };
+/// final flush that went on to seal it (review 2026-09-28, fifth pass, #2); one that started a
+/// process left a writer running after the final flush had stopped them all and sealed (sixth
+/// pass, #1). Nothing a capture runs may change the disk. A path a filter's attribute names is
+/// read as it is on disk, and the raw tree holds its bytes as ever; git's own conversions (line
+/// ends, `ident`, encodings) run no user code and still apply to the worktree tree.
+///
+/// Fails closed: the configuration cannot be read (nothing runs: the git that would have read
+/// it could not have been shown to run no filter), or git, read again under the overrides,
+/// still has a driver with a command or `required` on ([`GitError::UserCode`]).
+fn without_filters(cwd: &Path) -> Result<Vec<(OsString, OsString)>, GitError> {
+    let drivers: BTreeSet<Vec<u8>> = filter_config(git_command_filtering(cwd))?
+        .into_iter()
+        .map(|(driver, _, _)| driver)
+        .collect();
+    if drivers.is_empty() {
+        return Ok(Vec::new());
+    }
     let mut extra = Vec::new();
-    for driver in drivers {
+    for driver in &drivers {
         for (var, value) in [
             ("clean", ""),
             ("smudge", ""),
             ("process", ""),
             ("required", "false"),
         ] {
-            extra.push((format!("filter.{driver}.{var}"), value.to_owned()));
+            let mut key = b"filter.".to_vec();
+            key.extend_from_slice(driver);
+            key.push(b'.');
+            key.extend_from_slice(var.as_bytes());
+            extra.push((OsString::from_vec(key), OsString::from(value)));
         }
     }
-    extra
+    // What git makes of it: the last value of every key is the one it uses.
+    let mut last: BTreeMap<FilterKey, Option<Vec<u8>>> = BTreeMap::new();
+    for (driver, var, value) in filter_config(git_command_with(cwd, &extra))? {
+        last.insert((driver, var), value);
+    }
+    let left: Vec<String> = last
+        .into_iter()
+        .filter(
+            |((_, var), value)| match (var.as_slice(), value.as_deref()) {
+                (b"required", Some(v)) => !matches!(
+                    v.to_ascii_lowercase().as_slice(),
+                    b"false" | b"no" | b"off" | b"0" | b""
+                ),
+                (_, Some(v)) => !v.is_empty(),
+                // A bare key: `required` on; a command variable without a value fails git itself.
+                (_, None) => true,
+            },
+        )
+        .map(|((driver, var), _)| {
+            format!(
+                "filter.{}.{}",
+                String::from_utf8_lossy(&c_quote(&driver)),
+                String::from_utf8_lossy(&var)
+            )
+        })
+        .collect();
+    if !left.is_empty() {
+        return Err(GitError::UserCode(format!(
+            "a filter driver of the user's is still configured under the capture's overrides: {}",
+            left.join(", ")
+        )));
+    }
+    Ok(extra)
 }
 
 fn check(args: &[&str], out: Output) -> Result<Output, GitError> {
@@ -455,7 +527,7 @@ fn collect_loose_symrefs(
 impl GitRepo {
     /// Open the repository whose working tree is `root`.
     pub fn open(root: &Path) -> Result<Self, GitError> {
-        let out = git_command(root)
+        let out = git_command(root)?
             .args(["rev-parse", "--git-dir", "--git-common-dir"])
             .output_gated()?;
         if !out.status.success() {
@@ -477,7 +549,7 @@ impl GitRepo {
         fs::create_dir_all(root).map_err(at("mkdir -p", root))?;
         if !root.join(".git").exists() {
             let args = ["init", "-q"];
-            check(&args, git_command(root).args(args).output_gated()?)?;
+            check(&args, git_command(root)?.args(args).output_gated()?)?;
         }
         Self::open(root)
     }
@@ -510,7 +582,7 @@ impl GitRepo {
 
     /// [`Self::is_ignored`] for a path as bytes (a name that is not UTF-8).
     pub fn is_ignored_bytes(&self, path: &[u8]) -> Result<bool, GitError> {
-        let out = git_command(&self.root)
+        let out = git_command(&self.root)?
             .args(["check-ignore", "-q", "--"])
             .arg(OsStr::from_bytes(path))
             .output_gated()?;
@@ -526,12 +598,12 @@ impl GitRepo {
 
     /// Run a git command in the working tree and return its output on success.
     pub fn run(&self, args: &[&str]) -> Result<Output, GitError> {
-        check(args, git_command(&self.root).args(args).output_gated()?)
+        check(args, git_command(&self.root)?.args(args).output_gated()?)
     }
 
     /// Run a git command with stdin.
     fn run_with_stdin(&self, args: &[&str], stdin: &[u8]) -> Result<Output, GitError> {
-        let mut child = git_command(&self.root)
+        let mut child = git_command(&self.root)?
             .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -548,7 +620,7 @@ impl GitRepo {
     /// reach git as plain arguments.
     pub fn set_remote(&self, name: &str, url: &str) -> Result<RemoteChange, GitError> {
         let key = format!("remote.{name}.url");
-        let current = git_command(&self.root)
+        let current = git_command(&self.root)?
             .args(["config", "--local", "--get", &key])
             .output_gated()?;
         if !current.status.success() {
@@ -620,7 +692,7 @@ impl GitRepo {
                 return Ok(key_of(target).into_owned());
             }
         }
-        let out = git_command(&self.root)
+        let out = git_command(&self.root)?
             .args(["symbolic-ref", "-q", "--no-recurse", "HEAD"])
             .output_gated()?;
         if out.status.success() {
@@ -641,7 +713,7 @@ impl GitRepo {
 
     /// The tree `HEAD` points at, or `None` when `HEAD` names no commit (an unborn branch).
     pub fn head_tree(&self) -> Result<Option<String>, GitError> {
-        let out = git_command(&self.root)
+        let out = git_command(&self.root)?
             .args(["rev-parse", "--verify", "-q", "HEAD^{tree}"])
             .output_gated()?;
         Ok(out.status.success().then(|| stdout_string(&out)))
@@ -826,7 +898,7 @@ impl GitRepo {
         fs::create_dir_all(scratch_dir).map_err(at("mkdir -p", scratch_dir))?;
         let tmp_index = scratch_dir.join("index-tree");
         fs::copy(&real_index, &tmp_index).map_err(at("copy into", &tmp_index))?;
-        let out = git_command(&self.root)
+        let out = git_command(&self.root)?
             .env("GIT_INDEX_FILE", &tmp_index)
             .args(["write-tree"])
             .output_gated()?;
@@ -848,7 +920,7 @@ impl GitRepo {
     /// the real index: the untracked paths git would add, and on stderr the directories it
     /// could not open.
     fn untracked(&self, index: Option<&Path>) -> Result<Output, GitError> {
-        let mut cmd = git_command(&self.root);
+        let mut cmd = git_command(&self.root)?;
         if let Some(index) = index {
             cmd.env("GIT_INDEX_FILE", index);
         }
@@ -882,7 +954,7 @@ impl GitRepo {
             .filter(|d| holds_git(d))
             .map(|d| key_of(d).into_owned())
             .collect();
-        let mut cmd = git_command(&self.root);
+        let mut cmd = git_command(&self.root)?;
         if let Some(index) = index {
             cmd.env("GIT_INDEX_FILE", index);
         }
@@ -963,7 +1035,7 @@ impl GitRepo {
         if !cut.is_empty() {
             cut.sort();
             cut.dedup();
-            let mut cmd = git_command(&self.root);
+            let mut cmd = git_command(&self.root)?;
             if let Some(index) = index {
                 cmd.env("GIT_INDEX_FILE", index);
             }
@@ -1130,7 +1202,7 @@ impl GitRepo {
         let ls = ["ls-files", "-v", "-z"];
         let listed = check(
             &ls,
-            git_command(&self.root)
+            git_command(&self.root)?
                 .env("GIT_INDEX_FILE", index)
                 .args(ls)
                 .output_gated()?,
@@ -1163,7 +1235,7 @@ impl GitRepo {
                 continue;
             }
             let args = ["update-index", flag, "-z", "--stdin"];
-            let mut child = git_command(&self.root)
+            let mut child = git_command(&self.root)?
                 .env("GIT_INDEX_FILE", index)
                 .args(args)
                 .stdin(Stdio::piped())
@@ -1187,7 +1259,7 @@ impl GitRepo {
     /// Run `git add` as [`AddArgs`] says against `tmp_index`, its pathspecs from a file beside
     /// it, untranslated (what could not be read is read off the messages).
     fn run_add(&self, tmp_index: &Path, add: &AddArgs) -> Result<Output, GitError> {
-        let mut command = git_command(&self.root);
+        let mut command = git_command(&self.root)?;
         let spec_file = tmp_index.with_extension("pathspecs");
         let mut specs: Vec<u8> = Vec::new();
         for p in &add.pathspecs {
@@ -1273,7 +1345,7 @@ impl GitRepo {
                 let rt = ["read-tree", &head_tree];
                 check(
                     &rt,
-                    git_command(&self.root)
+                    git_command(&self.root)?
                         .env("GIT_INDEX_FILE", tmp_index)
                         .args(rt)
                         .output_gated()?,
@@ -1348,7 +1420,7 @@ impl GitRepo {
         let ls = ["ls-files", "-s", "-z"];
         let listed = check(
             &ls,
-            git_command(&self.root)
+            git_command(&self.root)?
                 .env("GIT_INDEX_FILE", &tmp_index)
                 .args(ls)
                 .output_gated()?,
@@ -1380,7 +1452,7 @@ impl GitRepo {
         let wt = ["write-tree"];
         let out = check(
             &wt,
-            git_command(&self.root)
+            git_command(&self.root)?
                 .env("GIT_INDEX_FILE", index)
                 .args(wt)
                 .output_gated()?,
@@ -1388,11 +1460,17 @@ impl GitRepo {
         Ok(stdout_string(&out))
     }
 
-    /// The raw tree of `tree` (written from `tmp_index`, whose entries are `entries`): each
-    /// regular file git's attributes or `core.autocrlf` may convert on its way into the tree —
-    /// a clean filter, `text`/`eol`/`crlf` line-end normalization, `working-tree-encoding`,
-    /// `ident` — takes a blob of its bytes as they are on disk (`git hash-object
-    /// --no-filters`); every other entry is the tree's own. `tree` itself when nothing differs.
+    /// The raw tree of `tree` (written from `tmp_index`, whose entries are `entries`): every
+    /// regular file takes a blob of its bytes as they are on disk (`git hash-object
+    /// --no-filters`), whatever git's attributes or `core.autocrlf` did to it on its way into the
+    /// tree (a clean filter, `text`/`eol`/`crlf` line-end normalization,
+    /// `working-tree-encoding`, `ident`); a file whose bytes are the tree's blob keeps its entry.
+    /// `tree` itself when nothing differs. Every file, not only the ones some attribute file is
+    /// seen to name: git reads a `.gitattributes` the index does not hold (an ignored one
+    /// included), and a raw tree that asked only when it found one among the index entries took
+    /// the cleaned blob for a CRLF file and a sealed restore wrote LF (review 2026-09-28, sixth
+    /// pass, #7). The blob ids are cached by stat ([`TreeOptions::raw_cache`]), so a file is
+    /// read again only once its stat moved.
     /// The index `git add` wrote and the user's real index are not touched: the raw blobs go
     /// into a copy. A path in `unreadable` takes the entry `options.carry_raw_from` (the previous
     /// raw tree) holds for it, else keeps `tree`'s. A file that cannot be read raw here (gone
@@ -1414,18 +1492,7 @@ impl GitRepo {
             .filter(|e| e.stage == "0" && (e.mode == "100644" || e.mode == "100755"))
             .filter(|e| !skip.iter().any(|s| at_or_under(&e.path, s)))
             .collect();
-        let candidates: Vec<&IndexEntry> = if self.autocrlf_active()? {
-            files
-        } else if !self.attributes_possible(entries)? {
-            // No attributes anywhere: nothing converts, and nothing is asked.
-            Vec::new()
-        } else {
-            let converted = self.attr_converted(tmp_index, &files)?;
-            files
-                .into_iter()
-                .filter(|e| converted.contains(&e.path))
-                .collect()
-        };
+        let candidates = files;
         let carry_raw = options.carry_raw_from.filter(|_| !unreadable.is_empty());
         if candidates.is_empty() && carry_raw.is_none() {
             return Ok(tree.to_owned());
@@ -1494,7 +1561,7 @@ impl GitRepo {
                     info.push(0);
                 }
                 let args = ["update-index", "-z", "--index-info"];
-                let mut child = git_command(&self.root)
+                let mut child = git_command(&self.root)?
                     .env("GIT_INDEX_FILE", &raw_index)
                     .args(args)
                     .stdin(Stdio::piped())
@@ -1512,71 +1579,14 @@ impl GitRepo {
         result
     }
 
-    /// Whether any attributes could apply to the paths of `entries`: a `.gitattributes` among
-    /// them, the repository's `info/attributes`, `core.attributesFile`, the per-user
-    /// attributes file git reads when that is unset, or the system one. When none exists, no
-    /// path has a conversion attribute and `git check-attr` need not be asked about each.
-    fn attributes_possible(&self, entries: &[IndexEntry]) -> Result<bool, GitError> {
-        if entries
-            .iter()
-            .any(|e| e.path == b".gitattributes" || e.path.ends_with(b"/.gitattributes"))
-            || self.common_dir.join("info").join("attributes").exists()
-            || self.git_dir.join("info").join("attributes").exists()
-            || Path::new("/etc/gitattributes").exists()
-        {
-            return Ok(true);
-        }
-        let configured = git_command(&self.root)
-            .args(["config", "--get", "core.attributesFile"])
-            .output_gated()?;
-        if configured.status.success() {
-            return Ok(true);
-        }
-        let per_user = std::env::var_os("XDG_CONFIG_HOME")
-            .filter(|v| !v.is_empty())
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
-            .map(|base| base.join("git").join("attributes"));
-        Ok(per_user.is_some_and(|p| p.exists()))
-    }
-
     /// Whether `core.autocrlf` (any config level) converts line ends on the way into the tree
     /// for a file no attribute speaks of: `true` or `input`.
     fn autocrlf_active(&self) -> Result<bool, GitError> {
-        let out = git_command(&self.root)
+        let out = git_command(&self.root)?
             .args(["config", "--get", "core.autocrlf"])
             .output_gated()?;
         let value = stdout_string(&out).to_ascii_lowercase();
         Ok(out.status.success() && !matches!(value.as_str(), "" | "false" | "no" | "off" | "0"))
-    }
-
-    /// Of `files`, the paths git's attributes (read as `git add` read them, against
-    /// `index`) have converted on the way into the tree, or smudge on the way out: `text`
-    /// (set, or `auto`), `eol`, `crlf`, a `filter` driver, `working-tree-encoding` or `ident`.
-    fn attr_converted(
-        &self,
-        index: &Path,
-        files: &[&IndexEntry],
-    ) -> Result<BTreeSet<Vec<u8>>, GitError> {
-        let mut found = BTreeSet::new();
-        if files.is_empty() {
-            return Ok(found);
-        }
-        let mut input: Vec<u8> = Vec::new();
-        for e in files {
-            input.extend_from_slice(&e.path);
-            input.push(0);
-        }
-        let out = self.attrs_of(Some(index), &input)?;
-        let mut fields = out.split(|b| *b == 0);
-        while let (Some(path), Some(attr), Some(value)) =
-            (fields.next(), fields.next(), fields.next())
-        {
-            if converts(attr, value) {
-                found.insert(path.to_vec());
-            }
-        }
-        Ok(found)
     }
 
     /// `git check-attr -z --stdin` of the attributes that convert, for the NUL-separated
@@ -1593,7 +1603,7 @@ impl GitRepo {
             "working-tree-encoding",
             "ident",
         ];
-        let mut cmd = git_command(&self.root);
+        let mut cmd = git_command(&self.root)?;
         if let Some(index) = index {
             cmd.env("GIT_INDEX_FILE", index);
         }
@@ -1631,7 +1641,7 @@ impl GitRepo {
             input.push(b'\n');
         }
         let args = ["hash-object", "-w", "--no-filters", "--stdin-paths"];
-        let mut child = git_command(&self.root)
+        let mut child = git_command(&self.root)?
             .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -1653,7 +1663,7 @@ impl GitRepo {
         // One path it could not read ends the batch: each path alone, then.
         let mut each = Vec::with_capacity(paths.len());
         for p in paths {
-            let out = git_command(&self.root)
+            let out = git_command(&self.root)?
                 .args(["hash-object", "-w", "--no-filters", "--"])
                 .arg(OsStr::from_bytes(p))
                 .output_gated()?;
@@ -1674,7 +1684,7 @@ impl GitRepo {
         unreadable: &[(String, String)],
     ) -> Vec<String> {
         let git = |args: &[&OsStr]| -> Result<Output, GitError> {
-            let out = git_command(&self.root)
+            let out = git_command(&self.root)?
                 .env("GIT_INDEX_FILE", tmp_index)
                 .env("GIT_LITERAL_PATHSPECS", "1")
                 .args(args)
@@ -1762,7 +1772,7 @@ impl GitRepo {
 
     /// `git fsck --connectivity-only --no-dangling`.
     pub fn fsck(&self) -> Result<FsckStatus, GitError> {
-        let out = git_command(&self.root)
+        let out = git_command(&self.root)?
             .args(["fsck", "--connectivity-only", "--no-dangling"])
             .output_gated()?;
         Ok(if out.status.success() {
@@ -1923,7 +1933,7 @@ pub struct TreeOptions<'a> {
     /// The previous capture's raw tree: an unreadable path takes its entry in the raw tree.
     pub carry_raw_from: Option<&'a str>,
     /// Where the raw tree's blob ids are remembered by file stat, so a file whose stat has not
-    /// moved is not read again (none: every file attributes may convert is read each time).
+    /// moved is not read again (none: every regular file is read each time).
     pub raw_cache: Option<&'a Path>,
 }
 
@@ -2211,7 +2221,7 @@ fn pack_once(
     let tmp = out_dir.join(format!(".git-pack-{attempt}.pack"));
     let file = File::create(&tmp).map_err(at("create", &tmp))?;
     let args = ["pack-objects", "--revs", "--stdout", "-q"];
-    let mut child = git_command(&repo.root)
+    let mut child = git_command(&repo.root)?
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::from(file))
@@ -2234,7 +2244,7 @@ fn pack_once(
     // 2.41+ also writes `<file>.rev`, which nothing here uses.
     let tmp_str = tmp.to_string_lossy().to_string();
     let args = ["index-pack", &tmp_str];
-    check(&args, git_command(&repo.root).args(args).output_gated()?)?;
+    check(&args, git_command(&repo.root)?.args(args).output_gated()?)?;
     fs::remove_file(tmp.with_extension("rev")).ok();
     let bytes = fs::read(&tmp)?;
     let sha256 = sha256_hex(&bytes);
@@ -2376,7 +2386,7 @@ pub fn install_pack(
         None => {
             let tmp_str = tmp.to_string_lossy().to_string();
             let args = ["index-pack", &tmp_str];
-            check(&args, git_command(&repo.root).args(args).output_gated()?)?;
+            check(&args, git_command(&repo.root)?.args(args).output_gated()?)?;
             fs::remove_file(tmp.with_extension("rev")).ok();
         }
     }
@@ -2530,9 +2540,9 @@ pub fn write_head(repo: &GitRepo, head: &str) -> Result<(), GitError> {
 
 /// The git a checkout runs: the user's filters smudge only when `smudge` (a tree whose blobs
 /// hold cleaned bytes and no raw tree beside it); a raw tree's blobs are the bytes to write.
-fn checkout_command(repo: &GitRepo, smudge: bool) -> Command {
+fn checkout_command(repo: &GitRepo, smudge: bool) -> Result<Command, GitError> {
     if smudge {
-        git_command_filtering(&repo.root)
+        Ok(git_command_filtering(&repo.root))
     } else {
         git_command(&repo.root)
     }
@@ -2551,7 +2561,7 @@ pub fn checkout_tree(
     let rt = ["read-tree", tree];
     check(
         &rt,
-        checkout_command(repo, smudge)
+        checkout_command(repo, smudge)?
             .env("GIT_INDEX_FILE", &tmp_index)
             .args(rt)
             .output_gated()?,
@@ -2559,7 +2569,7 @@ pub fn checkout_tree(
     let co = ["checkout-index", "-a", "-f", "-q"];
     check(
         &co,
-        checkout_command(repo, smudge)
+        checkout_command(repo, smudge)?
             .env("GIT_INDEX_FILE", &tmp_index)
             .args(co)
             .output_gated()?,
@@ -2598,7 +2608,7 @@ pub fn checkout_tree_changing(
     let seed = ["read-tree", from];
     check(
         &seed,
-        checkout_command(repo, smudge)
+        checkout_command(repo, smudge)?
             .env("GIT_INDEX_FILE", &tmp_index)
             .args(seed)
             .output_gated()?,
@@ -2606,7 +2616,7 @@ pub fn checkout_tree_changing(
     let merge = ["read-tree", "--reset", "-u", from, to];
     check(
         &merge,
-        checkout_command(repo, smudge)
+        checkout_command(repo, smudge)?
             .env("GIT_INDEX_FILE", &tmp_index)
             .args(merge)
             .output_gated()?,
@@ -2621,7 +2631,7 @@ pub fn checkout_tree_changing(
         from,
         to,
     ];
-    let out = check(&diff, git_command(&repo.root).args(diff).output_gated()?)?;
+    let out = check(&diff, git_command(&repo.root)?.args(diff).output_gated()?)?;
     Ok(out
         .stdout
         .split(|b| *b == 0)
@@ -2689,7 +2699,7 @@ pub fn restore_raw_bytes(
         return Ok(0);
     }
     let args = ["cat-file", "--batch"];
-    let mut child = git_command(&repo.root)
+    let mut child = git_command(&repo.root)?
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -2801,7 +2811,7 @@ pub fn untracked_against(
     let rt = ["read-tree", tree];
     check(
         &rt,
-        git_command(&repo.root)
+        git_command(&repo.root)?
             .env("GIT_INDEX_FILE", &tmp_index)
             .args(rt)
             .output_gated()?,
@@ -2819,7 +2829,7 @@ pub fn untracked_against(
     let argv: Vec<&str> = args.iter().map(String::as_str).collect();
     let out = check(
         &argv,
-        git_command(&repo.root)
+        git_command(&repo.root)?
             .env("GIT_INDEX_FILE", &tmp_index)
             .args(&argv)
             .output_gated()?,
@@ -3051,6 +3061,7 @@ mod tests {
             .chain(args.iter().map(|a| OsStr::from_bytes(a).to_owned()))
             .collect();
         let out = git_command(&root)
+            .unwrap()
             .env("GIT_INDEX_FILE", &tmp_index)
             .args(&without_flag)
             .output()
@@ -3061,6 +3072,7 @@ mod tests {
             String::from_utf8_lossy(&out.stderr)
         );
         let out = git_command(&root)
+            .unwrap()
             .env("GIT_INDEX_FILE", &tmp_index)
             .args(["ls-files", "-s"])
             .output()

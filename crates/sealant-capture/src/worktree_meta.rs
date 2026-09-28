@@ -553,6 +553,9 @@ pub struct Captured {
     /// does not hold what the disk does, so a capture that must be the disk (a final one) fails
     /// on them; an automatic one leaves them to the next snap.
     pub changed_kind: Vec<String>,
+    /// Every regular file of the worktree tree with more than one name, as read here
+    /// ([`crate::aliases`]).
+    pub linked: Vec<crate::aliases::LinkedName>,
 }
 
 /// A path of the worktree tree whose metadata could not be read.
@@ -589,6 +592,7 @@ pub fn capture(
     // (dev, ino) → (key, blob, nlink) of every file with more than one name.
     type Named = (String, Vec<u8>, u64);
     let mut inodes: BTreeMap<(u64, u64), Vec<Named>> = BTreeMap::new();
+    let mut linked = Vec::new();
     for tp in tree_paths(repo, worktree_tree)? {
         let meta = match longpath::symlink_metadata(&abs_of(&scope.root, &tp.path)) {
             Ok(meta) => meta,
@@ -617,6 +621,12 @@ pub fn capture(
             continue;
         }
         let entry = entry_of(&tp.path, tp.kind, &meta);
+        if tp.kind == MetaKind::File
+            && let Some(name) =
+                crate::aliases::LinkedName::of(&abs_of(&scope.root, &tp.path), &meta)
+        {
+            linked.push(name);
+        }
         if tp.kind == MetaKind::File && meta.nlink() > 1 {
             inodes.entry((meta.dev(), meta.ino())).or_default().push((
                 entry.path.clone(),
@@ -682,6 +692,7 @@ pub fn capture(
         outside,
         unreadable,
         changed_kind,
+        linked,
     })
 }
 

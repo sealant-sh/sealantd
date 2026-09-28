@@ -9,6 +9,7 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 #![forbid(unsafe_code)]
 
+pub mod aliases;
 pub mod cadence;
 pub mod chunk;
 mod cpu;
@@ -30,7 +31,7 @@ pub mod tree;
 pub mod watch;
 pub mod worktree_meta;
 
-pub use cadence::{CadenceRunner, CadenceSnapshot, FinalFlush, Incomplete, SnapHealth};
+pub use cadence::{CadenceRunner, CadenceSnapshot, Census, FinalFlush, Incomplete, SnapHealth};
 pub use engine::{
     Cadence, CaptureConfig, CaptureEngine, Class, EngineError, ReadReport, ReadReports,
     SnapOutcome, SnapRequest, SnapStats, StagedCapture, UNREADABLE_PATHS_CAP,

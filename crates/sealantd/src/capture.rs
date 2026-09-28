@@ -175,6 +175,10 @@ impl CaptureRuntime {
         self.runner.start(Some(Arc::new(move || {
             !rt.shutdown().is_hard() && !rt.writers_stopped()
         })));
+        // No process alive at a final flush's seal (review 2026-09-28, sixth pass, #1).
+        let rt = runtime.clone();
+        self.runner
+            .set_census(Some(Arc::new(move || rt.census_writers())));
         // A disk the boot resumed may have changed after its last snap, while no watcher ran:
         // both classes are snapped on their quiet clocks, as after any change.
         if self.resumed {
