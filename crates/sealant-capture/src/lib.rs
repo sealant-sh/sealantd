@@ -43,6 +43,6 @@ pub use materialize::{
 };
 pub use registrar::{HttpRegistrar, InMemoryRegistrar, Registrar, RegistrarError};
 pub use ship::{HeldCapture, MultipartConfig, ShipSnapshot, ShipWorker, Shipper, Staging};
-pub use sink::{BlobSink, LocalDir, PresignedHttp, UrlMinter};
+pub use sink::{BlobSink, LocalDir, PresignedHttp, PutTarget, UrlMinter};
 pub use transport::{ChannelTransport, TransportError};
 pub use watch::{ChangeSignal, Mode as WatchMode, WatchPolicy};

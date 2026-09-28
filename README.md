@@ -180,6 +180,11 @@ the protocol details live in `crates/sealant-capture/src/registrar.rs` and `mani
   time between `SIGTERM` and `SIGKILL`) less a margin of at least 5 s**, so the daemon reports
   "not saved" itself instead of being killed mid-upload. A final flush after the harness exits
   on its own is not bounded by it, unless a shutdown begins meanwhile.
+- **Keys the bucket already holds (decision 19).** `upload.urls` may answer a key in `present`
+  (the registrar verified the stored bytes against the key and minted no URL): the executor
+  takes it as uploaded, sends nothing, and goes on. Every PUT carries `If-None-Match: *`, and a
+  412 is the same answer. A key the executor asked for that comes back in none of `urls`,
+  `multipart` and `present` is an error (`no url for <key>`), never an upload taken as done.
 - **Uploads while the store or the registrar refuses.** A URL minted for a key is used again
   until that key's upload settles (stored, already there, or the URL refused) or it is five
   minutes old, and a multipart upload resumes under the same upload and part URLs. A pass that

@@ -37,3 +37,8 @@ decision 17.
   `observation`; same `(epoch, launch)` with different boots and generations above 0: by
   `(boot_generation, observation)`; anything else is incomparable. Control planes order evidence
   by this, never by their wall clocks, and fail closed on incomparable or contradictory evidence.
+- **A key the bucket already holds is uploaded (decision 19).** `upload.urls` answers such a key
+  in `present` (Mend verified its bytes and mints no URL for it); the executor used to take a key
+  without a URL as an error and never registered the capture. It now takes a `present` key, like
+  a PUT answered 412 under `If-None-Match: *`, as already uploaded and goes on. A key answered in
+  none of `urls`, `multipart` and `present` is still an error.
