@@ -840,6 +840,20 @@ impl<'a> Materializer<'a> {
             {
                 return Err(shared.into());
             }
+            // Every file a chunked class promised is a regular file once the restore is done:
+            // a name something consumed on the way fails the materialize (review 16 #2).
+            if strict {
+                for (_, (_, abs, _)) in &restored_files {
+                    if !longpath::symlink_metadata(abs).is_ok_and(|m| m.is_file()) {
+                        return Err(MaterializeError::Metadata {
+                            path: abs.display().to_string(),
+                            reason: "a file the capture holds is not a regular file after the \
+                                     restore"
+                                .to_owned(),
+                        });
+                    }
+                }
+            }
             // A name given an inode of its own, or left on one that lost names, holds the same
             // bytes under a new inode or ctime: the class's index says so while the size and
             // mtime it knows still hold.
@@ -1263,9 +1277,16 @@ impl<'a> Materializer<'a> {
                         }
                         continue;
                     }
-                    let tmp = dir.join(tmp_name(&entry.name));
-                    {
-                        let mut f = longpath::create(&tmp).at("create", &tmp)?;
+                    // Staged in a file of its own beside it: a name already there (a user's
+                    // `.<name>.capture-tmp`) is never truncated or consumed (review 16 #2).
+                    let (tmp, mut f) = longpath::create_temp(
+                        dir,
+                        &crate::tree::bytes_of(&entry.name),
+                        ".capture-tmp",
+                        0o600,
+                    )
+                    .at("create a staging file in", dir)?;
+                    let written = (|| {
                         for id in entry.chunks.iter().flatten() {
                             let data = store.read(id)?;
                             f.write_all(&data).at("write", &tmp)?;
@@ -1274,9 +1295,14 @@ impl<'a> Materializer<'a> {
                         f.set_permissions(fs::Permissions::from_mode(entry.mode))
                             .at("chmod", &tmp)?;
                         set_mtime(&f, entry.mtime).at("set the mtime of", &tmp)?;
+                        drop(f);
+                        remove_existing(&path).at("rm", &path)?;
+                        longpath::rename(&tmp, &path).at("rename into", &path)
+                    })();
+                    if let Err(e) = written {
+                        longpath::remove_file(&tmp).ok();
+                        return Err(e);
                     }
-                    remove_existing(&path).at("rm", &path)?;
-                    longpath::rename(&tmp, &path).at("rename into", &path)?;
                     report.files += 1;
                     let meta = longpath::symlink_metadata(&path).at("stat", &path)?;
                     write.index.files.insert(
@@ -1445,20 +1471,6 @@ fn check_format(section: &'static str, format: u32) -> Result<(), MaterializeErr
         return Err(MaterializeError::UnsupportedFormat { section, format });
     }
     Ok(())
-}
-
-/// The staging name a file is written under before it is renamed into place: `.<name>.capture-tmp`
-/// while that fits in a name (`NAME_MAX`, 255 bytes), else a digest of the name (a name near
-/// the limit could not be restored at all).
-fn tmp_name(name: &str) -> std::ffi::OsString {
-    let bytes = crate::tree::bytes_of(name);
-    if bytes.len() + ".capture-tmp".len() < 255 {
-        let mut tmp = b".".to_vec();
-        tmp.extend_from_slice(&bytes);
-        tmp.extend_from_slice(b".capture-tmp");
-        return OsStr::from_bytes(&tmp).to_owned();
-    }
-    format!(".capture-tmp-{}", &sha256_hex(&bytes)[..32]).into()
 }
 
 fn remove_existing(path: &Path) -> io::Result<()> {

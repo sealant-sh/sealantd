@@ -37,10 +37,10 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::OsStr;
-use std::fs::Metadata;
+use std::fs::{Metadata, Permissions};
 use std::io::{self, Read};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -1516,8 +1516,10 @@ impl DesiredInodes {
     }
 }
 
-/// Put `abs` on an inode of its own: a copy of its bytes, mode and mtime written beside it and
-/// renamed over it. The directory it is in keeps its mtime.
+/// Put `abs` on an inode of its own: a copy of its bytes, mode and mtime written beside it, in
+/// a file this call creates ([`longpath::create_temp`]), and renamed over it. A name already
+/// beside it is never written or consumed, and only that file is removed on a failure. The
+/// directory it is in keeps its mtime.
 fn copy_apart(abs: &Path) -> io::Result<()> {
     let meta = longpath::symlink_metadata(abs)?;
     let dir = abs
@@ -1525,20 +1527,14 @@ fn copy_apart(abs: &Path) -> io::Result<()> {
         .ok_or_else(|| io::Error::other("a name with no directory"))?;
     let dir_mtime = mtime_ns(&longpath::symlink_metadata(dir)?);
     let name = abs.file_name().unwrap_or_default().as_bytes();
-    let tmp = if name.len() + ".capture-apart".len() < 255 {
-        let mut tmp = b".".to_vec();
-        tmp.extend_from_slice(name);
-        tmp.extend_from_slice(b".capture-apart");
-        dir.join(OsStr::from_bytes(&tmp))
-    } else {
-        dir.join(format!(
-            ".capture-apart-{}",
-            &crate::chunk::sha256_hex(name)[..32]
-        ))
-    };
-    let written = longpath::copy(abs, &tmp)
-        .and_then(|_| longpath::set_mode(&tmp, meta.mode() & 0o7777))
-        .and_then(|()| set_mtime_nofollow(&tmp, mtime_ns(&meta)))
+    let (tmp, mut file) = longpath::create_temp(dir, name, ".capture-apart", 0o600)?;
+    let written = longpath::open(abs)
+        .and_then(|mut src| io::copy(&mut src, &mut file))
+        .and_then(|_| file.set_permissions(Permissions::from_mode(meta.mode() & 0o7777)))
+        .and_then(|()| {
+            drop(file);
+            set_mtime_nofollow(&tmp, mtime_ns(&meta))
+        })
         .and_then(|()| longpath::rename(&tmp, abs));
     if let Err(e) = written {
         longpath::remove_file(&tmp).ok();

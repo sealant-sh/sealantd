@@ -536,3 +536,94 @@ fn a_delta_restore_of_changed_tracked_bytes_breaks_the_old_link() {
     assert_eq!(fs::read(out.join("b")).unwrap(), b"new independent bytes\n");
     assert_ne!(ino(&out.join("a")), ino(&out.join("b")));
 }
+
+/// A user file named like the temporary a split copies through (`.b.capture-apart`, ignored,
+/// captured on an inode of its own) survives the delta restore that splits `b` from `a`: the
+/// copy goes to a fresh name created exclusively, never over an existing sibling (review 16
+/// #2; the reviewer's `audit_delta_split_keeps_a_file_named_like_its_copy_temporary`). A cold
+/// restore of the same head, the control, keeps it too.
+#[test]
+fn a_delta_split_keeps_a_file_named_like_its_copy_temporary() {
+    let fx = Fixture::new();
+    fs::write(
+        fx.root.join(".gitignore"),
+        b".b.capture-apart\nnode_modules/\n",
+    )
+    .unwrap();
+    fs::hard_link(fx.root.join("a"), fx.root.join("b")).unwrap();
+    git(&fx.root, &["add", "-A"]);
+    git(
+        &fx.root,
+        &["commit", "-qm", "linked files and ignored output"],
+    );
+    fs::write(fx.root.join(".b.capture-apart"), b"unique user work\n").unwrap();
+    let runner = fx.runner();
+    let first = fx.seal(&runner);
+    let out = fx.tmp.path().join("delta-apart-name");
+    let m = fx.materializer(&out);
+    m.materialize(&first.manifest, MaterializeClass::All)
+        .unwrap();
+    assert_eq!(
+        fs::read(out.join(".b.capture-apart")).unwrap(),
+        b"unique user work\n"
+    );
+    replace_with_copy(&fx.root.join("b"), Duration::ZERO);
+    let second = fx.seal(&runner);
+    let cold = fx.tmp.path().join("cold-apart-name");
+    fx.materializer(&cold)
+        .materialize(&second.manifest, MaterializeClass::All)
+        .unwrap();
+    assert_eq!(
+        fs::read(cold.join(".b.capture-apart")).unwrap(),
+        b"unique user work\n",
+        "the cold control keeps the user's file"
+    );
+    let report = m
+        .materialize(&second.manifest, MaterializeClass::All)
+        .unwrap();
+    assert_eq!(
+        fs::read(out.join(".b.capture-apart")).ok().as_deref(),
+        Some(&b"unique user work\n"[..]),
+        "the delta keeps the user's file: {report:?}"
+    );
+    assert_ne!(ino(&out.join("a")), ino(&out.join("b")));
+    assert_eq!(snapshot(&out), snapshot(&fx.root));
+    assert!(
+        fs::read_dir(&out).unwrap().all(|e| !e
+            .unwrap()
+            .file_name()
+            .as_bytes()
+            .starts_with(b".b.capture-apart-")),
+        "no temporary is left behind"
+    );
+}
+
+/// The same for the temporary a restored file is written through: a user file named
+/// `.b.capture-tmp` beside an ignored `b` comes back from a cold restore with its own bytes
+/// (review 16 #2, the write path's twin).
+#[test]
+fn a_restore_keeps_a_file_named_like_its_write_temporary() {
+    let fx = Fixture::new();
+    fs::write(fx.root.join(".gitignore"), b"ignored/\nnode_modules/\n").unwrap();
+    git(&fx.root, &["add", "-A"]);
+    git(&fx.root, &["commit", "-qm", "ignore a directory"]);
+    fs::create_dir_all(fx.root.join("ignored")).unwrap();
+    fs::write(fx.root.join("ignored/b"), b"the file\n").unwrap();
+    fs::write(
+        fx.root.join("ignored/.b.capture-tmp"),
+        b"unique user work\n",
+    )
+    .unwrap();
+    let runner = fx.runner();
+    let head = fx.seal(&runner);
+    let cold = fx.tmp.path().join("cold-tmp-name");
+    fx.materializer(&cold)
+        .materialize(&head.manifest, MaterializeClass::All)
+        .unwrap();
+    assert_eq!(
+        fs::read(cold.join("ignored/.b.capture-tmp")).unwrap(),
+        b"unique user work\n"
+    );
+    assert_eq!(fs::read(cold.join("ignored/b")).unwrap(), b"the file\n");
+    assert_eq!(snapshot(&cold), snapshot(&fx.root));
+}
