@@ -1006,6 +1006,29 @@ pub struct CaptureStatusReport {
     /// The first 20 unreadable paths, virtual (`tree/<path>`, `.git/<path>`, `harness/<path>`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unreadable_paths: Vec<String>,
+    /// A capture the registrar refused to register (422 on `capture.register`) that the
+    /// executor is working through: `missing-objects` or `unrestorable`. Never dropped: its
+    /// staged objects are uploaded again, then it is rebuilt from disk in its place. `None`
+    /// when nothing is refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub register_refused: Option<String>,
+    /// That capture's chain position.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub register_refused_n: Option<u64>,
+    /// The first 20 keys the registrar named as missing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub register_missing: Vec<String>,
+    /// Register refusals this daemon has seen since it started. `None` from an older daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub register_refusals: Option<u64>,
+    /// The refused capture waits to be rebuilt from disk; nothing behind it registers first.
+    #[serde(default)]
+    pub repairing: bool,
+    /// A bulk build is in progress (reading, or paused mid-way for a small capture): its
+    /// capture is not queued yet, so `pending` and `pending_bulk` do not count it, but
+    /// `pending_bytes` counts what it has staged so far. A drain is not done while this is true.
+    #[serde(default)]
+    pub bulk_building: bool,
 }
 
 /// Result of `capture.replan`: the identity the executor now acts under and what the delta
@@ -1082,7 +1105,7 @@ pub enum CommandResult {
     /// A capture was staged.
     CaptureStaged(CaptureStaged),
     /// Capture engine state.
-    CaptureStatus(CaptureStatusReport),
+    CaptureStatus(Box<CaptureStatusReport>),
     /// Lease epoch.
     LeaseEpoch(LeaseEpochReport),
     /// The plan was fetched again and the workspace brought to it.

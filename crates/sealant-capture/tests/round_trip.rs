@@ -535,6 +535,7 @@ fn fence_stops_shipping_and_a_new_epoch_continues_the_chain() {
             worktree_id: None,
             epoch: 2,
             platform: None,
+            manifest_format: Some(sealant_capture::manifest::MAX_SECTION_FORMAT),
         })
         .unwrap();
     assert_eq!(plan.worktree_id, "wt-fixture");

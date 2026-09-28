@@ -652,6 +652,23 @@ message CaptureStatusReport {
   // The first 20 unreadable paths, virtual (`tree/<path>` under the worktree, `.git/<path>`,
   // `harness/<path>`), small class first.
   repeated string unreadable_paths = 19;
+  // A capture the registrar refused to register (422 on `capture.register`) that the executor is
+  // working through: `missing-objects` (an object it names is not in the store) or
+  // `unrestorable` (a section's tree would not restore). Never dropped: the objects it staged
+  // are uploaded again, then it is rebuilt from disk in its place. Absent when none is refused.
+  optional string register_refused = 20;
+  // That capture's chain position.
+  optional uint64 register_refused_n = 21;
+  // The first 20 keys the registrar named as missing.
+  repeated string register_missing = 22;
+  // Register refusals this daemon has seen since it started. Absent from an older daemon.
+  optional uint64 register_refusals = 23;
+  // The refused capture waits to be rebuilt from disk; nothing behind it registers first.
+  bool repairing = 24;
+  // A bulk build is in progress (reading the dependency trees, or paused mid-way for a small
+  // capture): its capture is not queued yet, so `pending` and `pending_bulk` do not count it, but
+  // `pending_bytes` counts what it has staged so far. A drain is not done while this is true.
+  bool bulk_building = 25;
 }
 message LeaseEpochReport { uint64 epoch = 1; string worktree_id = 2; bool fenced = 3; }
 message CaptureReplanned {

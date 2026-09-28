@@ -1011,7 +1011,9 @@ impl Runtime {
                 grace_ms,
             } => match self.final_flush(deadline_ms, grace_ms).await {
                 // Answered whatever happened: `complete` and `incomplete_reason` say what.
-                Some(report) => ControlResponse::ok_with(rid, CommandResult::CaptureStatus(report)),
+                Some(report) => {
+                    ControlResponse::ok_with(rid, CommandResult::CaptureStatus(Box::new(report)))
+                }
                 None => ControlResponse::error(rid, crate::capture::not_enabled()),
             },
             Command::CaptureFlush {
@@ -1024,9 +1026,10 @@ impl Runtime {
                     let deadline = self.suspend_deadline(deadline_ms);
                     match tokio::task::spawn_blocking(move || capture.flush_suspend(deadline)).await
                     {
-                        Ok(Ok(report)) => {
-                            ControlResponse::ok_with(rid, CommandResult::CaptureStatus(report))
-                        }
+                        Ok(Ok(report)) => ControlResponse::ok_with(
+                            rid,
+                            CommandResult::CaptureStatus(Box::new(report)),
+                        ),
                         Ok(Err(error)) => ControlResponse::error(rid, error),
                         Err(error) => {
                             ControlResponse::error(rid, ControlError::internal(error.to_string()))
@@ -1036,9 +1039,10 @@ impl Runtime {
             },
             Command::CaptureStatus => match self.capture() {
                 None => ControlResponse::error(rid, crate::capture::not_enabled()),
-                Some(capture) => {
-                    ControlResponse::ok_with(rid, CommandResult::CaptureStatus(capture.status()))
-                }
+                Some(capture) => ControlResponse::ok_with(
+                    rid,
+                    CommandResult::CaptureStatus(Box::new(capture.status())),
+                ),
             },
             Command::LeaseEpoch => match self.capture() {
                 None => ControlResponse::error(rid, crate::capture::not_enabled()),

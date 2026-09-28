@@ -96,8 +96,10 @@ pub fn os_of_key(key: &str) -> OsString {
     OsString::from_vec(bytes_of(key).into_owned())
 }
 
-/// `raw_name` / `raw_target` for a key: the hex of its bytes when the key was escaped.
-fn raw_of(key: &str) -> Option<String> {
+/// `raw_name` / `raw_target` for a key (and the worktree metadata overlay's `raw_path` /
+/// `raw_member`): the hex of its bytes when the key was escaped.
+#[must_use]
+pub fn raw_of(key: &str) -> Option<String> {
     key.chars()
         .any(is_escape_char)
         .then(|| hex::encode(bytes_of(key)))

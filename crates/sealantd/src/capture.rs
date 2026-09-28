@@ -443,7 +443,16 @@ impl CaptureRuntime {
             .iter()
             .filter(|e| e.class == Some(Class::Bulk))
             .count() as u64;
-        let pending_bytes = staging.pending_bytes(&queued);
+        // A bulk build in progress has staged packs no queued capture lists yet: they are on
+        // this disk only, and a drain that read `pending_bytes` 0 mid-build stopped too early.
+        let cadence = self.runner.snapshot();
+        let bulk_building = cadence.bulk_running || cadence.bulk_in_progress;
+        let pending_bytes = staging.pending_bytes(&queued)
+            + if bulk_building {
+                staging.unqueued_bytes(&queued).unwrap_or(0)
+            } else {
+                0
+            };
         let staged_bytes = staging.staged_bytes().unwrap_or(0);
         let last = self.last_snap_unix_ms.load(Ordering::Relaxed);
         let (worktree_id, epoch) = self.identity();
@@ -460,6 +469,7 @@ impl CaptureRuntime {
             FinalOutcome::Snapped { .. } => None,
         };
         let reads = self.reads.current();
+        let refusal = self.runner.shipper().register_refusal();
         CaptureStatusReport {
             epoch,
             worktree_id,
@@ -486,6 +496,14 @@ impl CaptureRuntime {
             unreadable: Some(reads.unreadable),
             carried: Some(reads.carried),
             unreadable_paths: reads.paths,
+            register_refused: refusal.as_ref().map(|r| r.reason.clone()),
+            register_refused_n: refusal.as_ref().map(|r| r.n),
+            register_missing: refusal
+                .map(|r| r.missing.into_iter().take(20).collect())
+                .unwrap_or_default(),
+            register_refusals: Some(ship.register_refusals),
+            repairing: ship.repair_pending,
+            bulk_building,
         }
     }
 
@@ -619,7 +637,7 @@ mod tests {
         else {
             panic!("capture.flush: {:?}", resp.outcome);
         };
-        report
+        *report
     }
 
     /// The daemon used to clamp every flush's deadline to its shutdown grace (10 s, never
@@ -893,6 +911,19 @@ mod tests {
 
         capture.runner().shipper().reset_after_replan(Some(0));
         assert!(capture.status().refused.is_empty());
+
+        // Register refusals (422 `missing-objects` / `unrestorable`) and a capture waiting to be
+        // rebuilt from disk are reported too.
+        let status = capture.status();
+        assert_eq!(status.register_refusals, Some(0));
+        assert!(!status.repairing);
+        assert_eq!(status.register_refused, None);
+        let ship = &capture.runner().shipper().status;
+        ship.register_refusals.store(2, Ordering::Relaxed);
+        ship.repair_pending.store(true, Ordering::Relaxed);
+        let status = capture.status();
+        assert_eq!(status.register_refusals, Some(2));
+        assert!(status.repairing);
     }
 
     /// What the last snap could not read is in `capture.status`: how many paths, how many were
@@ -930,6 +961,116 @@ mod tests {
         let status = capture.status();
         assert_eq!((status.unreadable, status.carried), (Some(0), Some(0)));
         assert!(status.unreadable_paths.is_empty());
+    }
+
+    /// A bulk build in progress has staged packs no queued capture lists: `capture.status`
+    /// says a build is running and counts those bytes, so a drain never reads "nothing pending"
+    /// mid-build (Docker end to end: `pending 0 / pending_bulk 0` with 463 MB staged).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn capture_status_reports_a_bulk_build_in_progress() {
+        use std::sync::atomic::AtomicUsize;
+        let tmp = tempfile::tempdir().unwrap();
+        let (boot, _registrar) = boot(tmp.path());
+        let root = boot.layout.working_directory.clone();
+        std::fs::write(root.join(".gitignore"), "node_modules/\n").unwrap();
+        for p in 0..20 {
+            let dir = root.join(format!("node_modules/pkg{p}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            for f in 0..20 {
+                std::fs::write(
+                    dir.join(format!("m{f}.js")),
+                    format!("module.exports = [{p}, {f}];\n").repeat(200),
+                )
+                .unwrap();
+            }
+        }
+        let capture = CaptureRuntime::new(boot);
+        capture.snap(CaptureKind::Turn).unwrap();
+        capture.runner().shipper().ship_pending().unwrap();
+        let idle = capture.status();
+        assert!(!idle.bulk_building, "{idle:?}");
+        assert_eq!((idle.pending, idle.pending_bytes), (0, 0));
+
+        // A bulk build that yields part-way (a small capture wanted the engine).
+        let calls = AtomicUsize::new(0);
+        let outcome = capture.runner().with_engine_mut(|engine| {
+            engine.snap_preemptible(
+                SnapRequest {
+                    kind: EngineKind::Auto,
+                    class: Class::Bulk,
+                    seq: 99,
+                },
+                &|| calls.fetch_add(1, Ordering::SeqCst) > 100,
+            )
+        });
+        assert!(
+            matches!(outcome, Ok(sealant_capture::SnapOutcome::Preempted)),
+            "{outcome:?}"
+        );
+        let status = capture.status();
+        assert!(status.bulk_building, "{status:?}");
+        assert_eq!(
+            (status.pending, status.pending_bulk),
+            (0, 0),
+            "not queued yet"
+        );
+        assert!(
+            status.pending_bytes > 0,
+            "what the build staged is counted: {status:?}"
+        );
+    }
+
+    /// A path no capture has read yet that cannot be read now has nothing to carry: an automatic
+    /// snap leaves it out, and `capture.status` counts it (not carried) so the control plane can
+    /// name it; the next snap that can read it captures it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn capture_status_counts_a_never_captured_unreadable_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let (boot, registrar) = boot(tmp.path());
+        let root = boot.layout.working_directory.clone();
+        let probe = tmp.path().join("probe");
+        std::fs::write(&probe, b"p").unwrap();
+        std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::File::open(&probe).is_ok() {
+            eprintln!("skipped: permission bits do not bind this process");
+            return;
+        }
+        let fresh = root.join("fresh.md");
+        std::fs::write(&fresh, "never read yet\n").unwrap();
+        std::fs::set_permissions(&fresh, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let capture = CaptureRuntime::new(boot);
+        let snapped = capture.snap(CaptureKind::Turn);
+        std::fs::set_permissions(&fresh, std::fs::Permissions::from_mode(0o644)).unwrap();
+        snapped.expect("an automatic capture does not fail on it");
+        let status = capture.status();
+        assert_eq!(status.unreadable, Some(1), "{status:?}");
+        assert_eq!(status.carried, Some(0), "nothing to carry: {status:?}");
+        assert_eq!(status.unreadable_paths, vec!["tree/fresh.md".to_owned()]);
+
+        capture.snap(CaptureKind::Turn).unwrap();
+        let status = capture.status();
+        assert_eq!(status.unreadable, Some(0), "{status:?}");
+        capture.runner().shipper().ship_pending().unwrap();
+        let head = registrar.head().expect("registered");
+        let tree = head
+            .manifest
+            .sections
+            .git
+            .refs
+            .get(sealant_capture::manifest::WORKTREE_TREE_REF)
+            .cloned()
+            .expect("a worktree tree");
+        let out = Proc::new("git")
+            .current_dir(&root)
+            .args(["cat-file", "-p", &format!("{tree}:fresh.md")])
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "never read yet\n",
+            "captured once it can be read"
+        );
     }
 
     /// The standby flow end to end: the project base is captured for `wt-real` (epoch 1); a

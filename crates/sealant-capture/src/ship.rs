@@ -148,6 +148,45 @@ pub struct HeldCapture {
     pub retry_at: Instant,
 }
 
+/// A capture the registrar refused to register (422 `missing-objects` / `unrestorable`) that
+/// uploading its own objects again did not fix: an object it names is one it did not stage (a
+/// pack an earlier capture uploaded, which retention removed while this executor's chunk index
+/// still pointed at it), or the same capture was refused twice. The engine rebuilds it from
+/// disk in its place — same `n`, same parent, the named packs forgotten so their chunks are read
+/// and packed again — and nothing is dropped: the captures staged after it are folded into the
+/// rebuilt one, which holds the disk as it is now ([`crate::engine::CaptureEngine::repair`]).
+/// Kept in staging (`repair.json`), so a restart finishes it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepairRequest {
+    /// Chain position of the refused capture.
+    pub n: u64,
+    /// Its capture id.
+    pub capture_id: String,
+    /// Its class, when the entry names one.
+    pub class: Option<Class>,
+    /// `missing-objects` or `unrestorable`.
+    pub reason: String,
+    /// The keys the registrar named (empty: none named).
+    pub missing: Vec<String>,
+}
+
+/// The register refusal the shipper is working through, for `capture.status`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RegisterRefusal {
+    /// Chain position of the refused capture.
+    pub n: u64,
+    /// Its capture id.
+    pub capture_id: String,
+    /// Its class, when the entry names one.
+    pub class: Option<Class>,
+    /// `missing-objects` or `unrestorable`.
+    pub reason: String,
+    /// The keys the registrar named.
+    pub missing: Vec<String>,
+    /// Refusals of this capture in a row.
+    pub refusals: u32,
+}
+
 /// Shipping errors.
 #[derive(Debug, thiserror::Error)]
 pub enum ShipError {
@@ -174,6 +213,26 @@ pub enum ShipError {
         used: Option<u64>,
         /// Bytes the refused call asked for.
         requested: Option<u64>,
+    },
+    /// The registrar refused to register this capture (422 `missing-objects` /
+    /// `unrestorable`). The entry stays queued; see [`RepairRequest`].
+    #[error("register n={n} refused ({reason}): {message}")]
+    RegisterRefused {
+        /// Position.
+        n: u64,
+        /// `missing-objects` or `unrestorable`.
+        reason: String,
+        /// Keys the registrar named.
+        missing: Vec<String>,
+        /// The registrar's message.
+        message: String,
+    },
+    /// The capture at the head of the queue waits for the engine to rebuild it from disk
+    /// ([`RepairRequest`]); nothing behind it can register first.
+    #[error("capture n={n} was refused and waits to be rebuilt from disk")]
+    RepairPending {
+        /// Position.
+        n: u64,
     },
     /// The lease was fenced before (or while) this flush ran: nothing staged can register any
     /// more. `pending` captures are still staged on this disk.
@@ -219,6 +278,9 @@ pub enum ShipError {
 
 /// The file (beside `queue/`) that makes a restage one step: see [`Staging::restage`].
 const RESTAGE_JOURNAL: &str = "restage.json";
+
+/// The file (beside `queue/`) holding a [`RepairRequest`].
+const REPAIR_REQUEST: &str = "repair.json";
 
 /// Queue writes that land together or not at all ([`Staging::restage`]).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -529,6 +591,46 @@ impl Staging {
         fs::write(self.marker_path(file), b"")
     }
 
+    /// Drop an object file's ack (the registrar said the store does not hold it): the next
+    /// upload of an entry listing it puts it again, and a build stages it again.
+    pub fn unmark_uploaded(&self, file: &str) -> io::Result<()> {
+        match fs::remove_file(self.marker_path(file)) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        }
+    }
+
+    /// Ask the engine to rebuild a refused capture from disk ([`RepairRequest`]).
+    pub fn request_repair(&self, request: &RepairRequest) -> io::Result<()> {
+        let path = self.dir.join(REPAIR_REQUEST);
+        let tmp = path.with_extension("tmp");
+        write_synced(&tmp, &serde_json::to_vec(request)?)?;
+        fs::rename(&tmp, &path)?;
+        sync_dir(&self.dir);
+        self.bump();
+        Ok(())
+    }
+
+    /// The pending [`RepairRequest`], if any (one that does not parse reads as none, and is
+    /// asked for again at the next refusal).
+    #[must_use]
+    pub fn repair_request(&self) -> Option<RepairRequest> {
+        fs::read(self.dir.join(REPAIR_REQUEST))
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+    }
+
+    /// The repair is done (or its capture is no longer queued).
+    pub fn clear_repair(&self) -> io::Result<()> {
+        match fs::remove_file(self.dir.join(REPAIR_REQUEST)) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+            _ => {
+                self.bump();
+                Ok(())
+            }
+        }
+    }
+
     /// Append an entry (write-then-rename).
     pub fn enqueue(&self, entry: &QueueEntry) -> io::Result<()> {
         let path = self.queue_path(entry.n);
@@ -726,6 +828,29 @@ impl Staging {
         }
         Ok(total)
     }
+
+    /// Bytes staged on this disk that no queued entry lists and no upload took: the packs a
+    /// bulk build in progress has written so far (they join a capture when the build ends). What
+    /// a drain must still count while the build runs.
+    pub fn unqueued_bytes(&self, queued: &[QueueEntry]) -> io::Result<u64> {
+        let listed: HashSet<&str> = queued
+            .iter()
+            .flat_map(|e| e.uploads.iter().map(|u| u.file.as_str()))
+            .collect();
+        let mut total = 0;
+        for d in fs::read_dir(self.objects_dir())? {
+            let d = d?;
+            let name = d.file_name();
+            let name = name.to_string_lossy();
+            if d.file_type()?.is_file()
+                && !listed.contains(name.as_ref())
+                && !self.is_uploaded(&name)
+            {
+                total += d.metadata()?.len();
+            }
+        }
+        Ok(total)
+    }
 }
 
 /// A CPU-time duty cycle (amendment decision 12): after each unit of work, if this thread's CPU
@@ -813,6 +938,10 @@ pub struct ShipStatus {
     /// is paused and asked again after a backoff. Cleared by the next upload or register that
     /// goes through.
     pub lease_lost: AtomicBool,
+    /// Register refusals (422 `missing-objects` / `unrestorable`) seen.
+    pub register_refusals: AtomicU64,
+    /// The capture at the head of the queue waits to be rebuilt from disk ([`RepairRequest`]).
+    pub repair_pending: AtomicBool,
 }
 
 impl ShipStatus {
@@ -830,6 +959,8 @@ impl ShipStatus {
             refused_small: self.refused_small.load(Ordering::Relaxed),
             refused_bulk: self.refused_bulk.load(Ordering::Relaxed),
             lease_lost: self.lease_lost.load(Ordering::Relaxed),
+            register_refusals: self.register_refusals.load(Ordering::Relaxed),
+            repair_pending: self.repair_pending.load(Ordering::Relaxed),
         }
     }
 
@@ -866,6 +997,10 @@ pub struct ShipSnapshot {
     pub refused_bulk: bool,
     /// The registrar answered that the lease is not live; shipping is paused.
     pub lease_lost: bool,
+    /// Register refusals (422 `missing-objects` / `unrestorable`) seen.
+    pub register_refusals: u64,
+    /// The capture at the head of the queue waits to be rebuilt from disk.
+    pub repair_pending: bool,
 }
 
 /// Retry policy for one pass.
@@ -918,6 +1053,8 @@ struct Pass {
     done: bool,
     /// The pass stopped uploading a bulk capture's objects for a waiting flush.
     yielded: bool,
+    /// The pass stopped at a refused capture waiting for the engine to rebuild it.
+    repair: Option<u64>,
 }
 
 /// Uploads staged captures oldest-first and registers each, one pass at a time.
@@ -945,6 +1082,12 @@ pub struct Shipper {
     lease: Mutex<(u32, Option<Instant>)>,
     /// First wait after a lease-lost answer and its cap; doubles per answer in a row.
     lease_backoff: (Duration, Duration),
+    /// The register refusal being worked through (cleared when that capture registers or is
+    /// no longer queued).
+    refusal: Mutex<Option<RegisterRefusal>>,
+    /// Called when a refused capture needs the engine ([`RepairRequest`]): the cadence runner
+    /// wakes its small-class loop, whose next snap rebuilds it.
+    repair_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     /// Counters.
     pub status: Arc<ShipStatus>,
 }
@@ -981,6 +1124,8 @@ impl Shipper {
             hold_backoff: HOLD_BACKOFF,
             lease: Mutex::new((0, None)),
             lease_backoff: LEASE_LOST_BACKOFF,
+            refusal: Mutex::new(None),
+            repair_hook: Mutex::new(None),
             status,
         }
     }
@@ -1068,6 +1213,106 @@ impl Shipper {
     }
 
     /// Whether `entry`'s class is held for the byte quota and its backoff has not run out.
+    /// The register refusal being worked through, if any.
+    #[must_use]
+    pub fn register_refusal(&self) -> Option<RegisterRefusal> {
+        lock(&self.refusal).clone()
+    }
+
+    /// Set what is called when a refused capture needs the engine to rebuild it.
+    pub fn set_repair_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *lock(&self.repair_hook) = Some(hook);
+    }
+
+    fn call_repair_hook(&self) {
+        let hook = lock(&self.repair_hook).clone();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    /// Whether `entry` waits for the engine to rebuild it ([`RepairRequest`]).
+    fn awaiting_repair(&self, entry: &QueueEntry) -> bool {
+        self.staging
+            .repair_request()
+            .is_some_and(|r| r.n == entry.n && r.capture_id == entry.capture_id)
+    }
+
+    /// The registrar refused `entry`. First time, when every key it named is one of the
+    /// entry's own staged objects (every key, when it named none): drop those acks so the
+    /// objects are uploaded again, each checked against the store, and register again (`true`).
+    /// Otherwise — a key the entry did not stage, a staged file already swept, or the same
+    /// capture refused again — ask the engine to rebuild it from disk (`false`).
+    fn after_refusal(
+        &self,
+        entry: &QueueEntry,
+        reason: &str,
+        missing: &[String],
+    ) -> io::Result<bool> {
+        self.status
+            .register_refusals
+            .fetch_add(1, Ordering::Relaxed);
+        let refusals = {
+            let mut refusal = lock(&self.refusal);
+            let refusals = refusal
+                .as_ref()
+                .filter(|r| r.capture_id == entry.capture_id)
+                .map_or(0, |r| r.refusals)
+                + 1;
+            *refusal = Some(RegisterRefusal {
+                n: entry.n,
+                capture_id: entry.capture_id.clone(),
+                class: entry.class,
+                reason: reason.to_owned(),
+                missing: missing.to_vec(),
+                refusals,
+            });
+            refusals
+        };
+        let objects = self.staging.objects_dir();
+        let own: Vec<&Upload> = entry
+            .uploads
+            .iter()
+            .filter(|u| missing.is_empty() || missing.contains(&u.key))
+            .collect();
+        let all_named_staged = missing
+            .iter()
+            .all(|k| entry.uploads.iter().any(|u| &u.key == k));
+        // A file swept after an earlier ack can be put again only if the store still has it,
+        // which is what a refusal says it does not.
+        let reuploadable = own.iter().all(|u| objects.join(&u.file).exists());
+        tracing::warn!(
+            n = entry.n,
+            capture = %entry.capture_id,
+            class = ?entry.class,
+            reason,
+            missing = ?missing,
+            refusals,
+            "capture register refused; the capture stays queued"
+        );
+        if refusals == 1 && all_named_staged && reuploadable {
+            for u in own {
+                self.staging.unmark_uploaded(&u.file)?;
+            }
+            return Ok(true);
+        }
+        self.staging.request_repair(&RepairRequest {
+            n: entry.n,
+            capture_id: entry.capture_id.clone(),
+            class: entry.class,
+            reason: reason.to_owned(),
+            missing: missing.to_vec(),
+        })?;
+        self.status.repair_pending.store(true, Ordering::Relaxed);
+        tracing::warn!(
+            n = entry.n,
+            capture = %entry.capture_id,
+            "the refused capture is rebuilt from disk in its place"
+        );
+        self.call_repair_hook();
+        Ok(false)
+    }
+
     fn held_back(&self, entry: &QueueEntry) -> bool {
         lock(&self.held)[class_slot(entry.class)]
             .as_ref()
@@ -1396,6 +1641,18 @@ impl Shipper {
                     return Err(ShipError::Fenced(e));
                 }
                 Err(e @ RegistrarError::WrongParent { .. }) => return Err(ShipError::Conflict(e)),
+                Err(RegistrarError::RegisterRefused {
+                    reason,
+                    missing,
+                    message,
+                }) => {
+                    return Err(ShipError::RegisterRefused {
+                        n: entry.n,
+                        reason,
+                        missing,
+                        message,
+                    });
+                }
                 Err(RegistrarError::QuotaRefused {
                     reason,
                     limit,
@@ -1482,10 +1739,32 @@ impl Shipper {
         let mut cycle = DutyCycle::new(self.cpu_fraction);
         loop {
             let pending = self.staging.pending()?;
+            // A repair asked for a capture that is no longer queued (the engine rebuilt it, or
+            // a re-plan dropped it) is done.
+            match self.staging.repair_request() {
+                Some(request)
+                    if !pending
+                        .iter()
+                        .any(|e| e.n == request.n && e.capture_id == request.capture_id) =>
+                {
+                    self.staging.clear_repair()?;
+                    self.status.repair_pending.store(false, Ordering::Relaxed);
+                }
+                Some(_) => {}
+                None => self.status.repair_pending.store(false, Ordering::Relaxed),
+            }
             let Some(entry) = pending.first() else {
                 pass.done = true;
                 return Ok(pass);
             };
+            // Refused, and waiting for the engine to rebuild it from disk: nothing behind it
+            // can register first (the chain is ordered).
+            if self.awaiting_repair(entry) {
+                self.status.repair_pending.store(true, Ordering::Relaxed);
+                self.call_repair_hook();
+                pass.repair = Some(entry.n);
+                return Ok(pass);
+            }
             // A capture held for the byte quota waits out its backoff; nothing behind it can
             // register first (the chain is ordered), but a small capture is staged ahead of a
             // held bulk capture as ahead of any queued one.
@@ -1569,6 +1848,12 @@ impl Shipper {
                             .store(false, Ordering::Relaxed);
                     }
                     lock(&self.held)[class_slot(entry.class)] = None;
+                    {
+                        let mut refusal = lock(&self.refusal);
+                        if refusal.as_ref().is_some_and(|r| r.n <= entry.n) {
+                            *refusal = None;
+                        }
+                    }
                     tracing::info!(n = entry.n, capture = %entry.capture_id, kind = ?entry.kind, class = ?entry.class, "capture registered");
                 }
                 Err(ShipError::QuotaRefused {
@@ -1584,6 +1869,17 @@ impl Shipper {
                 Err(ShipError::LeaseLost) => {
                     self.staging.release();
                     self.lease_lost();
+                    return Ok(pass);
+                }
+                // Never dropped: uploaded again, or rebuilt from disk in its place.
+                Err(ShipError::RegisterRefused {
+                    reason, missing, ..
+                }) => {
+                    self.staging.release();
+                    if self.after_refusal(entry, &reason, &missing)? {
+                        continue;
+                    }
+                    pass.repair = Some(entry.n);
                     return Ok(pass);
                 }
                 Err(e) => {
@@ -1699,6 +1995,11 @@ impl Shipper {
                     total += pass.shipped;
                     if self.is_fenced() {
                         return Err(ShipError::AlreadyFenced { pending: pending() });
+                    }
+                    // The engine has to rebuild the head capture first: the caller (the cadence
+                    // runner) does, and flushes again.
+                    if let Some(n) = pass.repair {
+                        return Err(ShipError::RepairPending { n });
                     }
                     if pass.done {
                         return Ok(total);

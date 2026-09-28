@@ -74,7 +74,11 @@ impl Incomplete {
     }
 
     fn from_snap(class: Class, error: &EngineError) -> Self {
-        // SEAM(fix/capture-read-fidelity 2607672): `if error.unreadable().is_some() { return Self::Unreadable(error.to_string()); }`
+        // The snap failed because it could not read work (`EngineError::unreadable`): say so,
+        // so the control plane can name the paths instead of a generic snapshot failure.
+        if error.unreadable().is_some() {
+            return Self::Unreadable(error.to_string());
+        }
         Self::SnapshotFailed {
             class,
             error: error.to_string(),
@@ -180,6 +184,9 @@ struct State {
     bulk_mode: Mode,
     /// The watcher overflowed: the cadence thread drops it.
     overflowed: bool,
+    /// The shipper asked for a refused capture to be rebuilt from disk: the small-class loop
+    /// runs [`CaptureEngine::repair`] next.
+    repair: bool,
     stop: bool,
 }
 
@@ -440,13 +447,24 @@ impl Shared {
     /// The small-class loop.
     fn run_small(&self) {
         loop {
-            let (due, overflowed) = {
-                let st = self.state();
+            let (due, overflowed, repair) = {
+                let mut st = self.state();
                 if st.stop {
                     return;
                 }
-                (st.small.due(st.small_mode), st.overflowed)
+                let repair = std::mem::take(&mut st.repair);
+                (st.small.due(st.small_mode), st.overflowed, repair)
             };
+            if repair {
+                match self.engine().repair() {
+                    Ok(true) => self.wake_worker(),
+                    Ok(false) => {}
+                    Err(error) => {
+                        tracing::error!(%error, "rebuilding a refused capture failed");
+                    }
+                }
+                continue;
+            }
             if overflowed {
                 self.drop_watch();
             }
@@ -569,7 +587,7 @@ impl CadenceRunner {
         let cadence = config.cadence;
         let capture_bulk = config.capture_bulk;
         let staging = engine.staging();
-        Self {
+        let runner = Self {
             shared: Arc::new(Shared {
                 engine: Mutex::new(engine),
                 staging,
@@ -581,6 +599,7 @@ impl CadenceRunner {
                     small_mode: Mode::Polled,
                     bulk_mode: Mode::Polled,
                     overflowed: false,
+                    repair: false,
                     stop: false,
                 }),
                 cv: Condvar::new(),
@@ -596,7 +615,17 @@ impl CadenceRunner {
                 counters: Counters::default(),
             }),
             threads: Mutex::new(Vec::new()),
-        }
+        };
+        // A refused capture the shipper cannot fix by uploading again wakes the small-class
+        // loop, which rebuilds it from disk.
+        let weak = Arc::downgrade(&runner.shared);
+        runner.shared.shipper.set_repair_hook(Arc::new(move || {
+            if let Some(shared) = weak.upgrade() {
+                shared.state().repair = true;
+                shared.cv.notify_all();
+            }
+        }));
+        runner
     }
 
     /// Start the watcher, the ship worker and the class loops. `allow` is asked before every
@@ -753,14 +782,44 @@ impl CadenceRunner {
             tracing::error!(%error, "final bulk-class snap failed");
             incomplete.get_or_insert(Incomplete::from_snap(Class::Bulk, &error));
         }
-        let shipped = match self.shared.shipper.flush_final(left()) {
-            Ok(shipped) => shipped,
-            Err(error) => {
-                tracing::error!(%error, "final flush: shipping did not finish");
-                incomplete.get_or_insert(Incomplete::from_ship(&error));
-                0
+        let mut shipped = 0;
+        let mut repairs = 0u32;
+        loop {
+            match self.shared.shipper.flush_final(left()) {
+                Ok(n) => {
+                    shipped += n;
+                    break;
+                }
+                // A refused capture waits to be rebuilt from disk (the writers are stopped, so
+                // the disk is what the final capture must hold): rebuild it, ship again.
+                Err(ShipError::RepairPending { n }) => {
+                    repairs += 1;
+                    if repairs > 1 {
+                        // Refused again after a rebuild: back off, never give up while there
+                        // is time (the daemon's own flush has no deadline).
+                        let wait = Duration::from_secs(1 << (repairs - 2).min(5));
+                        thread::sleep(left().map_or(wait, |l| wait.min(l)));
+                    }
+                    if until.is_some_and(|u| Instant::now() >= u) {
+                        incomplete.get_or_insert(Incomplete::Deadline {
+                            pending: self.shared.staging.pending().map_or(0, |p| p.len()),
+                        });
+                        break;
+                    }
+                    tracing::warn!(n, repairs, "final flush: rebuilding a refused capture");
+                    if let Err(error) = self.shared.engine().repair() {
+                        tracing::error!(%error, "final flush: rebuilding a refused capture failed");
+                        incomplete.get_or_insert(Incomplete::from_snap(Class::Small, &error));
+                        break;
+                    }
+                }
+                Err(error) => {
+                    tracing::error!(%error, "final flush: shipping did not finish");
+                    incomplete.get_or_insert(Incomplete::from_ship(&error));
+                    break;
+                }
             }
-        };
+        }
         FinalFlush {
             shipped,
             incomplete,

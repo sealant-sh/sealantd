@@ -499,3 +499,51 @@ fn a_final_flush_after_a_fence_is_not_a_success() {
     );
     assert!(fx.registrar.chain().is_empty());
 }
+
+/// A final flush that meets work it cannot read is incomplete *because* of that work
+/// (`unreadable`), not as a generic snapshot failure: the control plane can name it. Nothing
+/// that would drop the file registers, and the staging directory is kept.
+#[test]
+fn a_final_flush_over_unreadable_work_is_incomplete_for_that_reason() {
+    use std::os::unix::fs::PermissionsExt;
+    let fx = fixture(3);
+    let notes = fx.root.join("notes.txt");
+    fs::write(&notes, b"KEEP").unwrap();
+    let config = CaptureConfig::new("wt", 1, &fx.root);
+    let staging_dir = config.staging_dir();
+    let runner = runner(config, fx.store.clone(), &fx);
+    runner.snap(CaptureKind::Turn).unwrap();
+    runner.ship(Duration::from_secs(30)).unwrap();
+
+    fs::set_permissions(&notes, fs::Permissions::from_mode(0o000)).unwrap();
+    if fs::read(&notes).is_ok() {
+        fs::set_permissions(&notes, fs::Permissions::from_mode(0o644)).unwrap();
+        eprintln!("skipped: permission bits do not bind this process");
+        return;
+    }
+    let reported = runner.flush_final(None);
+    fs::set_permissions(&notes, fs::Permissions::from_mode(0o644)).unwrap();
+
+    assert!(!reported.complete(), "{reported:?}");
+    assert_eq!(
+        reported.incomplete.as_ref().map(|i| i.reason()),
+        Some("unreadable"),
+        "{reported:?}"
+    );
+    assert!(
+        reported
+            .incomplete
+            .as_ref()
+            .is_some_and(|i| i.to_string().contains("notes.txt")),
+        "names the path: {reported:?}"
+    );
+    assert!(staging_dir.is_dir(), "the staging directory is kept");
+    let out = fx.base.join("restored");
+    restore_head(&fx, &out);
+    assert_eq!(
+        fs::read(out.join("notes.txt")).unwrap(),
+        b"KEEP",
+        "the head still holds the file's last read bytes"
+    );
+    runner.stop();
+}

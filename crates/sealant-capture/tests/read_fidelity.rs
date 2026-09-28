@@ -411,3 +411,58 @@ fn a_final_capture_fails_on_an_unreadable_worktree_directory_and_the_chain_stays
     );
     assert_eq!(fs::read(out.join("un/u")).unwrap(), b"untracked work\n");
 }
+
+/// A path no capture has read yet that cannot be read now has nothing to carry: an automatic
+/// capture leaves it out (never a deletion of anything captured) and counts it — unreadable,
+/// not carried, named — and the next capture that can read it holds it.
+#[test]
+fn a_never_captured_unreadable_path_is_counted_and_captured_once_readable() {
+    let fx = Fixture::new();
+    if !permissions_bind(&fx.base) {
+        eprintln!("skipped: permission bits do not bind this process");
+        return;
+    }
+    let s = &fx.source;
+    let mut engine = fx.engine(Duration::ZERO);
+    fx.snap(&mut engine, CaptureKind::Turn, Class::Small, 1)
+        .unwrap();
+    fx.ship(&engine);
+
+    let ignored = s.join("ignored/fresh");
+    let untracked = s.join("fresh.md");
+    fs::write(&ignored, b"ignored, never read yet\n").unwrap();
+    fs::write(&untracked, b"untracked, never read yet\n").unwrap();
+    for p in [&ignored, &untracked] {
+        fs::set_permissions(p, fs::Permissions::from_mode(0o000)).unwrap();
+    }
+    let turn = fx.snap(&mut engine, CaptureKind::Turn, Class::Small, 2);
+    for p in [&ignored, &untracked] {
+        fs::set_permissions(p, fs::Permissions::from_mode(0o644)).unwrap();
+    }
+    let turn = turn.expect("an automatic capture does not fail on it");
+    assert_eq!(turn.stats.unreadable, 2, "{:?}", turn.stats);
+    assert_eq!(turn.stats.carried, 0, "nothing to carry: {:?}", turn.stats);
+    assert_eq!(
+        turn.stats.unreadable_paths,
+        vec!["tree/fresh.md", "tree/ignored/fresh"]
+    );
+    fx.ship(&engine);
+    let out = fx.restore("before");
+    assert!(!out.join("ignored/fresh").exists());
+    assert_eq!(fs::read(out.join("tracked")).unwrap(), b"tracked\n");
+
+    let next = fx
+        .snap(&mut engine, CaptureKind::Turn, Class::Small, 3)
+        .unwrap();
+    assert_eq!(next.stats.unreadable, 0, "{:?}", next.stats);
+    fx.ship(&engine);
+    let out = fx.restore("after");
+    assert_eq!(
+        fs::read(out.join("ignored/fresh")).unwrap(),
+        b"ignored, never read yet\n"
+    );
+    assert_eq!(
+        fs::read(out.join("fresh.md")).unwrap(),
+        b"untracked, never read yet\n"
+    );
+}
