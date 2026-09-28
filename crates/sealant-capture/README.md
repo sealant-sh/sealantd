@@ -92,6 +92,15 @@ per filesystem (`MetaError::LinkUnfulfilled`), and no inode holds names of two g
 (`MetaError::ForeignLink`). `tests/review15_delta_links.rs` holds it with pnpm's layout by hand
 and, when `node` and `pnpm` are on `PATH`, a real install.
 
+**A staging file is the restore's own.** A file is written, and a split name copied, into a
+fresh name beside it (`.<name>.capture-tmp-<pid>-<n>`, `.<name>.capture-apart-<pid>-<n>`)
+created with `O_EXCL` (`longpath::create_temp`), the counter moving on past any name already
+there, and only that file is removed on a failure. The fixed names these were before consumed a
+captured user file of the same name: the split's copy truncated `.b.capture-apart` and renamed
+it onto `b`, and writing `b` did the same to `.b.capture-tmp` (review 16 #2). A sealed final
+capture restored whole also fails the materialize when any file a chunked class promised is not
+a regular file once the restore is done.
+
 **The next capture is incremental too.** A restored executor learns where the head's chunks are:
 at open (and at a re-plan) the engine maps the chunks of every workspace and bulk pack the
 registered head names that the materializer left in the pack cache (and, writing dir packs, the
@@ -817,7 +826,7 @@ A capture holds what is on disk, and says so when it cannot.
   still names whole, every untracked directory too long to open) are excluded from the add and
   carried by the workspace class like a nested repository (`tree/<path>`), and restored from
   there; ignored and bulk paths were never git's. A restore writes a file under a short staging
-  name when `.<name>.capture-tmp` would pass `NAME_MAX`. A directory too long to name to
+  name (a digest of the name) when `.<name>.capture-tmp-<pid>-<n>` would pass `NAME_MAX`. A directory too long to name to
   `inotify_add_watch` (it takes a path) is opened a run of components at a time and watched as
   `/proc/self/fd/<fd>`, at start and when one appears later; its events are named by its own
   path again. Only a directory that cannot be watched that way either makes its class poll (it

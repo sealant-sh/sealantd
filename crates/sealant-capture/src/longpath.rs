@@ -21,8 +21,9 @@ use std::fs::{self, File, Metadata};
 use std::io::{self, Read, Write};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use nix::dir::{Dir, Type};
 use nix::fcntl::{AT_FDCWD, AtFlags, OFlag, openat, readlinkat, renameat};
@@ -225,6 +226,54 @@ pub fn open(path: &Path) -> io::Result<File> {
         return File::open(path);
     }
     open_at(path, OFlag::O_RDONLY, 0)
+}
+
+/// `OpenOptions::create_new`: write only, created with `mode` (under the umask), and never an
+/// existing name (`O_EXCL`: `AlreadyExists` for any entry there, a symlink included).
+pub fn create_new(path: &Path, mode: u32) -> io::Result<File> {
+    if fits(path) {
+        return fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(mode)
+            .open(path);
+    }
+    open_at(path, OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_EXCL, mode)
+}
+
+/// A new file in `dir` to stage `name` in before it is renamed into place: `.<name><tag>-<pid>-<n>`
+/// (`<tag>-<digest of name>-<pid>-<n>` when that would not fit in a name), created with
+/// [`create_new`] and `n` moved on past any name already there. Nothing that was in `dir`
+/// before is opened or truncated: the file is the caller's own, to rename or remove (review
+/// 2026-09-28, sixteenth pass, #2).
+pub fn create_temp(dir: &Path, name: &[u8], tag: &str, mode: u32) -> io::Result<(PathBuf, File)> {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    // `-<pid>-<n>`: at most 32 bytes.
+    let mut stem = Vec::new();
+    if 1 + name.len() + tag.len() + 32 <= 255 {
+        stem.push(b'.');
+        stem.extend_from_slice(name);
+        stem.extend_from_slice(tag.as_bytes());
+    } else {
+        stem.extend_from_slice(tag.as_bytes());
+        stem.push(b'-');
+        stem.extend_from_slice(&crate::chunk::sha256_hex(name).as_bytes()[..32]);
+    }
+    for _ in 0..1024 {
+        let mut tmp = stem.clone();
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        tmp.extend_from_slice(format!("-{}-{n}", std::process::id()).as_bytes());
+        let path = dir.join(OsStr::from_bytes(&tmp));
+        match create_new(&path, mode) {
+            Ok(file) => return Ok((path, file)),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        format!("no unused staging name beside {}", dir.display()),
+    ))
 }
 
 /// `File::create`: write only, created (`0o666` under the umask) or truncated.
