@@ -7,6 +7,11 @@
 //! is materialized, at boot and again at a `capture.replan`, where a standby learns which
 //! worktree it serves.
 //!
+//! The callers apply them to a base only: a repository built from an empty chain, or from a
+//! capture that carries no `.git/config` (Mend's capture 0). A capture that carries one holds a
+//! session's own configuration, and it is the repository's, a remote the user removed included
+//! (review 2026-09-28, fourth pass, #8: a fresh executor added it back).
+//!
 //! A remote the repository already has is never changed. The repository's `.git/config` is
 //! captured with the rest of `.git/` (workspace-class bookkeeping), so a remote there is either
 //! one a capture carried — the user's own, whatever URL they gave it — or one this module added;

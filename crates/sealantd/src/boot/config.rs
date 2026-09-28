@@ -45,6 +45,8 @@ const CONSUMED_KEYS: &[&str] = &[
     "SEALANT_CAPTURE_CA_FILE",
     "SEALANT_CAPTURE_OBJECT_CA_PEM",
     "SEALANT_CAPTURE_OBJECT_CA_FILE",
+    "SEALANT_CAPTURE_LAUNCH_ID",
+    "SEALANT_SWEEP_EXEMPT_FILE",
     "SEALANT_WORKSPACE_MOUNT_HOST_PATH",
     "SEALANT_MOUNT_ALLOWED_STORE_ROOTS",
     "SEALANT_WORKSPACE_REPO_URL",
@@ -249,6 +251,11 @@ pub struct CaptureSourceConfig {
     /// A recovery boot ([`BootConfig::recovery`]): the disk is resumed as it is, never
     /// materialized over.
     pub recovery: bool,
+    /// `SEALANT_CAPTURE_LAUNCH_ID`: the launch this executor is (cross-repo decisions 5 and
+    /// 11), as the control plane minted it for the session token. The first `plan.get` names
+    /// it (`launch`), and a plan that answers another `executor` refuses the boot. Unset, the
+    /// first `plan.get` names the launch this disk last served, when it recorded one.
+    pub launch_id: Option<String>,
 }
 
 /// How the workspace working directory is provisioned.
@@ -531,6 +538,16 @@ pub struct BootConfig {
     /// SFTP; and runs the final flush when asked (or on its stop). Capture-store workspaces
     /// only.
     pub recovery: bool,
+    /// `SEALANT_SWEEP_EXEMPT_FILE`: where the host's agent lists its own helper processes
+    /// (`{"version":1,"exempt":[{"pid","startTime","role","descendants"}]}`, `startTime` being
+    /// field 22 of `/proc/<pid>/stat`; [`crate::sweep::read_exempt`]), rewritten atomically as
+    /// helpers start and exit. Set, the final flush's sweep of writers covers every process on
+    /// the machine but sealantd, its ancestors, its own helpers and the live processes listed
+    /// (re-read at every scan) — on a MicroVM, where the agent is PID 1 and adopts every orphan a
+    /// dead daemon left, a descendants-only sweep never saw them ([`crate::sweep`]; review
+    /// 2026-09-28, fourth pass, #4). A file that cannot be read or parsed makes the final flush
+    /// `sweep-unavailable`.
+    pub sweep_exempt_file: Option<PathBuf>,
 }
 
 /// Whether a string is one of the truthy tokens `1` / `true`.
@@ -748,6 +765,10 @@ impl BootConfig {
             passthrough_env,
             workspace_docker,
             recovery,
+            sweep_exempt_file: env
+                .get("SEALANT_SWEEP_EXEMPT_FILE")
+                .filter(|s| !s.trim().is_empty())
+                .map(PathBuf::from),
         })
     }
 
@@ -868,6 +889,10 @@ impl BootConfig {
                         .filter(|s| !s.trim().is_empty())
                         .map(PathBuf::from),
                     recovery: false,
+                    launch_id: env
+                        .get("SEALANT_CAPTURE_LAUNCH_ID")
+                        .map(|s| s.trim().to_owned())
+                        .filter(|s| !s.is_empty()),
                 }))
             }
             Some(other) => Err(BootError::config(format!(

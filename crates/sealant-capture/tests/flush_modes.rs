@@ -628,3 +628,96 @@ fn a_final_flush_over_unreadable_work_is_incomplete_for_that_reason() {
     );
     runner.stop();
 }
+
+/// Refuses `capture.register` with `lease-lost` while `refusing` is set (Mend round 4: 409
+/// `lease-lost` on register, the uploads having gone through), and passes everything else on.
+struct RefuseRegister {
+    inner: Arc<InMemoryRegistrar>,
+    refusing: std::sync::atomic::AtomicBool,
+}
+
+impl Registrar for RefuseRegister {
+    fn plan_get(
+        &self,
+        req: &sealant_capture::registrar::PlanGetRequest,
+    ) -> Result<sealant_capture::registrar::PlanGetResponse, sealant_capture::RegistrarError> {
+        self.inner.plan_get(req)
+    }
+    fn upload_urls(
+        &self,
+        req: &sealant_capture::registrar::UploadUrlsRequest,
+    ) -> Result<sealant_capture::registrar::UploadUrlsResponse, sealant_capture::RegistrarError>
+    {
+        self.inner.upload_urls(req)
+    }
+    fn upload_complete(
+        &self,
+        req: &sealant_capture::registrar::UploadCompleteRequest,
+    ) -> Result<sealant_capture::registrar::UploadCompleteResponse, sealant_capture::RegistrarError>
+    {
+        self.inner.upload_complete(req)
+    }
+    fn capture_register(
+        &self,
+        req: &sealant_capture::registrar::RegisterRequest,
+    ) -> Result<sealant_capture::registrar::RegisterResponse, sealant_capture::RegistrarError> {
+        if self.refusing.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(sealant_capture::RegistrarError::LeaseLost);
+        }
+        self.inner.capture_register(req)
+    }
+    fn lease_heartbeat(
+        &self,
+        req: &sealant_capture::registrar::HeartbeatRequest,
+    ) -> Result<sealant_capture::registrar::HeartbeatResponse, sealant_capture::RegistrarError>
+    {
+        self.inner.lease_heartbeat(req)
+    }
+    fn change_summary(
+        &self,
+        req: &sealant_capture::registrar::ChangeSummaryRequest,
+    ) -> Result<(), sealant_capture::RegistrarError> {
+        self.inner.change_summary(req)
+    }
+}
+
+/// `capture.register` answering `lease-lost` after the uploads went through (Mend round 4)
+/// pauses shipping: nothing is registered, nothing dropped, no fence, and the capture keeps the
+/// epoch it was staged under — the executor adopts none. Once the lease is back, the same
+/// capture registers under that epoch.
+#[test]
+fn a_register_refused_as_lease_lost_pauses_and_adopts_no_epoch() {
+    let fx = fixture(3);
+    let engine = CaptureEngine::open(CaptureConfig::new("wt", 1, &fx.root), None).unwrap();
+    let sink: Arc<dyn BlobSink> = fx.store.clone();
+    let refusing = Arc::new(RefuseRegister {
+        inner: fx.registrar.clone(),
+        refusing: std::sync::atomic::AtomicBool::new(true),
+    });
+    let registrar: Arc<dyn Registrar> = refusing.clone();
+    let shipper = Arc::new(
+        engine
+            .shipper(sink, registrar)
+            .with_lease_backoff(Duration::from_millis(20), Duration::from_millis(100)),
+    );
+    let runner = CadenceRunner::new(engine, shipper.clone());
+    runner.snap(CaptureKind::Turn).unwrap();
+    assert_eq!(shipper.ship_pending().unwrap(), 0, "a pass pauses");
+    let status = shipper.status.snapshot();
+    assert!(status.lease_lost);
+    assert!(!shipper.is_fenced());
+    let staged = runner.staging().pending().unwrap();
+    assert_eq!(staged.len(), 1, "still staged");
+    assert_eq!(staged[0].register.epoch, 1, "the epoch it was staged under");
+    assert!(fx.registrar.chain().is_empty());
+
+    refusing
+        .refusing
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    runner.flush(CaptureKind::Final, None).unwrap();
+    assert!(runner.staging().pending().unwrap().is_empty());
+    assert!(!shipper.status.snapshot().lease_lost);
+    let chain = fx.registrar.chain();
+    assert!(chain.iter().all(|h| h.manifest.epoch == 1));
+    assert_eq!(chain[0].manifest.kind, CaptureKind::Turn);
+}

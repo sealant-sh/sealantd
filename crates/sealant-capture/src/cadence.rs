@@ -60,11 +60,16 @@ pub enum Incomplete {
     /// A final snap met work it could not read (it would have been left out of the capture).
     #[error("unreadable work: {0}")]
     Unreadable(String),
+    /// The store cannot hold what the capture holds ([`CaptureEngine::fidelity_gap`]): what it
+    /// would restore is less than the disk, so the flush is never complete and nothing is
+    /// sealed, whatever registered.
+    #[error("{0}")]
+    StoreFidelity(String),
 }
 
 impl Incomplete {
     /// The reason code: `snapshot-failed`, `fenced`, `conflict`, `deadline`, `ship-failed`,
-    /// `unreadable` or `sealing`.
+    /// `unreadable`, `sealing` or `store-fidelity`.
     #[must_use]
     pub fn reason(&self) -> &'static str {
         match self {
@@ -75,6 +80,7 @@ impl Incomplete {
             Self::ShipFailed(_) => "ship-failed",
             Self::Unreadable(_) => "unreadable",
             Self::Sealing(_) => "sealing",
+            Self::StoreFidelity(_) => "store-fidelity",
         }
     }
 
@@ -1121,6 +1127,14 @@ impl CadenceRunner {
             }
         }
         let mut shipped = self.ship_final(until, &mut incomplete);
+        // A store that cannot hold what was captured: everything shipped all the same (it is
+        // the most the store can take), but nothing is sealed and the flush is not complete.
+        if incomplete.is_none()
+            && let Some(gap) = self.shared.engine().fidelity_gap()
+        {
+            tracing::error!(%gap, "final flush: the store cannot hold what the capture holds");
+            incomplete = Some(Incomplete::StoreFidelity(gap));
+        }
         // Everything registered: seal the completed flush on the chain, and say `complete` only
         // once the sealing capture registered. Bounded: a register refused and rebuilt in its
         // place loses the seal, and it is staged once more.

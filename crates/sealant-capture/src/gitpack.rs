@@ -72,8 +72,59 @@ fn names_operation_objects(name: &[u8]) -> bool {
 /// cherry-picks or reverts): every file under them may name objects.
 const OPERATION_DIRS: &[&str] = &["rebase-merge", "rebase-apply", "sequencer"];
 
-/// Every run of hex digits in `text` that could name an object (seven digits, git's shortest
-/// default abbreviation, up to a full sha-256 id), bounded by bytes that are not word bytes.
+/// The pseudo-refs of an operation in progress, each line of which names an object the
+/// operation needs to go on (a merge's other parents, the commit a cherry-pick, revert or
+/// rebase stopped at, the tree of a merge's result, the commit a bisect checked out).
+/// `FETCH_HEAD` and `ORIG_HEAD` outlive every operation and may name objects long pruned: their
+/// objects are carried when they resolve, and are not dependencies.
+const PENDING_REFS: &[&[u8]] = &[
+    b"MERGE_HEAD",
+    b"CHERRY_PICK_HEAD",
+    b"REVERT_HEAD",
+    b"REBASE_HEAD",
+    b"AUTO_MERGE",
+    b"BISECT_HEAD",
+    b"BISECT_EXPECTED_REV",
+];
+
+/// The instruction lists of an operation directory (a rebase's todo, its backup and what is
+/// done; a sequencer's todo): each `pick`-like line names the commit git resolves when the
+/// operation goes on.
+const TODO_FILES: &[&[u8]] = &[
+    b"git-rebase-todo",
+    b"git-rebase-todo.backup",
+    b"done",
+    b"todo",
+];
+
+/// The files of an operation directory that hold one object id: where a rebase goes `onto`,
+/// the head it started from, the commit it stopped at, what an `am` or a sequencer started from.
+const OID_FILES: &[&[u8]] = &[
+    b"onto",
+    b"orig-head",
+    b"stopped-sha",
+    b"amend",
+    b"squash-onto",
+    b"head",
+    b"abort-safety",
+    b"original-commit",
+];
+
+/// Todo commands whose first operand is a commit (`merge` only with `-C`/`-c`, a `fixup` may
+/// carry either before it); `label`, `reset`, `update-ref`, `exec` and `break` name none.
+const PICKS: &[&[u8]] = &[
+    b"pick", b"p", b"reword", b"r", b"edit", b"e", b"squash", b"s", b"fixup", b"f", b"drop", b"d",
+    b"revert", b"merge", b"m",
+];
+
+/// Whether `word` could be an object name git resolves: four hex digits (git's shortest
+/// abbreviation, `core.abbrev=4`) up to a full sha-256 id.
+fn hexish(word: &[u8]) -> bool {
+    (4..=64).contains(&word.len()) && word.iter().all(u8::is_ascii_hexdigit)
+}
+
+/// Every run of hex digits in `text` that could name an object ([`hexish`]), bounded by bytes
+/// that are not word bytes.
 fn hex_tokens(text: &[u8], found: &mut BTreeSet<String>) {
     let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'-';
     let mut i = 0;
@@ -87,10 +138,69 @@ fn hex_tokens(text: &[u8], found: &mut BTreeSet<String>) {
             i += 1;
         }
         let word = &text[start..i];
-        if (7..=64).contains(&word.len()) && word.iter().all(u8::is_ascii_hexdigit) {
+        if hexish(word) {
             found.insert(String::from_utf8_lossy(word).to_ascii_lowercase());
         }
     }
+}
+
+/// The commit operands of a todo list's `pick`-like lines ([`PICKS`]), as written.
+fn todo_operands(text: &[u8], found: &mut Vec<Vec<u8>>) {
+    for line in text.split(|b| *b == b'\n') {
+        let mut words = line
+            .split(u8::is_ascii_whitespace)
+            .filter(|w| !w.is_empty());
+        let Some(command) = words.next() else {
+            continue;
+        };
+        if command.starts_with(b"#") || !PICKS.contains(&command) {
+            continue;
+        }
+        let merge = command == b"merge" || command == b"m";
+        let mut operand = words.next();
+        if matches!(operand, Some(b"-C" | b"-c")) {
+            operand = words.next();
+        } else if merge {
+            // A merge without `-C` names a label, not a commit.
+            continue;
+        }
+        if let Some(word) = operand {
+            found.push(word.to_vec());
+        }
+    }
+}
+
+/// The first word of each line of `text` (a pseudo-ref's object ids).
+fn line_heads(text: &[u8], found: &mut Vec<Vec<u8>>) {
+    for line in text.split(|b| *b == b'\n') {
+        if let Some(word) = line.split(u8::is_ascii_whitespace).find(|w| !w.is_empty()) {
+            found.push(word.to_vec());
+        }
+    }
+}
+
+/// How [`GitRepo::operation_objects`] reads one file of operation state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    /// Prose: its hex words are carried when they resolve.
+    Text,
+    /// A pending pseudo-ref: each line's first word is a dependency.
+    Lines,
+    /// A todo list: each `pick`-like line's commit is a dependency.
+    Todo,
+    /// One object id: a dependency.
+    Oid,
+}
+
+/// What an operation in progress names ([`GitRepo::operation_objects`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OperationObjects {
+    /// Every object named that git resolves to exactly one: tips of the pack.
+    pub tips: Vec<String>,
+    /// Dependencies of the operation git cannot resolve to exactly one object —
+    /// `<file>: <name> (missing|ambiguous)`: the capture cannot know what the resumed operation
+    /// needs, and a final flush over it is not complete.
+    pub unresolved: Vec<String>,
 }
 
 /// Git errors.
@@ -153,7 +263,24 @@ pub struct GitRepo {
     pub common_dir: PathBuf,
 }
 
-/// Run git with a clean environment (no inherited `GIT_DIR`/`GIT_INDEX_FILE`/`GIT_WORK_TREE`).
+/// Configuration every git this module runs is given, over the repository's own, so the
+/// capture reads the disk and not the user's shortcuts past it (review 2026-09-28, fourth pass,
+/// #2): case-sensitive names and ignore rules (`core.ignorecase=true` left on a repository
+/// moved to a case-sensitive disk made `git add` take a distinct `A` for a tracked `a`, and
+/// drop it); no file-system monitor and no untracked cache (a stale answer from either leaves a
+/// change unseen); every stat field compared, `ctime` included. Passed as `GIT_CONFIG_COUNT`
+/// entries: the repository's `.git/config` is never written, and a restore gets the user's
+/// configuration back byte for byte.
+const CAPTURE_VIEW: [(&str, &str); 5] = [
+    ("core.ignorecase", "false"),
+    ("core.fsmonitor", "false"),
+    ("core.untrackedCache", "false"),
+    ("core.checkStat", "default"),
+    ("core.trustctime", "true"),
+];
+
+/// Run git with a clean environment (no inherited `GIT_DIR`/`GIT_INDEX_FILE`/`GIT_WORK_TREE`),
+/// under [`CAPTURE_VIEW`].
 ///
 /// Every child started from this command must be spawned through the process-wide spawn gate
 /// (`sealant_process::CommandGateExt`: `output_gated`/`spawn_gated`, never `output`/`spawn`).
@@ -168,7 +295,12 @@ fn git_command(cwd: &Path) -> Command {
         .env_remove("GIT_INDEX_FILE")
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_CONFIG_COUNT", CAPTURE_VIEW.len().to_string())
         .stdin(Stdio::null());
+    for (i, (key, value)) in CAPTURE_VIEW.iter().enumerate() {
+        c.env(format!("GIT_CONFIG_KEY_{i}"), key)
+            .env(format!("GIT_CONFIG_VALUE_{i}"), value);
+    }
     c
 }
 
@@ -447,19 +579,52 @@ impl GitRepo {
     }
 
     /// Every object a pseudo-ref or an in-progress operation's state names, which no ref or
+    /// reflog may reach ([`Self::operation_objects`]'s tips).
+    pub fn operation_tips(&self) -> Result<Vec<String>, GitError> {
+        Ok(self.operation_objects()?.tips)
+    }
+
+    /// Every object a pseudo-ref or an in-progress operation's state names, which no ref or
     /// reflog may reach: `FETCH_HEAD` (a `git fetch <remote> <branch>` with no destination ref
     /// leaves its commit named there only), `ORIG_HEAD`, `MERGE_HEAD`, `CHERRY_PICK_HEAD`,
     /// `REVERT_HEAD`, `REBASE_HEAD`, `AUTO_MERGE`, the `BISECT_*` files, and every file of a
     /// rebase's, `am`'s or a sequencer's state directory (a todo list names commits by
     /// abbreviated id). The capture carries those files as they are; without their objects in
-    /// the packs they came back naming commits no restored repository held. Read as text: every
-    /// run of seven to 64 hex digits is asked of the object store (`git cat-file
-    /// --batch-check`), and the ones it resolves to exactly one object are tips. A word that
-    /// happens to look like hex and name an object only adds that object to the pack.
-    pub fn operation_tips(&self) -> Result<Vec<String>, GitError> {
+    /// the packs they came back naming commits no restored repository held.
+    ///
+    /// Read as text: every run of four to 64 hex digits (git accepts an abbreviation down to
+    /// four, `core.abbrev=4`) is asked of the object store (`git cat-file --batch-check`, which
+    /// resolves a name as git does), and the ones it resolves to exactly one object are tips; a
+    /// word of prose that happens to look like hex only adds that object to the pack. What the
+    /// operation needs to go on — each line of a pending pseudo-ref ([`PENDING_REFS`]), the
+    /// commit operand of a todo list's `pick`-like lines ([`TODO_FILES`], [`PICKS`]), an
+    /// operation directory's single-id files ([`OID_FILES`]) — must resolve to exactly one
+    /// object, else it is [`OperationObjects::unresolved`] (review 2026-09-28, fourth pass,
+    /// #3: a four-digit todo operand was not read at all, and its commit was left out of a
+    /// complete capture).
+    pub fn operation_objects(&self) -> Result<OperationObjects, GitError> {
         let mut words = BTreeSet::new();
-        let mut read = |path: &Path| match fs::read(path) {
-            Ok(bytes) => hex_tokens(&bytes, &mut words),
+        // (file, name as written) for each dependency.
+        let mut needed: Vec<(String, String)> = Vec::new();
+        let mut read = |path: &Path, label: &str, kind: Kind| match fs::read(path) {
+            Ok(bytes) => {
+                hex_tokens(&bytes, &mut words);
+                let mut found = Vec::new();
+                match kind {
+                    Kind::Text => {}
+                    Kind::Lines => line_heads(&bytes, &mut found),
+                    Kind::Todo => todo_operands(&bytes, &mut found),
+                    Kind::Oid => line_heads(&bytes, &mut found),
+                }
+                if kind == Kind::Oid {
+                    found.truncate(1);
+                }
+                for word in found.into_iter().filter(|w| hexish(w)) {
+                    let word = String::from_utf8_lossy(&word).to_ascii_lowercase();
+                    words.insert(word.clone());
+                    needed.push((label.to_owned(), word));
+                }
+            }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => {
                 tracing::warn!(path = %path.display(), error = %e, "cannot read git operation state")
@@ -477,7 +642,12 @@ impl GitRepo {
                 let name = entry.file_name();
                 let is_file = entry.file_type().is_ok_and(|t| t.is_file());
                 if is_file && names_operation_objects(name.as_bytes()) {
-                    read(&entry.path());
+                    let kind = if PENDING_REFS.contains(&name.as_bytes()) {
+                        Kind::Lines
+                    } else {
+                        Kind::Text
+                    };
+                    read(&entry.path(), &name.to_string_lossy(), kind);
                 }
             }
             for op in OPERATION_DIRS {
@@ -488,7 +658,18 @@ impl GitRepo {
                 longpath::walk(&base, &mut |visit| match visit {
                     longpath::Visit::Entry { path, kind, .. } => {
                         if kind == longpath::Kind::File {
-                            read(path);
+                            let name = path.file_name().map_or(&b""[..], |n| n.as_bytes());
+                            // Only the directory's own files have git's meaning.
+                            let top = path.parent() == Some(base.as_path());
+                            let what = if top && TODO_FILES.contains(&name) {
+                                Kind::Todo
+                            } else if top && OID_FILES.contains(&name) {
+                                Kind::Oid
+                            } else {
+                                Kind::Text
+                            };
+                            let label = path.strip_prefix(dir).unwrap_or(path).to_string_lossy();
+                            read(path, &label, what);
                         }
                         kind == longpath::Kind::Dir
                     }
@@ -497,24 +678,63 @@ impl GitRepo {
             }
         }
         if words.is_empty() {
-            return Ok(Vec::new());
+            return Ok(OperationObjects::default());
         }
-        let input: String = words.iter().map(|w| format!("{w}\n")).collect();
+        let asked: Vec<&String> = words.iter().collect();
+        let input: String = asked.iter().map(|w| format!("{w}\n")).collect();
         let out = self.run_with_stdin(&["cat-file", "--batch-check"], input.as_bytes())?;
-        let mut tips: Vec<String> = stdout_string(&out)
+        // One line per name asked, in order: `<oid> <type> <size>`, or `<name> missing` /
+        // `<name> ambiguous`.
+        let answers: Vec<&str> = std::str::from_utf8(&out.stdout)
+            .unwrap_or_default()
             .lines()
-            .filter_map(|line| {
-                let mut fields = line.split(' ');
-                let (oid, kind) = (fields.next()?, fields.next()?);
-                (matches!(kind, "commit" | "tree" | "blob" | "tag")
-                    && (oid.len() == 40 || oid.len() == 64)
-                    && oid.bytes().all(|b| b.is_ascii_hexdigit()))
-                .then(|| oid.to_owned())
-            })
+            .collect();
+        if answers.len() != asked.len() {
+            return Err(GitError::Command {
+                args: "cat-file --batch-check".to_owned(),
+                stderr: format!(
+                    "{} names asked, {} answers: {}",
+                    asked.len(),
+                    answers.len(),
+                    String::from_utf8_lossy(&out.stderr).trim()
+                ),
+            });
+        }
+        let mut resolved: BTreeMap<&str, Result<&str, &str>> = BTreeMap::new();
+        for (word, line) in asked.iter().zip(&answers) {
+            let mut fields = line.split(' ');
+            let (first, second) = (fields.next().unwrap_or(""), fields.next().unwrap_or(""));
+            let object = matches!(second, "commit" | "tree" | "blob" | "tag")
+                && (first.len() == 40 || first.len() == 64)
+                && first.bytes().all(|b| b.is_ascii_hexdigit());
+            resolved.insert(
+                word.as_str(),
+                if object {
+                    Ok(first)
+                } else if second == "ambiguous" {
+                    Err("ambiguous")
+                } else {
+                    Err("missing")
+                },
+            );
+        }
+        let mut tips: Vec<String> = resolved
+            .values()
+            .filter_map(|r| r.ok().map(str::to_owned))
             .collect();
         tips.sort();
         tips.dedup();
-        Ok(tips)
+        let mut unresolved: Vec<String> = needed
+            .iter()
+            .filter_map(|(file, word)| match resolved.get(word.as_str()) {
+                Some(Ok(_)) => None,
+                Some(Err(why)) => Some(format!("{file}: {word} ({why})")),
+                None => Some(format!("{file}: {word} (missing)")),
+            })
+            .collect();
+        unresolved.sort();
+        unresolved.dedup();
+        Ok(OperationObjects { tips, unresolved })
     }
 
     /// Tree of the index, written from a scratch copy so a held `index.lock` never matters;
@@ -820,6 +1040,71 @@ impl GitRepo {
         })
     }
 
+    /// Take the user's shortcuts past the disk out of `index` (a scratch copy of the user's
+    /// index; the real one is never touched): `assume-unchanged` from every entry, and
+    /// `skip-worktree` from every entry whose path is on disk. With either bit git never looks
+    /// at the file, so an edit behind it kept the index's blob, and a complete final flush
+    /// restored the old bytes (review 2026-09-28, fourth pass, #2). An entry the sparse checkout
+    /// keeps off the disk keeps its bit: it is not there to read, and `add -A` would take it
+    /// for a deletion. The restored index is the user's own, bits and all.
+    fn clear_index_shortcuts(&self, index: &Path) -> Result<(), GitError> {
+        let ls = ["ls-files", "-v", "-z"];
+        let listed = check(
+            &ls,
+            git_command(&self.root)
+                .env("GIT_INDEX_FILE", index)
+                .args(ls)
+                .output_gated()?,
+        )?;
+        let mut assumed: Vec<u8> = Vec::new();
+        let mut skipped: Vec<u8> = Vec::new();
+        for record in listed.stdout.split(|b| *b == 0) {
+            let (Some(&tag), Some(b' ')) = (record.first(), record.get(1)) else {
+                continue;
+            };
+            let path = &record[2..];
+            // `ls-files -v` tags an assume-unchanged entry in lower case; `S`/`s` is
+            // skip-worktree.
+            if tag.is_ascii_lowercase() {
+                assumed.extend_from_slice(path);
+                assumed.push(0);
+            }
+            if matches!(tag, b'S' | b's')
+                && longpath::symlink_metadata(&self.root.join(OsStr::from_bytes(path))).is_ok()
+            {
+                skipped.extend_from_slice(path);
+                skipped.push(0);
+            }
+        }
+        for (flag, paths) in [
+            ("--no-assume-unchanged", assumed),
+            ("--no-skip-worktree", skipped),
+        ] {
+            if paths.is_empty() {
+                continue;
+            }
+            let args = ["update-index", flag, "-z", "--stdin"];
+            let mut child = git_command(&self.root)
+                .env("GIT_INDEX_FILE", index)
+                .args(args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn_gated()?;
+            let writer = child.take_stdin().map(|mut pipe| {
+                std::thread::spawn(move || {
+                    let _ = pipe.write_all(&paths);
+                })
+            });
+            let out = child.wait_with_output()?;
+            if let Some(writer) = writer {
+                let _ = writer.join();
+            }
+            check(&args, out)?;
+        }
+        Ok(())
+    }
+
     /// Run `git add` as [`AddArgs`] says against `tmp_index`, its pathspecs from a file beside
     /// it, untranslated (what could not be read is read off the messages).
     fn run_add(&self, tmp_index: &Path, add: &AddArgs) -> Result<Output, GitError> {
@@ -895,8 +1180,15 @@ impl GitRepo {
         let real_index = self.git_dir.join("index");
         let seed = |tmp_index: &Path| -> Result<(), GitError> {
             fs::remove_file(tmp_index).ok();
-            if real_index.exists() {
+            if let Ok(real) = fs::metadata(&real_index) {
                 fs::copy(&real_index, tmp_index).map_err(at("copy into", tmp_index))?;
+                self.clear_index_shortcuts(tmp_index)?;
+                // Git trusts an entry's stat data only when the index was written after the file
+                // changed (an entry as new as the index is "racily clean" and re-read): the copy
+                // keeps the real index's mtime, so it is exactly as trusting as the user's own.
+                let mtime = real.mtime().saturating_mul(1_000_000_000) + real.mtime_nsec();
+                longpath::set_mtime_nofollow(tmp_index, mtime)
+                    .map_err(at("set the mtime of", tmp_index))?;
             } else if let Some(head_tree) = self.head_tree()? {
                 let rt = ["read-tree", &head_tree];
                 check(
@@ -1675,6 +1967,9 @@ pub struct Closure {
     pub unreadable: Vec<(String, String)>,
     /// Of those, the ones carried from the previous capture's worktree tree.
     pub carried: Vec<String>,
+    /// What an operation in progress needs that git cannot resolve to exactly one object
+    /// ([`OperationObjects::unresolved`]).
+    pub unresolved_operations: Vec<String>,
 }
 
 /// Read the closure (refs, `HEAD`, index, stash, reflog, worktree) in that order. `excludes` are
@@ -1726,7 +2021,8 @@ pub fn read_closure_with(
         None => tips.extend(repo.index_blobs()?),
     }
     tips.extend(repo.reflog_tips()?);
-    tips.extend(repo.operation_tips()?);
+    let operations = repo.operation_objects()?;
+    tips.extend(operations.tips);
     let WorktreeTree {
         tree: worktree_tree,
         raw_tree,
@@ -1749,6 +2045,7 @@ pub fn read_closure_with(
         gitlinks,
         unreadable,
         carried,
+        unresolved_operations: operations.unresolved,
     })
 }
 

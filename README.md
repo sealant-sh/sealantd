@@ -76,7 +76,31 @@ the protocol details live in `crates/sealant-capture/src/registrar.rs` and `mani
   whatever their names. Without the feature the two trees ride `refs` as
   `refs/sealant/capture/worktree` and `…/index`, as before. `HEAD` is its immediate target (a
   symbolic ref chain is kept link by link), and every object `FETCH_HEAD`, `ORIG_HEAD`,
-  `MERGE_HEAD`, a rebase, a cherry-pick sequence or a bisect names is in the packs.
+  `MERGE_HEAD`, a rebase, a cherry-pick sequence or a bisect names is in the packs — down to
+  git's four-digit abbreviations. What an operation in progress needs to go on (a pending
+  pseudo-ref, a todo list's `pick`-like operands, a rebase's `onto`) must resolve to exactly one
+  object; one that is missing or ambiguous makes the final flush `snapshot-failed`, never
+  complete. The working tree is read from disk past the user's index shortcuts: the scratch
+  index drops `assume-unchanged`, and `skip-worktree` for every path on disk, and every git the
+  capture runs has `core.ignorecase=false`, no fsmonitor, no untracked cache and full stat
+  checks (`GIT_CONFIG_COUNT`); the user's `.git/index` and `.git/config` are never written.
+- **A store that cannot hold what a capture holds.** When `plan.get`'s `manifest_features`
+  leaves out one this daemon writes (`git_trees` above all), captures still ship, but no final
+  flush is complete: `incomplete_reason: "store-fidelity"`, no seal. The executor is kept until
+  a registrar that reads them recovers it.
+- **Launch identity.** Core passes `SEALANT_CAPTURE_LAUNCH_ID` (the launch Mend minted and bound
+  the session token to) in the boot environment. The first `plan.get` names it as `launch`
+  (else the launch the disk last served, on a restart or a recovery boot); a plan answering
+  another `executor` refuses the boot, and Mend refuses a `launch` that is not its token's (409
+  `launch-mismatch`). A disk's staging continues the chain across an epoch change only for the
+  launch that staged it. The daemon keeps presenting its own launch's token, a recovery boot's
+  included.
+- **Refusals that pause, never adopt.** `plan.get` 409 `worktree-leased` (another launch holds
+  the lease; no epoch given, whatever `live_epoch` says): a boot waits (1 s, doubling to 30 s)
+  and asks again, touching nothing; a re-plan keeps its identity. `upload.urls` and
+  `capture.register` 409 `lease-lost`: shipping pauses with everything staged under its epoch.
+  `lease.heartbeat` 404 (or 409) `lease-lost`: the harness pauses at once, and resumes when a
+  heartbeat under the same identity succeeds.
 - **The final seal** (`final_seal.executor`) is `plan.get`'s `executor`, the launch the session
   token was issued for, and nothing else. A plan that names no executor gets no seal.
 - **`complete` means current.** `capture.status` says `complete` only while the disk is as the
@@ -110,8 +134,22 @@ the protocol details live in `crates/sealant-capture/src/registrar.rs` and `mani
   reason (the watch limit, the budget, a permission) has its class poll, the rest of the class
   staying watched, and is tried again (2 s, doubling to 60 s): once it is watched, or gone, the
   class is watched again.
-- **Remotes.** Plan remotes are added only where the repository has no remote of that name. An
-  existing URL is never changed, and a resumed or recovered disk is left as it is.
+- **Remotes.** Plan remotes seed a base only: a repository built from an empty chain or from a
+  capture without `.git/config` (Mend's capture 0) gets each one it lacks. A capture that carries
+  `.git/config` is authoritative — a remote the user removed stays removed on a fresh executor —
+  an existing URL is never changed, and a resumed or recovered disk is left as it is.
+- **Which writers the final flush stops.** As PID 1 of its PID namespace (Docker, Kubernetes),
+  every process in it. On a MicroVM the agent is PID 1 and passes `SEALANT_SWEEP_EXEMPT_FILE`, a
+  JSON list it rewrites atomically as its helpers start and exit:
+  `{"version":1,"exempt":[{"pid":212,"startTime":"5310","role":"dockerd","descendants":false}]}`
+  (`startTime` is field 22 of `/proc/<pid>/stat`, a string or a number). The sweep then takes
+  every process on the machine but sealantd, its ancestors, its own helpers and each listed
+  process whose pid and start time both match a live one — with its descendants only when
+  `descendants` is true. Nothing is spared by name. A stale entry spares nothing; a file that
+  cannot be read or parsed makes the final flush `sweep-unavailable`. Without the file a daemon
+  that is not PID 1 sweeps its own descendants, and a recovery boot there is always
+  `sweep-unavailable` (the dead daemon's orphans were adopted by the agent). The workspace
+  daemon's containers are stopped through the Engine API, which a restart policy does not undo.
 - **Recovery reboot.** `sealantd boot --recovery` (or `SEALANT_RECOVERY=1`, or the marker
   `/.sealantd-recovery`) restarts a daemon that exited on its own disk, with the same boot
   environment and secret environment file. It never materializes over the disk and runs no
@@ -119,7 +157,13 @@ the protocol details live in `crates/sealant-capture/src/registrar.rs` and `mani
   runs the final flush on its stop or when asked, and exits 0 only when that flush is complete,
   else 75. It resumes a disk whose staging continues the chain head, or one whose recorded
   materialize (capture id, executor, epoch) is exactly the head's; any other disk is refused,
-  untouched. One daemon runs per capture disk: every capture boot holds an exclusive lock on
+  untouched — except a disk the daemon before it never materialized: the worktree absent, or
+  holding nothing but `.sealantd/boot.lock` (empty) — no materialize record, no staging, no
+  capture state, no repository, no file. Capture starts before any user code, so none ran there:
+  the recovery exits **76** (`EX_PROTOCOL`, `EXIT_NOTHING_TO_SAVE`) with `nothing to save: never
+  materialized` on stderr (log field `outcome="never-materialized"`), touching nothing and dialling
+  nothing, and the platform may release that executor. Checked under the disk lock, before
+  `plan.get`. Any other disk a recovery cannot save stays 75. One daemon runs per capture disk: every capture boot holds an exclusive lock on
   `<worktree>/.sealantd/boot.lock`, and a second boot beside a live one exits 75 without touching
   anything. On a still-running MicroVM, Core's agent stops every process the dead daemon left,
   then spawns `sealantd boot --recovery` exactly as it spawned `sealantd boot`.

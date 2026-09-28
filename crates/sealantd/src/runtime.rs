@@ -43,6 +43,16 @@ fn new_unit_mark() -> u64 {
 /// is on this disk is not all registered, and the staging directory is left as it is.
 pub const EXIT_CAPTURE_INCOMPLETE: u8 = 75;
 
+/// The exit code of a recovery boot (`sealantd boot --recovery`) on a disk that was never
+/// materialized (`EX_PROTOCOL`, 76): the daemon before it died before its first materialize
+/// completed, and nothing there is work product. Only after [`crate::boot::capture::never_materialized`]
+/// verified it: the worktree absent or empty but for the daemon's own lock file — no materialize
+/// record, no staging, no capture state, no repository, no file. Capture starts right after the
+/// materialize and before any user code (cross-repo decision 8), so no user code ever ran on
+/// such a disk, and the platform may release it. Anything else a recovery cannot save stays
+/// [`EXIT_CAPTURE_INCOMPLETE`].
+pub const EXIT_NOTHING_TO_SAVE: u8 = 76;
+
 /// Collect the values captured I/O must redact (plan §18): the values of secret-looking env vars
 /// plus every launcher-provided secret literal, whatever its name.
 fn secret_env_values(config: &RuntimeConfig) -> Vec<String> {
@@ -157,6 +167,13 @@ pub struct Runtime {
     sweep_mark: Mutex<Option<String>>,
     /// The sweep's scope as a test sets it (`None`: [`crate::sweep::Scope::detect`]).
     sweep_scope: Mutex<Option<crate::sweep::Scope>>,
+    /// Where the host's agent names its helpers (`SEALANT_SWEEP_EXEMPT_FILE`): set, a daemon
+    /// that is not PID 1 of its PID namespace sweeps the machine ([`crate::sweep::Scope::Machine`])
+    /// and spares exactly those.
+    sweep_exempt_file: Mutex<Option<std::path::PathBuf>>,
+    /// Admission was closed from the start: a recovery boot, whose disk the daemon before it
+    /// wrote — and whose orphans that daemon left, where it could not keep them.
+    recovery: AtomicBool,
     /// The last quiesce's outcome (`None`: none ran; `Some(None)`: every writer stopped). A
     /// final flush asked again after one that stopped every writer does not quiesce again:
     /// admission is closed, and nothing is left to stop.
@@ -270,6 +287,8 @@ impl Runtime {
             shutdown_cutoff: tokio::sync::watch::Sender::new(None),
             sweep_mark: Mutex::new(cfg!(test).then(|| format!("unit-test-{}", new_unit_mark()))),
             sweep_scope: Mutex::new(None),
+            sweep_exempt_file: Mutex::new(None),
+            recovery: AtomicBool::new(false),
             features,
             pidfd_supported,
             subreaper: AtomicBool::new(subreaper),
@@ -515,6 +534,37 @@ impl Runtime {
         };
         let mut sweeper = crate::sweep::Sweeper::this_process();
         sweeper.scope = self.sweep_scope();
+        // The helpers the host's agent names, read again at every scan (it may start one
+        // meanwhile; a scan whose read fails keeps the last list read). A list that cannot be
+        // read at all spares nothing the sweep cannot vouch for: the sweep falls back to
+        // sealantd's descendants, and the capture cannot be complete — nobody knows which of
+        // the processes left were the agent's.
+        let exempt_file = self
+            .sweep_exempt_file
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .filter(|_| sweeper.scope == crate::sweep::Scope::Machine);
+        let mut exempt_unreadable = false;
+        let listed = match &exempt_file {
+            None => crate::sweep::Exempt::default(),
+            Some(path) => crate::sweep::read_exempt(path).unwrap_or_else(|error| {
+                tracing::error!(%error, "the agent's list of its helpers cannot be read");
+                exempt_unreadable = true;
+                sweeper.scope = crate::sweep::Scope::Descendants;
+                crate::sweep::Exempt::default()
+            }),
+        };
+        let listed = Mutex::new(listed);
+        let exempt = || {
+            let mut last = listed.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(path) = exempt_file.as_ref().filter(|_| !exempt_unreadable)
+                && let Ok(now) = crate::sweep::read_exempt(path)
+            {
+                *last = now;
+            }
+            last.clone()
+        };
         let docker = self
             .workspace_docker
             .lock()
@@ -536,7 +586,7 @@ impl Runtime {
         let ((), (), (swept, sweep_left)) = tokio::join!(
             self.sessions.terminate_all(grace),
             self.processes.terminate_all(signal, grace),
-            sweeper.sweep(grace, self.shutdown.is_hard(), &admit),
+            sweeper.sweep(grace, self.shutdown.is_hard(), &admit, &exempt),
         );
         // Then again: a container a process started on its way out (admission stays closed,
         // but sealantd does not admit what the daemon runs).
@@ -566,7 +616,7 @@ impl Runtime {
             }
         };
         let remaining = managed_left + sweep_left + containers_left;
-        let sweep_unavailable = self.sweep_unavailable();
+        let sweep_unavailable = self.sweep_unavailable() || exempt_unreadable;
         tracing::info!(
             processes = running.len(),
             sessions,
@@ -587,8 +637,11 @@ impl Runtime {
         }
         if sweep_unavailable {
             tracing::error!(
-                "this daemon is not a child subreaper: an orphan may have left its descendants \
-                 unseen; the final capture cannot be complete"
+                recovery = self.recovery.load(Ordering::Relaxed),
+                "the sweep cannot have seen every writer — not a child subreaper, a recovery \
+                 boot that sweeps only its own descendants (the daemon before it left its \
+                 orphans to the agent), or an agent's helper list that cannot be read; the \
+                 final capture cannot be complete"
             );
             return Some("sweep-unavailable");
         }
@@ -596,13 +649,15 @@ impl Runtime {
     }
 
     /// Whether the final capture's sweep cannot guarantee it sees every writer: outside a PID
-    /// namespace of its own it takes sealantd's descendants, and without
-    /// `PR_SET_CHILD_SUBREAPER` an orphan is re-parented away from sealantd, out of sight.
-    /// Every final flush on such a daemon is incomplete (`sweep-unavailable`).
+    /// namespace of its own, and with no helper list from the host's agent, it takes sealantd's
+    /// descendants — and without `PR_SET_CHILD_SUBREAPER` an orphan is re-parented away from
+    /// sealantd, out of sight; on a recovery boot the daemon before this one left its orphans
+    /// to whatever adopted them, never to this one (review 2026-09-28, fourth pass, #4). Every
+    /// final flush on such a daemon is incomplete (`sweep-unavailable`).
     #[must_use]
     pub fn sweep_unavailable(&self) -> bool {
         self.sweep_scope() == crate::sweep::Scope::Descendants
-            && !self.subreaper.load(Ordering::Relaxed)
+            && (!self.subreaper.load(Ordering::Relaxed) || self.recovery.load(Ordering::Relaxed))
     }
 
     /// How many times a final flush stopped the writers (test observability).
@@ -612,12 +667,36 @@ impl Runtime {
         self.quiesces.load(Ordering::Relaxed)
     }
 
-    /// The final flush's sweep scope: [`crate::sweep::Scope::detect`], unless a test set one.
+    /// The final flush's sweep scope: [`crate::sweep::Scope::detect`] (unless a test set one),
+    /// and [`crate::sweep::Scope::Machine`] in place of the descendants when the host's agent
+    /// names its helpers ([`Runtime::set_sweep_exempt_file`]).
     fn sweep_scope(&self) -> crate::sweep::Scope {
-        self.sweep_scope
+        let scope = self
+            .sweep_scope
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .unwrap_or_else(crate::sweep::Scope::detect)
+            .unwrap_or_else(crate::sweep::Scope::detect);
+        let listed = self
+            .sweep_exempt_file
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some();
+        if scope == crate::sweep::Scope::Descendants && listed {
+            crate::sweep::Scope::Machine
+        } else {
+            scope
+        }
+    }
+
+    /// Where the host's agent names its helper processes (`SEALANT_SWEEP_EXEMPT_FILE`,
+    /// [`crate::sweep::read_exempt`]). Set, a daemon that is not PID 1 of its PID namespace
+    /// sweeps every process on the machine but its ancestors, its own helpers and those; a
+    /// final flush after one whose sweep could not stop every writer quiesces again under it.
+    pub fn set_sweep_exempt_file(&self, path: Option<std::path::PathBuf>) {
+        *self
+            .sweep_exempt_file
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = path;
     }
 
     /// Test hook: sweep as if sealantd were (`Namespace`) or were not (`Descendants`) PID 1 of
@@ -672,6 +751,7 @@ impl Runtime {
     /// no exec, session, SFTP bridge or other writer is admitted, exactly as after a final
     /// flush's quiesce. The final flush and `capture.status` are still served.
     pub fn close_admission(&self) {
+        self.recovery.store(true, Ordering::SeqCst);
         self.admission_closed.store(true, Ordering::SeqCst);
     }
 

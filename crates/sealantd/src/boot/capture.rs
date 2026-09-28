@@ -164,6 +164,70 @@ pub(crate) fn transport_of(source: &CaptureSourceConfig) -> Result<ChannelTransp
     Ok(transport)
 }
 
+/// Whether the disk at `working_directory` was never materialized, verified: `Ok` only when the
+/// worktree is absent, or a real directory (not a symlink) holding nothing but the daemon's own
+/// directory `.sealantd`, itself a real directory holding nothing but an empty regular
+/// `boot.lock` ([`crate::boot::lock`], taken before anything else). So: no materialize record
+/// (`.sealantd/capture/index/materialized.json`), no staging and no other capture state
+/// (`.sealantd/capture/`), no repository, no file of any kind. Capture starts right after a
+/// materialize and before any user code (cross-repo decision 8), so on such a disk no user code
+/// ran and nothing is work product. `Err` names the first thing found (a recovery then goes on,
+/// and exits 75 if it cannot save it). Read-only; the caller holds the disk lock.
+///
+/// # Errors
+/// What makes the disk anything but never materialized, or what could not be read.
+pub fn never_materialized(working_directory: &Path) -> Result<(), String> {
+    let only = |dir: &Path, allowed: &str| -> Result<Option<PathBuf>, String> {
+        let mut found = None;
+        let entries = std::fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        for entry in entries {
+            let entry = entry.map_err(|e| format!("{}: {e}", dir.display()))?;
+            if entry.file_name() != allowed {
+                return Err(format!("{} holds {:?}", dir.display(), entry.file_name()));
+            }
+            found = Some(entry.path());
+        }
+        Ok(found)
+    };
+    let meta = match std::fs::symlink_metadata(working_directory) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(format!("{}: {e}", working_directory.display())),
+    };
+    if !meta.file_type().is_dir() {
+        return Err(format!(
+            "{} is not a directory",
+            working_directory.display()
+        ));
+    }
+    let Some(daemon_dir) = only(working_directory, sealant_capture::index::DAEMON_DIR)? else {
+        return Ok(());
+    };
+    if !std::fs::symlink_metadata(&daemon_dir)
+        .map_err(|e| format!("{}: {e}", daemon_dir.display()))?
+        .file_type()
+        .is_dir()
+    {
+        return Err(format!("{} is not a directory", daemon_dir.display()));
+    }
+    let Some(lock) = only(&daemon_dir, "boot.lock")? else {
+        return Ok(());
+    };
+    let lock_meta =
+        std::fs::symlink_metadata(&lock).map_err(|e| format!("{}: {e}", lock.display()))?;
+    if !lock_meta.file_type().is_file() || lock_meta.len() != 0 {
+        return Err(format!("{} is not the empty lock file", lock.display()));
+    }
+    Ok(())
+}
+
+/// How long a boot first waits to ask `plan.get` again while another launch holds the lease;
+/// it doubles up to [`PLAN_LEASED_WAIT_MAX`].
+const PLAN_LEASED_WAIT: Duration = Duration::from_secs(1);
+
+/// The longest wait between two `plan.get`s refused as `worktree-leased`.
+const PLAN_LEASED_WAIT_MAX: Duration = Duration::from_secs(30);
+
 /// [`materialize`] over any registrar. `sink` is the object store to read the head from; `None`
 /// is the presigned-URL sink over the registrar (GET URLs from the plan, PUT URLs minted on
 /// demand), which is what a real boot uses.
@@ -178,9 +242,42 @@ pub fn boot_from(
     working_directory: &Path,
     workspace_root: &Path,
 ) -> Result<CaptureBoot, BootError> {
-    let plan = registrar
-        .plan_get(&PlanGetRequest::booting(source.worktree_id.clone()))
-        .map_err(|error| BootError::config(format!("capture plan.get failed: {error}")))?;
+    // The launch this executor is, from the very first request (cross-repo decision 11): as
+    // the launcher named it, else as this disk last served (a restart, a recovery boot).
+    let claimed = source.launch_id.clone().or_else(|| {
+        CaptureEngine::disk_launch(&CaptureConfig::new("", 0, working_directory).staging_dir())
+    });
+    let request = PlanGetRequest::booting(source.worktree_id.clone()).with_launch(claimed.clone());
+    // Another launch holds the worktree (409 `worktree-leased`): no epoch is this executor's,
+    // and it adopts none — it waits, touching nothing, and asks again until it is given one.
+    let mut wait = PLAN_LEASED_WAIT;
+    let plan = loop {
+        match registrar.plan_get(&request) {
+            Err(sealant_capture::RegistrarError::WorktreeLeased) => {
+                tracing::warn!(
+                    retry_in_ms = wait.as_millis() as u64,
+                    "capture plan.get: another launch holds the worktree's lease; waiting"
+                );
+                std::thread::sleep(wait);
+                wait = (wait * 2).min(PLAN_LEASED_WAIT_MAX);
+            }
+            other => {
+                break other.map_err(|error| {
+                    BootError::config(format!("capture plan.get failed: {error}"))
+                })?;
+            }
+        }
+    };
+    // A plan for another launch is not this executor's: capturing under it would seal (or
+    // resume) as a launch it is not.
+    if let (Some(named), Some(executor)) = (&source.launch_id, &plan.executor)
+        && named != executor
+    {
+        return Err(BootError::config(format!(
+            "SEALANT_CAPTURE_LAUNCH_ID is {named} but the plan answers executor {executor}: the \
+             session token is another launch's; refusing to capture under it"
+        )));
+    }
     let worktree_id = source
         .worktree_id
         .clone()
@@ -239,13 +336,17 @@ pub fn boot_from(
     // Dir packs only for a registrar that reads them; either format materializes here.
     config.dir_format = DirFormat::for_registrar(plan.manifest_format);
     // The git section's trees in their own fields (and the raw tree beside them) only for a
-    // registrar that reads them; for one that does not, the trees ride `refs` as before.
-    config.git_trees = plan.manifest_features.iter().any(|f| f == "git_trees");
-    if !config.git_trees {
-        tracing::warn!(
-            "the registrar does not read git_trees: the worktree and index trees ride refs as \
-             pseudo-refs, no raw tree is captured, and a restore checks the worktree out as git \
-             converts it"
+    // registrar that reads them; for one that does not, the trees ride `refs` as before. A
+    // store that does not read every feature this build writes cannot hold what a capture
+    // holds: captures still ship (crash protection), but no final flush over it is complete or
+    // sealed (decision 12; review 2026-09-28, fourth pass, #7).
+    config.set_store_features(&plan.manifest_features);
+    if !config.unread_features.is_empty() {
+        tracing::error!(
+            unread = %config.unread_features.join(", "),
+            "the registrar does not read every manifest feature this daemon writes: what it \
+             would restore is less than a capture holds, so no final flush will say complete \
+             (the executor is kept until a registrar that reads them saves it)"
         );
     }
     config.watch.raise_limit = source.raise_inotify_limit;
@@ -326,6 +427,8 @@ pub fn boot_from(
             "capture resumed on this disk: the head is not materialized over it"
         );
     }
+    // Whether the head restored a session's own `.git/config` (a base carries none).
+    let mut captured_config = false;
     let previous = match &plan.head {
         Some(head) if resumed => {
             let manifest = Materializer::new(
@@ -357,6 +460,7 @@ pub fn boot_from(
                 .map_err(|error| {
                     BootError::config(format!("capture materialize failed: {error}"))
                 })?;
+            captured_config = report.git_config;
             tracing::info!(
                 files = report.files,
                 bytes = report.bytes,
@@ -393,11 +497,14 @@ pub fn boot_from(
     // worktree, so it is laid down after the head and never enters a capture.
     sources::apply(sink.as_ref(), &plan.sources, &layout)?;
 
-    // The plan's remotes the repository lacks (one built here from an empty chain or a base
-    // with no `.git/config` has none). A disk resumed as it is — a restart, a recovery boot —
-    // keeps its configuration byte for byte: the user may have changed a remote since the last
-    // capture, and only the next capture may save it (review 2026-09-28 #13).
-    if !resumed {
+    // The plan's remotes seed a base only: a repository built here from an empty chain, or
+    // from a capture that carries no `.git/config` (Mend's capture 0). A capture that carries
+    // one is a session's own configuration and is authoritative, a remote the user removed
+    // included (review 2026-09-28, fourth pass, #8: a fresh executor added it back). A disk
+    // resumed as it is — a restart, a recovery boot — keeps its configuration byte for byte:
+    // the user may have changed a remote since the last capture, and only the next capture may
+    // save it (review 2026-09-28 #13).
+    if !resumed && !captured_config {
         remotes::apply(working_directory, &plan.remotes)?;
     }
 
@@ -462,6 +569,21 @@ mod tests {
         registrar: &Arc<InMemoryRegistrar>,
         platform: &str,
     ) -> Arc<LocalDir> {
+        capture_source_with(base, registrar, platform, true)
+    }
+
+    /// [`capture_source`] as Mend registers a base (capture 0): no `.git/config`, so no
+    /// configuration of a session's travels in it.
+    fn capture_base(base: &Path, registrar: &Arc<InMemoryRegistrar>) -> Arc<LocalDir> {
+        capture_source_with(base, registrar, &default_platform(), false)
+    }
+
+    fn capture_source_with(
+        base: &Path,
+        registrar: &Arc<InMemoryRegistrar>,
+        platform: &str,
+        with_config: bool,
+    ) -> Arc<LocalDir> {
         let src = base.join("src");
         std::fs::create_dir_all(src.join("node_modules/pkg")).unwrap();
         git(&src, &["init", "-q", "-b", "main"]);
@@ -476,6 +598,9 @@ mod tests {
         .unwrap();
         git(&src, &["add", "-A"]);
         git(&src, &["commit", "-q", "-m", "one"]);
+        if !with_config {
+            std::fs::remove_file(src.join(".git/config")).unwrap();
+        }
         let sink = Arc::new(LocalDir::new(&base.join("store")).unwrap());
         let mut config = CaptureConfig::new("wt-boot", 1, &src);
         config.platform = platform.to_owned();
@@ -537,6 +662,7 @@ mod tests {
             object_ca_pem: None,
             object_ca_file: None,
             recovery: false,
+            launch_id: None,
         }
     }
 
@@ -784,6 +910,7 @@ mod tests {
                 platform: Some(riscv.to_owned()),
                 manifest_format: Some(sealant_capture::manifest::MAX_SECTION_FORMAT),
                 manifest_features: PlanGetRequest::booting(None).manifest_features,
+                launch: None,
             })
             .unwrap();
         let answered = plan.head.unwrap().manifest.sections.bulk;
@@ -1066,7 +1193,7 @@ mod tests {
         use sealant_capture::registrar::PlanRemote;
         let tmp = tempfile::tempdir().unwrap();
         let registrar = Arc::new(InMemoryRegistrar::new("wt-boot", 1, None));
-        let sink = capture_source(tmp.path(), &registrar);
+        let sink = capture_base(tmp.path(), &registrar);
         registrar.set_remotes(vec![PlanRemote {
             name: "origin".to_owned(),
             url: "https://example.invalid/original.git".to_owned(),
@@ -1103,14 +1230,15 @@ mod tests {
 
     /// The user's remotes travel in the capture (`.git/config` is workspace-class bookkeeping),
     /// and neither a restart on the same disk nor a fresh executor materializing that capture
-    /// sets them back to the plan's: a plan remote is only added where the repository has none
-    /// of that name (review 2026-09-28 #13).
+    /// sets them back to the plan's (review 2026-09-28 #13), nor adds back one the user removed
+    /// (fourth pass, #8: a fresh executor re-added `upstream`, and this test asserted it did).
+    /// The plan's remotes seed only a base: a capture that carries no `.git/config`.
     #[test]
     fn a_captured_remote_change_survives_a_restart_and_a_fresh_materialize() {
         use sealant_capture::registrar::PlanRemote;
         let tmp = tempfile::tempdir().unwrap();
         let registrar = Arc::new(InMemoryRegistrar::new("wt-boot", 1, None));
-        let sink = capture_source(tmp.path(), &registrar);
+        let sink = capture_base(tmp.path(), &registrar);
         let dyn_sink: Arc<dyn BlobSink> = sink.clone();
         registrar.set_remotes(vec![
             PlanRemote {
@@ -1177,21 +1305,70 @@ mod tests {
             .ship_pending()
             .unwrap();
         drop(boot);
-        // A fresh executor materializes the capture that holds the user's `.git/config`.
+        // A fresh executor materializes the capture that holds the user's `.git/config`: that
+        // configuration is the repository's, byte for byte, the remote the user removed absent.
+        let captured_config = std::fs::read(ws.join(".git/config")).unwrap();
         let fresh = tmp.path().join("fresh");
         let boot = boot_from(registrar, Some(dyn_sink), &source(), &fresh, tmp.path()).unwrap();
         assert!(!boot.resumed);
         assert_eq!(origin_of(&fresh), "https://example.invalid/user-fork.git");
-        // A remote the plan names that a freshly materialized repository does not have is added.
-        assert_eq!(
-            Proc::new("git")
+        assert!(
+            !Proc::new("git")
                 .current_dir(&fresh)
                 .args(["remote", "get-url", "upstream"])
                 .output()
-                .map(|o| String::from_utf8(o.stdout).unwrap().trim().to_owned())
-                .unwrap(),
-            "https://example.invalid/upstream.git"
+                .unwrap()
+                .status
+                .success(),
+            "a remote the user removed is not added back"
         );
+        assert_eq!(
+            std::fs::read(fresh.join(".git/config")).unwrap(),
+            captured_config
+        );
+    }
+
+    /// A session capture's `.git/config` is authoritative even when it names no remote at all:
+    /// the plan's remotes seed a base (a capture without one, or an empty chain), never a
+    /// repository a session configured (review 2026-09-28, fourth pass, #8).
+    #[test]
+    fn plan_remotes_seed_a_base_and_never_a_captured_configuration() {
+        use sealant_capture::registrar::PlanRemote;
+        let origin = PlanRemote {
+            name: "origin".to_owned(),
+            url: "https://example.invalid/original.git".to_owned(),
+        };
+        let has_origin = |dir: &Path| {
+            Proc::new("git")
+                .current_dir(dir)
+                .args(["remote", "get-url", "origin"])
+                .output()
+                .unwrap()
+                .status
+                .success()
+        };
+        for (name, base) in [("session", false), ("base", true)] {
+            let tmp = tempfile::tempdir().unwrap();
+            let registrar = Arc::new(InMemoryRegistrar::new("wt-boot", 1, None));
+            let sink: Arc<dyn BlobSink> = if base {
+                capture_base(tmp.path(), &registrar)
+            } else {
+                capture_source(tmp.path(), &registrar)
+            };
+            registrar.set_remotes(vec![origin.clone()]);
+            let ws = tmp.path().join("ws");
+            let boot = boot_from(registrar, Some(sink), &source(), &ws, tmp.path()).unwrap();
+            assert!(!boot.resumed);
+            assert_eq!(has_origin(&ws), base, "{name}");
+        }
+        // An empty chain is a base too.
+        let tmp = tempfile::tempdir().unwrap();
+        let registrar = Arc::new(InMemoryRegistrar::new("wt-boot", 1, None));
+        registrar.set_remotes(vec![origin]);
+        let sink: Arc<dyn BlobSink> = Arc::new(LocalDir::new(&tmp.path().join("store")).unwrap());
+        let ws = tmp.path().join("ws");
+        drop(boot_from(registrar, Some(sink), &source(), &ws, tmp.path()).unwrap());
+        assert!(has_origin(&ws), "empty chain");
     }
 
     /// The seal names the executor `plan.get` answers — the launch the session token was
@@ -1266,6 +1443,243 @@ mod tests {
         )
         .unwrap();
         assert!(!boot.engine.config().git_trees);
+        // Such a store cannot hold what a capture holds: no final flush over it is complete
+        // (review 2026-09-28, fourth pass, #7). Every feature it leaves out counts.
+        assert!(
+            boot.engine
+                .fidelity_gap()
+                .is_some_and(|gap| gap.contains("git_trees"))
+        );
+        drop(boot);
+        let no_raw_names = Arc::new(
+            InMemoryRegistrar::new("wt-boot", 1, None).with_manifest_features(&[
+                "worktree_meta",
+                "symrefs",
+                "other_bulk",
+                "final_seal",
+                "git_trees",
+            ]),
+        );
+        let sink: Arc<dyn BlobSink> = capture_source(&tmp.path().join("c"), &no_raw_names);
+        let boot = boot_from(
+            no_raw_names,
+            Some(sink),
+            &source(),
+            &tmp.path().join("c/ws"),
+            tmp.path(),
+        )
+        .unwrap();
+        assert!(boot.engine.config().git_trees);
+        assert_eq!(boot.engine.config().unread_features, ["raw_names"]);
+        assert!(boot.engine.fidelity_gap().is_some());
+    }
+
+    /// While another launch holds the worktree, `plan.get` answers 409 `worktree-leased` and
+    /// gives no epoch (Mend round 4). The boot adopts none: it waits, touching nothing, asks
+    /// again, and boots on the epoch it is finally given. Before, the first refusal failed the
+    /// boot as a chain conflict.
+    #[test]
+    fn a_boot_refused_as_leased_waits_and_adopts_no_epoch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let registrar = Arc::new(InMemoryRegistrar::new("wt-boot", 1, None));
+        let sink: Arc<dyn BlobSink> = capture_source(tmp.path(), &registrar);
+        registrar.set_live_epoch(4);
+        registrar.refuse_plans_leased(2);
+        let ws = tmp.path().join("ws");
+        let started = std::time::Instant::now();
+        let boot = boot_from(registrar.clone(), Some(sink), &source(), &ws, tmp.path()).unwrap();
+        assert!(
+            started.elapsed() >= Duration::from_secs(3),
+            "it waited 1 s, then 2 s"
+        );
+        let asked = registrar.plan_requests();
+        assert_eq!(asked.len(), 3);
+        assert!(asked.iter().all(|r| r.epoch == 0), "no epoch was adopted");
+        assert_eq!(boot.epoch, 4, "the epoch it was given");
+    }
+
+    /// A disk the daemon before never materialized — absent, empty, or holding only the daemon's
+    /// empty lock file — is verified as such (a recovery boot on it exits 76, nothing to save);
+    /// anything else is not: a file, a repository, capture staging, a materialize record, a
+    /// second file beside the lock, a lock with bytes in it, a worktree that is a symlink.
+    #[test]
+    fn only_a_disk_with_nothing_on_it_was_never_materialized() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wt = tmp.path().join("repo");
+        assert_eq!(never_materialized(&wt), Ok(()), "absent");
+        std::fs::create_dir_all(&wt).unwrap();
+        assert_eq!(never_materialized(&wt), Ok(()), "empty");
+        let lock = crate::boot::lock::DiskLock::acquire(&wt).unwrap();
+        assert_eq!(never_materialized(&wt), Ok(()), "the lock alone");
+        drop(lock);
+        type Setup = fn(&Path);
+        let refused: [(&str, Setup); 8] = [
+            ("a file", |wt| {
+                std::fs::write(wt.join("draft.md"), "work").unwrap()
+            }),
+            ("a repository", |wt| {
+                std::fs::create_dir_all(wt.join(".git")).unwrap()
+            }),
+            ("an empty directory", |wt| {
+                std::fs::create_dir_all(wt.join("src")).unwrap()
+            }),
+            ("capture staging", |wt| {
+                std::fs::create_dir_all(wt.join(".sealantd/capture")).unwrap();
+            }),
+            ("a materialize record", |wt| {
+                let index = wt.join(".sealantd/capture/index");
+                std::fs::create_dir_all(&index).unwrap();
+                std::fs::write(index.join("materialized.json"), "{}").unwrap();
+            }),
+            ("a file beside the lock", |wt| {
+                std::fs::write(wt.join(".sealantd/other"), "").unwrap();
+            }),
+            ("a lock with bytes", |wt| {
+                std::fs::write(wt.join(".sealantd/boot.lock"), "x").unwrap();
+            }),
+            ("a daemon directory that is a file", |wt| {
+                std::fs::remove_dir_all(wt.join(".sealantd")).unwrap();
+                std::fs::write(wt.join(".sealantd"), "").unwrap();
+            }),
+        ];
+        for (what, setup) in refused {
+            let tmp = tempfile::tempdir().unwrap();
+            let wt = tmp.path().join("repo");
+            drop(crate::boot::lock::DiskLock::acquire(&wt).unwrap());
+            setup(&wt);
+            assert!(never_materialized(&wt).is_err(), "{what}");
+        }
+        let target = tmp.path().join("elsewhere");
+        std::fs::create_dir_all(&target).unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(never_materialized(&link).is_err(), "a symlink");
+    }
+
+    /// A registrar that ignores `launch` (an older Mend) but answers the executor its token was
+    /// issued for.
+    struct IgnoresLaunch(Arc<InMemoryRegistrar>);
+
+    impl Registrar for IgnoresLaunch {
+        fn plan_get(
+            &self,
+            req: &PlanGetRequest,
+        ) -> Result<sealant_capture::registrar::PlanGetResponse, sealant_capture::RegistrarError>
+        {
+            self.0.plan_get(&req.clone().with_launch(None))
+        }
+        fn upload_urls(
+            &self,
+            req: &sealant_capture::registrar::UploadUrlsRequest,
+        ) -> Result<sealant_capture::registrar::UploadUrlsResponse, sealant_capture::RegistrarError>
+        {
+            self.0.upload_urls(req)
+        }
+        fn upload_complete(
+            &self,
+            req: &sealant_capture::registrar::UploadCompleteRequest,
+        ) -> Result<
+            sealant_capture::registrar::UploadCompleteResponse,
+            sealant_capture::RegistrarError,
+        > {
+            self.0.upload_complete(req)
+        }
+        fn capture_register(
+            &self,
+            req: &sealant_capture::registrar::RegisterRequest,
+        ) -> Result<sealant_capture::registrar::RegisterResponse, sealant_capture::RegistrarError>
+        {
+            self.0.capture_register(req)
+        }
+        fn lease_heartbeat(
+            &self,
+            req: &sealant_capture::registrar::HeartbeatRequest,
+        ) -> Result<sealant_capture::registrar::HeartbeatResponse, sealant_capture::RegistrarError>
+        {
+            self.0.lease_heartbeat(req)
+        }
+        fn change_summary(
+            &self,
+            req: &sealant_capture::registrar::ChangeSummaryRequest,
+        ) -> Result<(), sealant_capture::RegistrarError> {
+            self.0.change_summary(req)
+        }
+    }
+
+    /// The boot's first `plan.get` names the launch this executor is (cross-repo decision 11):
+    /// as `SEALANT_CAPTURE_LAUNCH_ID` says, else as its disk last served (a restart). A plan for
+    /// another launch refuses the boot — the registrar's gate (409 `launch-mismatch`), or, from
+    /// one that does not read `launch`, the answered executor (review 2026-09-28, fourth pass,
+    /// #11).
+    #[test]
+    fn the_first_plan_get_names_the_launch_and_a_plan_for_another_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let registrar =
+            Arc::new(InMemoryRegistrar::new("wt-boot", 1, None).with_executor("launch-7"));
+        let sink: Arc<dyn BlobSink> = capture_source(tmp.path(), &registrar);
+        let named = |launch: &str| CaptureSourceConfig {
+            launch_id: Some(launch.to_owned()),
+            ..source()
+        };
+        let ws = tmp.path().join("ws");
+        let boot = boot_from(
+            registrar.clone(),
+            Some(sink.clone()),
+            &named("launch-7"),
+            &ws,
+            tmp.path(),
+        )
+        .unwrap();
+        assert_eq!(
+            registrar.plan_requests().last().unwrap().launch.as_deref(),
+            Some("launch-7")
+        );
+        let mut engine = boot.engine;
+        engine
+            .snap(SnapRequest {
+                kind: CaptureKind::Turn,
+                class: Class::Small,
+                seq: 3,
+            })
+            .unwrap();
+        drop(engine);
+        // A restart that was not told its launch names the one its disk served.
+        let boot = boot_from(
+            registrar.clone(),
+            Some(sink.clone()),
+            &source(),
+            &ws,
+            tmp.path(),
+        )
+        .unwrap();
+        assert!(boot.resumed);
+        assert_eq!(
+            registrar.plan_requests().last().unwrap().launch.as_deref(),
+            Some("launch-7")
+        );
+        drop(boot);
+        // Another launch's executor with this token: refused by the registrar...
+        let other = tmp.path().join("other");
+        let refused = boot_from(
+            registrar.clone(),
+            Some(sink.clone()),
+            &named("launch-8"),
+            &other,
+            tmp.path(),
+        )
+        .expect_err("another launch");
+        assert!(refused.to_string().contains("launch-mismatch"), "{refused}");
+        // ...and by sealantd itself when the registrar does not read `launch`.
+        let refused = boot_from(
+            Arc::new(IgnoresLaunch(registrar)),
+            Some(sink),
+            &named("launch-8"),
+            &other,
+            tmp.path(),
+        )
+        .expect_err("another launch");
+        assert!(refused.to_string().contains("launch-7"), "{refused}");
+        assert!(!other.join(".git").exists(), "nothing was materialized");
     }
 
     /// A recovery boot's fallback (no staging continues the head) binds the disk to the exact

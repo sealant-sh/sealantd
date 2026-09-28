@@ -169,8 +169,15 @@ pub struct CaptureConfig {
     /// `raw_tree`; the `git_trees` manifest feature) rather than as pseudo-refs in `refs`: for a
     /// registrar whose `plan.get` lists `git_trees`. Without it the worktree tree is the one
     /// restored, as git checks it out, and a user ref named `refs/sealant/capture/worktree` or
-    /// `…/index` is shadowed by the tree.
+    /// `…/index` is shadowed by the tree. Without it a final flush is never complete
+    /// ([`CaptureEngine::fidelity_gap`]).
     pub git_trees: bool,
+    /// Manifest features this build writes that the store does not read, validate and keep
+    /// ([`crate::registrar::MANIFEST_FEATURES`] less `plan.get`'s `manifest_features`;
+    /// [`Self::set_store_features`]). A store that cannot hold what a capture holds restores
+    /// less than was captured, so while any is missing a final flush is never complete and
+    /// seals nothing (review 2026-09-28, fourth pass, #7).
+    pub unread_features: Vec<String>,
 }
 
 impl CaptureConfig {
@@ -199,7 +206,20 @@ impl CaptureConfig {
             racy_window: index::RACY_WINDOW,
             executor: None,
             git_trees: true,
+            unread_features: Vec::new(),
         }
+    }
+
+    /// Take the features the store reads (`plan.get`'s `manifest_features`): the git section's
+    /// trees in their own fields only for a store that reads `git_trees`, and every feature of
+    /// [`crate::registrar::MANIFEST_FEATURES`] it leaves out noted as unread.
+    pub fn set_store_features(&mut self, reads: &[String]) {
+        self.git_trees = reads.iter().any(|f| f == "git_trees");
+        self.unread_features = crate::registrar::MANIFEST_FEATURES
+            .iter()
+            .filter(|f| !reads.iter().any(|r| r == *f))
+            .map(|f| (*f).to_owned())
+            .collect();
     }
 
     /// The staging directory in effect.
@@ -536,6 +556,10 @@ struct LastStaged {
     epoch: u64,
     n: u64,
     capture_id: String,
+    /// The launch it was staged for ([`CaptureConfig::executor`]); absent from a staging
+    /// written before it was recorded, or by an executor that was not told its launch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    executor: Option<String>,
 }
 
 impl LastStaged {
@@ -882,10 +906,44 @@ impl CaptureEngine {
         if !continues {
             return Ok(Pickup::Materialize);
         }
+        // Continuing the head is not enough: the staging must be this launch's (cross-repo
+        // decision 11). Across an epoch change only the launch that staged it continues it —
+        // an old launch's disk resumed into a replacement's epoch registered its stale state as
+        // the replacement's successor (review 2026-09-28, fourth pass, #11) — and a staging
+        // that names no launch cannot show it is. Under the same epoch, a launch it names
+        // must be this one.
+        let epoch_changed = last.epoch != config.epoch;
+        let same_launch = match (&last.executor, &config.executor) {
+            (Some(staged), Some(this)) => staged == this,
+            (None, _) | (_, None) => !epoch_changed,
+        };
+        if !same_launch {
+            tracing::error!(
+                staged_launch = ?last.executor,
+                staged_epoch = last.epoch,
+                launch = ?config.executor,
+                epoch = config.epoch,
+                queued = queued.len(),
+                "this disk's staging is not this launch's continuation of the chain"
+            );
+            return Ok(Pickup::Materialize);
+        }
         Ok(Pickup::Resume {
             queued: queued.len(),
-            epoch_changed: last.epoch != config.epoch,
+            epoch_changed,
         })
+    }
+
+    /// The launch the capture staging at `staging_dir` was last written for, or else the one
+    /// its last completed materialize was planned as ([`CaptureConfig::executor`] as it was
+    /// then), when either says: what a restarting executor names itself on its first
+    /// `plan.get` when its launcher did not ([`crate::registrar::PlanGetRequest::launch`]).
+    #[must_use]
+    pub fn disk_launch(staging_dir: &Path) -> Option<String> {
+        let index = staging_dir.join("index");
+        LastStaged::load(&index)
+            .and_then(|last| last.executor)
+            .or_else(|| DiskState::load(&index).capture.and_then(|c| c.executor))
     }
 
     /// Continue from the captures this identity staged and has not shipped (a daemon restarted
@@ -1050,6 +1108,32 @@ impl CaptureEngine {
         self.config.dir_format = format;
     }
 
+    /// The features the store reads, as a re-plan's `plan.get` answers them
+    /// ([`CaptureConfig::set_store_features`]).
+    pub fn set_store_features(&mut self, reads: &[String]) {
+        self.config.set_store_features(reads);
+    }
+
+    /// Why the store cannot hold what a capture holds, when it cannot: the features it does not
+    /// read ([`CaptureConfig::unread_features`], `git_trees` when [`CaptureConfig::git_trees`]
+    /// is off). A capture still stages and ships — the store has as much as it can take — but a
+    /// final flush is never complete and seals nothing while this is `Some` (decision 12: a
+    /// lossy capture never completes).
+    #[must_use]
+    pub fn fidelity_gap(&self) -> Option<String> {
+        let mut missing = self.config.unread_features.clone();
+        if !self.config.git_trees && !missing.iter().any(|f| f == "git_trees") {
+            missing.push("git_trees".to_owned());
+        }
+        (!missing.is_empty()).then(|| {
+            format!(
+                "the store does not read the manifest feature(s) {}: what it would restore is \
+                 less than the capture holds",
+                missing.join(", ")
+            )
+        })
+    }
+
     /// The executor this engine seals a completed final flush under (a re-plan names it again:
     /// a standby claimed for a session). See [`CaptureConfig::executor`].
     pub fn set_executor(&mut self, executor: Option<String>) {
@@ -1104,6 +1188,7 @@ impl CaptureEngine {
                 epoch: self.config.epoch,
                 n: previous.manifest.n,
                 capture_id: previous.capture_id.clone(),
+                executor: self.config.executor.clone(),
             }
             .save(&dir)?;
         }
@@ -1994,6 +2079,26 @@ impl CaptureEngine {
                         raw_cache: Some(&raw_cache),
                     },
                 )?;
+                // What an operation in progress needs and git cannot name as one object: an
+                // automatic snap carries what it can; a final one cannot say the capture holds
+                // what the resumed operation needs, and fails (review 2026-09-28, fourth pass,
+                // #3).
+                let unresolved = &git.closure.unresolved_operations;
+                if !unresolved.is_empty() {
+                    if strict {
+                        return Err(io::Error::other(format!(
+                            "an operation in progress names objects git cannot resolve to \
+                             exactly one: {}",
+                            unresolved.join(", ")
+                        ))
+                        .into());
+                    }
+                    tracing::warn!(
+                        unresolved = %unresolved.join(", "),
+                        "an operation in progress names objects git cannot resolve to exactly \
+                         one; a final flush over it is not complete"
+                    );
+                }
                 let mut git_unreadable: Vec<UnreadablePath> = git
                     .closure
                     .unreadable

@@ -350,15 +350,21 @@ fn a_restart_on_the_same_disk_resumes_the_queue_and_keeps_the_edits() {
     assert_eq!(files(&fresh), disk, "every edit, staged or not, comes back");
 }
 
-/// The lease lapsed while the daemon was down and the plan names a new epoch: the captures
-/// staged under the old one can never register, but the disk holds everything they held and
-/// more. It is resumed all the same, and the next snaps capture it whole under the new epoch.
+/// The lease lapsed while the daemon was down and the plan names a new epoch for the same
+/// launch: the captures staged under the old one can never register, but the disk holds
+/// everything they held and more. It is resumed all the same, and the next snaps capture it
+/// whole under the new epoch.
 #[test]
 fn a_restart_under_a_new_epoch_captures_the_disk_afresh() {
     let fx = fixture(10);
     let registrar = Arc::new(InMemoryRegistrar::new("wt", 1, None));
+    let launched = |epoch| {
+        let mut config = CaptureConfig::new("wt", epoch, &fx.root);
+        config.executor = Some("launch-a".to_owned());
+        config
+    };
     {
-        let mut engine = CaptureEngine::open(CaptureConfig::new("wt", 1, &fx.root), None).unwrap();
+        let mut engine = CaptureEngine::open(launched(1), None).unwrap();
         snap(&mut engine, CaptureKind::Auto, Class::Small, 1);
         ship(&engine, &fx.store, &registrar);
         fs::write(fx.root.join("src/lib.rs"), "pub fn f() { staged() }\n").unwrap();
@@ -369,7 +375,7 @@ fn a_restart_under_a_new_epoch_captures_the_disk_afresh() {
     let disk = files(&fx.root);
     registrar.set_live_epoch(2);
     let head = registrar.head().unwrap();
-    let config = CaptureConfig::new("wt", 2, &fx.root);
+    let config = launched(2);
     assert_eq!(
         CaptureEngine::pickup(&config, Some(&head.capture_id)).unwrap(),
         Pickup::Resume {
@@ -426,4 +432,55 @@ fn a_disk_that_does_not_continue_the_chain_is_materialized_over() {
         Pickup::Materialize,
         "another worktree's staging"
     );
+}
+
+/// Staging continues the chain across an epoch change only for the launch that staged it
+/// (review 2026-09-28, fourth pass, #11): a disk another launch staged on — or one whose
+/// staging names no launch — is not this executor's continuation under the new lease, however
+/// exactly it continues the head. Before, the head alone decided, and an old launch's disk was
+/// resumed into a replacement's epoch. The same launch under the same epoch still resumes.
+#[test]
+fn staging_continues_across_an_epoch_only_for_the_launch_that_staged_it() {
+    let fx = fixture(2);
+    let registrar = Arc::new(InMemoryRegistrar::new("wt", 1, None));
+    let launched = |epoch, launch: Option<&str>| {
+        let mut config = CaptureConfig::new("wt", epoch, &fx.root);
+        config.executor = launch.map(str::to_owned);
+        config
+    };
+    {
+        let mut engine = CaptureEngine::open(launched(1, Some("launch-old")), None).unwrap();
+        snap(&mut engine, CaptureKind::Auto, Class::Small, 1);
+        ship(&engine, &fx.store, &registrar);
+        fs::write(fx.root.join("src/lib.rs"), "pub fn f() { old }\n").unwrap();
+        snap(&mut engine, CaptureKind::Turn, Class::Small, 2);
+    }
+    let head = registrar.head().unwrap();
+    for (epoch, launch, expected) in [
+        (2, Some("launch-new"), Pickup::Materialize),
+        (2, None, Pickup::Materialize),
+        (1, Some("launch-new"), Pickup::Materialize),
+        (
+            2,
+            Some("launch-old"),
+            Pickup::Resume {
+                queued: 1,
+                epoch_changed: true,
+            },
+        ),
+        (
+            1,
+            Some("launch-old"),
+            Pickup::Resume {
+                queued: 1,
+                epoch_changed: false,
+            },
+        ),
+    ] {
+        assert_eq!(
+            CaptureEngine::pickup(&launched(epoch, launch), Some(&head.capture_id)).unwrap(),
+            expected,
+            "epoch {epoch}, launch {launch:?}"
+        );
+    }
 }

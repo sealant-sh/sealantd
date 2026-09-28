@@ -57,6 +57,7 @@ fn source(recovery: bool) -> CaptureSourceConfig {
         object_ca_pem: None,
         object_ca_file: None,
         recovery,
+        launch_id: None,
     }
 }
 
@@ -191,8 +192,15 @@ fn a_recovery_reboot_on_its_own_disk_saves_it_and_a_second_is_refused() {
         .expect("boot config")
         .into_recovery()
         .expect("a capture store");
+    // As a recovery in Docker or Kubernetes runs: sealantd PID 1 of the container, its sweep
+    // taking every process there (narrowed here to none: a mark no process holds). A daemon
+    // that is not PID 1 and has no helper list from an agent cannot see the dead daemon's
+    // orphans, and its recovery never completes (`recovery_sweep.rs`).
     let daemon = std::thread::spawn(move || {
-        let code = sealantd::boot::run_supervised(config, Vec::new(), Some(boot));
+        let code = sealantd::boot::run_supervised_with(config, Vec::new(), Some(boot), |rt| {
+            rt.set_sweep_scope_for_test(sealantd::sweep::Scope::Namespace);
+            rt.set_sweep_mark(Some(format!("recovery-reboot-{}", std::process::id())));
+        });
         drop(lock);
         code
     });

@@ -411,6 +411,9 @@ fn a_nested_repository_with_a_raw_name_is_restored() {
 /// A registrar that does not read `git_trees` gets the trees as the two pseudo-refs, as before,
 /// and the capture still restores; a user ref under `refs/sealant/capture/` other than those two
 /// names is restored as the ref it is (a reader drops only the two names it reads as trees).
+/// But such a store cannot hold what the capture read — the raw bytes, a user ref named like a
+/// pseudo-ref — so its final flush is never complete and seals nothing (review 2026-09-28,
+/// fourth pass, #7: it said `complete` over a lossy capture and sealed it).
 #[test]
 fn a_registrar_without_git_trees_gets_the_pseudo_refs() {
     let fx = Fixture::new();
@@ -422,8 +425,18 @@ fn a_registrar_without_git_trees_gets_the_pseudo_refs() {
     let engine = CaptureEngine::open(config, None).unwrap();
     let shipper = Arc::new(engine.shipper(fx.store.clone(), fx.registrar.clone()));
     let runner = CadenceRunner::new(engine, shipper);
-    assert!(runner.flush_final(None).complete());
+    let result = runner.flush_final(None);
+    assert_eq!(
+        result.incomplete.as_ref().map(|i| i.reason()),
+        Some("store-fidelity"),
+        "{result:?}"
+    );
+    assert!(
+        fx.registrar.seals().is_empty(),
+        "a lossy capture is never sealed"
+    );
     let head = fx.registrar.head().unwrap();
+    assert!(head.manifest.final_seal.is_none());
     let section = &head.manifest.sections.git;
     assert!(section.worktree_tree.is_none() && section.raw_tree.is_none());
     assert!(
@@ -456,4 +469,223 @@ fn a_registrar_without_git_trees_gets_the_pseudo_refs() {
             "refs/sealant/capture/worktree"
         ]
     ));
+}
+
+/// The user's `.git/index` and `.git/config`, byte for byte.
+fn index_and_config(root: &Path) -> (Vec<u8>, Vec<u8>) {
+    (
+        fs::read(root.join(".git/index")).unwrap(),
+        fs::read(root.join(".git/config")).unwrap(),
+    )
+}
+
+/// A tracked file the user marked `assume-unchanged` and then edited is captured as it is on
+/// disk (review 2026-09-28, fourth pass, #2). Before, the scratch index was a copy of the user's
+/// with the bit set, `git add -A` never looked at the file, and a complete, sealed final flush
+/// restored the committed `base`. The user's own index and configuration are not touched, and
+/// the restored index carries the bit as the user set it.
+#[test]
+fn an_assume_unchanged_edit_is_captured() {
+    let fx = Fixture::new();
+    git(&fx.root, &["update-index", "--assume-unchanged", "a"]);
+    fs::write(fx.root.join("a"), b"unique user work outside git status").unwrap();
+    let before = index_and_config(&fx.root);
+    fx.final_flush_and_restore();
+    assert_eq!(
+        index_and_config(&fx.root),
+        before,
+        "the user's index and config"
+    );
+    assert_eq!(
+        fs::read(fx.out.join("a")).unwrap(),
+        b"unique user work outside git status"
+    );
+    assert_eq!(git(&fx.out, &["ls-files", "-v", "a"]), "h a");
+    assert_eq!(fs::read(fx.out.join(".git/index")).unwrap(), before.0);
+}
+
+/// The same for `skip-worktree` over a file that is on disk (a local configuration file the
+/// user keeps out of `git status`). Before, the final flush could not complete at all.
+#[test]
+fn a_skip_worktree_edit_is_captured() {
+    let fx = Fixture::new();
+    git(&fx.root, &["update-index", "--skip-worktree", "a"]);
+    fs::write(
+        fx.root.join("a"),
+        b"unique skip-worktree local configuration",
+    )
+    .unwrap();
+    let before = index_and_config(&fx.root);
+    fx.final_flush_and_restore();
+    assert_eq!(
+        index_and_config(&fx.root),
+        before,
+        "the user's index and config"
+    );
+    assert_eq!(
+        fs::read(fx.out.join("a")).unwrap(),
+        b"unique skip-worktree local configuration"
+    );
+    assert_eq!(git(&fx.out, &["ls-files", "-v", "a"]), "S a");
+}
+
+/// `core.ignorecase=true` left in the configuration of a repository on a case-sensitive disk
+/// (moved from a case-insensitive one) does not hide a file whose name differs from a tracked
+/// one only by case (#2). Before, `git add` took `A` for the tracked `a`, the ignored-files walk
+/// did not list it either, and a complete, sealed final flush restored no `A`. The user's
+/// configuration keeps its `ignorecase`.
+#[test]
+fn ignorecase_does_not_hide_a_distinct_file() {
+    let fx = Fixture::new();
+    git(&fx.root, &["config", "core.ignorecase", "true"]);
+    fs::write(
+        fx.root.join("A"),
+        b"unique uppercase file on a case sensitive disk",
+    )
+    .unwrap();
+    let before = index_and_config(&fx.root);
+    fx.final_flush_and_restore();
+    assert_eq!(
+        index_and_config(&fx.root),
+        before,
+        "the user's index and config"
+    );
+    assert_eq!(
+        fs::read(fx.out.join("A")).unwrap(),
+        b"unique uppercase file on a case sensitive disk"
+    );
+    assert_eq!(fs::read(fx.out.join("a")).unwrap(), b"base");
+    assert_eq!(fs::read(fx.out.join(".git/config")).unwrap(), before.1);
+}
+
+/// A rebase todo list naming a commit by a four-digit abbreviation — git's minimum, valid with
+/// `core.abbrev=4` or as a user edited the list — has that commit in the packs (#3). Before,
+/// only runs of seven or more hex digits were looked up, the commit (no ref, no reflog) was left
+/// out, and the restored rebase could not pick it although the final flush was complete.
+#[test]
+fn a_rebase_todo_naming_a_commit_by_four_digits_is_restored() {
+    let fx = Fixture::new();
+    let oid = fx.loose_commit("unique work awaiting pick");
+    let short = &oid[..4];
+    assert_eq!(git(&fx.root, &["rev-parse", short]), oid);
+    fs::create_dir_all(fx.root.join(".git/rebase-merge")).unwrap();
+    fs::write(
+        fx.root.join(".git/rebase-merge/git-rebase-todo"),
+        format!("pick {short} unique work awaiting pick\n"),
+    )
+    .unwrap();
+    fx.final_flush_and_restore();
+    assert!(
+        git_ok(&fx.out, &["cat-file", "-e", &oid]),
+        "{oid} is not restored"
+    );
+    assert_eq!(
+        fs::read(fx.out.join(".git/rebase-merge/git-rebase-todo")).unwrap(),
+        fs::read(fx.root.join(".git/rebase-merge/git-rebase-todo")).unwrap()
+    );
+}
+
+/// Four hex digits two objects of the repository share, found by writing blobs until two
+/// collide (a few hundred suffice for 65 536 prefixes).
+fn ambiguous_prefix(root: &Path) -> String {
+    let dir = root.join(".git/blobs-for-a-collision");
+    fs::create_dir_all(&dir).unwrap();
+    let mut paths = String::new();
+    for i in 0..3000 {
+        let path = dir.join(i.to_string());
+        fs::write(&path, format!("blob {i}\n")).unwrap();
+        paths.push_str(&format!("{}\n", path.display()));
+    }
+    let out = Command::new("git")
+        .current_dir(root)
+        .args(["hash-object", "-w", "--stdin-paths"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            // From another thread: the ids fill the pipe before the paths are all written.
+            let mut stdin = child.stdin.take().unwrap();
+            let writer = std::thread::spawn(move || stdin.write_all(paths.as_bytes()));
+            let out = child.wait_with_output();
+            writer.join().unwrap()?;
+            out
+        })
+        .unwrap();
+    fs::remove_dir_all(&dir).unwrap();
+    let mut seen = std::collections::HashSet::new();
+    String::from_utf8(out.stdout)
+        .unwrap()
+        .lines()
+        .map(|oid| oid[..4].to_owned())
+        .find(|prefix| !seen.insert(prefix.clone()))
+        .expect("two of 3000 blobs share four leading digits")
+}
+
+/// A final flush over a paused rebase whose todo list names a commit git cannot resolve to
+/// exactly one object — an abbreviation two objects share, or one no object has — is not
+/// complete and seals nothing (#3): the capture cannot know what the resumed rebase needs.
+#[test]
+fn an_unresolvable_rebase_dependency_is_never_complete() {
+    for case in ["ambiguous", "missing"] {
+        let fx = Fixture::new();
+        let word = match case {
+            "ambiguous" => ambiguous_prefix(&fx.root),
+            _ => (0..=0xffff_u32)
+                .map(|n| format!("{n:04x}"))
+                .find(|w| !git_ok(&fx.root, &["cat-file", "-e", w]))
+                .unwrap(),
+        };
+        assert!(!git_ok(&fx.root, &["rev-parse", "--verify", "-q", &word]));
+        fs::create_dir_all(fx.root.join(".git/rebase-merge")).unwrap();
+        fs::write(
+            fx.root.join(".git/rebase-merge/git-rebase-todo"),
+            format!("# pick 0000 a comment names nothing\nexec true\npick {word} the pick\n"),
+        )
+        .unwrap();
+        let mut config = CaptureConfig::new("wt", 1, &fx.root);
+        config.executor = Some("exec-r3".to_owned());
+        let engine = CaptureEngine::open(config, None).unwrap();
+        let shipper = Arc::new(engine.shipper(fx.store.clone(), fx.registrar.clone()));
+        let runner = CadenceRunner::new(engine, shipper);
+        let result = runner.flush_final(None);
+        assert!(!result.complete(), "{case}: {result:?}");
+        assert!(fx.registrar.seals().is_empty(), "{case}: sealed");
+        // Free text that only looks like an abbreviation (a commit message) does not count.
+        let fx = Fixture::new();
+        fs::create_dir_all(fx.root.join(".git/rebase-merge")).unwrap();
+        fs::write(
+            fx.root.join(".git/rebase-merge/message"),
+            format!("fix {word}: a decade of faded beef\n"),
+        )
+        .unwrap();
+        fx.final_flush_and_restore();
+    }
+}
+
+/// The lossy fallback that review found (#7): `text eol=lf` over a CRLF file, and a user ref
+/// under the exact name the old format reads a tree from. The store would restore LF and drop
+/// the ref, so the final flush over it is not complete and nothing is sealed — the executor is
+/// kept, never stopped as saved. Asked again, it still is not.
+#[test]
+fn a_lossy_store_never_completes_a_final_flush() {
+    let fx = Fixture::new();
+    fx.ref_with_own_commit(
+        "refs/sealant/capture/worktree",
+        "user branch under the old name",
+    );
+    fs::write(fx.root.join(".gitattributes"), "*.txt text eol=lf\n").unwrap();
+    fs::write(fx.root.join("draft.txt"), b"first\r\nsecond\r\n").unwrap();
+    let mut config = CaptureConfig::new("wt", 1, &fx.root);
+    config.executor = Some("exec-r3".to_owned());
+    config.git_trees = false;
+    let engine = CaptureEngine::open(config, None).unwrap();
+    let shipper = Arc::new(engine.shipper(fx.store.clone(), fx.registrar.clone()));
+    let runner = CadenceRunner::new(engine, shipper);
+    for _ in 0..2 {
+        let result = runner.flush_final(None);
+        assert!(!result.complete(), "{result:?}");
+        assert!(fx.registrar.seals().is_empty());
+        assert!(!runner.final_sealed());
+    }
 }

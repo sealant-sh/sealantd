@@ -239,8 +239,12 @@ learns which worktree it serves.
 
 - **Name and URL only.** How a remote is authenticated stays the control plane's business; Mend
   points git's ssh at a transport that signs on its own machine.
-- **Set, never pruned.** A missing remote is added and one that points elsewhere is updated. A
-  remote the session added itself is left alone.
+- **A base only.** The plan's remotes seed a repository built from an empty chain or from a
+  capture that carries no `.git/config` (Mend's capture 0), adding each one it lacks. A capture
+  that carries `.git/config` holds a session's own configuration, and it is the repository's:
+  nothing is added, changed or removed, so a remote the user removed stays removed on a fresh
+  executor (review 2026-09-28, fourth pass, #8). A disk resumed as it is gets nothing either.
+  `MaterializeReport::git_config` says which a materialize restored.
 - A name or URL that could read as an option fails the boot: that is a control-plane bug. A git
   failure is logged and skipped, and the harness runs without that remote. URLs are never logged,
   since one may carry a credential.
@@ -794,9 +798,42 @@ chain conflict, never retried). `InMemoryRegistrar` refuses the same way (raw na
 does not walk dir objects; `registrar::missing_manifest_features`). A request without the list
 reads none; an answer without it is an older registrar's.
 
+**A store that reads less than the daemon writes never gets a complete final flush** (decision
+12; review 2026-09-28, fourth pass, #7). The daemon writes every feature it reads; a store whose
+answer leaves one out (`git_trees` above all: without it the trees ride `refs` as pseudo-refs,
+there is no raw tree, and a restore checks the worktree out as git converts it and drops a user
+ref of a pseudo-ref's name) would restore less than a capture holds. Its captures still stage
+and ship, as crash protection, but a final flush over it answers `complete: false`,
+`incomplete_reason: "store-fidelity"`, and seals nothing (`CaptureConfig::unread_features`,
+`CaptureEngine::fidelity_gap`). The executor is kept until a registrar that reads them recovers
+it.
+
 The answer's `executor` is the executor the session token was issued for: what a completed final
 flush's seal names (below). Absent from a registrar that does not say, and the daemon seals under
 `SEALANT_WORKSPACE_ID` instead (`CaptureConfig::executor`; a re-plan that names one takes it).
+
+### `launch` on `plan.get`
+
+Cross-repo decision 11: the executor names the launch it is from its very first `plan.get`,
+additively (`PlanGetRequest::launch`, absent when it does not know):
+
+```json
+→ {"worktree_id":null,"epoch":0,…,"launch":"<launch id>"}
+← 409 {"reason":"launch-mismatch","message":"…"}
+```
+
+It is `SEALANT_CAPTURE_LAUNCH_ID` when the launcher sets it (the launch Mend minted and issued
+the session token for), else the launch this disk last served — the one its staging was written
+for, or its last completed materialize was planned as (`CaptureEngine::disk_launch`): a restart
+or a recovery boot names the launch whose disk it is. The registrar refuses a `launch` that is
+not its token's (409 `launch-mismatch`) and binds the lease to (session, launch), so an old
+launch's executor never joins a newer launch's epoch. The daemon checks the other way too: a
+plan whose `executor` is not the `SEALANT_CAPTURE_LAUNCH_ID` it was given refuses the boot before
+anything is materialized. And a disk's staging continues the chain across an epoch change only
+for the launch that staged it (`index/last.json` records it): another launch's staging, or one
+that names no launch, is not resumed into the new epoch however exactly it continues the head
+(`CaptureEngine::pickup`; review 2026-09-28, fourth pass, #11). `InMemoryRegistrar` refuses a
+mismatched `launch` as Mend does and keeps every request (`plan_requests`).
 
 ### `final_seal` in a manifest
 
@@ -864,7 +901,8 @@ snap did, whenever: `snaps`), `fenced`, `conflict`, `deadline`, `ship-failed`, `
 (staged, or a bulk capture being built, after the final flush), `sealing` (everything
 registered, but not the capture that seals the completed flush: the flush returned at its
 deadline before it could stage it — send the final flush again, which seals without a second
-quiesce), `sweep-unavailable`, `unreadable` or `internal`; absent when `complete`.
+quiesce), `sweep-unavailable`, `unreadable`, `store-fidelity` (the store does not read every manifest
+feature this build writes, below) or `internal`; absent when `complete`.
 
 Once `complete` is said, nothing more is captured. The final flush ends the chain as the disk
 is: when its bulk snap staged a capture and the small snap found tracked or ignored files with
@@ -1058,7 +1096,15 @@ All absent / `false` from an older daemon, and when nothing is refused.
 
 A 409 `{"reason":"lease-lost"}` from any call, without a `live_epoch` other than the caller's,
 is a lost lease: the executor pauses shipping and asks again, and never reads it as a chain
-conflict. Nothing new on the wire; the reading changed.
+conflict. Nothing new on the wire; the reading changed. A heartbeat's 404 (or 409) `lease-lost`
+pauses the harness at once rather than after the lease TTL; a heartbeat that succeeds under the
+same identity resumes it.
+
+`plan.get` answers 409 `{"reason":"worktree-leased"}` while another launch holds the worktree's
+lease: no epoch is given, and a `live_epoch` in it is the holder's, never one to adopt
+(`RegistrarError::WorktreeLeased`). A boot waits (1 s, doubling to 30 s) and asks again, touching
+nothing; a re-plan keeps the identity it has. `InMemoryRegistrar::refuse_plans_leased` stands in
+for it.
 
 ### `platform` on `plan.get`
 

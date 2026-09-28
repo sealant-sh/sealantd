@@ -93,6 +93,17 @@ pub fn run_boot(log_level: &str, recovery: bool) -> ExitCode {
         Err(error) => {
             tracing::error!(%error, "boot preparation failed");
             eprintln!("sealantd boot: {error}");
+            // A recovery boot on a disk that was never materialized: verified empty, nothing
+            // to save (76), which the platform may release. Never a clean 0: nothing was saved
+            // either.
+            if let BootError::NeverMaterialized(_) = error {
+                tracing::warn!(
+                    outcome = "never-materialized",
+                    exit_code = crate::runtime::EXIT_NOTHING_TO_SAVE,
+                    "recovery: nothing to save: never materialized"
+                );
+                return ExitCode::from(crate::runtime::EXIT_NOTHING_TO_SAVE);
+            }
             // A recovery boot that could not start has not saved what the disk holds: it is
             // still unsaved work, never a clean exit. Nor has a capture boot refused beside a
             // daemon still running on its disk: that disk is the other daemon's to save.
@@ -131,6 +142,21 @@ fn prepare(
         )?),
         _ => None,
     };
+
+    // Step 1c: a recovery boot on a disk the daemon before it never materialized (it died at
+    // `plan.get`, say) has nothing to save — capture starts before any user code, so none ran
+    // there — and says so, touching nothing more: exit 76, never the 75 that keeps it forever.
+    // Checked under the lock (no daemon runs here) and before the channel is dialled (the
+    // failure that killed the first daemon may kill this one's `plan.get` too). Anything but a
+    // verified empty disk goes on to the recovery proper.
+    if config.recovery
+        && matches!(config.source, WorkspaceSource::Capture(_))
+        && capture::never_materialized(&config.workspace.working_directory).is_ok()
+    {
+        return Err(BootError::NeverMaterialized(
+            config.workspace.working_directory.display().to_string(),
+        ));
+    }
 
     // Step 2: become subreaper BEFORE any fork so double-forked orphans reparent here.
     if cfg!(target_os = "linux") {
@@ -401,6 +427,18 @@ pub fn run_supervised(
     secret_env: Vec<(String, String)>,
     capture_boot: Option<capture::CaptureBoot>,
 ) -> ExitCode {
+    run_supervised_with(config, secret_env, capture_boot, |_| {})
+}
+
+/// [`run_supervised`], `prepare` given the runtime before anything runs on it (a test sweeps
+/// as PID 1 of a container does, narrowed to its own processes).
+#[doc(hidden)]
+pub fn run_supervised_with(
+    config: BootConfig,
+    secret_env: Vec<(String, String)>,
+    capture_boot: Option<capture::CaptureBoot>,
+    prepare: impl FnOnce(&Runtime),
+) -> ExitCode {
     let runtime_config = into_runtime_config(&config, &secret_env);
     // Nothing downstream needs the values in this form; the runtime config owns them now.
     drop(secret_env);
@@ -411,6 +449,7 @@ pub fn run_supervised(
     }
     let shutdown = Arc::new(ShutdownSignal::new(runtime_config.shutdown_grace_ms));
     let runtime = Runtime::new(runtime_config, shutdown);
+    prepare(&runtime);
 
     let tokio_runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -696,11 +735,17 @@ fn start_capture(
         None => tracing::info!("no workspace Docker daemon; no container to stop at the end"),
     }
     runtime.set_workspace_docker(config.workspace_docker.clone());
+    // The helpers the host's agent names: the final flush sweeps every other process on the
+    // machine ([`crate::sweep::Scope::Machine`]).
+    runtime.set_sweep_exempt_file(config.sweep_exempt_file.clone());
     if runtime.sweep_unavailable() {
         tracing::error!(
-            "PR_SET_CHILD_SUBREAPER did not take effect and sealantd is not PID 1 of its PID \
-             namespace: the final capture cannot see an orphaned writer, and every final \
-             flush will answer complete: false (sweep-unavailable)"
+            recovery = config.recovery,
+            "sealantd is not PID 1 of its PID namespace, no agent named its helpers \
+             (SEALANT_SWEEP_EXEMPT_FILE), and either PR_SET_CHILD_SUBREAPER did not take effect \
+             or this is a recovery boot (the daemon before it left its orphans to whatever \
+             adopted them): the final capture cannot see every writer, and every final flush \
+             will answer complete: false (sweep-unavailable)"
         );
     }
     tracing::info!("capture engine started before any user code");
