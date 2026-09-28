@@ -1570,17 +1570,25 @@ impl CaptureEngine {
         }
     }
 
-    /// Whether the bulk class's capture holds its name `v` of the inode `key` as the disk has
-    /// it: `None` when `v` is not that inode on disk any more; `Some(false)` when it is, but
-    /// its stat is not the one the last bulk snap read (the file changed or gained a name
-    /// since, so the bulk capture may hold other bytes); `Some(true)` otherwise. A link names
-    /// only a member the capture holds as it is (review 2026-09-28, fifth pass, #11).
+    /// Whether the bulk class's capture holds its name `v` of one of the inodes in `wanted`
+    /// (this snap's `(dev, ino)`) as the disk has it: `None` when `v` is none of them on disk
+    /// now; else the inode it is, and `false` when its stat is not the one the last bulk snap
+    /// read (the file changed or gained a name since, so the bulk capture may hold other
+    /// bytes), `true` otherwise. A link names only a member the capture holds as it is (review
+    /// 2026-09-28, fifth pass, #11).
+    ///
+    /// The index's device number is not compared: it is the mount's, and a restarted
+    /// container's overlay is mounted anew under another one while every inode stays (Docker
+    /// end to end, round 8, F5: a recovery boot read every bulk name as another inode, left
+    /// the links out without deferring them, and sealed the chain without them). The disk's own
+    /// `(dev, ino)` says which inode the name is now; size, times, inode number and mode say
+    /// whether the capture holds it as it is.
     fn bulk_member_captured(
         &self,
         v: &str,
         known: &index::IndexedFile,
-        key: (u64, u64),
-    ) -> Option<bool> {
+        wanted: &dyn Fn((u64, u64)) -> bool,
+    ) -> Option<((u64, u64), bool)> {
         use std::os::unix::ffi::OsStrExt;
         use std::os::unix::fs::MetadataExt;
         let abs = self
@@ -1589,8 +1597,13 @@ impl CaptureEngine {
             .join(std::ffi::OsStr::from_bytes(&worktree_meta::bytes_of(v)));
         let meta = crate::longpath::symlink_metadata(&abs)
             .ok()
-            .filter(|m| m.is_file() && (m.dev(), m.ino()) == key)?;
-        Some(index::FileStat::of(&meta) == known.stat)
+            .filter(|m| m.is_file() && wanted((m.dev(), m.ino())))?;
+        let now = index::FileStat::of(&meta);
+        let held = index::FileStat {
+            dev: now.dev,
+            ..known.stat
+        };
+        Some(((meta.dev(), meta.ino()), now == held))
     }
 
     /// The names the workspace class (`listing`, this snap's) and the bulk class (its index,
@@ -1625,16 +1638,20 @@ impl CaptureEngine {
             }
         }
         let mut deferred = false;
+        let inos: HashSet<u64> = wanted.keys().map(|(_, ino)| *ino).collect();
         for (v, known) in &self.bulk_index.files {
-            let key = (known.stat.dev, known.stat.ino);
-            let Some(path) = wanted.get(&key) else {
+            if !inos.contains(&known.stat.ino) {
                 continue;
-            };
-            // The index is the last bulk snap's: the inode must still be this one, and the
-            // bulk capture must hold it as it is.
-            match self.bulk_member_captured(v, known, key) {
-                Some(true) => shared.push(link(path, worktree_meta::LinkClass::Bulk, v)),
-                Some(false) => deferred = true,
+            }
+            // The index is the last bulk snap's: the name must be one of these inodes on disk
+            // now, and the bulk capture must hold it as it is.
+            match self.bulk_member_captured(v, known, &|key| wanted.contains_key(&key)) {
+                Some((key, true)) => {
+                    if let Some(path) = wanted.get(&key) {
+                        shared.push(link(path, worktree_meta::LinkClass::Bulk, v));
+                    }
+                }
+                Some((_, false)) => deferred = true,
                 None => {}
             }
         }
@@ -1680,20 +1697,20 @@ impl CaptureEngine {
         }
         let mut bulk: HashMap<(u64, u64), Vec<worktree_meta::LinkMember>> = HashMap::new();
         let mut deferred = false;
+        let inos: HashSet<u64> = inodes.keys().map(|(_, ino)| *ino).collect();
         for (v, known) in &self.bulk_index.files {
-            let key = (known.stat.dev, known.stat.ino);
-            if !inodes.contains_key(&key) {
+            if !inos.contains(&known.stat.ino) {
                 continue;
             }
-            // The index is the last bulk snap's: the inode must still be this one, and the
-            // bulk capture must hold it as it is. A group never names a member the captures
-            // do not hold as the disk does.
-            match self.bulk_member_captured(v, known, key) {
-                Some(true) => bulk
+            // The index is the last bulk snap's: the name must be one of these inodes on disk
+            // now, and the bulk capture must hold it as it is. A group never names a member the
+            // captures do not hold as the disk does.
+            match self.bulk_member_captured(v, known, &|key| inodes.contains_key(&key)) {
+                Some((key, true)) => bulk
                     .entry(key)
                     .or_default()
                     .push(member(worktree_meta::LinkClass::Bulk, v)),
-                Some(false) => deferred = true,
+                Some((_, false)) => deferred = true,
                 None => {}
             }
         }

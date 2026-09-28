@@ -1241,25 +1241,27 @@ impl CadenceRunner {
                 tracing::error!(%error, "final small-class snap failed");
                 incomplete = Some(Incomplete::from_snap(Class::Small, &error));
             }
-            let mut bulk_staged = false;
             // The small snap failed: this flush is incomplete whatever the bulk snap does, and
             // nothing it stages would be read as saved. The bulk class is snapped by the flush
             // that can complete (a dependency tree is 2.5 s or more to walk; a kept executor
             // asked again and again spent it every time).
-            if self.shared.capture_bulk && incomplete.is_none() {
-                match self.shared.bulk_snap(true) {
-                    Ok(staged) => bulk_staged = !staged.unchanged,
-                    Err(error) => {
-                        tracing::error!(%error, "final bulk-class snap failed");
-                        incomplete.get_or_insert(Incomplete::from_snap(Class::Bulk, &error));
-                    }
-                }
+            if self.shared.capture_bulk
+                && incomplete.is_none()
+                && let Err(error) = self.shared.bulk_snap(true)
+            {
+                tracing::error!(%error, "final bulk-class snap failed");
+                incomplete.get_or_insert(Incomplete::from_snap(Class::Bulk, &error));
             }
-            // A link to a bulk name the first small snap left out (the bulk capture did not
-            // hold it as it is) is recorded by a small snap after the bulk snap, whether or not
-            // that one staged anything.
+            // The small snap's overlay names the bulk class's names of tracked files (and of
+            // workspace files the workspace class does not name) as the bulk index had them:
+            // it is taken again over the index the final bulk snap just wrote, whether or not
+            // that snap staged anything and whether or not a link was known to be left out. A
+            // small snap over an index this process did not write (a recovery boot, a lost
+            // index) can miss every bulk name without knowing it (Docker end to end, round 8,
+            // F5: a chain sealed without 88 tracked↔bulk hardlink groups); a small snap that
+            // finds nothing new stages nothing.
             if incomplete.is_none()
-                && (bulk_staged || self.shared.engine().links_deferred())
+                && self.shared.capture_bulk
                 && self.shared.engine().small_depends_on_bulk()
                 && let Err(error) = self.shared.small_snap(CaptureKind::Final)
             {
