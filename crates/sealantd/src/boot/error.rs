@@ -62,6 +62,11 @@ pub enum BootError {
     #[error("nothing to save: never materialized ({0})")]
     NeverMaterialized(String),
 
+    /// A recovery boot on the disk of a standby no session claimed and no writer was admitted
+    /// on ([`crate::unclaimed`]): its disk holds nothing of any session. Nothing was touched.
+    #[error("nothing to save: a standby no session claimed ({0})")]
+    NeverClaimed(String),
+
     /// The capture store cannot hold what a capture holds (it does not read every manifest
     /// feature this daemon writes): no user code is admitted over it
     /// ([`crate::runtime::EXIT_STORE_UNFIT`]). Nothing was materialized and nothing ran.

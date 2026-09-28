@@ -113,6 +113,14 @@ fn prepare_exit_code(error: &BootError, recovery: bool) -> u8 {
             );
             crate::runtime::EXIT_NOTHING_TO_SAVE
         }
+        BootError::NeverClaimed(_) => {
+            tracing::warn!(
+                outcome = "never-claimed",
+                exit_code = crate::runtime::EXIT_NOTHING_TO_SAVE,
+                "recovery: nothing to save: a standby no session claimed"
+            );
+            crate::runtime::EXIT_NOTHING_TO_SAVE
+        }
         // A store that cannot hold what a capture holds: refused before the materialize, no
         // user code ran, nothing is saved — its own code, so the platform can say why.
         BootError::StoreUnfit(_) => {
@@ -172,6 +180,22 @@ fn prepare(
         return Err(BootError::NeverMaterialized(
             config.workspace.working_directory.display().to_string(),
         ));
+    }
+    // Likewise a standby no session claimed and no writer was admitted on: it holds the base
+    // and its own boot's setup, nothing of any session (Docker end to end, round 8, F7).
+    if config.recovery
+        && matches!(config.source, WorkspaceSource::Capture(_))
+        && let Some(placeholder) = crate::unclaimed::read(
+            &sealant_capture::CaptureConfig::new("", 0, &config.workspace.working_directory)
+                .staging_dir(),
+        )
+    {
+        return Err(BootError::NeverClaimed(format!(
+            "{}, placeholder {} at epoch {}",
+            config.workspace.working_directory.display(),
+            placeholder.worktree_id,
+            placeholder.epoch
+        )));
     }
 
     // Step 2: become subreaper BEFORE any fork so double-forked orphans reparent here.
@@ -780,6 +804,15 @@ fn start_capture(
 async fn final_capture(runtime: &Arc<Runtime>, code: ExitCode) -> ExitCode {
     if runtime.exit_final_flush(None).await.is_none() {
         return code;
+    }
+    // A standby no session claimed: nothing on this disk is a session's
+    // ([`crate::unclaimed`]), and the platform may release it.
+    if runtime.capture_nothing_to_save() {
+        tracing::warn!(
+            code = crate::runtime::EXIT_NOTHING_TO_SAVE,
+            "nothing to save: a standby no session claimed; exiting with EX_PROTOCOL"
+        );
+        return ExitCode::from(crate::runtime::EXIT_NOTHING_TO_SAVE);
     }
     if runtime.capture_incomplete() {
         tracing::error!(

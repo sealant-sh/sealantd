@@ -543,6 +543,30 @@ impl Staging {
         Ok(dropped)
     }
 
+    /// Drop every queued entry and every staged object: nothing staged here is anyone's to
+    /// save (a standby no session claimed, whose placeholder captures no registrar takes).
+    /// Returns how many entries went. Call with the ship worker and the snap loops stopped.
+    pub fn discard_all(&self) -> io::Result<usize> {
+        let _g = self.coalesce_guard();
+        let mut dropped = 0;
+        for entry in self.pending()? {
+            fs::remove_file(self.queue_path(entry.n)).ok();
+            dropped += 1;
+        }
+        *self
+            .in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        for d in fs::read_dir(self.objects_dir())? {
+            let d = d?;
+            if d.file_type()?.is_file() {
+                fs::remove_file(d.path()).ok();
+            }
+        }
+        self.bump();
+        Ok(dropped)
+    }
+
     /// Changes whenever the queue does.
     #[must_use]
     pub fn generation(&self) -> u64 {

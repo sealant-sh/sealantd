@@ -365,6 +365,25 @@ impl DiskState {
 /// `D tooling/typescript/core.json` against a `.gitignore` line `core.*`).
 const GIT_CLASS_FILES: &[&str] = &[".git/index"];
 
+/// What the workspace sweep leaves of the repository the git class made, beside
+/// [`GIT_CLASS_FILES`], when the plan's workspace class does not carry it (a base: Mend's
+/// capture 0 carries no `.git/` at all): `.git/config`, which names the object format and ref
+/// backend `git init` made the repository in, and a reftable repository's `reftable/`, which
+/// holds the refs the git class just wrote. Swept, a SHA-256 restore read as SHA-1 and a
+/// reftable one lost every ref (Docker end to end, round 8, F4b). A plan that carries them
+/// writes its own, and the sweep treats them as it always did.
+fn repository_files(listing: &Listing, planned: &BTreeSet<String>) -> Vec<String> {
+    let mut protected: Vec<String> = GIT_CLASS_FILES.iter().map(|f| (*f).to_owned()).collect();
+    if !planned.contains(".git/config") {
+        protected.push(".git/config".to_owned());
+    }
+    let in_reftable = |v: &str| v == ".git/reftable" || v.starts_with(".git/reftable/");
+    if !planned.iter().any(|v| in_reftable(v)) {
+        protected.extend(listing.entries.keys().filter(|v| in_reftable(v)).cloned());
+    }
+    protected
+}
+
 /// Verify `bytes` against a content-addressed key.
 fn verify_key(key: &str, bytes: &[u8]) -> Result<(), MaterializeError> {
     if let Some(expected) = key_digest(key)
@@ -626,11 +645,13 @@ impl<'a> Materializer<'a> {
                 .into_iter()
                 .flatten()
                 .collect();
+                let protected = repository_files(&listing, &write.planned);
+                let protected: Vec<&str> = protected.iter().map(String::as_str).collect();
                 Self::sweep(
                     &listing,
                     &write.planned,
                     &keep,
-                    GIT_CLASS_FILES,
+                    &protected,
                     write.index,
                     &mut report,
                 )?;
@@ -691,6 +712,11 @@ impl<'a> Materializer<'a> {
         // the daemon directory stays out of the restored tree's index before anything runs in it.
         if matches!(class, MaterializeClass::Git | MaterializeClass::All) {
             let repo = GitRepo::open(&self.targets.root)?;
+            // The formats the git class made the repository in are the capture's, whatever the
+            // other classes wrote since (a captured config, or none): re-asserted before
+            // anything reads a ref — the boot's remotes and the engine's seed come next.
+            let git = &manifest.sections.git;
+            repo.assert_formats(git.object_format(), git.ref_format())?;
             repo.exclude_locally(&format!("/{DAEMON_DIR}/"))?;
             // Last of all: restoring the other classes moved the mtimes of the directories they
             // wrote into.

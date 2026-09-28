@@ -74,6 +74,10 @@ enum FinalOutcome {
     Snapped { shipping: Option<&'static str> },
     /// It cannot complete as it went; the reason code.
     Incomplete(&'static str),
+    /// A standby no session claimed and no writer was admitted on ([`crate::unclaimed`]):
+    /// nothing on this disk is a session's. Nothing was snapped or shipped, the placeholder's
+    /// queue was dropped, and nothing is admitted again: complete, with nothing pending.
+    NothingToSave,
 }
 
 /// How a report judges whether the disk is still as the last final flush captured it.
@@ -108,6 +112,8 @@ pub struct CaptureRuntime {
     launch: Mutex<Option<String>>,
     /// Where each answer stands ([`sealant_capture::position`]), shared with the engine's seals.
     observer: Arc<sealant_capture::position::Observer>,
+    /// Whether a session ever became this executor's writer ([`crate::unclaimed`]).
+    unclaimed: crate::unclaimed::Unclaimed,
 }
 
 impl std::fmt::Debug for CaptureRuntime {
@@ -138,6 +144,7 @@ impl CaptureRuntime {
         let reads = boot.engine.read_reports();
         let launch = boot.engine.config().executor.clone();
         let observer = boot.engine.observer();
+        let unclaimed = crate::unclaimed::Unclaimed::load(&boot.layout.staging_dir);
         Arc::new(Self {
             runner: CadenceRunner::new(boot.engine, shipper),
             resumed,
@@ -153,7 +160,29 @@ impl CaptureRuntime {
             final_outcome: Mutex::new(FinalOutcome::NotRun),
             launch: Mutex::new(launch),
             observer,
+            unclaimed,
         })
+    }
+
+    /// A writer the control API is about to admit (`what`: an exec, a session, …): from now on
+    /// this executor may hold a session's work ([`crate::unclaimed::Unclaimed::claim`]).
+    ///
+    /// # Errors
+    /// The executor was released with nothing to save, or it could not say durably that it
+    /// no longer is: the writer must not start.
+    pub fn admit_writer(&self, what: &str) -> Result<(), ControlError> {
+        self.unclaimed.claim(what).map_err(|reason| {
+            ControlError::new(ControlErrorCode::PolicyDenied, reason)
+                .with_detail(serde_json::json!({ "reason": "nothing-to-save" }))
+        })
+    }
+
+    /// Whether a final flush found nothing to save on this executor: a standby no session
+    /// claimed and no writer was admitted on ([`crate::unclaimed`]). The daemon then exits
+    /// [`crate::runtime::EXIT_NOTHING_TO_SAVE`].
+    #[must_use]
+    pub fn nothing_to_save(&self) -> bool {
+        self.unclaimed.released()
     }
 
     fn identity(&self) -> (String, u64) {
@@ -310,6 +339,12 @@ impl CaptureRuntime {
     /// # Errors
     /// Returns [`ControlError`] when the snap fails.
     pub fn snap(&self, kind: CaptureKind) -> Result<CaptureStaged, ControlError> {
+        if self.nothing_to_save() {
+            return Err(ControlError::new(
+                ControlErrorCode::PolicyDenied,
+                "nothing to snap: this standby was released with nothing to save".to_owned(),
+            ));
+        }
         let staged = self
             .runner
             .snap(engine_kind(kind))
@@ -336,7 +371,7 @@ impl CaptureRuntime {
         // After a complete final flush, over the disk it captured, a suspend flush is a status
         // read: it answers the final flush's report and stages nothing (a suspend capture of
         // the same tree after the final one left the chain's head reading `suspend`).
-        if self.runner.sealed_and_current() {
+        if self.runner.sealed_and_current() || self.nothing_to_save() {
             return Ok(self.status());
         }
         self.runner
@@ -360,6 +395,13 @@ impl CaptureRuntime {
         deadline: Option<Duration>,
         quiesce: Option<&'static str>,
     ) -> CaptureStatusReport {
+        // A standby no session claimed and no writer was admitted on: nothing here is a
+        // session's, and its placeholder's captures can never register (the registrar refuses
+        // every write for it). Nothing is snapped or waited for (Docker end to end, round 8,
+        // F7: the launch waited 12 minutes on them, failed, and needed a discard).
+        if self.unclaimed.release() {
+            return self.release_with_nothing_to_save();
+        }
         // The chain is sealed ([`sealant_capture::FinalSeal`]) only when every writer stopped.
         let flushed = self.runner.flush_final_sealing(deadline, quiesce.is_none());
         self.last_snap_unix_ms
@@ -390,6 +432,26 @@ impl CaptureRuntime {
         self.report(Currency::AsSnapped)
     }
 
+    /// [`Self::flush_final`] on a standby released with nothing to save: the loops, the watcher
+    /// and the ship worker stop (nothing more is staged or shipped under the placeholder), its
+    /// queue is dropped, and the outcome says so.
+    fn release_with_nothing_to_save(&self) -> CaptureStatusReport {
+        self.runner.stop();
+        match self.runner.staging().discard_all() {
+            Ok(dropped) => tracing::warn!(
+                dropped,
+                "final capture: nothing to save — a standby no session claimed and no writer was \
+                 admitted on; its placeholder's captures were dropped"
+            ),
+            Err(error) => tracing::error!(
+                %error,
+                "final capture: nothing to save, but the placeholder's queue could not be dropped"
+            ),
+        }
+        *self.final_outcome.lock().unwrap_or_else(|e| e.into_inner()) = FinalOutcome::NothingToSave;
+        self.report(Currency::AsSnapped)
+    }
+
     /// A final flush begins ([`Runtime::final_flush`], before it stops the writers):
     /// `capture.status` reads `in-progress` until it ends — unless the last one completed, the
     /// disk is as it left it and the chain still ends on its final capture
@@ -403,7 +465,7 @@ impl CaptureRuntime {
         let current = matches!(*outcome, FinalOutcome::Snapped { .. })
             && self.runner.sealed_and_current()
             && self.runner.final_sealed();
-        if !current {
+        if !current && *outcome != FinalOutcome::NothingToSave {
             *outcome = FinalOutcome::Running;
         }
     }
@@ -487,6 +549,12 @@ impl CaptureRuntime {
                     unchanged: true,
                 });
             }
+            // The claim: from here this executor may hold the session's work, said on the disk
+            // before the disk is touched ([`crate::unclaimed`]). A standby released with nothing
+            // to save takes no claim.
+            self.unclaimed
+                .claim("capture re-plan")
+                .map_err(|reason| ControlError::new(ControlErrorCode::PolicyDenied, reason))?;
             tracing::info!(
                 from_worktree = %worktree_id,
                 from_epoch = epoch,
@@ -674,6 +742,10 @@ impl CaptureRuntime {
             FinalOutcome::NotRun => Some("not-final"),
             FinalOutcome::Running => Some("in-progress"),
             FinalOutcome::Incomplete(reason) => Some(reason),
+            // Nothing of a session's: complete once nothing is left queued (the queue was
+            // dropped; one that could not be is pending, and says so).
+            FinalOutcome::NothingToSave if pending > 0 => Some("pending"),
+            FinalOutcome::NothingToSave => None,
             FinalOutcome::Snapped { .. } if ship.fenced => Some("fenced"),
             FinalOutcome::Snapped { .. } if snap_failing => Some("snapshot-failed"),
             FinalOutcome::Snapped { shipping } if pending > 0 => {
@@ -1591,6 +1663,321 @@ mod tests {
             "pub fn f() {}\n"
         );
         assert_eq!(capture.lease_epoch().worktree_id, "standby-1");
+    }
+
+    /// A standby booted on its project's base under the placeholder (the launcher named no
+    /// worktree), whose registrar refuses every write for it, as Mend's channel does for a
+    /// standby: a pre-claim capture of its own boot's setup is staged and can never register.
+    /// The runtime, the capture, the disk and the registrar.
+    fn standby_with_placeholder_staging(
+        tmp: &Path,
+    ) -> (
+        Arc<Runtime>,
+        Arc<CaptureRuntime>,
+        std::path::PathBuf,
+        Arc<InMemoryRegistrar>,
+    ) {
+        let src = tmp.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        git(&src, &["init", "-q", "-b", "main"]);
+        git(&src, &["config", "user.email", "t@t"]);
+        git(&src, &["config", "user.name", "t"]);
+        std::fs::write(src.join(".gitignore"), "warm/\n").unwrap();
+        std::fs::write(src.join("lib.rs"), "pub fn f() {}\n").unwrap();
+        git(&src, &["add", "-A"]);
+        git(&src, &["commit", "-q", "-m", "one"]);
+        let sink: Arc<dyn BlobSink> = Arc::new(LocalDir::new(&tmp.join("store")).unwrap());
+        let registrar =
+            Arc::new(InMemoryRegistrar::new("wt-real", 1, None).with_executor("standby:1"));
+        let dyn_registrar: Arc<dyn Registrar> = registrar.clone();
+        let mut source = CaptureEngine::open(CaptureConfig::new("wt-real", 1, &src), None).unwrap();
+        let shipper = source.shipper(sink.clone(), dyn_registrar.clone());
+        source
+            .snap(SnapRequest {
+                kind: EngineKind::Checkpoint,
+                class: Class::Small,
+                seq: 1,
+            })
+            .unwrap();
+        shipper.ship_pending().unwrap();
+
+        registrar.set_worktree_id("standby-1");
+        registrar.set_live_epoch(7);
+        registrar.set_lease_alive(false);
+        let ws = tmp.join("ws");
+        let boot = boot_from(
+            dyn_registrar,
+            Some(sink),
+            &CaptureSourceConfig {
+                endpoint: "http://unused".to_owned(),
+                worktree_id: None,
+                harness_home: None,
+                raise_inotify_limit: false,
+                allow_plaintext: false,
+                ca_pem: None,
+                ca_file: None,
+                object_ca_pem: None,
+                object_ca_file: None,
+                recovery: false,
+                launch_id: None,
+            },
+            &ws,
+            tmp,
+        )
+        .unwrap();
+        assert!(
+            crate::unclaimed::read(&ws.join(".sealantd/capture")).is_some(),
+            "a standby's boot says it is unclaimed"
+        );
+        let mut config = RuntimeConfig::new(new_runtime_id());
+        config.workspace_root = ws.clone();
+        let runtime = Runtime::new(config, Arc::new(ShutdownSignal::new(300)));
+        runtime.mark_healthy();
+        let capture = CaptureRuntime::new(boot);
+        assert!(runtime.install_capture(capture.clone()));
+        capture.start_without_harness(runtime.clone());
+        // What the standby's own boot wrote (dotfiles, a warmed cache): captured, never shipped.
+        std::fs::create_dir_all(ws.join("warm")).unwrap();
+        std::fs::write(ws.join("warm/cache.bin"), vec![7u8; 68 * 1024]).unwrap();
+        capture.snap(CaptureKind::Checkpoint).unwrap();
+        assert!(capture.status().pending > 0);
+        (runtime, capture, ws, registrar)
+    }
+
+    fn final_flush_request(id: &str, deadline_ms: u64) -> ControlRequest {
+        ControlRequest::new(
+            RequestId::new(id),
+            Command::CaptureFlush {
+                kind: CaptureFlushKind::Final,
+                deadline_ms: Some(deadline_ms),
+                grace_ms: Some(100),
+            },
+        )
+    }
+
+    /// Docker end to end, round 8, F7: a claimed standby whose re-plan failed (its `plan.get`
+    /// refused here; timed out there) and that never admitted a writer answers its final flush
+    /// at once: nothing to save — complete, nothing pending, its placeholder's queue dropped —
+    /// and the daemon ends (76). Nothing is admitted after that. Before, the flush waited on
+    /// captures the registrar refuses forever (`lease-lost`) and ended incomplete at its
+    /// deadline, and the launch failed 12 minutes later and needed a discard.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_standby_whose_replan_failed_has_nothing_to_save() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (runtime, capture, ws, registrar) = standby_with_placeholder_staging(tmp.path());
+
+        // The claim's re-plan fails before it touches anything; the registrar still answers
+        // `lease-lost` for every write of the placeholder, as Mend's channel does.
+        // (Every `plan.get` from here on: the ship worker asks too, after a `lease-lost`.)
+        registrar.refuse_plans_leased(1_000_000);
+        let failed = capture.replan().expect_err("the re-plan fails");
+        assert!(failed.message.contains("plan.get"), "{failed}");
+        assert_eq!(capture.lease_epoch().worktree_id, "standby-1");
+        assert!(crate::unclaimed::read(&ws.join(".sealantd/capture")).is_some());
+
+        let start = Instant::now();
+        let report = flush_report(runtime.dispatch(final_flush_request("f1", 5_000)).await);
+        assert!(report.complete, "nothing to save: {report:?}");
+        assert_eq!(report.incomplete_reason, None, "{report:?}");
+        assert_eq!(report.pending, 0, "{report:?}");
+        assert_eq!(report.pending_bytes, 0, "{report:?}");
+        assert!(!report.fenced && report.refused.is_empty(), "{report:?}");
+        assert_eq!(report.launch.as_deref(), Some("standby:1"));
+        assert!(
+            start.elapsed() < Duration::from_secs(3),
+            "answered at once, never waiting on the placeholder's captures: {:?}",
+            start.elapsed()
+        );
+        assert!(runtime.capture_nothing_to_save());
+        assert!(!runtime.capture_incomplete());
+        tokio::time::timeout(Duration::from_secs(1), runtime.shutdown().wait())
+            .await
+            .expect("the daemon ends on its own");
+        // The marker stays: a recovery boot on this disk exits 76 too.
+        assert!(crate::unclaimed::read(&ws.join(".sealantd/capture")).is_some());
+        assert!(
+            registrar.chain().iter().all(|h| h.n <= 1),
+            "nothing registered"
+        );
+
+        // Asked again, the same answer; and no writer or claim is admitted any more.
+        let again = flush_report(runtime.dispatch(final_flush_request("f2", 5_000)).await);
+        assert!(again.complete, "{again:?}");
+        assert!(capture.admit_writer("exec").is_err());
+        assert!(capture.replan().is_err());
+        assert!(capture.snap(CaptureKind::Checkpoint).is_err());
+        assert_eq!(capture.status().pending, 0);
+    }
+
+    /// Once any writer was admitted, a standby is never nothing to save: an exec through the
+    /// control API removes the marker before it starts, and the final flush then waits on what
+    /// is staged as it always did (here the registrar refuses it: incomplete at the deadline).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_standby_that_admitted_a_writer_is_never_nothing_to_save() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (runtime, capture, ws, _registrar) = standby_with_placeholder_staging(tmp.path());
+        let exec = runtime
+            .dispatch(ControlRequest::new(
+                RequestId::new("x1"),
+                Command::Exec(sealant_protocol::ExecArgs {
+                    execution_id: None,
+                    session_id: None,
+                    executable: "/bin/sh".to_owned(),
+                    args: vec!["-c".to_owned(), "echo work > user-work.txt".to_owned()],
+                    cwd: Some(ws.display().to_string()),
+                    env: vec![],
+                    stdin: false,
+                    attach: false,
+                    timeout_millis: None,
+                    background: false,
+                    capture: None,
+                    graceful_signal: None,
+                }),
+            ))
+            .await;
+        assert!(
+            matches!(exec.outcome, ResponseOutcome::Ok { .. }),
+            "{:?}",
+            exec.outcome
+        );
+        assert!(
+            crate::unclaimed::read(&ws.join(".sealantd/capture")).is_none(),
+            "the marker is gone before the writer ran"
+        );
+        let report = flush_report(runtime.dispatch(final_flush_request("f1", 1_500)).await);
+        assert!(!report.complete, "{report:?}");
+        assert!(!runtime.capture_nothing_to_save());
+        assert!(runtime.capture_incomplete());
+        assert!(capture.status().pending > 0);
+    }
+
+    /// A re-plan that acts on its plan claims the standby first, whatever happens after: here
+    /// the head it would materialize is not in the store, so the re-plan fails after the claim,
+    /// and the final flush is never nothing to save.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_replan_that_acted_claims_the_standby_even_when_it_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (runtime, capture, ws, registrar) = standby_with_placeholder_staging(tmp.path());
+        registrar.set_worktree_id("wt-real");
+        registrar.set_live_epoch(1);
+        // The head's manifest is gone from the store: the materialize fails.
+        std::fs::remove_dir_all(tmp.path().join("store/captures/wt-real/1")).unwrap();
+        capture.replan().expect_err("the head cannot be fetched");
+        assert!(crate::unclaimed::read(&ws.join(".sealantd/capture")).is_none());
+        let report = flush_report(runtime.dispatch(final_flush_request("f1", 1_500)).await);
+        assert!(!report.complete, "{report:?}");
+        assert!(!runtime.capture_nothing_to_save());
+    }
+
+    /// A standby a writer was admitted on, whose daemon then starts again on the same disk (a
+    /// container restart, not a recovery): the new boot never writes the marker again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_restarted_standby_that_admitted_a_writer_stays_claimed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (runtime, capture, ws, registrar) = standby_with_placeholder_staging(tmp.path());
+        capture.admit_writer("exec").unwrap();
+        assert!(crate::unclaimed::read(&ws.join(".sealantd/capture")).is_none());
+        capture.runner.stop();
+        drop(runtime);
+        registrar.set_lease_alive(true);
+        let sink: Arc<dyn BlobSink> = Arc::new(LocalDir::new(&tmp.path().join("store")).unwrap());
+        let dyn_registrar: Arc<dyn Registrar> = registrar.clone();
+        let again = boot_from(
+            dyn_registrar,
+            Some(sink),
+            &CaptureSourceConfig {
+                endpoint: "http://unused".to_owned(),
+                worktree_id: None,
+                harness_home: None,
+                raise_inotify_limit: false,
+                allow_plaintext: false,
+                ca_pem: None,
+                ca_file: None,
+                object_ca_pem: None,
+                object_ca_file: None,
+                recovery: false,
+                launch_id: None,
+            },
+            &ws,
+            tmp.path(),
+        )
+        .unwrap();
+        assert!(crate::unclaimed::read(&again.layout.staging_dir).is_none());
+        assert!(!CaptureRuntime::new(again).unclaimed.release());
+    }
+
+    /// A boot that named its worktree (every session's launch) is never an unclaimed standby,
+    /// and neither is a standby boot on a disk that already held capture state (a restart that
+    /// does not resume it: its first boot may have admitted a writer since).
+    #[test]
+    fn a_boot_that_named_its_worktree_writes_no_marker() {
+        a_boot_writes_no_marker(Some("wt-real"), "standby:1", false);
+    }
+
+    #[test]
+    fn a_standby_boot_on_a_disk_with_capture_state_writes_no_marker() {
+        a_boot_writes_no_marker(None, "standby:1", true);
+    }
+
+    /// A session's boot that names no worktree (the channel names it): its harness writes the
+    /// session's work, and it is never an unclaimed standby.
+    #[test]
+    fn a_session_boot_that_named_no_worktree_writes_no_marker() {
+        a_boot_writes_no_marker(None, "launch-1", false);
+    }
+
+    fn a_boot_writes_no_marker(worktree_id: Option<&str>, launch: &str, capture_state: bool) {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        git(&src, &["init", "-q", "-b", "main"]);
+        git(&src, &["config", "user.email", "t@t"]);
+        git(&src, &["config", "user.name", "t"]);
+        std::fs::write(src.join("lib.rs"), "pub fn f() {}\n").unwrap();
+        git(&src, &["add", "-A"]);
+        git(&src, &["commit", "-q", "-m", "one"]);
+        let sink: Arc<dyn BlobSink> = Arc::new(LocalDir::new(&tmp.path().join("store")).unwrap());
+        let registrar = Arc::new(InMemoryRegistrar::new("wt-real", 1, None).with_executor(launch));
+        let dyn_registrar: Arc<dyn Registrar> = registrar.clone();
+        let mut source = CaptureEngine::open(CaptureConfig::new("wt-real", 1, &src), None).unwrap();
+        let shipper = source.shipper(sink.clone(), dyn_registrar.clone());
+        source
+            .snap(SnapRequest {
+                kind: EngineKind::Checkpoint,
+                class: Class::Small,
+                seq: 1,
+            })
+            .unwrap();
+        shipper.ship_pending().unwrap();
+        if worktree_id.is_none() {
+            registrar.set_worktree_id("standby-1");
+            registrar.set_live_epoch(7);
+        }
+        if capture_state {
+            std::fs::create_dir_all(tmp.path().join("ws/.sealantd/capture")).unwrap();
+        }
+        let boot = boot_from(
+            dyn_registrar,
+            Some(sink),
+            &CaptureSourceConfig {
+                endpoint: "http://unused".to_owned(),
+                worktree_id: worktree_id.map(str::to_owned),
+                harness_home: None,
+                raise_inotify_limit: false,
+                allow_plaintext: false,
+                ca_pem: None,
+                ca_file: None,
+                object_ca_pem: None,
+                object_ca_file: None,
+                recovery: false,
+                launch_id: None,
+            },
+            &tmp.path().join("ws"),
+            tmp.path(),
+        )
+        .unwrap();
+        assert!(crate::unclaimed::read(&boot.layout.staging_dir).is_none());
+        assert!(!CaptureRuntime::new(boot).unclaimed.release());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

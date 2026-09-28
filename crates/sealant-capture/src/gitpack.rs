@@ -882,6 +882,55 @@ impl GitRepo {
         }
     }
 
+    /// Make the repository read as `format` objects and `ref_format` refs again, as
+    /// [`Self::init_with_formats`] made it: `true` when its configuration had to be written.
+    /// A restore established those formats (the packs it installed are in `format`, the refs
+    /// it wrote are in `ref_format`'s backend), and nothing it writes afterwards may take them
+    /// away: a workspace class that carries no `.git/config` (a base, Mend's capture 0) swept
+    /// the one `git init --object-format=sha256` wrote, and git then read 64-hex refs as SHA-1
+    /// (Docker end to end, round 8, F4b). `core.repositoryformatversion`,
+    /// `extensions.objectformat` and `extensions.refstorage` are written into the common
+    /// directory's config, and the repository is read again: one that still reads otherwise
+    /// is an error.
+    pub fn assert_formats(&self, format: &str, ref_format: &str) -> Result<bool, GitError> {
+        let found = (self.object_format()?, self.ref_format()?);
+        if found.0 == format && found.1 == ref_format {
+            return Ok(false);
+        }
+        let config = self.common_dir.join("config");
+        let config = config.to_string_lossy();
+        for (key, value) in [
+            ("core.repositoryformatversion", "1"),
+            ("extensions.objectformat", format),
+            ("extensions.refstorage", ref_format),
+        ] {
+            let args = ["config", "--file", config.as_ref(), key, value];
+            check(&args, git_command(&self.root)?.args(args).output_watched()?)?;
+        }
+        let now = (self.object_format()?, self.ref_format()?);
+        if now.0 != format || now.1 != ref_format {
+            return Err(GitError::Command {
+                args: "rev-parse --show-object-format --show-ref-format".to_owned(),
+                stderr: format!(
+                    "the repository at {} reads as {} objects and {} refs after its formats \
+                     were written; the capture holds {format} and {ref_format}",
+                    self.root.display(),
+                    now.0,
+                    now.1
+                ),
+            });
+        }
+        tracing::warn!(
+            root = %self.root.display(),
+            was_objects = %found.0,
+            was_refs = %found.1,
+            objects = format,
+            refs = ref_format,
+            "the repository's formats were written back into its config"
+        );
+        Ok(true)
+    }
+
     /// Add `pattern` to the repository's local excludes (`info/exclude` in the common dir) unless
     /// it is there already. The user's `.gitignore` is never touched.
     pub fn exclude_locally(&self, pattern: &str) -> Result<(), GitError> {

@@ -242,6 +242,10 @@ pub fn boot_from(
     working_directory: &Path,
     workspace_root: &Path,
 ) -> Result<CaptureBoot, BootError> {
+    // The first boot of this disk: no capture state on it yet (a restart finds its own).
+    let first_boot = !CaptureConfig::new("", 0, working_directory)
+        .staging_dir()
+        .exists();
     // The launch this executor is, from the very first request (cross-repo decision 11): as
     // the launcher named it, else as this disk last served (a restart, a recovery boot).
     let claimed = source.launch_id.clone().or_else(|| {
@@ -512,6 +516,33 @@ pub fn boot_from(
             None
         }
     };
+
+    // A standby holds nothing of any session until a claim or a writer is admitted: said on
+    // the disk before any user code can run, so a final flush or a recovery boot before either
+    // finds nothing to save (Docker end to end, round 8, F7; [`crate::unclaimed`]). A standby
+    // is what its launch declares: the plan's executor is a `standby:` launch, and the launcher
+    // named no worktree (the channel chose the placeholder). Nothing else is — a session's boot
+    // may name no worktree too, and its harness writes its work. Only on the disk's first boot:
+    // a restart keeps the marker it has, or has none because a claim or a writer removed it.
+    if first_boot
+        && source.worktree_id.is_none()
+        && plan
+            .executor
+            .as_deref()
+            .is_some_and(crate::unclaimed::is_standby_launch)
+        && !source.recovery
+        && !resumed
+    {
+        crate::unclaimed::record(
+            &layout.staging_dir,
+            &crate::unclaimed::Placeholder {
+                worktree_id: worktree_id.clone(),
+                epoch,
+                launch: plan.executor.clone(),
+            },
+        )
+        .map_err(|error| BootError::config(format!("capture unclaimed marker: {error}")))?;
+    }
 
     // Content beside the worktree (Mend's folders and reference repositories): outside the
     // worktree, so it is laid down after the head and never enters a capture.
