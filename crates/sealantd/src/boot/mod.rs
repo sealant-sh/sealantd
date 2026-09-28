@@ -307,6 +307,9 @@ fn into_runtime_config(config: &BootConfig, secret_env: &[(String, String)]) -> 
     runtime_config.default_shell = config.shells.login.display().to_string();
     runtime_config.bindable_mounts = config.bindable_mounts.clone();
     runtime_config.log_level = "info".to_owned();
+    if let Some(grace_ms) = config.control.shutdown_grace_ms {
+        runtime_config.shutdown_grace_ms = grace_ms;
+    }
     // The harness child's base environment: the passthrough env, the launcher's secret env, and
     // the prep-set identity vars. Every secret value seeds the I/O redactor whatever its name.
     runtime_config.child_env = harness_child_env(config, secret_env);
@@ -494,8 +497,7 @@ async fn boot_serve(
     // Step 15b: the capture engine runs beside the harness: cadence snaps, heartbeats, and the
     // fence that pauses the harness process group (ADR-0015).
     if let Some(boot) = capture_boot {
-        let capture_runtime =
-            crate::capture::CaptureRuntime::new(boot, runtime.shutdown().grace_ms());
+        let capture_runtime = crate::capture::CaptureRuntime::new(boot);
         if runtime.install_capture(capture_runtime.clone()) {
             capture_runtime.start(runtime.clone(), harness_process_id.clone());
         }
@@ -522,7 +524,7 @@ async fn boot_serve(
     // Step 16b: the final capture (a no-op when the signal listener or a gracefulShutdown command
     // already flushed).
     runtime
-        .flush_captures(sealant_protocol::CaptureKind::Final)
+        .flush_captures(sealant_protocol::CaptureFlushKind::Final)
         .await;
 
     // Steps 17–18.

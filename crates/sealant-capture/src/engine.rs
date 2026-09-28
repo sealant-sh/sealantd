@@ -1055,6 +1055,7 @@ impl CaptureEngine {
                 git: small.manifest.sections.git.clone(),
                 workspace: small.manifest.sections.workspace.clone(),
                 bulk: old.sections.bulk.clone(),
+                other_bulk: old.sections.other_bulk.clone(),
             },
             checkpoint: None,
         }
@@ -1176,6 +1177,12 @@ impl CaptureEngine {
                         .previous
                         .as_ref()
                         .map_or(BulkState::pending(), |p| p.manifest.sections.bulk.clone()),
+                    // Other platforms' bulk sections ride along, never dropped.
+                    other_bulk: self
+                        .previous
+                        .as_ref()
+                        .map(|p| p.manifest.sections.other_bulk.clone())
+                        .unwrap_or_default(),
                 }
             }
             Class::Bulk => {
@@ -1195,16 +1202,21 @@ impl CaptureEngine {
                     .as_ref()
                     .map(|p| p.manifest.sections.clone())
                     .ok_or_else(|| io::Error::other("bulk snap without a previous capture"))?;
+                let bulk = BulkState::Ready(BulkSection {
+                    root: built.root,
+                    packs: built.packs,
+                    platform: self.config.platform.clone(),
+                    format: built.format,
+                    dir_packs: built.dir_packs,
+                });
+                // A bulk section the chain holds for another platform (a head continued from
+                // an executor elsewhere) is kept beside this one, so it stays restorable there.
+                let other_bulk = Sections::other_bulk_after(&prev, &bulk);
                 Sections {
                     git: prev.git,
                     workspace: prev.workspace,
-                    bulk: BulkState::Ready(BulkSection {
-                        root: built.root,
-                        packs: built.packs,
-                        platform: self.config.platform.clone(),
-                        format: built.format,
-                        dir_packs: built.dir_packs,
-                    }),
+                    bulk,
+                    other_bulk,
                 }
             }
         };
@@ -1226,6 +1238,7 @@ impl CaptureEngine {
         };
         if let Some((_, below)) = &hoist {
             sections.bulk = below.manifest.sections.bulk.clone();
+            sections.other_bulk = below.manifest.sections.other_bulk.clone();
         }
         let follows = match &hoist {
             Some((_, below)) => Some(below),

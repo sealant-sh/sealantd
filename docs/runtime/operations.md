@@ -76,3 +76,11 @@ shared volume; run as the same uid as the controlling process so peer validation
 `SIGTERM`/`SIGINT` (or the `runtime.gracefulShutdown` command) drains: managed processes and PTY
 sessions are signalled within the grace window, the final filesystem diff is emitted, the egress
 proxy stops, and the spool is flushed before exit.
+
+The grace window is 10 s unless `SEALANT_SHUTDOWN_GRACE_MS` (boot) or `--shutdown-grace-ms`
+(`sealantd serve`) sets it. On a capture-store workspace a final capture flush runs first —
+both capture classes snapped, everything shipped and registered — and it is not bounded by the
+grace window: it returns once nothing is pending, or the lease is fenced. A platform that must
+bound it sends `capture.flush {kind: final, deadline_ms}` (`sealantctl capture flush --final
+--deadline 15m`) before it signals the daemon, and reads the report's `pending` and
+`pending_bytes`.

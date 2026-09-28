@@ -7,15 +7,15 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use sealant_capture::manifest::{BulkState, DirFormat};
+use sealant_capture::manifest::DirFormat;
 use sealant_capture::registrar::{HeartbeatRequest, PlanGetRequest, RegistrarError};
 use sealant_capture::{
     BlobSink, CadenceRunner, CaptureKind as EngineKind, Class, MaterializeClass, Materializer,
     Registrar,
 };
 use sealant_protocol::{
-    CaptureClass, CaptureKind, CaptureReplanned, CaptureStaged, CaptureStatusReport, ControlError,
-    LeaseEpochReport, ProcessId, Signal,
+    CaptureClass, CaptureFlushKind, CaptureKind, CaptureReplanned, CaptureStaged,
+    CaptureStatusReport, ControlError, LeaseEpochReport, ProcessId, Signal,
 };
 
 use crate::boot::capture::{CaptureBoot, SharedMinter, SourceLayout};
@@ -57,7 +57,6 @@ pub struct CaptureRuntime {
     identity: Mutex<(String, u64)>,
     /// Where content the plan names beside the worktree lands.
     layout: SourceLayout,
-    grace: Duration,
     paused: AtomicBool,
     last_snap_unix_ms: AtomicU64,
     harness: Mutex<Option<ProcessId>>,
@@ -77,9 +76,9 @@ impl std::fmt::Debug for CaptureRuntime {
 }
 
 impl CaptureRuntime {
-    /// Wrap a materialized boot. `grace_ms` bounds every flush.
+    /// Wrap a materialized boot.
     #[must_use]
-    pub fn new(boot: CaptureBoot, grace_ms: u64) -> Arc<Self> {
+    pub fn new(boot: CaptureBoot) -> Arc<Self> {
         let shipper = Arc::new(
             boot.engine
                 .shipper(boot.sink.clone(), boot.registrar.clone()),
@@ -93,7 +92,6 @@ impl CaptureRuntime {
             minter: boot.minter,
             identity: Mutex::new((boot.worktree_id, boot.epoch)),
             layout: boot.layout,
-            grace: Duration::from_millis(grace_ms),
             paused: AtomicBool::new(false),
             last_snap_unix_ms: AtomicU64::new(0),
             harness: Mutex::new(None),
@@ -227,21 +225,28 @@ impl CaptureRuntime {
         })
     }
 
-    /// Forced snap of `kind`, then ship and register what it needs, bounded by
-    /// `min(deadline, grace)`. A `final` flush is not bounded: it snaps the bulk class too and
-    /// returns once everything staged is registered (or the lease is fenced), because what is
-    /// staged on this disk is lost with it; the process ending is what stops it. Blocking.
+    /// A forced snap, then ship and register what `kind` waits for, bounded by `deadline` as
+    /// the caller gave it — never clamped to the shutdown grace (it once was, to 10 s, which cut
+    /// every flush of a dependency tree short). `suspend`: a small-class snap; returns once
+    /// every capture ahead of a bulk capture still uploading is registered (none: until they
+    /// are). `final`: a small-class and a bulk-class snap; returns once nothing is pending, bulk
+    /// included, on a fence or a chain conflict, or at `deadline`; without one only the process
+    /// ending stops it, because what is staged on this disk is lost with it. The report says
+    /// what is left (`pending`, `pending_bulk`, `pending_bytes`, `refused`). Blocking.
     ///
     /// # Errors
-    /// Returns [`ControlError`] when the snap fails or shipping stops on a fence.
+    /// Returns [`ControlError`] when the snap fails or shipping stops on a fence or a conflict.
     pub fn flush(
         &self,
-        kind: CaptureKind,
-        deadline: Duration,
+        kind: CaptureFlushKind,
+        deadline: Option<Duration>,
     ) -> Result<CaptureStatusReport, ControlError> {
-        let deadline = deadline.min(self.grace);
+        let snap_kind = match kind {
+            CaptureFlushKind::Suspend => EngineKind::Suspend,
+            CaptureFlushKind::Final => EngineKind::Final,
+        };
         self.runner
-            .flush(engine_kind(kind), deadline)
+            .flush(snap_kind, deadline)
             .map_err(|error| ControlError::internal(error.to_string()))?;
         self.last_snap_unix_ms
             .store(now_unix_ms(), Ordering::Relaxed);
@@ -304,11 +309,14 @@ impl CaptureRuntime {
                     let mut manifest = Materializer::new(self.sink.as_ref(), targets)
                         .fetch_manifest(&head.manifest_key, &head.capture_id)
                         .map_err(|e| internal(&format!("capture head manifest: {e}")))?;
-                    // The plan's answer decides the bulk section (another platform's stays
-                    // pending), as at boot.
-                    if head.manifest.sections.bulk.section().is_none() {
-                        manifest.manifest.sections.bulk = BulkState::pending();
-                    }
+                    // The plan's answer decides the bulk section restored here; another
+                    // platform's is carried on the chain, as at boot.
+                    let platform = engine.config().platform.clone();
+                    crate::boot::capture::continue_bulk(
+                        &mut manifest.manifest.sections,
+                        &head.manifest.sections.bulk,
+                        &platform,
+                    );
                     let report = engine
                         .materialize_delta(
                             self.sink.as_ref(),
@@ -379,6 +387,7 @@ impl CaptureRuntime {
             .iter()
             .filter(|e| e.class == Some(Class::Bulk))
             .count() as u64;
+        let pending_bytes = staging.pending_bytes(&queued);
         let staged_bytes = staging.staged_bytes().unwrap_or(0);
         let last = self.last_snap_unix_ms.load(Ordering::Relaxed);
         let (worktree_id, epoch) = self.identity();
@@ -402,6 +411,7 @@ impl CaptureRuntime {
             .flatten()
             .collect(),
             pending_bulk,
+            pending_bytes,
         }
     }
 
@@ -455,6 +465,14 @@ mod tests {
     }
 
     fn boot(base: &Path) -> (CaptureBoot, Arc<InMemoryRegistrar>) {
+        boot_with(base, |store| store)
+    }
+
+    /// [`boot`] over the sink `wrap` makes of the local store.
+    fn boot_with(
+        base: &Path,
+        wrap: impl FnOnce(Arc<dyn BlobSink>) -> Arc<dyn BlobSink>,
+    ) -> (CaptureBoot, Arc<InMemoryRegistrar>) {
         let root = base.join("ws");
         std::fs::create_dir_all(root.join("src")).unwrap();
         git(&root, &["init", "-q", "-b", "main"]);
@@ -464,7 +482,7 @@ mod tests {
         git(&root, &["add", "-A"]);
         git(&root, &["commit", "-q", "-m", "one"]);
         let registrar = Arc::new(InMemoryRegistrar::new("wt-hooks", 1, None));
-        let sink: Arc<dyn BlobSink> = Arc::new(LocalDir::new(&base.join("store")).unwrap());
+        let sink = wrap(Arc::new(LocalDir::new(&base.join("store")).unwrap()));
         let engine = CaptureEngine::open(CaptureConfig::new("wt-hooks", 1, &root), None).unwrap();
         let dyn_registrar: Arc<dyn Registrar> = registrar.clone();
         (
@@ -484,6 +502,171 @@ mod tests {
             },
             registrar,
         )
+    }
+
+    /// A store that refuses every PUT (403, not retried) until `opens`, then takes them: an
+    /// upload that cannot finish before then, whatever a flush does meanwhile.
+    struct Gate {
+        inner: Arc<dyn BlobSink>,
+        opens: Instant,
+    }
+
+    impl BlobSink for Gate {
+        fn put_if_absent(
+            &self,
+            key: &str,
+            source: BlobSource<'_>,
+        ) -> Result<sealant_capture::sink::PutOutcome, sealant_capture::sink::SinkError> {
+            if Instant::now() < self.opens {
+                return Err(sealant_capture::sink::SinkError::Http {
+                    method: "PUT",
+                    key: key.to_owned(),
+                    status: 403,
+                });
+            }
+            self.inner.put_if_absent(key, source)
+        }
+
+        fn get(&self, key: &str) -> Result<Vec<u8>, sealant_capture::sink::SinkError> {
+            self.inner.get(key)
+        }
+
+        fn exists(&self, key: &str) -> Result<bool, sealant_capture::sink::SinkError> {
+            self.inner.exists(key)
+        }
+    }
+
+    fn flush_report(resp: sealant_protocol::ControlResponse) -> CaptureStatusReport {
+        let ResponseOutcome::Ok {
+            result: Some(CommandResult::CaptureStatus(report)),
+        } = resp.outcome
+        else {
+            panic!("capture.flush: {:?}", resp.outcome);
+        };
+        report
+    }
+
+    /// The daemon used to clamp every flush's deadline to its shutdown grace (10 s, never
+    /// configured), so a flush the caller gave 30 s ended at 10 s with the capture still staged.
+    /// Here the store takes nothing for 11 s: a suspend flush with a 30 s deadline keeps going
+    /// past 10 s and returns with the capture registered, under the default grace.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_flush_deadline_is_honoured_past_the_ten_second_grace() {
+        let tmp = tempfile::tempdir().unwrap();
+        let opens = Instant::now() + Duration::from_millis(11_000);
+        let (boot, registrar) = boot_with(tmp.path(), |inner| Arc::new(Gate { inner, opens }));
+        let mut config = RuntimeConfig::new(new_runtime_id());
+        config.workspace_root = tmp.path().join("ws");
+        assert_eq!(config.shutdown_grace_ms, 10_000, "the default grace");
+        let runtime = Runtime::new(
+            config.clone(),
+            Arc::new(ShutdownSignal::new(config.shutdown_grace_ms)),
+        );
+        runtime.mark_healthy();
+        let capture = CaptureRuntime::new(boot);
+        assert!(runtime.install_capture(capture.clone()));
+
+        let start = Instant::now();
+        let report = flush_report(
+            runtime
+                .dispatch(ControlRequest::new(
+                    RequestId::new("r1"),
+                    Command::CaptureFlush {
+                        kind: CaptureFlushKind::Suspend,
+                        deadline_ms: Some(30_000),
+                    },
+                ))
+                .await,
+        );
+        let took = start.elapsed();
+        assert!(Instant::now() >= opens, "returned once the store took it");
+        assert!(
+            took > Duration::from_millis(10_500),
+            "past the old clamp: {took:?}"
+        );
+        assert!(took < Duration::from_secs(25), "{took:?}");
+        assert_eq!(report.pending, 0, "{report:?}");
+        assert_eq!(report.pending_bytes, 0, "{report:?}");
+        assert_eq!(registrar.chain().len(), 1);
+    }
+
+    /// Without a deadline a suspend flush is bounded by the shutdown grace, as it always was
+    /// (here configured to 2 s), and reports what is left, `pending_bytes` included. A final
+    /// flush without a deadline is bounded by nothing: it snaps the bulk class too and returns
+    /// once everything is registered, however long the store refuses.
+    ///
+    /// The grace has to hold the suspend flush's snap and its first refused pass: a pass that
+    /// ends past the grace answers with its error (on a loaded runner a 300 ms grace was spent
+    /// before the pass ended, and the flush answered the store's 403). The store opens well
+    /// after the grace.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn without_a_deadline_suspend_takes_the_grace_and_final_takes_what_it_needs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let opens = Instant::now() + Duration::from_secs(6);
+        let (boot, registrar) = boot_with(tmp.path(), |inner| Arc::new(Gate { inner, opens }));
+        let mut config = RuntimeConfig::new(new_runtime_id());
+        config.workspace_root = tmp.path().join("ws");
+        let runtime = Runtime::new(config, Arc::new(ShutdownSignal::new(2_000)));
+        runtime.mark_healthy();
+        let capture = CaptureRuntime::new(boot);
+        assert!(runtime.install_capture(capture.clone()));
+
+        let start = Instant::now();
+        let report = flush_report(
+            runtime
+                .dispatch(ControlRequest::new(
+                    RequestId::new("r1"),
+                    Command::CaptureFlush {
+                        kind: CaptureFlushKind::Suspend,
+                        deadline_ms: None,
+                    },
+                ))
+                .await,
+        );
+        let took = start.elapsed();
+        assert!(
+            took < Duration::from_millis(4_500),
+            "the grace bounds it: {took:?}"
+        );
+        assert!(Instant::now() < opens, "the store still refuses");
+        assert_eq!(report.pending, 1, "{report:?}");
+        assert_eq!(report.pending_bulk, 0, "{report:?}");
+        assert!(report.pending_bytes > 0, "{report:?}");
+        assert_eq!(capture.status().pending_bytes, report.pending_bytes);
+        assert!(registrar.chain().is_empty());
+
+        let report = flush_report(
+            runtime
+                .dispatch(ControlRequest::new(
+                    RequestId::new("r2"),
+                    Command::CaptureFlush {
+                        kind: CaptureFlushKind::Final,
+                        deadline_ms: None,
+                    },
+                ))
+                .await,
+        );
+        assert!(Instant::now() >= opens);
+        assert_eq!(
+            (report.pending, report.pending_bulk, report.pending_bytes),
+            (0, 0, 0),
+            "{report:?}"
+        );
+        assert!(report.refused.is_empty());
+        let chain = registrar.chain();
+        assert_eq!(chain.last().unwrap().manifest.kind, EngineKind::Auto);
+        assert!(
+            chain
+                .last()
+                .unwrap()
+                .manifest
+                .sections
+                .bulk
+                .section()
+                .is_some(),
+            "the final flush snapped and shipped the bulk class"
+        );
+        assert!(chain.iter().any(|h| h.manifest.kind == EngineKind::Final));
     }
 
     fn wait_chain(registrar: &InMemoryRegistrar, n: usize) -> Vec<HeadInfo> {
@@ -512,7 +695,7 @@ mod tests {
         config.workspace_root = tmp.path().join("ws");
         let runtime = Runtime::new(config, Arc::new(ShutdownSignal::new(5_000)));
         runtime.mark_healthy();
-        let capture = CaptureRuntime::new(boot, 5_000);
+        let capture = CaptureRuntime::new(boot);
         assert!(runtime.install_capture(capture.clone()));
         capture.start(runtime.clone(), ProcessId::new("p-harness"));
         let before = capture.runner().snapshot();
@@ -543,7 +726,10 @@ mod tests {
         let resp = runtime
             .dispatch(ControlRequest::new(
                 RequestId::new("r2"),
-                Command::CaptureFlush,
+                Command::CaptureFlush {
+                    kind: CaptureFlushKind::Suspend,
+                    deadline_ms: None,
+                },
             ))
             .await;
         let ResponseOutcome::Ok {
@@ -561,7 +747,7 @@ mod tests {
         // The signal listener's path (SIGTERM / SIGINT): a final snap, and a bulk snap — the
         // bulk class had never been captured, so the chain now records it (empty here) — both
         // registered before the flush returns.
-        runtime.flush_captures(CaptureKind::Final).await;
+        runtime.flush_captures(CaptureFlushKind::Final).await;
         let chain = registrar.chain();
         assert_eq!(chain.len(), 4);
         assert_eq!(chain[2].manifest.kind, EngineKind::Final);
@@ -602,7 +788,7 @@ mod tests {
     async fn capture_status_names_the_refused_classes() {
         let tmp = tempfile::tempdir().unwrap();
         let (boot, _registrar) = boot(tmp.path());
-        let capture = CaptureRuntime::new(boot, 5_000);
+        let capture = CaptureRuntime::new(boot);
         assert!(capture.status().refused.is_empty());
 
         capture
@@ -694,7 +880,7 @@ mod tests {
         config.workspace_root = ws.clone();
         let runtime = Runtime::new(config, Arc::new(ShutdownSignal::new(5_000)));
         runtime.mark_healthy();
-        let capture = CaptureRuntime::new(boot, 5_000);
+        let capture = CaptureRuntime::new(boot);
         assert!(runtime.install_capture(capture.clone()));
         capture.start(runtime.clone(), ProcessId::new("p-harness"));
         assert_eq!(capture.lease_epoch().worktree_id, "standby-1");

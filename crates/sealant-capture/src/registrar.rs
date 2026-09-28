@@ -71,6 +71,25 @@
 //! leaves the plan unchanged when the field is absent (an older executor) or the platforms
 //! match. The materializer treats `"pending"` as "nothing to restore, nothing to sweep".
 //!
+//! Another platform's bulk section is never dropped from the chain. The executor keeps it in
+//! the manifest's `sections.other_bulk` (keyed by platform), carries it through every capture,
+//! and its own bulk snap fills `bulk` beside it. A registrar answering an executor of platform
+//! P answers `bulk` when it was captured on P, else `other_bulk[P]` (with its packs in
+//! `get_urls`), else `"pending"`; it keeps every pack `other_bulk` names alive in retention.
+//!
+//! ```json
+//! "sections":{…,"bulk":{"root":"…","packs":[…],"platform":"linux-x86_64-gnu"},
+//!             "other_bulk":{"linux-aarch64-gnu":{"root":"…","packs":[…],"platform":"linux-aarch64-gnu"}}}
+//! ```
+//!
+//! # `lease-lost`
+//!
+//! A 409 `{"reason":"lease-lost"}` (the lease lapsed, was released, or a standby is not claimed
+//! yet) is [`RegistrarError::LeaseLost`] from every call — unless it names a `live_epoch` other
+//! than the caller's, which is a fence. The shipper pauses and asks again after a backoff (1 s,
+//! doubling, 30 s at most), keeping everything staged. It used to read as a wrong parent — a
+//! chain conflict — which ended a final flush with the captures still on the disk.
+//!
 //! # `manifest_format` on `plan.get`
 //!
 //! The answer names the highest section format the registrar reads (`manifest.rs`): what it
@@ -135,8 +154,9 @@ pub struct PlanGetRequest {
     pub worktree_id: Option<String>,
     /// Caller's epoch; 0 = not claimed yet (the plan of a booting executor claims the lease).
     pub epoch: u64,
-    /// The executor's `<os>-<arch>-<libc>`: the registrar answers the bulk section as
-    /// `"pending"` when the head's was captured for another platform. Absent = the head as is.
+    /// The executor's `<os>-<arch>-<libc>`: the registrar answers the head's bulk section when
+    /// it was captured on this platform, else the one `other_bulk` carries for it, else
+    /// `"pending"`. Absent = the head as is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub platform: Option<String>,
 }
@@ -838,15 +858,21 @@ impl Registrar for InMemoryRegistrar {
             ));
         }
         let mut head = state.chain.last().cloned();
-        // Another platform's dependency tree is not this executor's to restore.
-        if let (Some(h), Some(platform)) = (head.as_mut(), &req.platform)
-            && h.manifest
-                .sections
+        // Another platform's dependency tree is not this executor's to restore; one captured
+        // on this executor's platform and carried in `other_bulk` is.
+        if let (Some(h), Some(platform)) = (head.as_mut(), &req.platform) {
+            let sections = &mut h.manifest.sections;
+            if sections
                 .bulk
                 .section()
-                .is_some_and(|b| b.platform != *platform)
-        {
-            h.manifest.sections.bulk = BulkState::pending();
+                .is_none_or(|b| b.platform != *platform)
+            {
+                sections.bulk = sections
+                    .other_bulk
+                    .get(platform)
+                    .cloned()
+                    .map_or(BulkState::pending(), BulkState::Ready);
+            }
         }
         let mut get_urls = BTreeMap::new();
         if let (Some(h), Some(_)) = (&head, &self.url_base) {
@@ -1003,6 +1029,10 @@ impl Registrar for InMemoryRegistrar {
     fn capture_register(&self, req: &RegisterRequest) -> Result<RegisterResponse, RegistrarError> {
         let mut state = self.lock();
         Self::check_epoch(&state, req.epoch)?;
+        // Mend's lease predicate: the lease must be live to register (409 `lease-lost`).
+        if !state.lease_alive {
+            return Err(RegistrarError::LeaseLost);
+        }
         // The backstop: keys this capture names that no `upload.urls` call ever sized are priced
         // here, from what the store holds.
         let unsized_keys: Vec<(String, u64)> = manifest_keys(req)
@@ -1180,45 +1210,55 @@ impl HttpRegistrar {
             200..=299 => {
                 serde_json::from_slice(&bytes).map_err(|e| RegistrarError::Protocol(e.to_string()))
             }
-            409 => {
-                let c: ConflictBody =
-                    serde_json::from_slice(&bytes).unwrap_or_else(|_| ConflictBody::empty());
-                if let Some(live) = c.live_epoch.filter(|l| *l != epoch) {
-                    Err(RegistrarError::Fenced { epoch, live })
-                } else if c.reason == "stale-epoch" {
-                    Err(RegistrarError::Fenced { epoch, live: 0 })
-                } else if c.reason == "byte-quota" {
-                    // The bytes, not the chain: no parent to fix, nothing a retry can change.
-                    Err(c.quota_refused())
-                } else if name == "change.summary" {
-                    Err(RegistrarError::SummaryRefused(c.reason))
-                } else if name == "upload.complete" {
-                    if c.reason == "exists" {
-                        Err(RegistrarError::KeyExists {
-                            key: c.key.unwrap_or_default(),
-                        })
-                    } else {
-                        Err(RegistrarError::Protocol(format!(
-                            "upload.complete refused: {}",
-                            c.reason
-                        )))
+            s => Err(refusal(name, s, &bytes, epoch)),
+        }
+    }
+}
+
+/// The error a non-2xx answer of `name` is, for a caller at `epoch`.
+fn refusal(name: &str, status: u16, bytes: &[u8], epoch: u64) -> RegistrarError {
+    match status {
+        409 => {
+            let c: ConflictBody =
+                serde_json::from_slice(bytes).unwrap_or_else(|_| ConflictBody::empty());
+            if let Some(live) = c.live_epoch.filter(|l| *l != epoch) {
+                RegistrarError::Fenced { epoch, live }
+            } else if c.reason == "stale-epoch" {
+                RegistrarError::Fenced { epoch, live: 0 }
+            } else if c.reason == "lease-lost" {
+                // The lease is not live (released, lapsed, or a standby not claimed yet),
+                // and no other epoch holds the worktree: nothing about the chain is wrong.
+                // Before, this read as a wrong parent — a chain conflict, which ends a
+                // final flush with everything still staged.
+                RegistrarError::LeaseLost
+            } else if c.reason == "byte-quota" {
+                // The bytes, not the chain: no parent to fix, nothing a retry can change.
+                c.quota_refused()
+            } else if name == "change.summary" {
+                RegistrarError::SummaryRefused(c.reason)
+            } else if name == "upload.complete" {
+                if c.reason == "exists" {
+                    RegistrarError::KeyExists {
+                        key: c.key.unwrap_or_default(),
                     }
                 } else {
-                    Err(RegistrarError::WrongParent {
-                        head_n: c.head_n.unwrap_or(0),
-                        head_capture_id: c.head_capture_id.unwrap_or_default(),
-                    })
+                    RegistrarError::Protocol(format!("upload.complete refused: {}", c.reason))
+                }
+            } else {
+                RegistrarError::WrongParent {
+                    head_n: c.head_n.unwrap_or(0),
+                    head_capture_id: c.head_capture_id.unwrap_or_default(),
                 }
             }
-            413 => Err(serde_json::from_slice::<ConflictBody>(&bytes)
-                .unwrap_or_else(|_| ConflictBody::empty())
-                .quota_refused()),
-            404 if name == "lease.heartbeat" => Err(RegistrarError::LeaseLost),
-            s if s >= 500 || s == 429 || s == 408 => {
-                Err(RegistrarError::Transport(format!("{name}: http {s}")))
-            }
-            s => Err(RegistrarError::Protocol(format!("{name}: http {s}"))),
         }
+        413 => serde_json::from_slice::<ConflictBody>(bytes)
+            .unwrap_or_else(|_| ConflictBody::empty())
+            .quota_refused(),
+        404 if name == "lease.heartbeat" => RegistrarError::LeaseLost,
+        s if s >= 500 || s == 429 || s == 408 => {
+            RegistrarError::Transport(format!("{name}: http {s}"))
+        }
+        s => RegistrarError::Protocol(format!("{name}: http {s}")),
     }
 }
 
@@ -1443,6 +1483,9 @@ impl<R: Registrar + ?Sized> crate::sink::UrlMinter for RegistrarMinter<R> {
                 key: key.to_owned(),
                 reason,
             }),
+            Err(RegistrarError::LeaseLost) => Err(SinkError::LeaseLost {
+                key: key.to_owned(),
+            }),
             Err(e) => Err(SinkError::Multipart {
                 key: key.to_owned(),
                 reason: e.to_string(),
@@ -1473,6 +1516,10 @@ fn mint_error(key: &str, error: RegistrarError) -> crate::sink::SinkError {
             method: "upload.urls",
             key: key.to_owned(),
             reason,
+        },
+        // The lease is not live right now: the shipper pauses and asks again.
+        RegistrarError::LeaseLost => crate::sink::SinkError::LeaseLost {
+            key: key.to_owned(),
         },
         other => crate::sink::SinkError::NoUrl {
             key: key.to_owned(),
@@ -1513,6 +1560,7 @@ mod tests {
                 },
                 workspace: WorkspaceSection::objects("r", vec![]),
                 bulk: BulkState::pending(),
+                other_bulk: BTreeMap::new(),
             },
             checkpoint: None,
         }
@@ -1724,6 +1772,105 @@ mod tests {
         assert!(!err.is_retryable());
         assert_eq!(r.used_bytes(), 367, "a refused batch prices nothing");
         UrlMinter::prefetch_put(&minter, &keys).expect("priced keys cost nothing again");
+    }
+
+    /// A 409 `lease-lost` is a lost lease — pause and ask again — not a wrong parent, which
+    /// the shipper reads as a chain conflict and a final flush stops on. With a `live_epoch`
+    /// other than the caller's it is a fence, as before; the other refusals keep their reading.
+    #[test]
+    fn a_409_lease_lost_is_a_lost_lease_not_a_conflict() {
+        for name in [
+            "capture.register",
+            "upload.urls",
+            "upload.complete",
+            "lease.heartbeat",
+        ] {
+            assert_eq!(
+                refusal(name, 409, br#"{"reason":"lease-lost","message":"m"}"#, 3),
+                RegistrarError::LeaseLost,
+                "{name}"
+            );
+            assert_eq!(
+                refusal(name, 409, br#"{"reason":"lease-lost","live_epoch":3}"#, 3),
+                RegistrarError::LeaseLost,
+                "{name}: the caller's own epoch is not a fence"
+            );
+            assert_eq!(
+                refusal(name, 409, br#"{"reason":"lease-lost","live_epoch":4}"#, 3),
+                RegistrarError::Fenced { epoch: 3, live: 4 },
+                "{name}"
+            );
+        }
+        assert_eq!(
+            refusal("lease.heartbeat", 404, b"", 3),
+            RegistrarError::LeaseLost
+        );
+        assert!(matches!(
+            refusal(
+                "capture.register",
+                409,
+                br#"{"reason":"wrong-parent","head_n":4,"head_capture_id":"h"}"#,
+                3
+            ),
+            RegistrarError::WrongParent { head_n: 4, .. }
+        ));
+        assert!(matches!(
+            refusal("capture.register", 409, br#"{"reason":"byte-quota"}"#, 3),
+            RegistrarError::QuotaRefused { .. }
+        ));
+        // Through the minter it stays a lost lease, which the shipper pauses on.
+        assert!(matches!(
+            mint_error("captures/wt/3/packs/p", RegistrarError::LeaseLost),
+            crate::sink::SinkError::LeaseLost { .. }
+        ));
+    }
+
+    /// The double answers `plan.get` for a platform from `other_bulk` when the head's own bulk
+    /// section was captured elsewhere, and `"pending"` when it holds none for it.
+    #[test]
+    fn plan_get_answers_a_carried_bulk_section_for_its_platform() {
+        let r = InMemoryRegistrar::new("wt", 1, Some("http://x".into()));
+        let section = |platform: &str, root: &str| BulkSection {
+            root: root.into(),
+            packs: vec![format!("captures/wt/1/packs/{root}")],
+            platform: platform.into(),
+            format: crate::manifest::FORMAT_DIR_OBJECTS,
+            dir_packs: vec![],
+        };
+        let mut req = register(0, None, "a", 1);
+        req.manifest.sections.bulk = BulkState::Ready(section("linux-x86_64-gnu", "x86"));
+        req.manifest.sections.other_bulk.insert(
+            "linux-aarch64-gnu".into(),
+            section("linux-aarch64-gnu", "arm"),
+        );
+        r.capture_register(&req).unwrap();
+        let plan = |platform: &str| {
+            r.plan_get(&PlanGetRequest {
+                worktree_id: None,
+                epoch: 0,
+                platform: Some(platform.into()),
+            })
+            .unwrap()
+        };
+        let arm = plan("linux-aarch64-gnu");
+        let bulk = arm.head.unwrap().manifest.sections.bulk;
+        assert_eq!(bulk.section().unwrap().root, "arm");
+        assert!(arm.get_urls.contains_key("captures/wt/1/packs/arm"));
+        assert!(!arm.get_urls.contains_key("captures/wt/1/packs/x86"));
+        let x86 = plan("linux-x86_64-gnu")
+            .head
+            .unwrap()
+            .manifest
+            .sections
+            .bulk;
+        assert_eq!(x86.section().unwrap().root, "x86");
+        let riscv = plan("linux-riscv64-musl")
+            .head
+            .unwrap()
+            .manifest
+            .sections
+            .bulk;
+        assert_eq!(riscv, BulkState::pending());
     }
 
     fn parts(n: u32) -> Vec<CompletedPart> {

@@ -3,8 +3,8 @@
 //! - A `"pending"` bulk section is never taken for "nothing there": a materialize from such a
 //!   head leaves the bulk directories on disk as they are, and the next bulk snap captures them.
 //! - A `final` flush (the executor and its disk are going away) snaps the bulk class and ships
-//!   everything, bulk included, whatever deadline it was given; a capture held for the byte
-//!   quota keeps it waiting instead of being abandoned.
+//!   everything, bulk included; without a deadline it returns only once nothing is pending, and
+//!   a capture held for the byte quota keeps it waiting instead of being abandoned.
 //! - A daemon that restarts on its own disk resumes it: the head is not materialized over
 //!   captures that were staged and not shipped, or over edits made after the last snap; the
 //!   queue ships, and a lease that moved to a new epoch meanwhile gets the disk captured afresh.
@@ -199,10 +199,10 @@ impl BlobSink for Slow {
 }
 
 /// A `final` flush snaps the bulk class — the dependency tree was never snapped here, the bulk
-/// clocks had not fired — and does not return before the bulk capture is registered, however
-/// short the deadline it was given: the disk goes with the executor.
+/// clocks had not fired — and, given no deadline, does not return before the bulk capture is
+/// registered: the disk goes with the executor.
 #[test]
-fn a_final_flush_ships_the_bulk_class_whatever_the_deadline() {
+fn a_final_flush_without_a_deadline_ships_the_bulk_class() {
     let fx = fixture(60);
     let registrar = Arc::new(InMemoryRegistrar::new("wt", 1, None));
     let slow = Arc::new(Slow {
@@ -221,9 +221,7 @@ fn a_final_flush_ships_the_bulk_class_whatever_the_deadline() {
     let runner = CadenceRunner::new(engine, shipper);
 
     let start = Instant::now();
-    runner
-        .flush(CaptureKind::Final, Duration::from_millis(1))
-        .unwrap();
+    runner.flush(CaptureKind::Final, None).unwrap();
     let took = start.elapsed();
     let puts = slow.puts.load(Ordering::SeqCst);
     eprintln!("final flush: {puts} PUTs in {took:?}");
@@ -277,9 +275,7 @@ fn a_final_flush_waits_for_a_held_bulk_capture() {
             Instant::now()
         })
     };
-    runner
-        .flush(CaptureKind::Final, Duration::from_millis(1))
-        .unwrap();
+    runner.flush(CaptureKind::Final, None).unwrap();
     let returned = Instant::now();
     let lifted = lift.join().unwrap();
     assert!(

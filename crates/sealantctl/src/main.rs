@@ -11,8 +11,8 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 use sealant_control::{read_frame, write_frame};
 use sealant_protocol::{
-    CaptureKind, ClientMessage, Command, ControlRequest, DEFAULT_MAX_FRAME_BYTES, EventPayload,
-    ExecArgs, RequestId, ServerMessage,
+    CaptureFlushKind, CaptureKind, ClientMessage, Command, ControlRequest, DEFAULT_MAX_FRAME_BYTES,
+    EventPayload, ExecArgs, RequestId, ServerMessage,
 };
 use tokio::net::UnixStream;
 
@@ -75,8 +75,21 @@ enum CaptureCmd {
         #[arg(long, default_value = "checkpoint")]
         kind: String,
     },
-    /// Final capture, then ship and register everything staged (the suspend/terminate hook).
-    Flush,
+    /// A forced capture, then ship and register it (the suspend and terminate hooks). Without
+    /// `--final`: returns once everything ahead of a bulk upload is registered. With it: snaps
+    /// the bulk class too and returns once nothing is pending, bulk included (or at
+    /// `--deadline`, or on a fence). Prints the report: `pending`, `pendingBulk`,
+    /// `pendingBytes`, `refused`.
+    Flush {
+        /// Snap and ship everything, dependency trees included: the executor is going away.
+        #[arg(long = "final")]
+        final_: bool,
+        /// How long the flush may take: `500ms`, `90s`, `15m`, `2h` (a bare number is
+        /// seconds). Never clamped by the daemon. Without it a final flush runs until done and
+        /// a suspend flush is bounded by the daemon's shutdown grace.
+        #[arg(long, value_parser = parse_duration_ms)]
+        deadline: Option<u64>,
+    },
     /// Report the capture engine's state.
     Status,
     /// Fetch the plan again and bring the workspace to it (a standby taking its worktree).
@@ -87,6 +100,27 @@ enum CaptureCmd {
 enum LeaseCmd {
     /// Report the lease epoch this executor holds.
     Epoch,
+}
+
+/// `500ms`, `90s`, `15m`, `2h`, or a bare number of seconds, as milliseconds.
+fn parse_duration_ms(text: &str) -> Result<u64, String> {
+    let text = text.trim();
+    let split = text
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(text.len());
+    let (digits, unit) = text.split_at(split);
+    let n: u64 = digits
+        .parse()
+        .map_err(|_| format!("{text:?} is not a duration (500ms, 90s, 15m, 2h)"))?;
+    let per = match unit {
+        "ms" => 1,
+        "" | "s" => 1_000,
+        "m" => 60_000,
+        "h" => 3_600_000,
+        other => return Err(format!("unknown unit {other:?} (ms, s, m, h)")),
+    };
+    n.checked_mul(per)
+        .ok_or_else(|| format!("{text:?} is too long"))
 }
 
 fn parse_kind(kind: &str) -> Option<CaptureKind> {
@@ -137,7 +171,17 @@ async fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             },
-            CaptureCmd::Flush => (Command::CaptureFlush, false),
+            CaptureCmd::Flush { final_, deadline } => (
+                Command::CaptureFlush {
+                    kind: if final_ {
+                        CaptureFlushKind::Final
+                    } else {
+                        CaptureFlushKind::Suspend
+                    },
+                    deadline_ms: deadline,
+                },
+                false,
+            ),
             CaptureCmd::Status => (Command::CaptureStatus, false),
             CaptureCmd::Replan => (Command::CaptureReplan, false),
         },
@@ -209,4 +253,51 @@ async fn main() -> ExitCode {
         }
     }
     exit
+}
+
+#[cfg(test)]
+mod tests {
+
+    use super::*;
+
+    #[test]
+    fn durations_parse_to_milliseconds() {
+        assert_eq!(parse_duration_ms("500ms"), Ok(500));
+        assert_eq!(parse_duration_ms("90s"), Ok(90_000));
+        assert_eq!(parse_duration_ms("90"), Ok(90_000));
+        assert_eq!(parse_duration_ms("15m"), Ok(900_000));
+        assert_eq!(parse_duration_ms("2h"), Ok(7_200_000));
+        assert!(parse_duration_ms("").is_err());
+        assert!(parse_duration_ms("10d").is_err());
+        assert!(parse_duration_ms("s").is_err());
+    }
+
+    #[test]
+    fn capture_flush_takes_final_and_a_deadline() {
+        let flush = |args: &[&str]| {
+            let cli = Cli::try_parse_from(args).expect("parse");
+            match cli.command {
+                Cmd::Capture {
+                    action: CaptureCmd::Flush { final_, deadline },
+                } => (final_, deadline),
+                other => panic!("{other:?}"),
+            }
+        };
+        assert_eq!(flush(&["sealantctl", "capture", "flush"]), (false, None));
+        assert_eq!(
+            flush(&["sealantctl", "capture", "flush", "--final"]),
+            (true, None)
+        );
+        assert_eq!(
+            flush(&[
+                "sealantctl",
+                "capture",
+                "flush",
+                "--final",
+                "--deadline",
+                "15m"
+            ]),
+            (true, Some(900_000))
+        );
+    }
 }

@@ -293,8 +293,67 @@ pub struct Sections {
     pub git: GitSection,
     /// `.git` bookkeeping, ignored work files, harness home.
     pub workspace: WorkspaceSection,
-    /// Dependencies and build outputs.
+    /// Dependencies and build outputs, as this chain last captured them on the platform that
+    /// wrote the capture (or `"pending"`).
     pub bulk: BulkState,
+    /// Bulk sections captured on other platforms, keyed by `<os>-<arch>-<libc>`, carried from
+    /// capture to capture unchanged so each stays restorable on its own platform. An executor
+    /// that continues a head whose bulk section was captured elsewhere (the registrar answered
+    /// it `"pending"`) keeps that section here instead of dropping it; its own bulk snap then
+    /// fills `bulk`, and the other platform's section stays. Absent when empty, so a manifest
+    /// without one encodes exactly as before.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub other_bulk: BTreeMap<String, BulkSection>,
+}
+
+impl Sections {
+    /// Every bulk section this manifest holds, by platform: `bulk` (when captured) and
+    /// `other_bulk`. `bulk` wins over an `other_bulk` entry of the same platform.
+    #[must_use]
+    pub fn bulk_by_platform(&self) -> BTreeMap<String, BulkSection> {
+        let mut all = self.other_bulk.clone();
+        if let Some(bulk) = self.bulk.section() {
+            all.insert(bulk.platform.clone(), bulk.clone());
+        }
+        all
+    }
+
+    /// The sections an executor continues the chain from when the registrar answered
+    /// `answered` for this head's bulk section: `bulk` is the answered section when it is one
+    /// of this manifest's (the one to restore here), `"pending"` otherwise; every other bulk
+    /// section this manifest holds moves to (or stays in) `other_bulk`. Nothing is dropped.
+    #[must_use]
+    pub fn with_bulk_answer(&self, answered: &BulkState) -> Self {
+        let mut other_bulk = self.bulk_by_platform();
+        let bulk = match answered.section() {
+            Some(chosen) if other_bulk.get(&chosen.platform) == Some(chosen) => {
+                other_bulk.remove(&chosen.platform);
+                BulkState::Ready(chosen.clone())
+            }
+            _ => BulkState::pending(),
+        };
+        Self {
+            git: self.git.clone(),
+            workspace: self.workspace.clone(),
+            bulk,
+            other_bulk,
+        }
+    }
+
+    /// `other_bulk` for a capture whose bulk section is `bulk`, following a capture whose
+    /// sections are `previous`: the previous capture's other platforms, plus its own bulk
+    /// section when that was captured on another platform than `bulk`'s; `bulk`'s own platform
+    /// is never listed twice.
+    #[must_use]
+    pub fn other_bulk_after(previous: &Self, bulk: &BulkState) -> BTreeMap<String, BulkSection> {
+        // Still pending here: the previous capture's bulk section, whatever its platform, is
+        // not this capture's to restore, but it is kept.
+        let mut other = previous.bulk_by_platform();
+        if let Some(own) = bulk.section() {
+            other.remove(&own.platform);
+        }
+        other
+    }
 }
 
 /// Checkpoint stamp.
@@ -434,9 +493,69 @@ mod tests {
                 },
                 workspace: WorkspaceSection::objects("captures/wt/1/trees/t", vec![]),
                 bulk: BulkState::pending(),
+                other_bulk: BTreeMap::new(),
             },
             checkpoint: None,
         }
+    }
+
+    fn bulk(platform: &str, root: &str) -> BulkSection {
+        BulkSection {
+            root: root.into(),
+            packs: vec![format!("captures/wt/1/packs/{root}")],
+            platform: platform.into(),
+            format: FORMAT_DIR_OBJECTS,
+            dir_packs: vec![],
+        }
+    }
+
+    /// Another platform's bulk section is never dropped: continuing a head whose section the
+    /// registrar answered `"pending"` keeps it in `other_bulk`; this platform's own bulk section
+    /// takes `bulk` and the other stays; a head answered with a section `other_bulk` holds
+    /// restores that one. The field is absent from the bytes when empty.
+    #[test]
+    fn other_platforms_bulk_sections_are_carried() {
+        let mut head = sample();
+        head.sections.bulk = BulkState::Ready(bulk("linux-aarch64-gnu", "arm"));
+        // The registrar answers pending to an x86 executor: nothing to restore, nothing lost.
+        let here = head.sections.with_bulk_answer(&BulkState::pending());
+        assert_eq!(here.bulk, BulkState::pending());
+        assert_eq!(
+            here.other_bulk.keys().collect::<Vec<_>>(),
+            ["linux-aarch64-gnu"]
+        );
+        // The x86 executor's own bulk snap.
+        let own = BulkState::Ready(bulk("linux-x86_64-gnu", "x86"));
+        let next = Sections {
+            other_bulk: Sections::other_bulk_after(&here, &own),
+            bulk: own.clone(),
+            ..here.clone()
+        };
+        assert_eq!(next.other_bulk["linux-aarch64-gnu"].root, "arm");
+        assert!(!next.other_bulk.contains_key("linux-x86_64-gnu"));
+        // Back on arm: the registrar answers the arm section out of `other_bulk`.
+        let arm = next.with_bulk_answer(&BulkState::Ready(bulk("linux-aarch64-gnu", "arm")));
+        assert_eq!(arm.bulk.section().unwrap().root, "arm");
+        assert_eq!(arm.other_bulk["linux-x86_64-gnu"].root, "x86");
+        // An answer the manifest does not hold restores nothing and keeps everything.
+        let odd = next.with_bulk_answer(&BulkState::Ready(bulk("linux-aarch64-gnu", "forged")));
+        assert_eq!(odd.bulk, BulkState::pending());
+        assert_eq!(odd.other_bulk.len(), 2);
+
+        let mut m = sample();
+        m.sections = next;
+        let e = m.clone().encode();
+        let text = String::from_utf8(e.bytes.clone()).unwrap();
+        assert!(
+            text.contains(r#""other_bulk":{"linux-aarch64-gnu":{"root":"arm""#),
+            "{text}"
+        );
+        assert_eq!(Manifest::decode(&e.bytes).unwrap().manifest, m);
+        assert!(
+            !String::from_utf8(sample().encode().bytes)
+                .unwrap()
+                .contains("other_bulk")
+        );
     }
 
     #[test]

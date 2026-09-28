@@ -80,6 +80,7 @@ const CONSUMED_KEYS: &[&str] = &[
     "SEALANT_CONTROL_WSS_KEY",
     "SEALANT_CONTROL_WSS_CLIENT_CA",
     "SEALANT_CONTROL_WSS_MAX_CONNECTIONS",
+    "SEALANT_SHUTDOWN_GRACE_MS",
     "SEALANT_WATCH_FILESYSTEM",
     "SEALANT_NETWORK_PROXY",
     "SEALANT_SPOOL_DIR",
@@ -439,6 +440,12 @@ pub struct ControlConfig {
     pub execution_id: Option<String>,
     /// Bound workspace id, when supplied.
     pub workspace_id: Option<String>,
+    /// `SEALANT_SHUTDOWN_GRACE_MS`: how long a graceful shutdown waits for processes after
+    /// `SIGTERM` before it kills them, and how long a suspend `capture.flush` without a
+    /// deadline may take. Absent: the runtime's default (10 s). It bounds nothing else: a final
+    /// capture flush (SIGTERM, SIGINT, `runtime.gracefulShutdown`, harness exit) runs until
+    /// everything is shipped, and a `capture.flush` with a deadline gets that deadline.
+    pub shutdown_grace_ms: Option<u64>,
 }
 
 /// The fully-parsed, validated boot configuration.
@@ -628,6 +635,17 @@ impl BootConfig {
                 .into(),
             execution_id: env.get("SEALANT_EXECUTION_ID").filter(|s| !s.is_empty()),
             workspace_id: env.get("SEALANT_WORKSPACE_ID").filter(|s| !s.is_empty()),
+            shutdown_grace_ms: match env
+                .get("SEALANT_SHUTDOWN_GRACE_MS")
+                .filter(|s| !s.trim().is_empty())
+            {
+                None => None,
+                Some(raw) => Some(raw.trim().parse::<u64>().map_err(|_| {
+                    BootError::config(format!(
+                        "SEALANT_SHUTDOWN_GRACE_MS must be a whole number of milliseconds, got {raw:?}"
+                    ))
+                })?),
+            },
         };
 
         let passthrough_env = passthrough_env(env);
@@ -1269,6 +1287,29 @@ mod tests {
         assert!(
             message.contains("fedora|arch|nix|ubuntu|custom"),
             "{message}"
+        );
+    }
+
+    #[test]
+    fn shutdown_grace_is_configurable_and_checked() {
+        assert_eq!(load_with(&[]).unwrap().control.shutdown_grace_ms, None);
+        let cfg = load_with(&[("SEALANT_SHUTDOWN_GRACE_MS", "45000")]).expect("valid");
+        assert_eq!(cfg.control.shutdown_grace_ms, Some(45_000));
+        assert_eq!(
+            crate::boot::into_runtime_config(&cfg, &[]).shutdown_grace_ms,
+            45_000,
+            "the runtime takes it"
+        );
+        assert!(
+            !cfg.passthrough_env
+                .iter()
+                .any(|(k, _)| k == "SEALANT_SHUTDOWN_GRACE_MS"),
+            "consumed, not passed to the harness"
+        );
+        let err = load_with(&[("SEALANT_SHUTDOWN_GRACE_MS", "10s")]).unwrap_err();
+        assert!(
+            err.to_string().contains("SEALANT_SHUTDOWN_GRACE_MS"),
+            "{err}"
         );
     }
 

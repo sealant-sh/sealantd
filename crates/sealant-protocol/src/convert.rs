@@ -10,16 +10,17 @@ use crate::ids::{
 use crate::wire;
 use crate::{
     ArtifactRef, AttachMode, AttachSessionArgs, Base64Bytes, Capabilities, CaptureClass,
-    CaptureKind, CaptureMethod, CaptureMode, CapturePolicy, CaptureReplanned, CaptureStaged,
-    CaptureStatusReport, ClientMessage, Command, CommandResult, Confidence, ControlError,
-    ControlErrorCode, ControlRequest, ControlResponse, Encoding, EnvVar, EventEnvelope,
-    EventPayload, ExecAccepted, ExecArgs, ExecutionStartArgs, ExitReason, Feature, FeatureMatrix,
-    FeatureState, ForwardOpened, ForwardProtocol, HealthReport, IoChunk, LeaseEpochReport, Limits,
-    NetworkMode, OpenForwardArgs, OpenSessionArgs, OpenSftpArgs, ProcessAttached, ProcessExited,
-    ProcessList, ProcessStarted, ProcessState, ProcessSummary, ResponseOutcome, RuntimeHeartbeat,
-    RuntimeMetrics, RuntimeState, RuntimeStateChanged, ServerMessage, SessionList, SessionOpened,
-    SessionSummary, SftpOpened, ShutdownAccepted, Signal, StreamAttached, StreamEnd, StreamFrame,
-    StreamKind, StreamPayload, TelemetryDropped, TransformMeta,
+    CaptureFlushKind, CaptureKind, CaptureMethod, CaptureMode, CapturePolicy, CaptureReplanned,
+    CaptureStaged, CaptureStatusReport, ClientMessage, Command, CommandResult, Confidence,
+    ControlError, ControlErrorCode, ControlRequest, ControlResponse, Encoding, EnvVar,
+    EventEnvelope, EventPayload, ExecAccepted, ExecArgs, ExecutionStartArgs, ExitReason, Feature,
+    FeatureMatrix, FeatureState, ForwardOpened, ForwardProtocol, HealthReport, IoChunk,
+    LeaseEpochReport, Limits, NetworkMode, OpenForwardArgs, OpenSessionArgs, OpenSftpArgs,
+    ProcessAttached, ProcessExited, ProcessList, ProcessStarted, ProcessState, ProcessSummary,
+    ResponseOutcome, RuntimeHeartbeat, RuntimeMetrics, RuntimeState, RuntimeStateChanged,
+    ServerMessage, SessionList, SessionOpened, SessionSummary, SftpOpened, ShutdownAccepted,
+    Signal, StreamAttached, StreamEnd, StreamFrame, StreamKind, StreamPayload, TelemetryDropped,
+    TransformMeta,
 };
 use crate::{
     FileChange, FileChangeKind, FileDiffAvailable, FileEntry, FileSnapshotCompleted, FileType,
@@ -129,6 +130,27 @@ enum_pair!(
     wire::CaptureKind,
     [Auto, Turn, Checkpoint, Suspend, Final]
 );
+impl From<CaptureFlushKind> for wire::CaptureFlushKind {
+    fn from(value: CaptureFlushKind) -> Self {
+        match value {
+            CaptureFlushKind::Suspend => Self::Suspend,
+            CaptureFlushKind::Final => Self::Final,
+        }
+    }
+}
+
+/// `UNSPECIFIED` is a suspend flush: a client that predates the kind sends an empty
+/// `CaptureFlushArgs` (the command carried `Empty` before) and gets what it always got.
+fn capture_flush_kind(raw: i32) -> Result<CaptureFlushKind, WireError> {
+    match wire::CaptureFlushKind::try_from(raw) {
+        Ok(wire::CaptureFlushKind::Unspecified | wire::CaptureFlushKind::Suspend) => {
+            Ok(CaptureFlushKind::Suspend)
+        }
+        Ok(wire::CaptureFlushKind::Final) => Ok(CaptureFlushKind::Final),
+        Err(_) => Err(unknown("CaptureFlushKind")),
+    }
+}
+
 enum_pair!(
     capture_class,
     CaptureClass,
@@ -1003,7 +1025,12 @@ impl From<Command> for wire::command::Command {
             Command::CaptureNow { kind } => W::CaptureNow(wire::CaptureNowArgs {
                 kind: enum_i32::<_, wire::CaptureKind>(kind),
             }),
-            Command::CaptureFlush => W::CaptureFlush(wire::Empty {}),
+            Command::CaptureFlush { kind, deadline_ms } => {
+                W::CaptureFlush(wire::CaptureFlushArgs {
+                    kind: enum_i32::<_, wire::CaptureFlushKind>(kind),
+                    deadline_ms,
+                })
+            }
             Command::CaptureStatus => W::CaptureStatus(wire::Empty {}),
             Command::LeaseEpoch => W::LeaseEpoch(wire::Empty {}),
             Command::CaptureReplan => W::CaptureReplan(wire::Empty {}),
@@ -1087,7 +1114,10 @@ impl TryFrom<wire::command::Command> for Command {
             W::CaptureNow(a) => Command::CaptureNow {
                 kind: capture_kind(a.kind)?,
             },
-            W::CaptureFlush(_) => Command::CaptureFlush,
+            W::CaptureFlush(a) => Command::CaptureFlush {
+                kind: capture_flush_kind(a.kind)?,
+                deadline_ms: a.deadline_ms,
+            },
             W::CaptureStatus(_) => Command::CaptureStatus,
             W::LeaseEpoch(_) => Command::LeaseEpoch,
             W::CaptureReplan(_) => Command::CaptureReplan,
@@ -1376,6 +1406,7 @@ impl From<CommandResult> for wire::command_result::Result {
                     .map(enum_i32::<_, wire::CaptureClass>)
                     .collect(),
                 pending_bulk: c.pending_bulk,
+                pending_bytes: c.pending_bytes,
             }),
             CommandResult::LeaseEpoch(l) => W::LeaseEpoch(wire::LeaseEpochReport {
                 epoch: l.epoch,
@@ -1483,6 +1514,7 @@ impl TryFrom<wire::command_result::Result> for CommandResult {
                     .map(capture_class)
                     .collect::<Result<_, _>>()?,
                 pending_bulk: c.pending_bulk,
+                pending_bytes: c.pending_bytes,
             }),
             W::LeaseEpoch(l) => CommandResult::LeaseEpoch(LeaseEpochReport {
                 epoch: l.epoch,
@@ -1960,13 +1992,56 @@ mod tests {
         assert_eq!(decode_client(&bytes).expect("decode"), msg);
     }
 
+    /// `capture.flush` carried `Empty` before it had arguments. The bytes an older client sends
+    /// (an empty submessage at field 29) decode as a suspend flush with no deadline, and a
+    /// status report from an older daemon decodes with `pending_bytes` 0.
+    #[test]
+    fn an_empty_capture_flush_is_a_suspend_flush() {
+        let old = wire::ClientMessage {
+            message: Some(wire::client_message::Message::Request(
+                wire::ControlRequest {
+                    schema_version: crate::SCHEMA_VERSION,
+                    request_id: "req_old".to_owned(),
+                    command: Some(wire::Command {
+                        command: Some(wire::command::Command::CaptureFlush(
+                            wire::CaptureFlushArgs::default(),
+                        )),
+                    }),
+                },
+            )),
+        }
+        .encode_to_vec();
+        let Ok(ClientMessage::Request(request)) = decode_client(&old) else {
+            panic!("decode");
+        };
+        assert_eq!(
+            request.command,
+            Command::CaptureFlush {
+                kind: CaptureFlushKind::Suspend,
+                deadline_ms: None,
+            }
+        );
+        let unknown = wire::CaptureFlushArgs {
+            kind: 7,
+            deadline_ms: None,
+        };
+        assert!(capture_flush_kind(unknown.kind).is_err());
+    }
+
     #[test]
     fn capture_commands_and_results_round_trip() {
         for command in [
             Command::CaptureNow {
                 kind: CaptureKind::Checkpoint,
             },
-            Command::CaptureFlush,
+            Command::CaptureFlush {
+                kind: CaptureFlushKind::Suspend,
+                deadline_ms: None,
+            },
+            Command::CaptureFlush {
+                kind: CaptureFlushKind::Final,
+                deadline_ms: Some(90_000),
+            },
             Command::CaptureStatus,
             Command::LeaseEpoch,
             Command::CaptureReplan,
@@ -1996,6 +2071,7 @@ mod tests {
                 last_snap_unix_ms: None,
                 refused: vec![CaptureClass::Bulk],
                 pending_bulk: 1,
+                pending_bytes: 812_000_000,
             }),
             CommandResult::LeaseEpoch(LeaseEpochReport {
                 epoch: 2,

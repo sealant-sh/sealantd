@@ -75,6 +75,11 @@ struct ServeArgs {
     /// Default shell for interactive sessions.
     #[arg(long)]
     shell: Option<String>,
+    /// Graceful-shutdown grace in milliseconds (default 10000): how long processes get after
+    /// `SIGTERM` before `SIGKILL`, and the bound of a suspend `capture.flush` sent without a
+    /// deadline. A final capture flush and a flush with a deadline are not bounded by it.
+    #[arg(long)]
+    shutdown_grace_ms: Option<u64>,
     /// Validate configuration, print a sanitized summary, and exit.
     #[arg(long)]
     check_config: bool,
@@ -135,6 +140,9 @@ fn build_config(cli: &ServeArgs) -> RuntimeConfig {
     }
     if let Some(execution_id) = &cli.execution_id {
         config.default_execution_id = Some(execution_id.clone().into());
+    }
+    if let Some(grace_ms) = cli.shutdown_grace_ms {
+        config.shutdown_grace_ms = grace_ms;
     }
     if let Some(shell) = &cli.shell {
         config.default_shell = shell.clone();
@@ -217,8 +225,9 @@ fn run_serve(cli: ServeArgs) -> ExitCode {
     tokio_runtime.block_on(serve(cli, wss, runtime))
 }
 
-/// On `SIGTERM` / `SIGINT`: flush captures (a final small-class snap, ship, register — bounded by
-/// the grace period; a no-op without a capture engine), then request graceful shutdown.
+/// On `SIGTERM` / `SIGINT`: flush captures (a final flush: both classes snapped, everything
+/// shipped and registered with no deadline; a no-op without a capture engine), then request
+/// graceful shutdown.
 pub(crate) fn spawn_signal_listener(runtime: Arc<Runtime>) {
     tokio::spawn(async move {
         use tokio::signal::unix::{SignalKind, signal};
@@ -241,7 +250,7 @@ pub(crate) fn spawn_signal_listener(runtime: Arc<Runtime>) {
             _ = interrupt.recv() => tracing::info!("received SIGINT"),
         }
         runtime
-            .flush_captures(sealant_protocol::CaptureKind::Final)
+            .flush_captures(sealant_protocol::CaptureFlushKind::Final)
             .await;
         runtime.shutdown().request_graceful(None);
     });
