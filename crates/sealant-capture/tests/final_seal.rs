@@ -238,12 +238,26 @@ fn sealing_runner(
     (CadenceRunner::new(engine, shipper), registrar)
 }
 
-fn seal(executor: &str) -> FinalSeal {
-    FinalSeal {
-        complete: true,
-        epoch: 1,
-        executor: executor.to_owned(),
-    }
+/// Whose seal it is: complete, epoch, launch.
+type SealedBy = (bool, u64, String);
+
+/// Whose seal it is ([`SealedBy`]), wherever it stands in that executor's order.
+fn identity(seal: Option<&FinalSeal>) -> Option<SealedBy> {
+    seal.map(|s| (s.complete, s.epoch, s.executor.clone()))
+}
+
+/// A complete seal of epoch 1 for `executor` ([`identity`]).
+fn seal(executor: &str) -> Option<SealedBy> {
+    Some((true, 1, executor.to_owned()))
+}
+
+/// The seals the registrar recorded, by [`identity`].
+fn seals(registrar: &InMemoryRegistrar) -> Vec<(u64, Option<SealedBy>)> {
+    registrar
+        .seals()
+        .iter()
+        .map(|(n, s)| (*n, identity(Some(s))))
+        .collect()
 }
 
 /// Cross-repo decision 1: a completed final flush is a store-side fact. Once everything is
@@ -261,7 +275,7 @@ fn a_complete_final_flush_seals_the_chain_and_a_later_capture_unseals_it() {
     let chain = registrar.chain();
     let head = chain.last().unwrap();
     assert_eq!(head.manifest.kind, CaptureKind::Final);
-    assert_eq!(head.manifest.final_seal, Some(seal("exec-1")));
+    assert_eq!(identity(head.manifest.final_seal.as_ref()), seal("exec-1"));
     assert_eq!(
         head.manifest.sections,
         chain[chain.len() - 2].manifest.sections,
@@ -272,7 +286,16 @@ fn a_complete_final_flush_seals_the_chain_and_a_later_capture_unseals_it() {
             .iter()
             .all(|h| h.manifest.final_seal.is_none())
     );
-    assert_eq!(registrar.seals(), vec![(head.n, seal("exec-1"))]);
+    assert_eq!(seals(&registrar), vec![(head.n, seal("exec-1"))]);
+    // Where it stands in the executor's order (decision 17): this boot, its first boot of the
+    // disk, and an observation number of its own.
+    let sealed = head.manifest.final_seal.as_ref().unwrap();
+    assert!(
+        sealed.boot_id.as_ref().is_some_and(|id| id.len() == 32),
+        "{sealed:?}"
+    );
+    assert_eq!(sealed.boot_generation, Some(1), "{sealed:?}");
+    assert!(sealed.observation.is_some_and(|n| n >= 1), "{sealed:?}");
     assert!(runner.final_sealed());
 
     // The drain and the SIGTERM handler ask again: nothing new, the same seal.
@@ -294,7 +317,7 @@ fn a_complete_final_flush_seals_the_chain_and_a_later_capture_unseals_it() {
     // The next final flush seals again.
     assert!(runner.flush_final(None).complete());
     let head = registrar.head().unwrap();
-    assert_eq!(head.manifest.final_seal, Some(seal("exec-1")));
+    assert_eq!(identity(head.manifest.final_seal.as_ref()), seal("exec-1"));
     assert_eq!(registrar.seals().len(), 2);
     assert_eq!(registrar.seals()[1].0, head.n);
 
@@ -354,8 +377,8 @@ fn a_seal_naming_another_executor_is_registered_but_not_recorded() {
     runner.start(None);
     assert!(runner.flush_final(None).complete());
     assert_eq!(
-        registrar.head().unwrap().manifest.final_seal,
-        Some(seal("exec-other"))
+        identity(registrar.head().unwrap().manifest.final_seal.as_ref()),
+        seal("exec-other")
     );
     assert!(registrar.seals().is_empty());
     runner.stop();

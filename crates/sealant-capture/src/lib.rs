@@ -22,6 +22,7 @@ pub mod longpath;
 pub mod manifest;
 pub mod materialize;
 pub mod pack;
+pub mod position;
 pub mod registrar;
 pub mod roots;
 pub mod ship;

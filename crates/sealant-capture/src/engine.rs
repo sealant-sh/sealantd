@@ -29,6 +29,7 @@ use crate::materialize::{
     Materializer,
 };
 use crate::pack::{MAX_PACK_BYTES, PackBuilder, PackError, PackReader};
+use crate::position::Observer;
 use crate::registrar::RegisterRequest;
 use crate::registrar::Registrar;
 use crate::roots::ClassRoots;
@@ -723,6 +724,8 @@ pub struct CaptureEngine {
     reads: Arc<ReadReports>,
     /// Every multi-link file each class's last snap read ([`crate::aliases`]).
     aliases: Arc<Aliases>,
+    /// Where each answer and seal of this boot stands ([`crate::position`]).
+    observer: Arc<Observer>,
     /// The multi-link files the snap in progress read, recorded in [`Self::aliases`] once it
     /// staged (or found nothing changed).
     linked: Option<(Class, Vec<LinkedName>)>,
@@ -775,6 +778,8 @@ impl CaptureEngine {
             &config.worktree_id,
             config.epoch,
         )?);
+        // One more boot of this disk (decision 17): counted before any answer is given.
+        let observer = Arc::new(Observer::open(&config.staging_dir()));
         // Staging sits inside the worktree: keep it out of the user's index (an agent's or a
         // checkpoint's `git add -A`) through the repository's local excludes, never the user's
         // `.gitignore`. A root that is not a repository yet gets the entry when materialized.
@@ -847,6 +852,7 @@ impl CaptureEngine {
             reads: Arc::new(ReadReports::default()),
             aliases: Arc::new(Aliases::default()),
             linked: None,
+            observer,
         };
         // Captures staged under another identity (a lease that moved to a new epoch while the
         // daemon was down) can never register; left queued, a snap would coalesce with one and
@@ -1195,6 +1201,13 @@ impl CaptureEngine {
     #[must_use]
     pub fn invalidations(&self) -> Arc<Invalidations> {
         Arc::clone(&self.invalidations)
+    }
+
+    /// Where this boot's answers and seals stand ([`crate::position`]): `capture.status` takes
+    /// its answers' positions here, so they and the seals share one order.
+    #[must_use]
+    pub fn observer(&self) -> Arc<Observer> {
+        Arc::clone(&self.observer)
     }
 
     /// The multi-link files each class's last snap read, shared with the watcher (an event on
@@ -2821,6 +2834,9 @@ impl CaptureEngine {
             complete: true,
             epoch: self.config.epoch,
             executor: executor.clone(),
+            boot_id: None,
+            boot_generation: None,
+            observation: None,
         })
     }
 
@@ -2831,10 +2847,12 @@ impl CaptureEngine {
     pub fn completion_sealed(&self) -> bool {
         match self.final_seal() {
             None => true,
-            Some(seal) => self
-                .previous
-                .as_ref()
-                .is_some_and(|p| p.manifest.final_seal.as_ref() == Some(&seal)),
+            Some(seal) => self.previous.as_ref().is_some_and(|p| {
+                p.manifest
+                    .final_seal
+                    .as_ref()
+                    .is_some_and(|s| s.same_executor(&seal))
+            }),
         }
     }
 
@@ -2854,11 +2872,21 @@ impl CaptureEngine {
         if self.previous.is_none() || self.completion_sealed() {
             return Ok(None);
         }
+        // Where the seal stands in this executor's order (decision 17): after every answer
+        // given before it, before every answer given after.
+        let seal = self.observer.observe(|at| FinalSeal {
+            boot_id: Some(at.boot_id),
+            boot_generation: Some(at.boot_generation),
+            observation: Some(at.observation),
+            ..seal
+        });
         let staged = self.stage_over_previous(seq, Some(seal.clone()))?;
         tracing::info!(
             n = staged.n,
             epoch = seal.epoch,
             executor = %seal.executor,
+            boot_generation = ?seal.boot_generation,
+            observation = ?seal.observation,
             "final seal staged: the final flush completed"
         );
         Ok(Some(staged))

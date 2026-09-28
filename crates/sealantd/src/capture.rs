@@ -92,6 +92,10 @@ pub struct CaptureRuntime {
     resumed: bool,
     /// The last final flush's outcome, reported as `complete` / `incomplete_reason`.
     final_outcome: Mutex<FinalOutcome>,
+    /// The executor `plan.get` named (the launch); a re-plan moves it.
+    launch: Mutex<Option<String>>,
+    /// Where each answer stands ([`sealant_capture::position`]), shared with the engine's seals.
+    observer: Arc<sealant_capture::position::Observer>,
 }
 
 impl std::fmt::Debug for CaptureRuntime {
@@ -115,6 +119,8 @@ impl CaptureRuntime {
         );
         let resumed = boot.resumed;
         let reads = boot.engine.read_reports();
+        let launch = boot.engine.config().executor.clone();
+        let observer = boot.engine.observer();
         Arc::new(Self {
             runner: CadenceRunner::new(boot.engine, shipper),
             resumed,
@@ -128,6 +134,8 @@ impl CaptureRuntime {
             reads,
             harness: Mutex::new(None),
             final_outcome: Mutex::new(FinalOutcome::NotRun),
+            launch: Mutex::new(launch),
+            observer,
         })
     }
 
@@ -525,6 +533,7 @@ impl CaptureRuntime {
             // nothing else: a seal never carries over from the placeholder's plan to another
             // launch (cross-repo decision 5). A plan that names none seals nothing.
             engine.set_executor(plan.executor.clone());
+            *self.launch.lock().unwrap_or_else(|e| e.into_inner()) = plan.executor.clone();
             // The registrar of the assigned worktree decides whether dir objects travel in
             // dir packs from the next snap on, and whether it can hold what a capture holds
             // (a final flush over a store that cannot is never complete).
@@ -566,8 +575,29 @@ impl CaptureRuntime {
         self.report(Currency::Now)
     }
 
-    /// The state, its currency judged as `currency` says.
+    /// The state, its currency judged as `currency` says, at its position in this executor's
+    /// order (cross-repo decision 17): computed under the observation number it carries, so a
+    /// later number never describes an older state. Every answer — `capture.status`, a flush's —
+    /// is one of these.
     fn report(&self, currency: Currency) -> CaptureStatusReport {
+        self.observer.observe(|at| {
+            let launch = self
+                .launch
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            CaptureStatusReport {
+                launch,
+                boot_id: Some(at.boot_id),
+                boot_generation: Some(at.boot_generation),
+                observation: Some(at.observation),
+                ..self.observed(currency)
+            }
+        })
+    }
+
+    /// [`Self::report`]'s content. Takes no position and waits for no engine.
+    fn observed(&self, currency: Currency) -> CaptureStatusReport {
         // The final flush's outcome first, then the queue: a flush sets its outcome once it has
         // shipped, so the queue read after it is at least as new. Read the other way round, a
         // queue read while the flush ran met the outcome it set on its way out, and the report
@@ -690,6 +720,10 @@ impl CaptureRuntime {
             repairing: ship.repair_pending,
             bulk_building,
             snaps,
+            launch: None,
+            boot_id: None,
+            boot_generation: None,
+            observation: None,
         }
     }
 
@@ -2786,15 +2820,31 @@ mod tests {
             complete: true,
             epoch: 1,
             executor: EXECUTOR.to_owned(),
+            boot_id: None,
+            boot_generation: None,
+            observation: None,
         };
-        assert_eq!(head.manifest.final_seal.as_ref(), Some(&seal));
+        let sealed = head.manifest.final_seal.clone().unwrap();
+        assert!(sealed.same_executor(&seal), "{sealed:?}");
         assert_eq!(head.manifest.kind, sealant_capture::CaptureKind::Final);
         assert_eq!(
             head.manifest.sections,
             chain[chain.len() - 2].manifest.sections,
             "the sealing capture holds the newest capture's sections"
         );
-        assert_eq!(registrar.seals(), vec![(head.n, seal)]);
+        assert_eq!(registrar.seals(), vec![(head.n, sealed.clone())]);
+        // Where the seal and the answers stand (decision 17): one boot, one order, the answer
+        // after the seal it reports.
+        assert_eq!(report.launch.as_deref(), Some(EXECUTOR));
+        assert_eq!(report.boot_id, sealed.boot_id);
+        assert_eq!(report.boot_generation, sealed.boot_generation);
+        assert_eq!(report.boot_generation, Some(1));
+        assert!(
+            report.observation > sealed.observation,
+            "{report:?} {sealed:?}"
+        );
+        let later = capture.status();
+        assert!(later.observation > report.observation);
         assert_eq!(
             report.head_n,
             Some(head.n),

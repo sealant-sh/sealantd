@@ -164,7 +164,11 @@
 //! session token was issued for (cross-repo decision 5) — and nothing else: a plan that names
 //! none gets no seal, and a re-plan replaces it (a seal never carries over to another launch).
 //! The registrar records the seal on the chain only when it is complete, names the registering
-//! epoch and names that executor.
+//! epoch and names that executor. The seal also says where it stands in that executor's own
+//! order (cross-repo decision 17, [`crate::position`]): `boot_id`, `boot_generation` and
+//! `observation`, beside the manifest's `n`, in the same order as every `capture.status` and
+//! final `capture.flush` answer's position (`CaptureStatusReport` fields 27–30). A registrar
+//! that does not read them ignores them; none of them is part of whose seal it is.
 //!
 //! ```json
 //! ← {"worktree_id":"wt","epoch":3,…,"manifest_features":[…],"executor":"<executor id>"}
@@ -2255,6 +2259,9 @@ mod tests {
             complete: true,
             epoch: 1,
             executor: "exec-1".into(),
+            boot_id: None,
+            boot_generation: None,
+            observation: None,
         });
         r.capture_register(&RegisterRequest {
             manifest: m,
