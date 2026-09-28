@@ -41,7 +41,25 @@ pseudo-ref through a two-tree `read-tree --reset -u` (a full `checkout-index` wh
 known about the disk). Files, symlinks and emptied directories the plan no longer names are
 removed, and only inside what a capture would list (`ClassRoots`, the same policy the engine's
 listings use): never the staging directory, excluded names, credentials, or the bulk
-directories of a `"pending"` bulk section. Content and dir packs are fetched up front, eight GETs in flight (`PACK_GETS_IN_FLIGHT`), into
+directories of a `"pending"` bulk section. Each removed path is logged at debug
+(`materialize: removed …`); `removed` in the `capture head materialized` line counts them.
+
+On a fresh executor that count is not zero, and what it counts is `git init`'s template, never
+work product. The materializer creates the repository with a plain `git init`
+(`GitRepo::init`), which writes `.git/hooks/*.sample` (14 with git 2.43, the Ubuntu workspace
+image; 13 with Debian's 2.39), `.git/description`, `.git/config` and `.git/info/exclude`. The
+workspace class lists `.git/` bookkeeping, and no captured disk holds the samples or
+`description` (the first executor's materialize removed them before its first snap), so every
+later fresh boot removes exactly those 15 (`removed=15` in the Docker end to end, from heads 17
+to 67). The executor that boots on a control-plane base capture (an empty workspace root)
+removes 17: `config` and `info/exclude` too, which sealantd writes again right after
+(`info/exclude` with `/.sealantd/`, `config` by `remotes::apply`); the template's `config` holds
+only git's built-in defaults for a non-bare repository. Git never runs a `*.sample` hook, and a
+real hook is captured and restored like any `.git/` file. Nothing in the worktree or the
+harness home is removed on a fresh executor: the disk is empty before the head is laid down
+(`tests/fresh_boot_removals.rs` holds it: `removed` is exactly the template files no capture
+holds, and the worktree and harness home come back whole).
+Content and dir packs are fetched up front, eight GETs in flight (`PACK_GETS_IN_FLIGHT`), into
 the pack cache (`.sealantd/capture/cache/`), and a pack already there is not fetched again.
 `tests/delta.rs` measures it: a head applied over a
 materialized base wrote 9 files / 213 KB where a fresh materialize writes 427 files / 1.7 MB,
@@ -86,6 +104,9 @@ and empty directories and every tracked mtime were lost.
   and linking would then replace one content with the other. Left unlinked, each name holds
   exactly what its class captured, and the next bulk capture brings them together again. The
   relinked name's new inode goes into its class's index, so a head over itself writes nothing.
+  Relinking (remove the name, link it) moves its directory's mtime, and that directory's class
+  set it already — `node_modules` itself, a pnpm `file:` package's directories (the Docker end
+  to end found 31 wrong): the directory gets back the mtime it had before the relink.
 - **A path it cannot read is not gone.** A tracked path whose metadata cannot be read (a
   directory above it that cannot be searched; git carries its content from the previous capture,
   see "What a snap reads") keeps the previous document's entry in an automatic snap and counts as
@@ -365,7 +386,9 @@ restore, byte for byte, so the user never notices the compute changed.
   `Runtime::final_flush` (`crates/sealantd/src/runtime.rs`), in this order:
   1. admission closes for good: no new process, exec (attached or not), session, SFTP bridge,
      execution, bind or re-plan is accepted, and the boot supervisor launches nothing more;
-  2. every writer is terminated and awaited: SFTP bridges are closed, a process group the
+  2. every writer is terminated and awaited, admission closed throughout, in this order —
+     the workspace's own Docker containers, then the processes, then the containers again
+     (below): SFTP bridges are closed, a process group the
      fence stopped is continued, then `SIGTERM` (`SIGHUP` for sessions), then `SIGKILL` after
      the grace (`grace_ms`, else the shutdown grace; a hard shutdown kills at once) — the
      managed process groups and sessions, and at the same time every process outside them
@@ -378,7 +401,13 @@ restore, byte for byte, so the user never notices the compute changed.
      sealantd, which as the child subreaper inherits every orphan of what it started — the
      VM's agent and its `sealantctl` are never touched. sealantd, its threads, its own helpers
      (its own process group: the capture engine's `git`), kernel threads and zombies are left
-     alone. A daemon that is not PID 1 of its namespace and did not become a child subreaper
+     alone, and so is the process at the far end of a live control-socket connection
+     (`SO_PEERCRED`) with its ancestors short of PID 1, while that connection is open — when
+     its ancestry leaves the namespace or reaches PID 1 without passing through sealantd: in
+     Docker, Core reaches the socket through `docker exec … socat - UNIX-CONNECT:…`, and
+     stopping that `socat` lost the final flush's own reply ("connection closed" on every
+     stop). A process sealantd started or adopted is swept whatever connection it holds. A
+     daemon that is not PID 1 of its namespace and did not become a child subreaper
      cannot see an orphan, so every final flush it runs is incomplete (`sweep-unavailable`,
      logged at boot). And every running container of the workspace's own Docker daemon is
      stopped (`POST /containers/{id}/stop?t=<grace>`, `crates/sealantd/src/docker.rs`) until
@@ -386,8 +415,12 @@ restore, byte for byte, so the user never notices the compute changed.
      `SEALANT_WORKSPACE_DOCKER_HOST`, else a `DOCKER_HOST` Core reserves for the workspace's
      own daemon — `unix:///run/docker/docker.sock` (Docker in the MicroVM, the Kubernetes dind
      sidecar) or `tcp://docker:2375` (the Docker adapter's dind sidecar); any other
-     `DOCKER_HOST` (a host daemon) is never touched. A container left running, or a daemon
-     named and not reached, is `processes-remain`;
+     `DOCKER_HOST` (a host daemon) is never touched. The containers stop first, with the
+     grace, while the processes still run: a workspace process can be what carries a
+     container's output into the worktree (`docker logs -f > file`), and stopped at the same
+     time it was gone before the container printed its last lines. After the processes, the
+     containers are checked again and any a process started on its way out is stopped. A
+     container left running, or a daemon named and not reached, is `processes-remain`;
   3. the small class and, forced, the bulk class are snapped (`CadenceRunner::flush_final`),
      both as `final` snaps —
      whatever the bulk clocks say; a scheduled bulk build in progress yields to it at its next
@@ -395,6 +428,12 @@ restore, byte for byte, so the user never notices the compute changed.
      key moved or whose last read was racy (see "What a snap reads"); a file or directory it
      cannot read fails the snap (`EngineError::unreadable()`), it never becomes a deletion;
   4. everything ships, bulk included (`Shipper::flush_final`).
+
+  Once a final flush stopped every writer, nothing snaps on a schedule any more: its forced
+  snaps are the last (a turn snap or another final flush still runs). A scheduled bulk build
+  the forced one preempted does not resume after it — the Docker end to end saw
+  `bulk_building` true for 0.6–11.4 s after `complete: true`. A capture staged or being built
+  after the final one turns `complete` false (`pending`) until it has shipped.
 
   The daemon used to snap first and terminate after, so what an agent wrote during the upload,
   or from its `SIGTERM` handler, was on the disk only. The report's `complete` is true only when
@@ -497,8 +536,15 @@ that runs past the 10 s it was once clamped to, the grace bounding a suspend flu
 deadline, a writer's `SIGTERM` handler landing in the head of a final flush and of
 `runtime.gracefulShutdown`, and the fenced and cut-short final flushes answering incomplete;
 `crates/sealantd/tests/final_sweep.rs` a `setsid`'d, double-forked writer stopped before the
-last snap, its `SIGTERM` handler's file in the head; `crates/sealantd/src/capture.rs` also the
-containers of a fake Docker daemon stopped (and a stuck one, or no daemon, incomplete), a
+last snap, its `SIGTERM` handler's file in the head;
+`tests/flush_modes.rs` a preempted scheduled bulk build not resuming after the final flush;
+`crates/sealantd/src/capture.rs` no scheduled snap after a final flush, and a bulk capture
+being built after it reported incomplete;
+`crates/sealantd/tests/final_sweep_control_peer.rs` the relay carrying a final flush over a
+real control socket spared (its reply arrives) while a bystander in the same scope is stopped; `crates/sealantd/src/capture.rs` also the
+containers of a fake Docker daemon stopped (and a stuck one, or no daemon, incomplete), stopped
+before the process streaming their output into the worktree (its last line in the head) and a
+container a process started on its way out stopped after the processes, a
 daemon without a subreaper incomplete, and a flush past its deadline completing in the
 background and answering `complete` when asked again without a second quiesce;
 `crates/sealantd/src/boot/capture.rs` another platform's dependency tree carried through an
@@ -665,7 +711,8 @@ terminated and awaited, the small and the bulk class snapped after that, everyth
 — and while that still holds (nothing staged since, the lease not fenced). It is the only answer
 a control plane may read as saved: `pending == 0` alone is not (a failed snap leaves nothing
 pending). `incomplete_reason` says why not: `not-final`, `processes-remain`, `snapshot-failed`,
-`fenced`, `conflict`, `deadline`, `ship-failed`, `pending` (staged after the final flush),
+`fenced`, `conflict`, `deadline`, `ship-failed`, `pending` (staged, or a bulk capture being
+built, after the final flush),
 `sweep-unavailable`, `unreadable` or `internal`; absent when `complete`. After a flush that
 returned at its deadline (`deadline`, `ship-failed`), `complete` turns true once the worker has
 shipped the rest: poll `capture.status`, or send the final flush again. An older daemon's report decodes with `complete: false`.

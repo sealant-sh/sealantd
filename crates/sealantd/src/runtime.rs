@@ -155,6 +155,8 @@ pub struct Runtime {
     /// runtime in it would take every other's processes, so a unit test's runtime starts with
     /// a mark nobody holds.
     sweep_mark: Mutex<Option<String>>,
+    /// The sweep's scope as a test sets it (`None`: [`crate::sweep::Scope::detect`]).
+    sweep_scope: Mutex<Option<crate::sweep::Scope>>,
     /// The last quiesce's outcome (`None`: none ran; `Some(None)`: every writer stopped). A
     /// final flush asked again after one that stopped every writer does not quiesce again:
     /// admission is closed, and nothing is left to stop.
@@ -169,6 +171,9 @@ pub struct Runtime {
     /// The workspace's own Docker daemon, whose containers the final capture stops
     /// ([`crate::docker`]). Set by boot; none by default.
     workspace_docker: Mutex<Option<crate::docker::DockerEndpoint>>,
+    /// The processes at the far end of the live control-socket connections, which the final
+    /// capture's sweep spares while their connection is open ([`crate::sweep`]).
+    control_peers: sealant_control::ControlPeers,
 }
 
 impl Runtime {
@@ -256,10 +261,12 @@ impl Runtime {
             quiesced: Mutex::new(None),
             quiesces: std::sync::atomic::AtomicU64::new(0),
             sweep_mark: Mutex::new(cfg!(test).then(|| format!("unit-test-{}", new_unit_mark()))),
+            sweep_scope: Mutex::new(None),
             features,
             pidfd_supported,
             subreaper: AtomicBool::new(subreaper),
             workspace_docker: Mutex::new(None),
+            control_peers: sealant_control::ControlPeers::default(),
         })
     }
 
@@ -286,9 +293,12 @@ impl Runtime {
     ///
     /// 1. admission closes for good — no new process, exec, session, SFTP bridge, execution,
     ///    bind or re-plan;
-    /// 2. every managed process and session is terminated (a process the fence paused is
-    ///    continued, then `SIGTERM`; `SIGKILL` after `grace_ms`, the shutdown grace when
-    ///    absent; a hard shutdown kills at once) and awaited, and SFTP bridges are closed;
+    /// 2. every writer is terminated and awaited (the quiesce): SFTP bridges are
+    ///    closed; the containers of the workspace's own Docker daemon are stopped first, while
+    ///    the processes that may stream their output still run; then every managed process and
+    ///    session (a process the fence paused is continued, then `SIGTERM`; `SIGKILL` after
+    ///    `grace_ms`, the shutdown grace when absent; a hard shutdown kills at once) and every
+    ///    process the sweep finds; then the containers again;
     /// 3. the small AND the bulk class are snapped — both must succeed;
     /// 4. everything ships until nothing is pending.
     ///
@@ -361,14 +371,16 @@ impl Runtime {
         self.capture().is_some_and(|c| !c.status().complete)
     }
 
-    /// Close admission and stop every writer in the workspace: SFTP bridges closed, paused
-    /// processes continued, then `SIGTERM` (or `SIGKILL` on a hard shutdown) to every managed
-    /// process group and `SIGHUP` to every session, `SIGKILL` after `grace`, and awaited; then
-    /// at the same time every process outside those groups ([`crate::sweep`]: the PID namespace
-    /// when sealantd is its PID 1, else sealantd's descendants) the same way.
-    /// Every container of the workspace's own Docker daemon is stopped at the same time. Returns
-    /// why the capture that follows cannot be complete (`processes-remain`,
-    /// `sweep-unavailable`), or `None`.
+    /// Close admission and stop every writer in the workspace, admission closed throughout:
+    /// SFTP bridges closed; every container of the workspace's own Docker daemon stopped
+    /// (`SIGTERM`, `SIGKILL` after `grace`) while the processes that may stream their output
+    /// still run; then paused processes continued, `SIGTERM` (or `SIGKILL` on a hard shutdown)
+    /// to every managed process group and `SIGHUP` to every session, `SIGKILL` after `grace`,
+    /// and awaited, and at the same time every process outside those groups
+    /// ([`crate::sweep`]: the PID namespace when sealantd is its PID 1, else sealantd's
+    /// descendants) the same way; then the containers once more, for one a process started on
+    /// its way out. Returns why the capture that follows cannot be complete
+    /// (`processes-remain`, `sweep-unavailable`), or `None`.
     async fn quiesce(&self, grace: Duration) -> Option<&'static str> {
         self.admission_closed.store(true, Ordering::SeqCst);
         self.quiesces.fetch_add(1, Ordering::Relaxed);
@@ -403,27 +415,46 @@ impl Runtime {
             mark.as_deref()
                 .is_none_or(|m| crate::sweep::has_env_entry(pid, SWEEP_MARK_ENV, m))
         };
-        let sweeper = crate::sweep::Sweeper::this_process();
+        let mut sweeper = crate::sweep::Sweeper::this_process();
+        sweeper.scope = self.sweep_scope();
+        // The far ends of the live control connections: the one carrying this flush's reply.
+        let control_peers = self.control_peers.clone();
+        let peers = move || control_peers.pids();
         let docker = self
             .workspace_docker
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         let started = Instant::now();
-        // And every container of the workspace's own Docker daemon: a container can bind-mount
-        // the worktree, and its processes are neither in sealantd's groups nor its descendants.
-        let stop_containers = async {
+        // Every container of the workspace's own Docker daemon first: a container can
+        // bind-mount the worktree, and its processes are neither in sealantd's groups nor its
+        // descendants. First, because a workspace process may be what carries a container's
+        // output into the worktree (`docker logs -f > file`): stopped at the same time, it was
+        // gone before the container printed its last lines, and they were lost.
+        let stop_containers = || async {
             match &docker {
                 None => Ok(None),
                 Some(endpoint) => crate::docker::stop_all(endpoint, grace).await.map(Some),
             }
         };
-        let ((), (), (swept, sweep_left), containers) = tokio::join!(
+        let first = stop_containers().await;
+        let ((), (), (swept, sweep_left)) = tokio::join!(
             self.sessions.terminate_all(grace),
             self.processes.terminate_all(signal, grace),
-            sweeper.sweep(grace, self.shutdown.is_hard(), &admit),
-            stop_containers,
+            sweeper.sweep(grace, self.shutdown.is_hard(), &admit, &peers),
         );
+        // Then again: a container a process started on its way out (admission stays closed,
+        // but sealantd does not admit what the daemon runs).
+        let containers = match first {
+            Ok(first) => stop_containers().await.map(|again| match (first, again) {
+                (Some(first), Some(again)) => Some(crate::docker::Stopped {
+                    containers: first.containers + again.containers,
+                    running: again.running,
+                }),
+                (_, again) => again,
+            }),
+            Err(error) => Err(error),
+        };
         let managed_left = self.processes.registry.running().len() + self.sessions.registry.len();
         let (containers_stopped, containers_left) = match &containers {
             Ok(None) => (0, 0),
@@ -475,7 +506,7 @@ impl Runtime {
     /// Every final flush on such a daemon is incomplete (`sweep-unavailable`).
     #[must_use]
     pub fn sweep_unavailable(&self) -> bool {
-        crate::sweep::Scope::detect() == crate::sweep::Scope::Descendants
+        self.sweep_scope() == crate::sweep::Scope::Descendants
             && !self.subreaper.load(Ordering::Relaxed)
     }
 
@@ -484,6 +515,21 @@ impl Runtime {
     #[must_use]
     pub fn quiesce_count(&self) -> u64 {
         self.quiesces.load(Ordering::Relaxed)
+    }
+
+    /// The final flush's sweep scope: [`crate::sweep::Scope::detect`], unless a test set one.
+    fn sweep_scope(&self) -> crate::sweep::Scope {
+        self.sweep_scope
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(crate::sweep::Scope::detect)
+    }
+
+    /// Test hook: sweep as if sealantd were (`Namespace`) or were not (`Descendants`) PID 1 of
+    /// its PID namespace. Narrow the sweep with [`Runtime::set_sweep_mark`] first.
+    #[doc(hidden)]
+    pub fn set_sweep_scope_for_test(&self, scope: crate::sweep::Scope) {
+        *self.sweep_scope.lock().unwrap_or_else(|e| e.into_inner()) = Some(scope);
     }
 
     /// Test hook: behave as if `PR_SET_CHILD_SUBREAPER` had (not) taken effect.
@@ -513,6 +559,17 @@ impl Runtime {
     fn admission_closed_error() -> ControlError {
         ControlError::runtime_shutting_down(
             "the executor is ending: a final capture flush closed admission".to_owned(),
+        )
+    }
+
+    /// Whether a final capture flush stopped every writer (admission closed, nothing left
+    /// running): from then on the disk changes only through what sealantd itself does, and the
+    /// capture's scheduled snaps stop — the final flush's forced snaps are the last ones.
+    #[must_use]
+    pub fn writers_stopped(&self) -> bool {
+        matches!(
+            *self.quiesced.lock().unwrap_or_else(|e| e.into_inner()),
+            Some(None)
         )
     }
 
@@ -1335,5 +1392,9 @@ impl ControlService for Runtime {
 
     fn max_frame_bytes(&self) -> u32 {
         self.config.limits.max_frame_bytes
+    }
+
+    fn control_peers(&self) -> Option<sealant_control::ControlPeers> {
+        Some(self.control_peers.clone())
     }
 }

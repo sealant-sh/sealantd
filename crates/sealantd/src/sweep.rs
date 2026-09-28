@@ -24,6 +24,15 @@
 //! which it spawns without a group of their own, while every managed process gets its own group
 //! — kernel threads and zombies (they write nothing) are left alone. A process that moved itself
 //! into sealantd's process group on purpose would be taken for a helper.
+//!
+//! Nor is the process at the far end of a live control connection ([`Sweeper::select`]'s
+//! `peers`, from `SO_PEERCRED`), with its ancestors: in Docker, Core reaches sealantd through
+//! `docker exec … socat - UNIX-CONNECT:<control socket>`, and that `socat` — in the namespace,
+//! its parent outside it — carries the final flush's own request and reply. Stopping it lost
+//! the reply. It is spared only while its connection is open, and only when its ancestry leaves
+//! the namespace (or reaches PID 1) without passing through sealantd: a process sealantd
+//! started, or adopted as a subreaper, is swept whatever connection it holds, so a harness
+//! cannot keep writing by opening one (nor by running `sealantctl`).
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -138,10 +147,19 @@ impl Sweeper {
         }
     }
 
-    /// The live processes of `procs` the sweep stops, `admit` narrowing them further.
+    /// The live processes of `procs` the sweep stops, `admit` narrowing them further. `peers`
+    /// are the pids at the far end of live control connections: each is spared with its
+    /// ancestors (short of PID 1) when that chain does not pass through sealantd
+    /// (`Sweeper::spared`).
     #[must_use]
-    pub fn select(&self, procs: &[ProcInfo], admit: &dyn Fn(i32) -> bool) -> Vec<i32> {
+    pub fn select(
+        &self,
+        procs: &[ProcInfo],
+        admit: &dyn Fn(i32) -> bool,
+        peers: &[i32],
+    ) -> Vec<i32> {
         let parent: HashMap<i32, i32> = procs.iter().map(|p| (p.pid, p.ppid)).collect();
+        let spared = self.spared(&parent, peers);
         let descends = |mut pid: i32| {
             // Bounded: a pid table read while it changes may hold a cycle.
             for _ in 0..procs.len() + 1 {
@@ -162,11 +180,46 @@ impl Sweeper {
                 Scope::Descendants => descends(p.pid),
             })
             .map(|p| p.pid)
+            .filter(|pid| !spared.contains(pid))
             .filter(|&pid| admit(pid))
             .collect()
     }
 
-    /// Stop every process [`Sweeper::select`] finds: `SIGCONT` and `SIGTERM` (unless `hard`),
+    /// The control connections' far ends the sweep leaves running: each peer and its ancestors
+    /// up to, not including, PID 1 — when the chain ends outside the namespace (a parent of
+    /// pid 0: `docker exec`) or at PID 1 without passing through sealantd. A peer sealantd
+    /// started or adopted, or whose ancestry cannot be read whole, is not spared.
+    fn spared(&self, parent: &HashMap<i32, i32>, peers: &[i32]) -> HashSet<i32> {
+        let mut spared = HashSet::new();
+        for &peer in peers {
+            let mut chain = Vec::new();
+            let mut pid = peer;
+            let mut outside = false;
+            // Bounded: a pid table read while it changes may hold a cycle.
+            for _ in 0..=parent.len() {
+                if pid == self.me {
+                    break;
+                }
+                if pid <= 1 {
+                    outside = true;
+                    break;
+                }
+                chain.push(pid);
+                // Gone, or its parent went meanwhile: nothing proves it is not sealantd's.
+                let Some(&ppid) = parent.get(&pid) else {
+                    break;
+                };
+                pid = ppid;
+            }
+            if outside {
+                spared.extend(chain);
+            }
+        }
+        spared
+    }
+
+    /// Stop every process [`Sweeper::select`] finds (`peers` is asked again at every scan):
+    /// `SIGCONT` and `SIGTERM` (unless `hard`),
     /// re-scanning until none is left or `grace` passes, then `SIGKILL`, re-scanning up to
     /// [`KILL_WAIT`]. Returns how many signalled processes there were and how many are still
     /// alive.
@@ -175,6 +228,7 @@ impl Sweeper {
         grace: Duration,
         hard: bool,
         admit: &(dyn Fn(i32) -> bool + Sync),
+        peers: &(dyn Fn() -> Vec<i32> + Sync),
     ) -> (usize, usize) {
         use nix::sys::signal::{Signal, kill};
         use nix::unistd::Pid;
@@ -183,7 +237,7 @@ impl Sweeper {
         if !hard {
             let until = Instant::now() + grace;
             loop {
-                let targets = self.select(&read_proc(proc_root), admit);
+                let targets = self.select(&read_proc(proc_root), admit, &peers());
                 if targets.is_empty() {
                     return (seen.len(), 0);
                 }
@@ -205,7 +259,7 @@ impl Sweeper {
         }
         let until = Instant::now() + KILL_WAIT;
         loop {
-            let targets = self.select(&read_proc(proc_root), admit);
+            let targets = self.select(&read_proc(proc_root), admit, &peers());
             if targets.is_empty() {
                 return (seen.len(), 0);
             }
@@ -289,10 +343,10 @@ mod tests {
             p(106, 103, 106), // a grandchild in a group of its own
             zombie,
         ];
-        let mut picked = sweeper.select(&procs, &|_| true);
+        let mut picked = sweeper.select(&procs, &|_| true, &[]);
         picked.sort_unstable();
         assert_eq!(picked, vec![103, 104, 105, 106]);
-        let only = sweeper.select(&procs, &|pid| pid == 104);
+        let only = sweeper.select(&procs, &|pid| pid == 104, &[]);
         assert_eq!(only, vec![104]);
     }
 
@@ -315,8 +369,54 @@ mod tests {
             p(10, 1, 10), // an escaped daemon
             kthread,
         ];
-        let mut picked = sweeper.select(&procs, &|_| true);
+        let mut picked = sweeper.select(&procs, &|_| true, &[]);
         picked.sort_unstable();
         assert_eq!(picked, vec![8, 9, 10]);
+    }
+
+    /// The far end of a live control connection is spared with its ancestors when it entered
+    /// the namespace from outside (`docker exec sh -c 'socat …'`: parent pid 0), and swept when
+    /// sealantd started or adopted it (a harness, or a `sealantctl` it runs, holding a
+    /// connection); a peer whose ancestry cannot be read is swept.
+    #[test]
+    fn the_far_end_of_a_control_connection_is_spared_unless_sealantd_started_it() {
+        let sweeper = Sweeper {
+            me: 1,
+            my_pgid: 1,
+            scope: Scope::Namespace,
+        };
+        let procs = [
+            p(1, 0, 1),     // sealantd
+            p(20, 0, 20),   // `docker exec`'s shell
+            p(21, 20, 20),  // its socat, connected to the control socket
+            p(22, 20, 22),  // something else that shell started
+            p(30, 1, 30),   // the harness
+            p(31, 30, 30),  // its sealantctl, connected to the control socket
+            p(40, 1, 40),   // an orphan re-parented to sealantd, connected
+            p(50, 999, 50), // connected, its parent gone from the table
+        ];
+        let mut picked = sweeper.select(&procs, &|_| true, &[21, 31, 40, 50]);
+        picked.sort_unstable();
+        assert_eq!(picked, vec![22, 30, 31, 40, 50]);
+        // No connection, nothing spared.
+        let mut all = sweeper.select(&procs, &|_| true, &[]);
+        all.sort_unstable();
+        assert_eq!(all, vec![20, 21, 22, 30, 31, 40, 50]);
+
+        // Outside a namespace of its own: a peer that is not sealantd's descendant is never a
+        // target; one that is stays one.
+        let me = 100;
+        let sweeper = Sweeper {
+            me,
+            my_pgid: 90,
+            scope: Scope::Descendants,
+        };
+        let procs = [
+            p(1, 0, 1),
+            p(50, 1, 50),    // the VM agent's sealantctl, connected
+            p(me, 1, 90),    // sealantd
+            p(103, me, 103), // the harness, connected
+        ];
+        assert_eq!(sweeper.select(&procs, &|_| true, &[50, 103]), vec![103]);
     }
 }

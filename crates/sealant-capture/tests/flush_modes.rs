@@ -241,6 +241,87 @@ fn a_final_flush_preempts_a_scheduled_bulk_build() {
     );
 }
 
+/// Docker end to end, round 2: `bulk_building` stayed true for seconds after a final flush
+/// completed. A scheduled bulk build the final flush's forced snap preempted resumed once the
+/// forced one was done and built again after the final capture. Once scheduled snaps are no
+/// longer allowed (the daemon says so as soon as a final flush stopped every writer), a
+/// scheduled build that yielded does not resume: the forced snap took its progress.
+#[test]
+fn a_preempted_scheduled_bulk_build_does_not_resume_after_the_final_flush() {
+    let fx = fixture(0);
+    let lib = fx.root.join("node_modules/pkg/lib");
+    fs::create_dir_all(&lib).unwrap();
+    let mut seed = 7u64;
+    for i in 0..120 {
+        // Incompressible bytes: the build hashes and packs every one of them.
+        let bytes: Vec<u8> = (0..100_000)
+            .map(|_| {
+                seed = seed
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                (seed >> 33) as u8
+            })
+            .collect();
+        fs::write(lib.join(format!("blob{i}.bin")), bytes).unwrap();
+    }
+    let mut config = CaptureConfig::new("wt", 1, &fx.root);
+    config.cpu_fraction = 0.05;
+    config.cadence = Cadence {
+        bulk_quiet: Duration::from_millis(50),
+        bulk_max_interval: Duration::from_millis(200),
+        ..Cadence::default()
+    };
+    let runner = runner(config, fx.store.clone(), &fx);
+    let allowed = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let gate = allowed.clone();
+    runner.start(Some(Arc::new(move || gate.load(Ordering::SeqCst))));
+    runner.snap(CaptureKind::Checkpoint).unwrap();
+    // The bulk loop reads its clock, lets go of the state lock and takes it again to wait: a
+    // signal in between wakes nobody, and the build waits for the next one (on a loaded runner
+    // it waited out the whole 10 s). What this test is about is the build once it runs, so the
+    // change is signalled again until it does.
+    let start = Instant::now();
+    let mut signalled: Option<Instant> = None;
+    while !runner.snapshot().bulk_running {
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "a scheduled bulk build starts: {:?}",
+            runner.snapshot()
+        );
+        if signalled.is_none_or(|at| at.elapsed() >= Duration::from_millis(500)) {
+            runner.signal(sealant_capture::ChangeSignal::Changed(Class::Bulk));
+            signalled = Some(Instant::now());
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    // Every writer stopped: no more scheduled snaps. Then the final flush.
+    allowed.store(false, Ordering::SeqCst);
+    let flushed = runner.flush_final(None);
+    assert!(flushed.complete(), "{flushed:?}");
+    let after = runner.snapshot();
+    assert!(
+        after.preemptions >= 1,
+        "the scheduled build yielded to the forced one: {after:?}"
+    );
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_millis(1_500) {
+        let snap = runner.snapshot();
+        assert!(
+            !snap.bulk_running && !snap.bulk_in_progress,
+            "nothing builds after the final flush: {snap:?}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let snap = runner.snapshot();
+    assert_eq!(
+        (snap.bulk_snaps, snap.bulk_staged),
+        (1, 1),
+        "the forced bulk snap only: {snap:?}"
+    );
+    runner.stop();
+}
+
 /// A final flush given a deadline returns at it — the rest stays staged and is reported, never
 /// dropped, and the flush is not complete (it answered `Ok` before, like a finished one) — and
 /// a final flush without one then finishes the job.
