@@ -270,6 +270,11 @@ async fn a_final_flush_sweeps_the_relay_and_the_final_flush_asked_again_answers_
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert!(!alive(relay), "the relay carrying the request was swept");
+    // The sweep stops processes one after another: the bystander may go a moment after the relay.
+    let start = Instant::now();
+    while alive(bystander) && start.elapsed() < Duration::from_secs(10) {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     assert!(
         !alive(bystander),
         "the sweep ran over the namespace: the bystander is stopped"
