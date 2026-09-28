@@ -125,10 +125,15 @@ impl CaptureRuntime {
     /// Wrap a materialized boot.
     #[must_use]
     pub fn new(boot: CaptureBoot) -> Arc<Self> {
-        let shipper = Arc::new(
-            boot.engine
-                .shipper(boot.sink.clone(), boot.registrar.clone()),
-        );
+        let mut shipper = boot
+            .engine
+            .shipper(boot.sink.clone(), boot.registrar.clone());
+        // One final flush begun marks the registers and the URLs minted for it alike
+        // (`flush: final`; decision 35).
+        if let Some(minter) = &boot.minter {
+            shipper = shipper.with_preserving(minter.preserving());
+        }
+        let shipper = Arc::new(shipper);
         let resumed = boot.resumed;
         let reads = boot.engine.read_reports();
         let launch = boot.engine.config().executor.clone();
@@ -391,6 +396,9 @@ impl CaptureRuntime {
     /// ([`CadenceRunner::sealed_and_current`]), when this one snaps nothing and the status stays
     /// `complete` throughout.
     pub fn begin_final(&self) {
+        // From here the executor is ending: what it ships while its writers are stopped, and
+        // after, preserves work already admitted (`flush: final`; decision 35).
+        self.runner.shipper().preserving().begin();
         let mut outcome = self.final_outcome.lock().unwrap_or_else(|e| e.into_inner());
         let current = matches!(*outcome, FinalOutcome::Snapped { .. })
             && self.runner.sealed_and_current()

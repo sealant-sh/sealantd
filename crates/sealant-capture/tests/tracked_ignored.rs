@@ -167,6 +167,7 @@ fn control_plane_base(
             capture_id: manifest.capture_id.clone(),
             manifest_key,
             manifest: manifest.manifest.clone(),
+            flush: None,
         })
         .unwrap();
     manifest

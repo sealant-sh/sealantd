@@ -131,6 +131,7 @@ fn entry(uploads: Vec<Upload>) -> QueueEntry {
                 checkpoint: None,
                 final_seal: None,
             },
+            flush: None,
         },
     }
 }

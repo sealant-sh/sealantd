@@ -26,7 +26,9 @@ use crate::cpu::thread_cpu;
 use crate::engine::Class;
 use crate::io_at::IoAt;
 use crate::manifest::CaptureKind;
-use crate::registrar::{RegisterRequest, Registrar, RegistrarError, SealAnswer, SealState, opt};
+use crate::registrar::{
+    PreservingFlush, RegisterRequest, Registrar, RegistrarError, SealAnswer, SealState, opt,
+};
 use crate::sink::{BlobSink, BlobSource, SinkError};
 
 /// Lock, taking the value of a poisoned lock as it is.
@@ -1183,6 +1185,10 @@ pub struct Shipper {
     /// The last capture carrying a final seal that registered, and what the registrar said of
     /// its seal (`None`: it did not say) — [`Self::seal_standing`].
     seal_answer: Mutex<Option<(String, Option<SealAnswer>)>>,
+    /// Whether this executor began a final flush: every register from then on says so
+    /// (`flush: final`; decision 35), and so does every `upload.urls` of a minter sharing it
+    /// ([`Self::with_preserving`]).
+    preserving: PreservingFlush,
     /// Counters.
     pub status: Arc<ShipStatus>,
 }
@@ -1229,8 +1235,25 @@ impl Shipper {
             refusal: Mutex::new(None),
             repair_hook: Mutex::new(None),
             seal_answer: Mutex::new(None),
+            preserving: PreservingFlush::default(),
             status,
         }
+    }
+
+    /// Mark requests under `preserving`, the handle the URL minter behind the sink marks its
+    /// `upload.urls` by ([`crate::registrar::RegistrarMinter::preserving`]): one final flush
+    /// begun marks both.
+    #[must_use]
+    pub fn with_preserving(mut self, preserving: PreservingFlush) -> Self {
+        self.preserving = preserving;
+        self
+    }
+
+    /// Whether this executor began a final flush, as its requests say
+    /// ([`PreservingFlush::begin`] marks every later `upload.urls` and `capture.register`).
+    #[must_use]
+    pub fn preserving(&self) -> &PreservingFlush {
+        &self.preserving
     }
 
     /// Whether the final seal the sealing capture `req` carries stands (cross-repo decision
@@ -1290,7 +1313,10 @@ impl Shipper {
                 }
             }
             asks += 1;
-            match self.registrar.capture_register(req) {
+            match self
+                .registrar
+                .capture_register(&req.marked(&self.preserving))
+            {
                 Ok(resp) if resp.head_capture_id == req.capture_id => {
                     *lock(&self.seal_answer) = Some((req.capture_id.clone(), resp.seal.clone()));
                     answer = Some(resp.seal);
@@ -1867,7 +1893,10 @@ impl Shipper {
     fn register_one(&self, entry: &QueueEntry) -> Result<(), ShipError> {
         let mut last = None;
         for attempt in 0..self.retry.attempts {
-            match self.registrar.capture_register(&entry.register) {
+            match self
+                .registrar
+                .capture_register(&entry.register.marked(&self.preserving))
+            {
                 Ok(resp) => {
                     self.status.registered.fetch_add(1, Ordering::Relaxed);
                     self.status.head_n.store(resp.head_n, Ordering::Relaxed);
@@ -2486,6 +2515,7 @@ mod tests {
                     checkpoint: None,
                     final_seal: None,
                 },
+                flush: None,
             },
         }
     }

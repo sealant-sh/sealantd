@@ -696,16 +696,32 @@ executor's captures and restored on its own platform byte for byte.
 
 A capture holds what is on disk, and says so when it cannot.
 
-- **Nothing is excluded by name but git's own transients.** Outside the daemon's paths and the
-  harness credential files, every regular file, directory and symlink under a class root is
-  captured whatever it is called: an ignored `Cargo.lock`, `tmp/pids/server.pid`, a SQLite
+- **Nothing is excluded by name but git's own transaction files.** Outside the daemon's paths
+  and the harness credential files, every regular file, directory and symlink under a class root
+  is captured whatever it is called: an ignored `Cargo.lock`, `tmp/pids/server.pid`, a SQLite
   `-shm` (SQLite rebuilds a stale one when the first connection opens the database), a `.pack`
-  without an `.idx`. Only inside a git directory (a `.git` component; the workspace class mounts
-  the repository's git dir at `.git/`) are `*.lock`, `gc.pid`, `objects/**/tmp_*`,
-  `objects/**/incoming-*` and a `.pack` without its `.idx` left out (`index::is_git_transient`):
-  each is git's half-written state, made real by a rename the next snap sees, and a restored
-  `index.lock` would make every git command in the workspace fail. Sockets, fifos and devices
-  are not file content.
+  without an `.idx`. Inside a git directory (a `.git` component; the workspace class mounts the
+  repository's git dir at `.git/`) the exclusions are an allow-list of the files git names for a
+  transaction in progress, each where git writes it (`index::is_git_transient`; review
+  2026-09-28, eleventh pass, #2, cross-repo decision 33): `index.lock` (and a partial commit's
+  `next-index-<pid>.lock`), `HEAD.lock` and the other root refs' locks (`ORIG_HEAD.lock`,
+  `*_HEAD.lock`, `AUTO_MERGE.lock`, `MERGE_RR.lock`, …), `config.lock`, `config.worktree.lock`,
+  `packed-refs.lock`, `shallow.lock`, `gc.pid` and its lock, `gc.log.lock`, any `.lock` under
+  `refs/`, `logs/`, `reftable/`, `rebase-merge/`, `rebase-apply/` or `sequencer/` (a ref name
+  never ends in `.lock`), `info/refs.lock`, `info/sparse-checkout.lock`, and in the object store
+  `maintenance.lock`, `schedule.lock`, `info/*.lock`, `info/commit-graphs/*.lock`,
+  `pack/multi-pack-index.lock`, `pack/multi-pack-index.d/*.lock`, `tmp_*` and `incoming-*`
+  anywhere under `objects/`, a repack's `pack/.tmp-*` and a `pack/*.pack` without its `.idx`;
+  the same names in a linked worktree's `worktrees/<name>/` (its per-worktree ones) and a
+  submodule's `modules/<name>/`. Each is git's half-written state, made real by a rename the next
+  snap sees. Every other file is the user's and is captured, in every class: a hook project's
+  `.git/hooks/Cargo.lock`, a config include called `.git/personal.lock` (before, every `*.lock`
+  under a `.git` was dropped, and a sealed restore lost both). A final flush drops a transaction
+  lock too: it runs after every writer was stopped, so a lock found then is stale — the git that
+  took it is gone and nothing will rename it; its content is a write git never made real, and
+  git's own recovery is to remove it. Captured, it would come back and make every later git
+  command of its kind fail; refusing the flush over it would keep an executor a killed git left
+  a lock on from ever completing. Sockets, fifos and devices are not file content.
 - **Local git-lfs objects are captured.** `.git/lfs/` rides in the workspace class (restored to
   `<root>/.git/lfs/`), so an object never pushed survives a replacement. The watcher does not
   descend into it (its sharded object directories would spend the watch budget); git-lfs writes a
@@ -1375,6 +1391,38 @@ error=register n=4: … http 413` on every tick); from #79 until this change a r
 capture and everything staged after it — a dependency tree, or an agent's edits, discarded for a
 quota. `InMemoryRegistrar` takes a byte quota (`with_byte_quota`) so both refusal points are
 tested (`tests/quota_refusals.rs`).
+
+### `flush` on `upload.urls` and `capture.register`: a preserving flush, named
+
+Preserving work already admitted is never refused for budget reasons (cross-repo decisions 30
+and 35; review 2026-09-28, eleventh pass, carried tenth-review #6: a registrar exempted only
+what a control plane's drain had marked, so a final flush Core's deadline or the daemon's own
+shutdown asked for was metered at `upload.urls`, and a held dependency tree stayed unsaved).
+Once this executor begins a final flush — whoever asked for it: a drain, a runtime deadline,
+`SIGTERM`, a recovery boot — every `upload.urls` and `capture.register` it sends carries
+`"flush":"final"`, to the end of the process: the executor is ending, and everything it ships
+from then on (the final captures, a bulk capture the flush's deadline left uploading, a held
+capture asked for again) is the work it ends with. `PreservingFlush` is the one handle the
+shipper stamps its registers from and the URL minter its `upload.urls` from
+(`Shipper::with_preserving(minter.preserving())`); `CaptureRuntime::begin_final` and
+`CadenceRunner::flush_final_sealing` begin it. A register is stamped when it is sent, never when
+it is staged, so a capture staged before the flush and shipped during it is marked too.
+
+```json
+→ {"worktree_id":"wt","epoch":3,"keys":["captures/wt/3/packs/<sha>"],
+   "sizes":{"captures/wt/3/packs/<sha>":150000000},"flush":"final"}
+→ {"worktree_id":"wt","epoch":3,"n":7,"parent":"…","capture_id":"…","manifest_key":"…",
+   "manifest":{…},"flush":"final"}
+```
+
+A registrar that reads the field exempts the request from its byte and call quotas, bounded per
+launch against abuse but never refusing a first final flush. The field is additive: absent before
+a final flush begins and from an older executor; a registrar from before it decodes the request
+as it always did — Mend's request schemas are `Schema.Struct`s, which drop an unknown property —
+and meters it as any other request, which is what it did before (the capture stays held, the
+flush says incomplete, nothing is dropped). `InMemoryRegistrar::flush_seen` records what each call
+carried, and `exempting_final_flushes` models a registrar that reads it
+(`tests/quota_refusals.rs`, `a_final_flush_names_itself_on_upload_urls_and_register`).
 
 ### Multipart uploads
 

@@ -17,11 +17,11 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use sealant_capture::manifest::BulkState;
-use sealant_capture::registrar::RegistrarMinter;
+use sealant_capture::registrar::{FlushMarker, RegistrarMinter};
 use sealant_capture::{
-    BlobSink, CaptureConfig, CaptureEngine, CaptureKind, Class, InMemoryRegistrar, LocalDir,
-    MaterializeClass, MaterializeTargets, Materializer, PresignedHttp, Registrar, Shipper,
-    SnapRequest,
+    BlobSink, CadenceRunner, CaptureConfig, CaptureEngine, CaptureKind, Class, InMemoryRegistrar,
+    LocalDir, MaterializeClass, MaterializeTargets, Materializer, PresignedHttp, Registrar,
+    Shipper, SnapRequest,
 };
 
 fn git(root: &Path, args: &[&str]) {
@@ -422,4 +422,91 @@ fn a_held_small_capture_drops_nothing_staged_after_it() {
         files(&restore.join("node_modules")),
         files(&root.join("node_modules"))
     );
+}
+
+/// A final flush names itself on the wire (decision 35; review 2026-09-28, eleventh pass,
+/// carried review 10 #6): from the moment it begins, every `upload.urls` the minter sends and
+/// every `capture.register` the shipper sends carries `flush: final` — the bulk capture the
+/// budget held included, and nothing before it does. A registrar that reads the marker
+/// exempts it from the byte quota, and the final flush saves the held dependency tree; one
+/// from before it ignores the marker and meters the request as it always did: the capture
+/// stays held, the flush is incomplete, and nothing is dropped.
+#[test]
+fn a_final_flush_names_itself_on_upload_urls_and_register() {
+    for exempting in [true, false] {
+        let server = common::serve();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("ws");
+        workspace(&root, 200);
+        let registrar = InMemoryRegistrar::new("wt", 1, Some(server.base.clone()));
+        let registrar = Arc::new(if exempting {
+            registrar.exempting_final_flushes()
+        } else {
+            registrar
+        });
+        let dyn_registrar: Arc<dyn Registrar> = registrar.clone();
+        let minter = Arc::new(RegistrarMinter::new(
+            dyn_registrar,
+            "wt",
+            1,
+            Default::default(),
+        ));
+        let preserving = minter.preserving();
+        let sink: Arc<dyn BlobSink> = Arc::new(PresignedHttp::new(
+            Box::new(minter),
+            std::time::Duration::from_secs(30),
+        ));
+        let mut engine = CaptureEngine::open(CaptureConfig::new("wt", 1, &root), None).unwrap();
+        let shipper = shipper(&engine, sink, registrar.clone()).with_preserving(preserving);
+
+        snap(&mut engine, Class::Small, 1);
+        assert_eq!(shipper.ship_pending().unwrap(), 1);
+        registrar.set_byte_quota(Some(registrar.used_bytes() + 64 * 1024), None);
+        snap(&mut engine, Class::Bulk, 2);
+        assert_eq!(
+            shipper.ship_pending().unwrap(),
+            0,
+            "the bulk capture is held"
+        );
+        let before = registrar.flush_seen();
+        assert!(
+            before.iter().any(|(call, _)| *call == "upload.urls")
+                && before.iter().any(|(call, _)| *call == "capture.register"),
+            "{before:?}"
+        );
+        assert!(
+            before.iter().all(|(_, flush)| flush.is_none()),
+            "no request before the final flush is marked: {before:?}"
+        );
+
+        let runner = CadenceRunner::new(engine, Arc::new(shipper));
+        let deadline = Duration::from_secs(if exempting { 60 } else { 3 });
+        let result = runner.flush_final(Some(deadline));
+        let during = registrar.flush_seen()[before.len()..].to_vec();
+        assert!(
+            during.iter().any(|(call, _)| *call == "upload.urls")
+                && during.iter().any(|(call, _)| *call == "capture.register"),
+            "{exempting}: {during:?}"
+        );
+        assert!(
+            during
+                .iter()
+                .all(|(_, flush)| *flush == Some(FlushMarker::Final)),
+            "{exempting}: every request of the final flush is marked: {during:?}"
+        );
+        if exempting {
+            assert!(result.complete(), "{result:?}");
+            assert!(runner.staging().pending().unwrap().is_empty());
+            assert!(matches!(
+                registrar.head().unwrap().manifest.sections.bulk,
+                BulkState::Ready(_)
+            ));
+        } else {
+            assert!(!result.complete(), "{result:?}");
+            assert!(
+                !runner.staging().pending().unwrap().is_empty(),
+                "the held capture is kept"
+            );
+        }
+    }
 }
