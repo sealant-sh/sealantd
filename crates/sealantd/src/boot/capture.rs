@@ -926,6 +926,7 @@ mod tests {
                 manifest_format: Some(sealant_capture::manifest::MAX_SECTION_FORMAT),
                 manifest_features: PlanGetRequest::booting(None).manifest_features,
                 launch: None,
+                upload_answers: None,
             })
             .unwrap();
         let answered = plan.head.unwrap().manifest.sections.bulk;

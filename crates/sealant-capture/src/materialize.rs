@@ -532,6 +532,11 @@ impl<'a> Materializer<'a> {
             packs.extend(&meta.packs);
         }
         self.fetch_packs(&packs, &mut report)?;
+        // The workspace class's root directories — `.git` and the harness home — as captured:
+        // set last of all, once nothing the restore writes (refs, the index, a child of the
+        // class, `info/exclude`, a relinked name) moves them any more (review 2026-09-28,
+        // seventh pass, #2). The worktree root (`tree`) is the overlay's.
+        let mut class_roots: Vec<(PathBuf, u32, i64)> = Vec::new();
         // Read before anything is written: a document that does not verify or decode fails
         // the materialize with the disk untouched.
         let meta = match meta {
@@ -579,6 +584,10 @@ impl<'a> Materializer<'a> {
                     &mut write,
                     &mut report,
                 )?;
+                if entry.kind == EntryKind::Dir && (entry.name == ".git" || entry.name == "harness")
+                {
+                    class_roots.push((target, entry.mode, entry.mtime));
+                }
             }
             report.git_config = write.planned.contains(".git/config");
             let resolve = |v: &str| roots.workspace_path(&git_dir, v);
@@ -708,6 +717,7 @@ impl<'a> Materializer<'a> {
                 }
             }
         }
+        Self::restore_dirs(&class_roots)?;
         Ok(report)
     }
 

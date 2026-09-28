@@ -79,7 +79,10 @@ the protocol details live in `crates/sealant-capture/src/registrar.rs` and `mani
   `refs` is then the repository's refs,
   whatever their names. Without the feature the two trees ride `refs` as
   `refs/sealant/capture/worktree` and `…/index`, as before. `HEAD` is its immediate target (a
-  symbolic ref chain is kept link by link), and every object `FETCH_HEAD`, `ORIG_HEAD`,
+  symbolic ref chain is kept link by link). A symbolic ref or `HEAD` stored as a symlink
+  (`core.preferSymlinkRefs`) is kept as a symbolic ref — name and target bytes, dangling and
+  chained — and as the symlink it was, its link text and mtime riding the workspace class. The
+  `.git` directory and the harness home keep their mode and nanosecond mtime. Every object `FETCH_HEAD`, `ORIG_HEAD`,
   `MERGE_HEAD`, a rebase, a cherry-pick sequence or a bisect names is in the packs — down to
   git's four-digit abbreviations. What an operation in progress needs to go on (a pending
   pseudo-ref, a todo list's `pick`-like operands, a rebase's `onto`) must resolve to exactly one
@@ -185,6 +188,12 @@ the protocol details live in `crates/sealant-capture/src/registrar.rs` and `mani
   takes it as uploaded, sends nothing, and goes on. Every PUT carries `If-None-Match: *`, and a
   412 is the same answer. A key the executor asked for that comes back in none of `urls`,
   `multipart` and `present` is an error (`no url for <key>`), never an upload taken as done.
+- **`present` is negotiated (decision 20).** Every `plan.get` request says
+  `"upload_answers":["present"]`. A registrar answers `present` only to an executor whose
+  `plan.get` listed it, bound to that launch; to one that did not (an older daemon, including the
+  binary on a retained disk a recovery boots) it mints a conditional URL as before, whose 412 the
+  older daemon already takes as uploaded. An older daemon answered `present` failed with `no url`
+  on every retry.
 - **Uploads while the store or the registrar refuses.** A URL minted for a key is used again
   until that key's upload settles (stored, already there, or the URL refused) or it is five
   minutes old, and a multipart upload resumes under the same upload and part URLs. A pass that

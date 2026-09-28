@@ -2343,6 +2343,26 @@ impl CaptureEngine {
                             })
                             .collect();
                         doc.shared = shared;
+                        // One inode, one mode, one mtime: names of one inode read with
+                        // different ones moved while they were read. A final snap cannot say it
+                        // holds the disk; any other takes the first name's and the next snap
+                        // takes the change. Never a document no restore can keep (review
+                        // 2026-09-28, seventh pass, #10).
+                        if let Some(conflict) = doc.inode_conflict() {
+                            if strict {
+                                return Err(io::Error::other(format!(
+                                    "a hardlinked file changed while it was read: {conflict}"
+                                ))
+                                .into());
+                            }
+                            let settled = doc.settle_inodes();
+                            tracing::warn!(
+                                %conflict,
+                                paths = %settled.join(", "),
+                                "hardlinked names read with different metadata; the next snap \
+                                 takes the change"
+                            );
+                        }
                         Some(doc)
                     }
                     None => None,

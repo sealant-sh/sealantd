@@ -50,6 +50,19 @@
 //!    "present":["captures/wt/3/packs/<b>"]}
 //! ```
 //!
+//! `present` is negotiated (cross-repo decision 20). An executor from before it requires a URL
+//! for every key it asks for and fails on a `present` answer; a retained disk keeps running
+//! that older binary until it is recovered. So every `plan.get` request of this build lists the
+//! answer shapes it reads beyond a URL in `upload_answers` ([`UPLOAD_ANSWERS`]), and a
+//! registrar answers `present` only to an executor whose `plan.get` listed it — to any other it
+//! mints a (conditional) URL as before, whose PUT meets a 412 the executor takes as uploaded.
+//! The registrar binds what the executor listed to the launch that sent it: a later call of
+//! that launch is answered as its `plan.get` asked.
+//!
+//! ```json
+//! → {"worktree_id":null,"epoch":0,…,"upload_answers":["present"]}
+//! ```
+//!
 //! ETags travel verbatim as the store returned them (quotes included). Part URLs are minted
 //! only while the lease predicate holds, like PUT URLs, and count against the same URL quota.
 //! A multipart upload the executor abandons (it dies, or a part fails past its retries and the
@@ -279,7 +292,18 @@ pub struct PlanGetRequest {
     /// older daemon, or a first boot with no launch named): the token alone decides.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch: Option<String>,
+    /// The `upload.urls` answer shapes this executor reads beyond a URL ([`UPLOAD_ANSWERS`]):
+    /// `present`, a key the bucket already holds, taken as uploaded (cross-repo decision 20).
+    /// A registrar answers a shape only to an executor that names it here; to one that does
+    /// not (absent: an executor from before the list), it answers a URL as before — its PUT
+    /// meets the store's 412 on `If-None-Match: *`, which every executor takes as uploaded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upload_answers: Option<Vec<String>>,
 }
+
+/// Every `upload.urls` answer shape beyond a URL this build reads (`plan.get`
+/// `upload_answers`): see the module docs.
+pub const UPLOAD_ANSWERS: [&str; 1] = ["present"];
 
 impl PlanGetRequest {
     /// The request a booting executor sends: `epoch` 0, this build's platform and the highest
@@ -293,6 +317,7 @@ impl PlanGetRequest {
             manifest_format: Some(MAX_SECTION_FORMAT),
             manifest_features: Some(MANIFEST_FEATURES.iter().map(|f| (*f).to_owned()).collect()),
             launch: None,
+            upload_answers: Some(UPLOAD_ANSWERS.iter().map(|a| (*a).to_owned()).collect()),
         }
     }
 
@@ -2153,6 +2178,7 @@ mod tests {
                 manifest_format: Some(MAX_SECTION_FORMAT),
                 manifest_features: None,
                 launch: None,
+                upload_answers: None,
             })
             .unwrap();
         assert_eq!(plan.head.unwrap().capture_id, "a");
@@ -2185,6 +2211,7 @@ mod tests {
                 manifest_format: Some(MAX_SECTION_FORMAT),
                 manifest_features: PlanGetRequest::booting(None).manifest_features,
                 launch: None,
+                upload_answers: None,
             })
             .unwrap()
         };
@@ -2227,6 +2254,7 @@ mod tests {
             manifest_format: None,
             manifest_features: None,
             launch: None,
+            upload_answers: None,
         })
         .unwrap();
         assert!(bare.get("platform").is_none());
@@ -2290,6 +2318,7 @@ mod tests {
             manifest_format: None,
             manifest_features: None,
             launch: None,
+            upload_answers: None,
         };
         assert!(
             serde_json::to_value(&bare)
@@ -2354,6 +2383,7 @@ mod tests {
             manifest_format: Some(MAX_SECTION_FORMAT),
             manifest_features: None,
             launch: None,
+            upload_answers: None,
         };
         assert!(
             serde_json::to_value(&bare)
@@ -2618,6 +2648,7 @@ mod tests {
                 manifest_format: Some(MAX_SECTION_FORMAT),
                 manifest_features: PlanGetRequest::booting(None).manifest_features,
                 launch: None,
+                upload_answers: None,
             })
             .unwrap()
         };

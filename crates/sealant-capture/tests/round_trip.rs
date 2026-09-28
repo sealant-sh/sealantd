@@ -544,6 +544,7 @@ fn fence_stops_shipping_and_a_new_epoch_continues_the_chain() {
             manifest_features: sealant_capture::registrar::PlanGetRequest::booting(None)
                 .manifest_features,
             launch: None,
+            upload_answers: None,
         })
         .unwrap();
     assert_eq!(plan.worktree_id, "wt-fixture");
