@@ -421,7 +421,9 @@ fn a_ref_symlink_reaching_outside_the_repository_leaves_the_final_flush_incomple
 // ---------------------------------------------------------------------------------------------
 
 /// Every class: an untracked file (the workspace class), a tracked one (the worktree
-/// metadata), an untracked directory, a bulk file. Each leaves the final flush incomplete as
+/// metadata), an untracked directory, a bulk file. For a store that does not read
+/// `wide_times` (tenth pass: every capture records such a time exactly, and one that does read
+/// it completes, `review10_fidelity.rs`), each leaves the final flush incomplete as
 /// `unreadable`, naming the path.
 #[test]
 fn a_modification_time_after_2262_leaves_the_final_flush_incomplete() {
@@ -454,7 +456,14 @@ fn a_modification_time_after_2262_leaves_the_final_flush_incomplete() {
         let fx = Fixture::new();
         let (path, named) = setup(&fx.root);
         set_mtime_secs(&path, FUTURE_SECS);
-        let (reason, error) = fx.incomplete_flush(fx.config());
+        let mut config = fx.config();
+        let reads: Vec<String> = sealant_capture::registrar::MANIFEST_FEATURES
+            .iter()
+            .filter(|f| **f != "wide_times")
+            .map(|f| (*f).to_owned())
+            .collect();
+        config.set_store_features(&reads);
+        let (reason, error) = fx.incomplete_flush(config);
         println!("{named}: {reason}: {error}");
         assert_eq!(reason, "unreadable", "{named}: {error}");
         assert!(error.contains(named), "{named}: {error}");

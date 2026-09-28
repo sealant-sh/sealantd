@@ -341,7 +341,12 @@ pub fn boot_from(
     // holds: captures still ship (crash protection), but no final flush over it is complete or
     // sealed (decision 12; review 2026-09-28, fourth pass, #7).
     config.set_store_features(&plan.manifest_features);
-    if let Some(gap) = config.fidelity_gap() {
+    // And the repository the writers get: a SHA-256 or reftable one — the head's, or the one
+    // already on this disk — needs the store to read `object_format` or `ref_format`. Refused
+    // here, before anything runs, rather than by the final flush after the writers' work
+    // (review 2026-09-28, tenth pass).
+    let head_git = plan.head.as_ref().map(|h| &h.manifest.sections.git);
+    if let Some(gap) = config.admission_gap(head_git, working_directory) {
         // No writer admission without full fidelity (decision 16; review 2026-09-28, fifth
         // pass, #5): every capture over such a store — the periodic ones a hard crash would be
         // picked up from, not only the final one — restores less than the disk held, so no user
@@ -584,24 +589,28 @@ mod tests {
         registrar: &Arc<InMemoryRegistrar>,
         platform: &str,
     ) -> Arc<LocalDir> {
-        capture_source_with(base, registrar, platform, true)
+        capture_source_with(base, registrar, platform, true, &[])
     }
 
     /// [`capture_source`] as Mend registers a base (capture 0): no `.git/config`, so no
     /// configuration of a session's travels in it.
     fn capture_base(base: &Path, registrar: &Arc<InMemoryRegistrar>) -> Arc<LocalDir> {
-        capture_source_with(base, registrar, &default_platform(), false)
+        capture_source_with(base, registrar, &default_platform(), false, &[])
     }
 
+    /// `init` are further `git init` options (`--ref-format=reftable`).
     fn capture_source_with(
         base: &Path,
         registrar: &Arc<InMemoryRegistrar>,
         platform: &str,
         with_config: bool,
+        init: &[&str],
     ) -> Arc<LocalDir> {
         let src = base.join("src");
         std::fs::create_dir_all(src.join("node_modules/pkg")).unwrap();
-        git(&src, &["init", "-q", "-b", "main"]);
+        let mut args = vec!["init", "-q", "-b", "main"];
+        args.extend_from_slice(init);
+        git(&src, &args);
         git(&src, &["config", "user.email", "t@t"]);
         git(&src, &["config", "user.name", "t"]);
         std::fs::write(src.join(".gitignore"), "node_modules/\n").unwrap();
@@ -1486,6 +1495,78 @@ mod tests {
             // Refused before the materialize: the head's files are not on the disk.
             assert!(!disk.join("lib.rs").exists());
             assert!(!disk.join("node_modules").exists());
+        }
+    }
+
+    /// A store that reads every feature a capture always holds, but not the one the repository
+    /// needs — `ref_format` for a reftable repository, `object_format` for a SHA-256 one —
+    /// admits no user code over it either (review 2026-09-28, tenth pass). Before, both were
+    /// left out of the admission gate: the boot materialized the head and admitted writers,
+    /// and only their final flush said incomplete. Refused whether the chain head names the
+    /// format or the repository is already on the disk; a store that reads the feature boots.
+    #[test]
+    fn a_store_that_cannot_hold_the_repository_admits_no_user_code() {
+        for (name, init, feature) in [
+            ("reftable", "--ref-format=reftable", "ref_format"),
+            ("sha256", "--object-format=sha256", "object_format"),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let without: Vec<&str> = sealant_capture::registrar::MANIFEST_FEATURES
+                .iter()
+                .copied()
+                .filter(|f| *f != feature)
+                .collect();
+            // The chain head names the format.
+            let older = Arc::new(
+                InMemoryRegistrar::new("wt-boot", 1, None).with_manifest_features(&without),
+            );
+            let sink: Arc<dyn BlobSink> = capture_source_with(
+                &tmp.path().join("head"),
+                &older,
+                &default_platform(),
+                true,
+                &[init],
+            );
+            let disk = tmp.path().join("head").join("ws");
+            let Err(refused) = boot_from(older, Some(sink), &source(), &disk, tmp.path()) else {
+                panic!("{name}: a boot over a store that cannot hold the repository is refused");
+            };
+            let BootError::StoreUnfit(gap) = &refused else {
+                panic!("{name}: refused for another reason: {refused}");
+            };
+            assert!(gap.contains(feature), "{name}: {gap}");
+            assert!(
+                !disk.join("lib.rs").exists(),
+                "{name}: nothing materialized"
+            );
+            // The repository is already on the disk (an empty chain).
+            let older = Arc::new(
+                InMemoryRegistrar::new("wt-boot", 1, None).with_manifest_features(&without),
+            );
+            let sink: Arc<dyn BlobSink> =
+                Arc::new(LocalDir::new(&tmp.path().join("store")).unwrap());
+            let disk = tmp.path().join("disk");
+            std::fs::create_dir_all(&disk).unwrap();
+            git(&disk, &["init", "-q", "-b", "main", init]);
+            let Err(BootError::StoreUnfit(gap)) =
+                boot_from(older, Some(sink), &source(), &disk, tmp.path())
+            else {
+                panic!("{name}: a boot over the repository on the disk is refused as unfit");
+            };
+            assert!(gap.contains(feature), "{name}: {gap}");
+            // A store that reads the feature boots.
+            let reads = Arc::new(InMemoryRegistrar::new("wt-boot", 1, None));
+            let sink: Arc<dyn BlobSink> = capture_source_with(
+                &tmp.path().join("fit"),
+                &reads,
+                &default_platform(),
+                true,
+                &[init],
+            );
+            let disk = tmp.path().join("fit").join("ws");
+            let boot = boot_from(reads, Some(sink), &source(), &disk, tmp.path()).unwrap();
+            assert!(disk.join("lib.rs").exists(), "{name}");
+            drop(boot);
         }
     }
 

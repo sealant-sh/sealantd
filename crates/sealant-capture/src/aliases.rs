@@ -32,7 +32,7 @@ use crate::longpath;
 /// A stat recorded within this many nanoseconds of a change is not trusted to show the next
 /// one (a write in the same timestamp tick leaves it as it was): the inode is stat'ed as
 /// changed at the next poll, once.
-const RACY_NS: i64 = 2_000_000_000;
+const RACY_NS: i128 = 2_000_000_000;
 
 /// One name of a multi-link regular file, as a snap read it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,10 +88,10 @@ fn slot(class: Class) -> usize {
     usize::from(class == Class::Bulk)
 }
 
-fn now_ns() -> i64 {
+fn now_ns() -> i128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX))
+        .map_or(0, |d| i128::try_from(d.as_nanos()).unwrap_or(i128::MAX))
 }
 
 /// Whether two stats of one inode say the same bytes: a write moves the size, the mtime or the

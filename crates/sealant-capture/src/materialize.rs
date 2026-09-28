@@ -434,7 +434,7 @@ struct ClassWrite<'i> {
     /// (canonical virtual path, member path on disk, mode).
     links: Vec<(String, PathBuf, u32)>,
     /// (directory on disk, mode, mtime).
-    dirs: Vec<(PathBuf, u32, i64)>,
+    dirs: Vec<(PathBuf, u32, i128)>,
 }
 
 fn join_virtual(prefix: &str, name: &str) -> String {
@@ -536,7 +536,7 @@ impl<'a> Materializer<'a> {
         // set last of all, once nothing the restore writes (refs, the index, a child of the
         // class, `info/exclude`, a relinked name) moves them any more (review 2026-09-28,
         // seventh pass, #2). The worktree root (`tree`) is the overlay's.
-        let mut class_roots: Vec<(PathBuf, u32, i64)> = Vec::new();
+        let mut class_roots: Vec<(PathBuf, u32, i128)> = Vec::new();
         // Read before anything is written: a document that does not verify or decode fails
         // the materialize with the disk untouched.
         let meta = match meta {
@@ -1288,7 +1288,7 @@ impl<'a> Materializer<'a> {
 
     /// Restore directory modes and mtimes once nothing writes into them any more. A failure
     /// fails the materialize: a directory left with the wrong mode or mtime is not restored.
-    fn restore_dirs(dirs: &[(PathBuf, u32, i64)]) -> Result<(), MaterializeError> {
+    fn restore_dirs(dirs: &[(PathBuf, u32, i128)]) -> Result<(), MaterializeError> {
         for (path, mode, mtime) in dirs {
             let failed = |what: &str, e: io::Error| MaterializeError::Metadata {
                 path: path.display().to_string(),
@@ -1332,18 +1332,29 @@ fn remove_existing(path: &Path) -> io::Result<()> {
     }
 }
 
-fn set_mtime(f: &File, mtime_ns: i64) -> io::Result<()> {
-    f.set_times(fs::FileTimes::new().set_modified(system_time_from_ns(mtime_ns)))
+fn set_mtime(f: &File, mtime_ns: i128) -> io::Result<()> {
+    let at = system_time_from_ns(mtime_ns).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{mtime_ns} ns since the epoch is past what a file's time holds"),
+        )
+    })?;
+    f.set_times(fs::FileTimes::new().set_modified(at))
 }
 
-/// Convenience: nanoseconds → `SystemTime`, for tests and callers comparing mtimes.
+/// Nanoseconds since the epoch (a recorded time, wide or not) as a `SystemTime`; `None` past
+/// what one holds (signed 64-bit seconds).
 #[must_use]
-pub fn system_time_from_ns(mtime_ns: i64) -> SystemTime {
-    if mtime_ns >= 0 {
-        UNIX_EPOCH + Duration::from_nanos(mtime_ns as u64)
+pub fn system_time_from_ns(mtime_ns: i128) -> Option<SystemTime> {
+    let secs = i64::try_from(mtime_ns.div_euclid(1_000_000_000)).ok()?;
+    let nanos = u32::try_from(mtime_ns.rem_euclid(1_000_000_000)).ok()?;
+    let whole = Duration::from_secs(secs.unsigned_abs());
+    let at = if secs >= 0 {
+        UNIX_EPOCH.checked_add(whole)?
     } else {
-        UNIX_EPOCH - Duration::from_nanos(mtime_ns.unsigned_abs())
-    }
+        UNIX_EPOCH.checked_sub(whole)?
+    };
+    at.checked_add(Duration::from_nanos(u64::from(nanos)))
 }
 
 /// Linking a member onto a canonical file, or sweeping one away, moves the canonical's ctime (its
@@ -1369,7 +1380,7 @@ fn refresh_linked(
     }
 }
 
-fn set_symlink_mtime(path: &Path, mtime_ns: i64) -> Result<(), MaterializeError> {
+fn set_symlink_mtime(path: &Path, mtime_ns: i128) -> Result<(), MaterializeError> {
     worktree_meta::set_mtime_nofollow(path, mtime_ns).map_err(|e| MaterializeError::Metadata {
         path: path.display().to_string(),
         reason: format!("symlink mtime: {e}"),

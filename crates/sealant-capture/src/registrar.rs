@@ -173,7 +173,11 @@
 //! that backend: it initializes it with `git init --ref-format=<ref_format>` and writes the refs,
 //! the symbolic refs and `HEAD` through git (`update-ref`, `symbolic-ref`), never as
 //! `packed-refs` or a `HEAD` file, which that backend does not read. The workspace class carries
-//! the backend's own files (`.git/reftable/`), reflogs included.
+//! the backend's own files (`.git/reftable/`), reflogs included. `wide_times` — a dir entry of
+//! the answered workspace or bulk section, or an entry of its worktree metadata, has an `mtime`
+//! outside signed 64 bits (a modification time before 1677 or after 2262, recorded exactly in
+//! nanoseconds as a JSON integer). A registrar that reads `wide_times` keeps such an `mtime` as
+//! the exact integer it is (never through a double, never clamped) and compares it exactly.
 //!
 //! The executor writes `git_trees` only for a registrar whose answer lists it (else the trees
 //! ride `refs` as pseudo-refs, as before): the git section then names `worktree_tree`,
@@ -188,7 +192,7 @@
 //! ```json
 //! → {"worktree_id":null,"epoch":0,"platform":"linux-x86_64-gnu","manifest_format":2,
 //!    "manifest_features":["worktree_meta","symrefs","other_bulk","raw_names","final_seal","git_trees",
-//!      "object_format","ref_format"]}
+//!      "object_format","ref_format","wide_times"]}
 //! ← 409 {"reason":"manifest-features","message":"…","missing":["final_seal"]}
 //! ```
 //!
@@ -257,7 +261,7 @@ use crate::manifest::{
 
 /// Every manifest feature this build reads, validates and carries on (`plan.get`
 /// `manifest_features`): see the module docs.
-pub const MANIFEST_FEATURES: [&str; 8] = [
+pub const MANIFEST_FEATURES: [&str; 9] = [
     "worktree_meta",
     "symrefs",
     "other_bulk",
@@ -266,6 +270,7 @@ pub const MANIFEST_FEATURES: [&str; 8] = [
     "git_trees",
     "object_format",
     "ref_format",
+    "wide_times",
 ];
 use crate::transport::{ChannelTransport, TransportError};
 
@@ -404,16 +409,18 @@ fn plan_format(manifest: &Manifest) -> u32 {
 
 /// The manifest features `planned` (the head as the executor would restore it; `stored` as
 /// registered) holds that `reads` leaves out, as Mend's `missingManifestFeatures` decides them.
-/// `raw_names` needs the dir objects walked, which this does not do: it is decided only when the
-/// caller says (`raw_names`).
+/// `raw_names` and `wide_times` need the dir objects (and the worktree metadata) walked, which
+/// this does not do: each is decided only when the caller says (`walked`: `raw_names`,
+/// `wide_times`).
 #[must_use]
 pub fn missing_manifest_features(
     stored: &Manifest,
     planned: &Manifest,
     platform: Option<&str>,
     reads: &[String],
-    raw_names: bool,
+    walked: (bool, bool),
 ) -> Vec<String> {
+    let (raw_names, wide_times) = walked;
     let stored_bulk_elsewhere = platform.is_some_and(|platform| {
         stored
             .sections
@@ -439,6 +446,7 @@ pub fn missing_manifest_features(
             planned.sections.git.object_format.is_some(),
         ),
         ("ref_format", planned.sections.git.ref_format.is_some()),
+        ("wide_times", wide_times),
     ]
     .into_iter()
     .filter(|(feature, held)| *held && !reads.iter().any(|r| r == feature))
@@ -1318,7 +1326,7 @@ impl Registrar for InMemoryRegistrar {
                 &planned.manifest,
                 req.platform.as_deref(),
                 req.manifest_features.as_deref().unwrap_or_default(),
-                false,
+                (false, false),
             );
             if !missing.is_empty() {
                 return Err(RegistrarError::Protocol(format!(
@@ -2498,7 +2506,8 @@ mod tests {
                 "final_seal",
                 "git_trees",
                 "object_format",
-                "ref_format"
+                "ref_format",
+                "wide_times"
             ])
         );
         let bare = PlanGetRequest {
@@ -2579,10 +2588,14 @@ mod tests {
     fn manifest_features_are_held_as_mend_decides_them() {
         let none: Vec<String> = Vec::new();
         let plain = manifest(0, None);
-        assert!(missing_manifest_features(&plain, &plain, None, &none, false).is_empty());
+        assert!(missing_manifest_features(&plain, &plain, None, &none, (false, false)).is_empty());
         assert_eq!(
-            missing_manifest_features(&plain, &plain, None, &none, true),
+            missing_manifest_features(&plain, &plain, None, &none, (true, false)),
             vec!["raw_names"]
+        );
+        assert_eq!(
+            missing_manifest_features(&plain, &plain, None, &none, (false, true)),
+            vec!["wide_times"]
         );
         // A ready bulk section of another platform than the request names: the executor must
         // carry it into `other_bulk`.
@@ -2595,24 +2608,38 @@ mod tests {
             dir_packs: vec![],
         });
         assert_eq!(
-            missing_manifest_features(&stored, &plain, Some("linux-x86_64-gnu"), &none, false),
+            missing_manifest_features(
+                &stored,
+                &plain,
+                Some("linux-x86_64-gnu"),
+                &none,
+                (false, false)
+            ),
             vec!["other_bulk"]
         );
         assert!(
-            missing_manifest_features(&stored, &plain, Some("linux-aarch64-gnu"), &none, false)
-                .is_empty()
+            missing_manifest_features(
+                &stored,
+                &plain,
+                Some("linux-aarch64-gnu"),
+                &none,
+                (false, false)
+            )
+            .is_empty()
         );
         // Trees in their own fields: an executor that does not read them would take a user ref
         // for the worktree tree, or restore no tree at all.
         let mut trees = manifest(0, None);
         trees.sections.git.worktree_tree = Some("t".into());
         assert_eq!(
-            missing_manifest_features(&trees, &trees, None, &none, false),
+            missing_manifest_features(&trees, &trees, None, &none, (false, false)),
             vec!["git_trees"]
         );
         let all: Vec<String> = MANIFEST_FEATURES.iter().map(|f| (*f).to_owned()).collect();
-        assert!(missing_manifest_features(&stored, &plain, Some("x"), &all, true).is_empty());
-        assert!(missing_manifest_features(&trees, &trees, None, &all, false).is_empty());
+        assert!(
+            missing_manifest_features(&stored, &plain, Some("x"), &all, (true, true)).is_empty()
+        );
+        assert!(missing_manifest_features(&trees, &trees, None, &all, (false, false)).is_empty());
     }
 
     /// Every key of a prefetch batch travels with its size (not only multipart candidates), so

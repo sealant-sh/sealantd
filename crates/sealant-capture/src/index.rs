@@ -135,46 +135,53 @@ pub fn is_vanished(error: &io::Error) -> bool {
     )
 }
 
-/// Modification time as nanoseconds since the Unix epoch, saturating: what the stat comparisons
-/// that decide whether a file changed use. What a capture records goes through
-/// [`recorded_mtime_ns`], which never saturates.
+/// Modification time as nanoseconds since the Unix epoch, exactly: signed 64-bit seconds and
+/// the nanoseconds within them, which no filesystem time overflows. What the stat comparisons
+/// that decide whether a file changed use, and what a capture records (review 2026-09-28, ninth
+/// pass, #3 and tenth pass: a time past 2262 was recorded as the last nanosecond of 2262, by a
+/// final capture and then by an automatic one, and a restore wrote that false time).
 #[must_use]
-pub fn mtime_ns(meta: &Metadata) -> i64 {
-    meta.mtime()
-        .saturating_mul(1_000_000_000)
-        .saturating_add(meta.mtime_nsec())
+pub fn mtime_ns(meta: &Metadata) -> i128 {
+    i128::from(meta.mtime()) * 1_000_000_000 + i128::from(meta.mtime_nsec())
 }
 
-/// Modification time as nanoseconds since the Unix epoch, exactly, or why a capture cannot record
-/// it: signed 64-bit nanoseconds hold 1677-09-21 to 2262-04-11, and a filesystem holds times
-/// past either end (review 2026-09-28, ninth pass, #3 — one in 2286 was recorded as the last
-/// nanosecond of 2262 and restored so, in a sealed capture). A final snap fails naming the path
-/// (`unreadable`); an automatic one carries the path's bytes with the time saturated.
-pub fn recorded_mtime_ns(meta: &Metadata) -> Result<i64, String> {
-    meta.mtime()
-        .checked_mul(1_000_000_000)
-        .and_then(|ns| ns.checked_add(meta.mtime_nsec()))
-        .ok_or_else(|| {
-            format!(
-                "its modification time ({} s since the epoch) is outside what a capture records \
-                 (1677 to 2262)",
-                meta.mtime()
-            )
-        })
-}
+/// The first and last nanosecond a signed 64-bit count holds: 1677-09-21 to 2262-04-11. A
+/// recorded time outside them is a wide time: written exactly all the same, but read only by
+/// a store that reads the `wide_times` manifest feature (`crate::registrar::MANIFEST_FEATURES`),
+/// and by a restore of this build (one before it refuses the number rather than write another
+/// time).
+pub const NARROW_NS: (i128, i128) = (i64::MIN as i128, i64::MAX as i128);
 
-/// Status-change time as nanoseconds since the Unix epoch.
+/// Whether `ns` is a wide time ([`NARROW_NS`]).
 #[must_use]
-pub fn ctime_ns(meta: &Metadata) -> i64 {
-    meta.ctime()
-        .saturating_mul(1_000_000_000)
-        .saturating_add(meta.ctime_nsec())
+pub fn is_wide_ns(ns: i128) -> bool {
+    ns < NARROW_NS.0 || ns > NARROW_NS.1
 }
 
-fn now_ns() -> i64 {
+/// Why `meta`'s modification time cannot be recorded for a store that does not read
+/// `wide_times` (it is a wide time, [`NARROW_NS`]); `Ok` when it can. A final snap for such a
+/// store fails naming the path (`unreadable`); an automatic one records the time exactly
+/// all the same (a restore of this build writes it back; the store keeps the number).
+pub fn narrow_mtime(meta: &Metadata) -> Result<(), String> {
+    if is_wide_ns(mtime_ns(meta)) {
+        return Err(format!(
+            "its modification time ({} s since the epoch) is outside signed 64-bit nanoseconds              (1677 to 2262), and the store does not read the manifest feature wide_times",
+            meta.mtime()
+        ));
+    }
+    Ok(())
+}
+
+/// Status-change time as nanoseconds since the Unix epoch, exactly ([`mtime_ns`]).
+#[must_use]
+pub fn ctime_ns(meta: &Metadata) -> i128 {
+    i128::from(meta.ctime()) * 1_000_000_000 + i128::from(meta.ctime_nsec())
+}
+
+fn now_ns() -> i128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX))
+        .map_or(0, |d| i128::try_from(d.as_nanos()).unwrap_or(i128::MAX))
 }
 
 /// Stat fields that decide whether a file must be re-read.
@@ -182,8 +189,8 @@ fn now_ns() -> i64 {
 pub struct FileStat {
     /// Size.
     pub size: u64,
-    /// mtime in nanoseconds.
-    pub mtime: i64,
+    /// mtime in nanoseconds ([`mtime_ns`]).
+    pub mtime: i128,
     /// Inode.
     pub ino: u64,
     /// Device.
@@ -191,7 +198,7 @@ pub struct FileStat {
     /// ctime in nanoseconds (0 in an index written before it was recorded, which then never
     /// matches, so such a file is read once more).
     #[serde(default)]
-    pub ctime: i64,
+    pub ctime: i128,
     /// `st_mode` permission bits (what a carried entry is written with).
     #[serde(default)]
     pub mode: u32,
@@ -767,7 +774,8 @@ pub struct TreeBuilder<'a> {
     index: &'a mut TreeIndex,
     key_for_dir: &'a dyn Fn(&str) -> String,
     strict: bool,
-    racy_window_ns: i64,
+    narrow_times: bool,
+    racy_window_ns: i128,
     suspects: Option<&'a mut Suspects>,
     /// Paths read fresh this build whose read was racy.
     racy: HashSet<String>,
@@ -810,7 +818,8 @@ impl<'a> TreeBuilder<'a> {
             index,
             key_for_dir,
             strict: false,
-            racy_window_ns: i64::try_from(RACY_WINDOW.as_nanos()).unwrap_or(i64::MAX),
+            narrow_times: false,
+            racy_window_ns: i128::try_from(RACY_WINDOW.as_nanos()).unwrap_or(i128::MAX),
             suspects: None,
             racy: HashSet::new(),
         }
@@ -824,10 +833,19 @@ impl<'a> TreeBuilder<'a> {
         self
     }
 
+    /// A build for a store that does not read the `wide_times` manifest feature, which must be
+    /// what that store keeps (a final snap's): a wide modification time ([`is_wide_ns`]) is
+    /// unreadable to it, and the build fails naming the path as [`Self::strict`] does.
+    #[must_use]
+    pub fn narrow_times(mut self, narrow: bool) -> Self {
+        self.narrow_times = narrow;
+        self
+    }
+
     /// The racy window (default [`RACY_WINDOW`]); zero trusts every stat.
     #[must_use]
     pub fn racy_window(mut self, window: Duration) -> Self {
-        self.racy_window_ns = i64::try_from(window.as_nanos()).unwrap_or(i64::MAX);
+        self.racy_window_ns = i128::try_from(window.as_nanos()).unwrap_or(i128::MAX);
         self
     }
 
@@ -1001,12 +1019,13 @@ impl<'a> TreeBuilder<'a> {
             .iter()
             .map(|(v, u)| (v.clone(), u.error.clone()))
             .collect();
-        // A modification time the dir objects cannot record (outside signed 64-bit
-        // nanoseconds): a strict build does not hold that path as it is, and says so (review
-        // 2026-09-28, ninth pass, #3). An automatic one carries the bytes, the time saturated.
-        if self.strict {
+        // A wide modification time (outside signed 64-bit nanoseconds) for a store that does
+        // not read `wide_times`: a strict build does not hold that path as the store can keep
+        // it, and says so (review 2026-09-28, ninth pass, #3). Otherwise the dir objects record
+        // it exactly, an automatic build's as a final one's.
+        if self.narrow_times {
             for (v, src) in &listing.entries {
-                if let Err(why) = recorded_mtime_ns(&src.meta) {
+                if let Err(why) = narrow_mtime(&src.meta) {
                     unreadable.push((v.clone(), why));
                 }
             }

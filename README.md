@@ -107,7 +107,20 @@ the protocol details live in `crates/sealant-capture/src/registrar.rs` and `mani
   (`refs/heads/alias -> main`) comes back as that symlink, and the restore writes the ref file it
   reaches loose again so it still resolves (the git section packs every ref). One whose chain
   ends where a restore cannot bring a file back (outside the repository, on no ref the capture
-  holds) makes a final flush `snapshot-failed`. What an operation in progress needs to go on (a pending
+  holds) makes a final flush `snapshot-failed`. Every object a reflog names is packed, whatever
+  its type: a blob, a tree or an annotated tag a ref was moved away from (a notes or custom ref, a
+  tag) was left out, because `git rev-list --reflog` lists commits only, and a sealed capture
+  restored a reflog naming objects the repository did not hold. A nested repository that shares
+  git storage with the top-level one is captured with what it needs: a linked worktree inside the
+  workspace (`git worktree add <workspace>/child`) keeps its administrative directory
+  (`.git/worktrees/<name>`: its `index`, `HEAD`, `ORIG_HEAD`, reflog and per-worktree refs, in the
+  workspace class), and its `HEAD`, refs, reflogs, every index stage and operation state join
+  the top-level closure; a nested repository whose `objects/info/alternates` (or common
+  directory) is the top-level object store gets the objects its own state reaches there packed
+  beside the closure. A nested repository whose git directory, common directory or alternates
+  live outside the workspace cannot come back from a capture of it: a final flush over one is
+  `snapshot-failed`, naming it (an automatic capture ships all the same); one under a bulk
+  directory that borrows the top-level store is refused the same way. What an operation in progress needs to go on (a pending
   pseudo-ref, a todo list's `pick`-like operands, a rebase's `onto`) must resolve to exactly one
   object; one that is missing or ambiguous makes the final flush `snapshot-failed`, never
   complete. The working tree is read from disk past the user's index shortcuts: the scratch
@@ -133,11 +146,14 @@ the protocol details live in `crates/sealant-capture/src/registrar.rs` and `mani
   `worktree_tree`, and `raw_tree` holds the bytes. A restore of a capture without `raw_tree` is
   the one git that smudges. A tree path whose kind on disk is not the tree's (a regular file
   where `core.symlinks=false` kept a symlink's mode) makes a final flush `snapshot-failed`,
-  never a capture that silently leaves its metadata out. A modification time is recorded as
-  signed 64-bit nanoseconds (1677 to 2262); a path whose time is outside that range, in any class
-  and a directory as much as a file, makes a final flush `unreadable`, naming the path — before,
-  the time saturated to the last nanosecond of 2262 and the flush sealed. An automatic capture
-  still carries the path's bytes, its time saturated. A restore of a sealed capture never relinks
+  never a capture that silently leaves its metadata out. A modification time is recorded exactly,
+  as nanoseconds since the epoch (a JSON integer): outside signed 64 bits (before 1677 or after
+  2262) it is a wide time, and every capture — an automatic one as much as a final one, in any
+  class, a directory as much as a file — writes it exactly and a restore writes it back (before,
+  it saturated to the last nanosecond of 2262, and a crash restore wrote that false time). A
+  store keeps a wide time only if it reads the `wide_times` manifest feature: for one that does
+  not, a final flush over a wide time is `unreadable`, naming the path. A restore of an older
+  build refuses the number rather than write another time. A restore of a sealed capture never relinks
   a tracked hardlink group whose names hold different bytes (a workspace overlay can hold newer
   bytes for one of them than the tree): it fails naming the member instead of writing one
   name's bytes over the other's; any other restore leaves the two apart.
@@ -154,7 +170,11 @@ the protocol details live in `crates/sealant-capture/src/registrar.rs` and `mani
   onto such a store is refused the same way, before it touches the disk: `policy-denied`, detail
   `{"reason":"store-unfit","unread":[…]}`. A recovery boot admits no writer and is not refused:
   it ships what the store can take, and its final flush answers `incomplete_reason:
-  "store-fidelity"` and seals nothing, so it exits 75.
+  "store-fidelity"` and seals nothing, so it exits 75. The repository the writers get is part of
+  the gate: a SHA-256 one needs the store to read `object_format`, a reftable one `ref_format`,
+  whether the chain head's git section names the format or the repository is already on the
+  disk (a restart, a standby's base). Before, both were left out of it: the boot admitted
+  writers, and only their final flush said incomplete.
 - **Launch identity.** Core passes `SEALANT_CAPTURE_LAUNCH_ID` (the launch Mend minted and bound
   the session token to) in the boot environment. The first `plan.get` names it as `launch`
   (else the launch the disk last served, on a restart or a recovery boot); a plan answering

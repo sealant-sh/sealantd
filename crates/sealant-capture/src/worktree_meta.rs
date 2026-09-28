@@ -152,8 +152,9 @@ pub struct MetaEntry {
     /// `st_mode & 0o7777`; absent for a symlink (its mode is not settable).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<u32>,
-    /// Modification time, nanoseconds since the Unix epoch.
-    pub mtime: i64,
+    /// Modification time, nanoseconds since the Unix epoch, exactly: outside signed 64 bits for
+    /// a wide time (`wide_times`; [`crate::tree::DirEntry::mtime`]).
+    pub mtime: i128,
 }
 
 /// The class that carries a shared link's other name.
@@ -697,10 +698,10 @@ pub struct Captured {
     /// a capture that must be the disk (a final one) fails on them (review 2026-09-28, eighth
     /// pass, #3).
     pub linked_symlinks: Vec<String>,
-    /// Paths whose modification time the document cannot record exactly (outside signed 64-bit
-    /// nanoseconds; [`crate::index::recorded_mtime_ns`]), with why. Their entries hold the time
-    /// saturated; a capture that must be the disk (a final one) fails on them (review
-    /// 2026-09-28, ninth pass, #3).
+    /// Paths whose modification time is a wide time (outside signed 64-bit nanoseconds;
+    /// [`crate::index::narrow_mtime`]), with why a store that does not read `wide_times`
+    /// cannot keep it. Their entries hold the time exactly; a capture that must be what such a
+    /// store keeps (a final one) fails on them (review 2026-09-28, ninth pass, #3).
     pub unrecordable_times: Vec<UnreadableMeta>,
 }
 
@@ -742,7 +743,7 @@ pub fn capture(
     let mut linked_symlinks = Vec::new();
     let mut unrecordable_times = Vec::new();
     let mut note_time = |path: &str, meta: &Metadata| {
-        if let Err(error) = crate::index::recorded_mtime_ns(meta) {
+        if let Err(error) = crate::index::narrow_mtime(meta) {
             unrecordable_times.push(UnreadableMeta {
                 path: path.to_owned(),
                 error,
@@ -1200,7 +1201,7 @@ fn settle(root: &Path, rel: &[u8], e: &MetaEntry) -> Result<bool, MetaError> {
 /// Set `abs`'s mtime (nanoseconds since the epoch) without following a symlink, so a
 /// symlink gets its own mtime and a file is not opened (its mode may forbid that). A path of
 /// any length ([`longpath::set_mtime_nofollow`]).
-pub fn set_mtime_nofollow(abs: &Path, mtime_ns: i64) -> io::Result<()> {
+pub fn set_mtime_nofollow(abs: &Path, mtime_ns: i128) -> io::Result<()> {
     longpath::set_mtime_nofollow(abs, mtime_ns)
 }
 
@@ -1422,7 +1423,7 @@ mod tests {
     /// ones. `settle_inodes` gives every name the first's, and then there is no conflict.
     #[test]
     fn one_inode_is_promised_one_mode_and_one_mtime() {
-        let with_meta = |path: &str, mode: u32, mtime: i64| MetaEntry {
+        let with_meta = |path: &str, mode: u32, mtime: i128| MetaEntry {
             mode: Some(mode),
             mtime,
             ..file(path)

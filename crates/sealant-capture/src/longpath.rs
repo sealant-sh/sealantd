@@ -444,11 +444,17 @@ pub fn set_mode(path: &Path, mode: u32) -> io::Result<()> {
 
 /// Set `path`'s mtime (nanoseconds since the epoch) without following a symlink, so a symlink
 /// gets its own mtime and a file is not opened (its mode may forbid that).
-pub fn set_mtime_nofollow(path: &Path, mtime_ns: i64) -> io::Result<()> {
-    let mtime = TimeSpec::new(
-        mtime_ns.div_euclid(1_000_000_000),
-        mtime_ns.rem_euclid(1_000_000_000),
-    );
+pub fn set_mtime_nofollow(path: &Path, mtime_ns: i128) -> io::Result<()> {
+    let secs = i64::try_from(mtime_ns.div_euclid(1_000_000_000)).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{mtime_ns} ns since the epoch is past what a file's time holds"),
+        )
+    })?;
+    // Below 10^9: fits every `c_long`.
+    #[allow(clippy::cast_possible_truncation)]
+    let nanos = mtime_ns.rem_euclid(1_000_000_000) as i64;
+    let mtime = TimeSpec::new(secs, nanos);
     let (base, name): (Base, OsString) = if fits(path) {
         (Base::Cwd, path.as_os_str().to_owned())
     } else {

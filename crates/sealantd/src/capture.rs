@@ -426,7 +426,10 @@ impl CaptureRuntime {
             // is refused before it touches the disk, and no harness is started on it.
             let mut assigned = engine.config().clone();
             assigned.set_store_features(&plan.manifest_features);
-            if let Some(gap) = assigned.fidelity_gap() {
+            // The repository the claimed session's writers get included: the head's, and the
+            // one on this disk (review 2026-09-28, tenth pass).
+            let head_git = plan.head.as_ref().map(|h| &h.manifest.sections.git);
+            if let Some(gap) = assigned.admission_gap(head_git, &self.layout.working_directory) {
                 tracing::error!(
                     %gap,
                     worktree = %plan.worktree_id,
@@ -1396,6 +1399,8 @@ mod tests {
     struct LossyAfter {
         inner: Arc<InMemoryRegistrar>,
         lossy: std::sync::atomic::AtomicBool,
+        /// The manifest feature the store stops reading once `lossy`.
+        drops: &'static str,
     }
 
     impl Registrar for LossyAfter {
@@ -1406,7 +1411,7 @@ mod tests {
         {
             let mut plan = self.inner.plan_get(req)?;
             if self.lossy.load(Ordering::SeqCst) {
-                plan.manifest_features.retain(|f| f != "git_trees");
+                plan.manifest_features.retain(|f| f != self.drops);
             }
             Ok(plan)
         }
@@ -1456,10 +1461,28 @@ mod tests {
     /// store every periodic capture of it was lossy for.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_replan_onto_a_store_that_cannot_hold_a_capture_is_refused() {
+        replan_onto_an_unfit_store(&[], "git_trees");
+    }
+
+    /// The repository included (review 2026-09-28, tenth pass): a standby on a reftable base
+    /// re-planned onto a store that does not read `ref_format` is refused the same way, before
+    /// the head is materialized. Before, `ref_format` was left out of the admission gate: the
+    /// re-plan materialized the head and admitted the session's code, and only its final
+    /// flush said incomplete.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_replan_onto_a_store_that_cannot_hold_the_repository_is_refused() {
+        replan_onto_an_unfit_store(&["--ref-format=reftable"], "ref_format");
+    }
+
+    /// A standby booted over a store that reads every feature, re-planned onto one that stops
+    /// reading `drops` (the source repository made with `git init` and `init`): refused.
+    fn replan_onto_an_unfit_store(init: &[&str], drops: &'static str) {
         let tmp = tempfile::tempdir().unwrap();
         let src = tmp.path().join("src");
         std::fs::create_dir_all(&src).unwrap();
-        git(&src, &["init", "-q", "-b", "main"]);
+        let mut args = vec!["init", "-q", "-b", "main"];
+        args.extend_from_slice(init);
+        git(&src, &args);
         git(&src, &["config", "user.email", "t@t"]);
         git(&src, &["config", "user.name", "t"]);
         std::fs::write(src.join("lib.rs"), "pub fn f() {}\n").unwrap();
@@ -1470,6 +1493,7 @@ mod tests {
         let registrar = Arc::new(LossyAfter {
             inner: inner.clone(),
             lossy: std::sync::atomic::AtomicBool::new(false),
+            drops,
         });
         let dyn_registrar: Arc<dyn Registrar> = registrar.clone();
         let mut source = CaptureEngine::open(CaptureConfig::new("wt-real", 1, &src), None).unwrap();
@@ -1535,7 +1559,7 @@ mod tests {
             refused.code(),
             sealant_protocol::ControlErrorCode::PolicyDenied
         );
-        assert!(refused.message.contains("git_trees"), "{refused}");
+        assert!(refused.message.contains(drops), "{refused}");
         assert_eq!(
             refused.detail.as_ref().and_then(|d| d["reason"].as_str()),
             Some("store-unfit")

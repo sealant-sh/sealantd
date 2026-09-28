@@ -131,8 +131,11 @@ pub struct DirEntry {
     pub mode: u32,
     /// Size in bytes (0 for dirs).
     pub size: u64,
-    /// Modification time, nanoseconds since the Unix epoch.
-    pub mtime: i64,
+    /// Modification time, nanoseconds since the Unix epoch, exactly: a JSON integer, outside
+    /// signed 64 bits for a time before 1677 or after 2262 (a wide time, the `wide_times`
+    /// manifest feature; `crate::index::NARROW_NS`). A reader that holds it in 64 bits fails
+    /// on such an entry rather than restore another time.
+    pub mtime: i128,
     /// Content chunks, in order (files only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chunks: Option<Vec<ChunkId>>,
@@ -171,7 +174,7 @@ impl DirEntry {
         name: impl Into<String>,
         mode: u32,
         size: u64,
-        mtime: i64,
+        mtime: i128,
         chunks: Vec<ChunkId>,
     ) -> Self {
         Self {
@@ -197,7 +200,7 @@ impl DirEntry {
     pub fn symlink(
         name: impl Into<String>,
         mode: u32,
-        mtime: i64,
+        mtime: i128,
         target: impl Into<String>,
     ) -> Self {
         let target = target.into();
@@ -224,7 +227,7 @@ impl DirEntry {
     pub fn dir(
         name: impl Into<String>,
         mode: u32,
-        mtime: i64,
+        mtime: i128,
         child_key: impl Into<String>,
     ) -> Self {
         Self {
@@ -251,7 +254,7 @@ impl DirEntry {
         name: impl Into<String>,
         mode: u32,
         size: u64,
-        mtime: i64,
+        mtime: i128,
         canonical: impl Into<String>,
     ) -> Self {
         Self {
