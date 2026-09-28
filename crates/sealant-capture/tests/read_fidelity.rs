@@ -223,6 +223,14 @@ fn unreadable_work_is_carried_and_fails_a_final_capture() {
         b"KEEP",
         "and its last read bytes"
     );
+    // The worktree metadata overlay restores the directory's mode as it was when captured.
+    let sec = out.join("sec");
+    assert_eq!(
+        fs::symlink_metadata(&sec).unwrap().permissions().mode() & 0o7777,
+        0o000,
+        "the directory with its mode now"
+    );
+    fs::set_permissions(&sec, fs::Permissions::from_mode(0o755)).unwrap();
     assert_eq!(
         fs::read(out.join("sec/a.log")).ok().as_deref(),
         Some(&b"ignored inside a dir git will not open\n"[..])
@@ -330,6 +338,9 @@ fn an_unreadable_worktree_directory_is_carried_from_the_previous_capture() {
     let mut engine = worktree_with_dirs(&fx);
     let s = &fx.source;
     let locked = [s.join("un"), s.join("tr")];
+    // What the metadata overlay read of `tr/a` at the first capture; the next one cannot read
+    // it and keeps that entry.
+    let captured_mtime = fs::metadata(s.join("tr/a")).unwrap().modified().unwrap();
     set_mode(&locked, 0o000);
     fs::write(s.join("other"), b"a change elsewhere\n").unwrap();
     let turn = fx.snap(&mut engine, CaptureKind::Turn, Class::Small, 2);
@@ -340,6 +351,18 @@ fn an_unreadable_worktree_directory_is_carried_from_the_previous_capture() {
     assert_eq!(turn.stats.unreadable_paths, vec!["tree/tr", "tree/un"]);
     fx.ship(&engine);
     let out = fx.restore("restored");
+    // The worktree metadata overlay restores both directories with the mode they had.
+    let restored = [out.join("un"), out.join("tr")];
+    for dir in &restored {
+        let mode = fs::symlink_metadata(dir).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o000, "{} with its mode now", dir.display());
+    }
+    set_mode(&restored, 0o755);
+    assert_eq!(
+        fs::metadata(out.join("tr/a")).unwrap().modified().unwrap(),
+        captured_mtime,
+        "the overlay's entry for a path it cannot read is carried, not dropped"
+    );
     assert_eq!(fs::read(out.join("un/u")).unwrap(), b"untracked work\n");
     assert_eq!(fs::read(out.join("un/deep/d")).unwrap(), b"deeper\n");
     assert_eq!(

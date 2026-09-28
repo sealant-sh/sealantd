@@ -206,6 +206,18 @@ impl GitRepo {
             .collect())
     }
 
+    /// Symbolic refs other than `HEAD` (`refs/remotes/origin/HEAD` → `refs/remotes/origin/main`):
+    /// ref name → the ref it points at. [`Self::refs`] lists them too, by the sha they resolve to.
+    pub fn symrefs(&self) -> Result<BTreeMap<String, String>, GitError> {
+        let out = self.run(&["for-each-ref", "--format=%(refname) %(symref)"])?;
+        Ok(stdout_string(&out)
+            .lines()
+            .filter_map(|l| l.split_once(' '))
+            .filter(|(_, target)| !target.is_empty())
+            .map(|(r, t)| (r.to_owned(), t.to_owned()))
+            .collect())
+    }
+
     /// `HEAD` as a ref name (symbolic) or a sha (detached).
     pub fn head(&self) -> Result<String, GitError> {
         let out = git_command(&self.root)
@@ -651,6 +663,8 @@ fn unreadable_in_add(root: &Path, stderr: &str) -> Vec<(String, String)> {
 pub struct Closure {
     /// Refs plus the two pseudo-refs.
     pub refs: BTreeMap<String, String>,
+    /// Symbolic refs other than `HEAD`: name → the ref it points at.
+    pub symrefs: BTreeMap<String, String>,
     /// `HEAD`.
     pub head: String,
     /// Every positive tip: ref values, `HEAD`, reflog entries, index and worktree trees (or the
@@ -684,6 +698,7 @@ pub fn read_closure_carrying(
     carry_from: Option<&str>,
 ) -> Result<Closure, GitError> {
     let mut refs = repo.refs()?;
+    let symrefs = repo.symrefs()?;
     let head = repo.head()?;
     let mut tips: Vec<String> = refs.values().cloned().collect();
     if !head.starts_with("refs/") {
@@ -709,6 +724,7 @@ pub fn read_closure_carrying(
     tips.dedup();
     Ok(Closure {
         refs,
+        symrefs,
         head,
         tips,
         gitlinks,
@@ -955,27 +971,97 @@ pub fn install_pack(
     Ok(true)
 }
 
-/// Write `packed-refs` from `refs`, skipping the pseudo-refs, and remove loose refs that would
-/// shadow it.
-pub fn write_packed_refs(repo: &GitRepo, refs: &BTreeMap<String, String>) -> Result<(), GitError> {
-    let mut text = String::from("# pack-refs with: peeled fully-peeled sorted \n");
+/// Make the repository's refs exactly `refs` (the pseudo-refs skipped) with `symrefs`
+/// symbolic: `packed-refs` is written from the direct ones and every loose ref is removed,
+/// whether the manifest names it or not, so a branch, tag, remote-tracking ref or stash the
+/// disk held beyond the manifest does not survive a materialize; then each symbolic ref is
+/// written loose (`packed-refs` cannot hold one) as `ref: <target>`. Directories under `refs/`
+/// a loose ref leaves empty go too, except `refs/heads` and `refs/tags`, which git expects.
+pub fn write_packed_refs(
+    repo: &GitRepo,
+    refs: &BTreeMap<String, String>,
+    symrefs: &BTreeMap<String, String>,
+) -> Result<(), GitError> {
+    for (name, target) in symrefs {
+        if !is_safe_ref_name(name) || !is_safe_ref_name(target) {
+            return Err(GitError::Command {
+                args: "symbolic-ref".to_owned(),
+                stderr: format!("refusing symbolic ref {name:?} -> {target:?}"),
+            });
+        }
+    }
+    // No `peeled` trait: this file carries no `^<peeled>` lines, and a file that claimed the
+    // trait without them tells git that no ref here is an annotated tag. Git 2.43 and 2.52
+    // believe it: `describe` finds no annotated tag, `show-ref -d` and the refs a fetch is
+    // offered lose `v1^{}`, and 2.52's `for-each-ref %(*objectname)` fails on "bad tag".
+    // Without the trait git peels each tag from its object, on every version.
+    let mut text = String::from("# pack-refs with: sorted \n");
     for (name, sha) in refs {
-        if name.starts_with(PSEUDO_REF_PREFIX) {
+        if name.starts_with(PSEUDO_REF_PREFIX) || symrefs.contains_key(name) {
             continue;
         }
         text.push_str(sha);
         text.push(' ');
         text.push_str(name);
         text.push('\n');
-        let loose = repo.common_dir.join(name);
-        if loose.is_file() {
-            fs::remove_file(loose)?;
-        }
     }
     let path = repo.common_dir.join("packed-refs");
     let tmp = repo.common_dir.join("packed-refs.capture-tmp");
     fs::write(&tmp, text)?;
     fs::rename(tmp, path)?;
+    // After `packed-refs` holds the manifest's refs: a loose ref shadows a packed one, so none
+    // may remain.
+    for dir in [&repo.common_dir, &repo.git_dir] {
+        remove_loose_refs(&dir.join("refs"), 0)?;
+    }
+    for (name, target) in symrefs {
+        let path = repo.common_dir.join(name);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(path, format!("ref: {target}\n"))?;
+    }
+    Ok(())
+}
+
+/// A ref name that is safe to write as a path under the git dir: `refs/…`, components that
+/// are not empty, `.`/`..`-led, or `.lock`, and no control or special characters.
+fn is_safe_ref_name(name: &str) -> bool {
+    name.starts_with("refs/")
+        && name
+            .split('/')
+            .all(|c| !c.is_empty() && !c.starts_with('.') && !c.ends_with(".lock"))
+        && !name.contains("..")
+        && !name
+            .chars()
+            .any(|c| c.is_control() || matches!(c, ' ' | '~' | '^' | ':' | '?' | '*' | '[' | '\\'))
+}
+
+/// Remove every file under `dir` (a `refs/` directory) and the directories that empties, but
+/// `refs/` itself, `refs/heads` and `refs/tags`.
+fn remove_loose_refs(dir: &Path, depth: usize) -> Result<(), GitError> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        if entry.file_type()?.is_dir() {
+            remove_loose_refs(&path, depth + 1)?;
+            let keep = depth == 0 && (entry.file_name() == "heads" || entry.file_name() == "tags");
+            if !keep {
+                match fs::remove_dir(&path) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == io::ErrorKind::DirectoryNotEmpty => {}
+                    Err(e) => return Err(e.into()),
+                }
+            }
+        } else {
+            fs::remove_file(&path)?;
+        }
+    }
     Ok(())
 }
 
@@ -1114,6 +1200,29 @@ fn scratch_index(scratch_dir: &Path) -> Result<PathBuf, GitError> {
     Ok(tmp_index)
 }
 
+/// Every path `tree` names — blobs, symlinks, subtrees and gitlinks — relative to the root.
+/// A name that is not UTF-8 is converted lossily.
+pub fn tree_names(
+    repo: &GitRepo,
+    tree: &str,
+) -> Result<std::collections::BTreeSet<String>, GitError> {
+    let out = repo.run(&[
+        "ls-tree",
+        "-r",
+        "-t",
+        "-z",
+        "--name-only",
+        "--full-tree",
+        tree,
+    ])?;
+    Ok(out
+        .stdout
+        .split(|b| *b == 0)
+        .filter(|p| !p.is_empty())
+        .map(|p| String::from_utf8_lossy(p).into_owned())
+        .collect())
+}
+
 /// Rebuild the real index from `tree` (used when the workspace class carried no index).
 pub fn read_tree_into_index(repo: &GitRepo, tree: &str) -> Result<(), GitError> {
     repo.run(&["read-tree", tree]).map(|_| ())
@@ -1173,7 +1282,7 @@ mod tests {
         let fresh = GitRepo::init(&dir.path().join("fresh")).unwrap();
         let bytes = fs::read(&pack.path).unwrap();
         install_pack(&fresh, &pack.sha256, &bytes, None).unwrap();
-        write_packed_refs(&fresh, &r.closure.refs).unwrap();
+        write_packed_refs(&fresh, &r.closure.refs, &r.closure.symrefs).unwrap();
         write_head(&fresh, &r.closure.head).unwrap();
         checkout_tree(&fresh, &r.closure.refs[WORKTREE_TREE_REF], &scratch).unwrap();
         read_tree_into_index(&fresh, &r.closure.refs[INDEX_TREE_REF]).unwrap();
@@ -1327,5 +1436,61 @@ mod tests {
         let entries = stdout_string(&out);
         assert!(entries.contains("160000 commit"), "{entries}");
         assert!(!entries.contains("vendor/x"), "{entries}");
+    }
+
+    /// An annotated tag restored through `packed-refs` still peels to its commit: the file
+    /// never claims a peel trait it does not carry the `^` lines for (checked on the file
+    /// itself, so it holds whichever git runs it), and git sees the tag as annotated.
+    #[test]
+    fn an_annotated_tag_in_packed_refs_still_peels() {
+        let (dir, repo) = fixture();
+        repo.run(&["tag", "-a", "v1", "-m", "v1"]).unwrap();
+        repo.run(&["tag", "light"]).unwrap();
+        let scratch = dir.path().join("scratch");
+        let r = build_git_pack(&repo, &scratch, &[], &[]).unwrap();
+        let fresh = GitRepo::init(&dir.path().join("fresh")).unwrap();
+        let pack = r.pack.as_ref().unwrap();
+        install_pack(&fresh, &pack.sha256, &fs::read(&pack.path).unwrap(), None).unwrap();
+        write_packed_refs(&fresh, &r.closure.refs, &r.closure.symrefs).unwrap();
+        write_head(&fresh, &r.closure.head).unwrap();
+
+        let text = fs::read_to_string(fresh.common_dir.join("packed-refs")).unwrap();
+        let header = text.lines().next().unwrap_or_default();
+        let claims_peeled = header.starts_with("# pack-refs with:")
+            && header
+                .split_whitespace()
+                .any(|t| t == "peeled" || t == "fully-peeled");
+        let lines: Vec<&str> = text.lines().collect();
+        for (i, line) in lines.iter().enumerate() {
+            let Some((sha, name)) = line.split_once(' ') else {
+                continue;
+            };
+            if line.starts_with('#') || line.starts_with('^') {
+                continue;
+            }
+            let kind = stdout_string(&fresh.run(&["cat-file", "-t", sha]).unwrap());
+            if claims_peeled && kind.trim() == "tag" {
+                let peeled =
+                    stdout_string(&fresh.run(&["rev-parse", &format!("{sha}^{{}}")]).unwrap());
+                assert_eq!(
+                    lines.get(i + 1).copied(),
+                    Some(format!("^{}", peeled.trim()).as_str()),
+                    "{name} is an annotated tag the peel trait leaves unpeeled:\n{text}"
+                );
+            }
+        }
+
+        let peel = |dir: &GitRepo| {
+            stdout_string(
+                &dir.run(&[
+                    "for-each-ref",
+                    "--format=%(refname) %(objectname) %(*objectname)",
+                ])
+                .unwrap(),
+            )
+        };
+        assert_eq!(peel(&fresh), peel(&repo));
+        let describe = |dir: &GitRepo| stdout_string(&dir.run(&["describe", "HEAD"]).unwrap());
+        assert_eq!(describe(&fresh).trim(), "v1");
     }
 }

@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-use crate::chunk::ChunkId;
+use crate::chunk::{Chunk, ChunkId, chunk_bytes, sha256_hex};
 use crate::gitpack::{self, GitError, GitRepo};
 use crate::index::{
     self, BuildStats, ChunkSink, DAEMON_DIR, Listing, Suspects, TreeBuilder, TreeIndex,
@@ -18,7 +18,7 @@ use crate::index::{
 use crate::keys::KeyPrefix;
 use crate::manifest::{
     BulkSection, BulkState, CaptureKind, DirFormat, EncodedManifest, GitSection, Manifest,
-    Sections, WORKTREE_TREE_REF, WorkspaceSection, rfc3339_now,
+    Sections, WORKTREE_META_FORMAT, WORKTREE_TREE_REF, WorkspaceSection, WorktreeMeta, rfc3339_now,
 };
 use crate::materialize::{
     DiskState, MaterializeClass, MaterializeError, MaterializeReport, MaterializeTargets,
@@ -34,6 +34,7 @@ use crate::ship::{
 use crate::sink::BlobSink;
 use crate::tree::EncodedDir;
 use crate::watch::{Invalidations, WatchPolicy};
+use crate::worktree_meta::{self, MetaError, MetaScope};
 
 /// Snap cadence (ADR-0015 *Cadence and budgets*).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -187,6 +188,9 @@ pub enum EngineError {
     /// Materialize.
     #[error(transparent)]
     Materialize(#[from] MaterializeError),
+    /// The worktree metadata overlay.
+    #[error(transparent)]
+    WorktreeMeta(#[from] MetaError),
     /// I/O.
     #[error(transparent)]
     Io(#[from] io::Error),
@@ -516,6 +520,11 @@ pub struct CaptureEngine {
     /// the negatives of the next pack. The manifest only carries refs, so reflog-only history
     /// would otherwise be packed again on every snap.
     last_tips: Vec<String>,
+    /// The worktree metadata overlay the last small snap read, in memory: an automatic snap
+    /// keeps its entry for a tracked path whose metadata it cannot read (git carries the path's
+    /// content). Empty after a restart, when such a path's metadata is left out and the path is
+    /// reported unreadable all the same.
+    last_meta: Option<worktree_meta::MetaDocument>,
     /// The manifest the queued bulk capture was staged on (its parent). A small snap while that
     /// bulk capture's objects upload is staged ahead of it: it takes the bulk capture's place on
     /// the chain with this manifest's bulk section, and the bulk capture moves on top of it. See
@@ -630,6 +639,7 @@ impl CaptureEngine {
             chunks,
             dirs,
             last_tips,
+            last_meta: None,
             below: None,
             invalidations: Arc::new(Invalidations::default()),
             reads: Arc::new(ReadReports::default()),
@@ -784,6 +794,7 @@ impl CaptureEngine {
             self.last_tips.clear();
             self.persist()?;
         }
+        self.last_meta = None;
         self.below = None;
         tracing::info!(
             worktree = worktree_id,
@@ -922,6 +933,79 @@ impl CaptureEngine {
         Ok(self.roots().workspace_listing(repo, gitlinks)?)
     }
 
+    /// What the worktree metadata overlay covers: the working tree minus the daemon's paths,
+    /// the harness home, bulk directories and the nested repositories in `nested`.
+    fn meta_scope(&self, nested: &[String]) -> MetaScope {
+        MetaScope {
+            root: self.config.root.clone(),
+            excludes: self.daemon_excludes(),
+            bulk_dirs: self.config.bulk_dirs.clone(),
+            nested: nested.to_vec(),
+            skip_abs: [
+                Some(self.config.staging_dir()),
+                self.config.harness_home.clone(),
+            ]
+            .into_iter()
+            .flatten()
+            .collect(),
+        }
+    }
+
+    /// The names the workspace class (`listing`, this snap's) and the bulk class (its index,
+    /// each name checked on disk) carry of the tracked files in `outside`, whose inodes have
+    /// names the overlay does not hold.
+    fn shared_links(
+        &self,
+        outside: &[worktree_meta::OutsideLinks],
+        listing: &Listing,
+    ) -> Vec<worktree_meta::SharedLink> {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::MetadataExt;
+        if outside.is_empty() {
+            return Vec::new();
+        }
+        let wanted: HashMap<(u64, u64), &str> = outside
+            .iter()
+            .map(|o| ((o.dev, o.ino), o.path.as_str()))
+            .collect();
+        let link = |path: &str, class, member: &str| worktree_meta::SharedLink {
+            path: path.to_owned(),
+            class,
+            member: member.to_owned(),
+            raw_member: None,
+        };
+        let mut shared = Vec::new();
+        for (v, src) in &listing.entries {
+            if src.meta.is_file()
+                && let Some(path) = wanted.get(&(src.meta.dev(), src.meta.ino()))
+            {
+                shared.push(link(path, worktree_meta::LinkClass::Workspace, v));
+            }
+        }
+        for (v, known) in &self.bulk_index.files {
+            let Some(path) = wanted.get(&(known.stat.dev, known.stat.ino)) else {
+                continue;
+            };
+            // The index is the last bulk snap's; the inode must still be this one.
+            let abs = self
+                .config
+                .root
+                .join(std::ffi::OsStr::from_bytes(&worktree_meta::bytes_of(v)));
+            let on_disk = fs::symlink_metadata(abs).is_ok_and(|m| {
+                m.is_file() && (m.dev(), m.ino()) == (known.stat.dev, known.stat.ino)
+            });
+            if on_disk {
+                shared.push(link(path, worktree_meta::LinkClass::Bulk, v));
+            }
+        }
+        for s in &mut shared {
+            s.raw_member = worktree_meta::raw_of(&s.member);
+        }
+        shared.sort();
+        shared.dedup();
+        shared
+    }
+
     /// The bulk class listing: every bulk directory under the root.
     fn bulk_listing(&self) -> Listing {
         self.roots().bulk_listing()
@@ -939,6 +1023,7 @@ impl CaptureEngine {
         &mut self,
         listing: &Listing,
         class: Class,
+        extra: &[Chunk],
         uploads: &mut Vec<Upload>,
         stats: &mut SnapStats,
         preempt: &dyn Fn() -> bool,
@@ -971,11 +1056,25 @@ impl CaptureEngine {
             cycle: DutyCycle::new(self.config.cpu_fraction),
             preempt: (class == Class::Bulk).then_some(preempt),
         };
-        let built = TreeBuilder::new(&mut work.index, &key_for_dir)
-            .strict(strict)
-            .racy_window(self.config.racy_window)
-            .suspects(&mut work.suspects)
-            .build(listing, &mut sink);
+        // Chunks the section names beside its tree (the worktree metadata overlay) go into the
+        // same packs, deduplicated like a file's.
+        let mut extra_put = Ok(());
+        for chunk in extra {
+            if !sink.contains(&chunk.id)
+                && let Err(e) = sink.put(chunk.id, &chunk.data)
+            {
+                extra_put = Err(e);
+                break;
+            }
+        }
+        let built = match extra_put {
+            Ok(()) => TreeBuilder::new(&mut work.index, &key_for_dir)
+                .strict(strict)
+                .racy_window(self.config.racy_window)
+                .suspects(&mut work.suspects)
+                .build(listing, &mut sink),
+            Err(e) => Err(e),
+        };
         let (mut built, packs) = match built {
             Ok(built) => (built, sink.builder.finish()),
             Err(e) => {
@@ -1055,7 +1154,7 @@ impl CaptureEngine {
         self.chunks.packs.extend(work.chunks);
         uploads.extend(work.packs);
         let mut needed: BTreeSet<String> = BTreeSet::new();
-        for c in &built.chunks {
+        for c in built.chunks.iter().chain(extra.iter().map(|c| &c.id)) {
             if let Some(k) = self.chunks.packs.get(c) {
                 needed.insert(k.clone());
             } else {
@@ -1370,7 +1469,7 @@ impl CaptureEngine {
                     &excludes,
                     carry_from.as_deref(),
                 )?;
-                let git_unreadable: Vec<UnreadablePath> = git
+                let mut git_unreadable: Vec<UnreadablePath> = git
                     .closure
                     .unreadable
                     .iter()
@@ -1405,9 +1504,59 @@ impl CaptureEngine {
                     git_packs.push(key);
                 }
                 let listing = self.workspace_listing(&repo, &git.closure.gitlinks)?;
+                // What the worktree tree does not carry: modes, mtimes, untracked directories,
+                // hardlink groups.
+                let meta_doc = match git.closure.refs.get(WORKTREE_TREE_REF) {
+                    Some(tree) => {
+                        let captured = worktree_meta::capture(
+                            &repo,
+                            tree,
+                            &self.meta_scope(&git.closure.gitlinks),
+                            self.last_meta.as_ref().filter(|_| !strict),
+                        )?;
+                        // Metadata the overlay could not read, under no path git already
+                        // reported (a directory counts once): unreadable, never gone.
+                        let meta_unreadable: Vec<UnreadablePath> = captured
+                            .unreadable
+                            .iter()
+                            .map(|u| UnreadablePath {
+                                path: format!("tree/{}", u.path),
+                                error: u.error.clone(),
+                                carried: u.carried,
+                            })
+                            .filter(|u| {
+                                !git_unreadable.iter().any(|g| {
+                                    u.path == g.path
+                                        || u.path
+                                            .strip_prefix(g.path.as_str())
+                                            .is_some_and(|r| r.starts_with('/'))
+                                })
+                            })
+                            .collect();
+                        git_unreadable = merge_unreadable(git_unreadable, meta_unreadable);
+                        let mut doc = captured.doc;
+                        // A tracked file under a bulk directory is the overlay's own name.
+                        let own: HashSet<&str> =
+                            doc.entries.iter().map(|e| e.path.as_str()).collect();
+                        let shared = self
+                            .shared_links(&captured.outside, &listing)
+                            .into_iter()
+                            .filter(|l| {
+                                l.class != worktree_meta::LinkClass::Bulk
+                                    || !own.contains(l.member.as_str())
+                            })
+                            .collect();
+                        doc.shared = shared;
+                        Some(doc)
+                    }
+                    None => None,
+                };
+                let meta_bytes = meta_doc.as_ref().map(worktree_meta::MetaDocument::encode);
+                let meta_chunks = meta_bytes.as_deref().map(chunk_bytes).unwrap_or_default();
                 let Some(built) = self.build_class(
                     &listing,
                     Class::Small,
+                    &meta_chunks,
                     &mut uploads,
                     &mut stats,
                     preempt,
@@ -1417,22 +1566,50 @@ impl CaptureEngine {
                 else {
                     return Err(io::Error::other("small-class build yielded").into());
                 };
+                let worktree_meta = match meta_bytes {
+                    Some(bytes) => {
+                        let mut packs: Vec<String> = Vec::new();
+                        for c in &meta_chunks {
+                            let key = self.chunks.packs.get(&c.id).ok_or_else(|| {
+                                io::Error::other(format!(
+                                    "worktree metadata chunk {} is in no pack",
+                                    c.id
+                                ))
+                            })?;
+                            if !packs.contains(key) {
+                                packs.push(key.clone());
+                            }
+                        }
+                        packs.sort();
+                        Some(WorktreeMeta {
+                            format: WORKTREE_META_FORMAT,
+                            size: bytes.len() as u64,
+                            sha256: sha256_hex(&bytes),
+                            chunks: meta_chunks.iter().map(|c| c.id).collect(),
+                            packs,
+                        })
+                    }
+                    None => None,
+                };
                 // Only a snap that goes on to stage its git pack makes that pack's tips the next
                 // pack's negatives: a snap that fails here (a final one that cannot read work)
                 // stages nothing, and its tips would leave objects out of every later pack.
                 self.last_tips = git.closure.tips.clone();
+                self.last_meta.clone_from(&meta_doc);
                 Sections {
                     git: GitSection {
                         packs: git_packs,
                         refs: git.closure.refs,
                         head: git.closure.head,
                         fsck: git.fsck,
+                        symrefs: git.closure.symrefs,
                     },
                     workspace: WorkspaceSection {
                         root: built.root,
                         packs: built.packs,
                         format: built.format,
                         dir_packs: built.dir_packs,
+                        worktree_meta,
                     },
                     bulk: self
                         .previous
@@ -1451,6 +1628,7 @@ impl CaptureEngine {
                 let Some(built) = self.build_class(
                     &listing,
                     Class::Bulk,
+                    &[],
                     &mut uploads,
                     &mut stats,
                     preempt,
