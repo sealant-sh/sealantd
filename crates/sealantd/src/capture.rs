@@ -15,7 +15,7 @@ use sealant_capture::{
 };
 use sealant_protocol::{
     CaptureClass, CaptureClassSnaps, CaptureKind, CaptureReplanned, CaptureStaged,
-    CaptureStatusReport, ControlError, LeaseEpochReport, ProcessId, Signal,
+    CaptureStatusReport, ControlError, ControlErrorCode, LeaseEpochReport, ProcessId, Signal,
 };
 
 use crate::boot::capture::{CaptureBoot, SharedMinter, SourceLayout};
@@ -409,6 +409,29 @@ impl CaptureRuntime {
                 .registrar
                 .plan_get(&PlanGetRequest::booting(None))
                 .map_err(|e| internal(&format!("capture plan.get failed: {e}")))?;
+            // No writer admission without full fidelity (decision 16; review 2026-09-28, fifth
+            // pass, #5): a standby claimed onto a store that cannot hold what a capture holds
+            // is refused before it touches the disk, and no harness is started on it.
+            let mut assigned = engine.config().clone();
+            assigned.set_store_features(&plan.manifest_features);
+            if let Some(gap) = assigned.fidelity_gap() {
+                tracing::error!(
+                    %gap,
+                    worktree = %plan.worktree_id,
+                    "capture re-plan refused: the store cannot hold what a capture holds"
+                );
+                return Err(ControlError::new(
+                    ControlErrorCode::PolicyDenied,
+                    format!(
+                        "capture re-plan refused: {gap}; no user code is admitted over this \
+                         store (nothing was materialized)"
+                    ),
+                )
+                .with_detail(serde_json::json!({
+                    "reason": "store-unfit",
+                    "unread": assigned.unread_features,
+                })));
+            }
             let (worktree_id, epoch) = self.identity();
             let same_identity = plan.worktree_id == worktree_id && plan.epoch == epoch;
             let same_head = plan.head.as_ref().map(|h| h.capture_id.as_str())
@@ -1330,6 +1353,163 @@ mod tests {
     /// assigns the standby the real worktree; `capture.replan` fetches the plan, materializes
     /// the head as a delta, takes the identity, and the next capture continues the chain under
     /// `captures/wt-real/1/`. A second `capture.replan` changes nothing.
+    /// A registrar whose `plan.get` stops answering `git_trees` once `lossy` is set: the store
+    /// of the worktree a standby is assigned is one that cannot hold what a capture holds.
+    struct LossyAfter {
+        inner: Arc<InMemoryRegistrar>,
+        lossy: std::sync::atomic::AtomicBool,
+    }
+
+    impl Registrar for LossyAfter {
+        fn plan_get(
+            &self,
+            req: &sealant_capture::registrar::PlanGetRequest,
+        ) -> Result<sealant_capture::registrar::PlanGetResponse, sealant_capture::RegistrarError>
+        {
+            let mut plan = self.inner.plan_get(req)?;
+            if self.lossy.load(Ordering::SeqCst) {
+                plan.manifest_features.retain(|f| f != "git_trees");
+            }
+            Ok(plan)
+        }
+        fn upload_urls(
+            &self,
+            req: &sealant_capture::registrar::UploadUrlsRequest,
+        ) -> Result<sealant_capture::registrar::UploadUrlsResponse, sealant_capture::RegistrarError>
+        {
+            self.inner.upload_urls(req)
+        }
+        fn upload_complete(
+            &self,
+            req: &sealant_capture::registrar::UploadCompleteRequest,
+        ) -> Result<
+            sealant_capture::registrar::UploadCompleteResponse,
+            sealant_capture::RegistrarError,
+        > {
+            self.inner.upload_complete(req)
+        }
+        fn capture_register(
+            &self,
+            req: &sealant_capture::registrar::RegisterRequest,
+        ) -> Result<sealant_capture::registrar::RegisterResponse, sealant_capture::RegistrarError>
+        {
+            self.inner.capture_register(req)
+        }
+        fn lease_heartbeat(
+            &self,
+            req: &sealant_capture::registrar::HeartbeatRequest,
+        ) -> Result<sealant_capture::registrar::HeartbeatResponse, sealant_capture::RegistrarError>
+        {
+            self.inner.lease_heartbeat(req)
+        }
+        fn change_summary(
+            &self,
+            req: &sealant_capture::registrar::ChangeSummaryRequest,
+        ) -> Result<(), sealant_capture::RegistrarError> {
+            self.inner.change_summary(req)
+        }
+    }
+
+    /// No writer admission without full fidelity (decision 16; review 2026-09-28, fifth pass,
+    /// #5), a standby included: a re-plan onto a worktree whose store cannot hold what a
+    /// capture holds is refused before it touches the disk (`policy-denied`, detail reason
+    /// `store-unfit`), and the standby keeps its placeholder identity — no harness is started
+    /// on it. Before, the re-plan materialized the head and admitted the session's code over a
+    /// store every periodic capture of it was lossy for.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_replan_onto_a_store_that_cannot_hold_a_capture_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        git(&src, &["init", "-q", "-b", "main"]);
+        git(&src, &["config", "user.email", "t@t"]);
+        git(&src, &["config", "user.name", "t"]);
+        std::fs::write(src.join("lib.rs"), "pub fn f() {}\n").unwrap();
+        git(&src, &["add", "-A"]);
+        git(&src, &["commit", "-q", "-m", "one"]);
+        let sink: Arc<dyn BlobSink> = Arc::new(LocalDir::new(&tmp.path().join("store")).unwrap());
+        let inner = Arc::new(InMemoryRegistrar::new("wt-real", 1, None));
+        let registrar = Arc::new(LossyAfter {
+            inner: inner.clone(),
+            lossy: std::sync::atomic::AtomicBool::new(false),
+        });
+        let dyn_registrar: Arc<dyn Registrar> = registrar.clone();
+        let mut source = CaptureEngine::open(CaptureConfig::new("wt-real", 1, &src), None).unwrap();
+        let shipper = source.shipper(sink.clone(), dyn_registrar.clone());
+        source
+            .snap(SnapRequest {
+                kind: EngineKind::Checkpoint,
+                class: Class::Small,
+                seq: 1,
+            })
+            .unwrap();
+        shipper.ship_pending().unwrap();
+
+        // A standby boots against the placeholder, whose store reads every feature.
+        inner.set_worktree_id("standby-1");
+        inner.set_live_epoch(7);
+        let ws = tmp.path().join("ws");
+        let boot = boot_from(
+            dyn_registrar.clone(),
+            Some(sink.clone()),
+            &CaptureSourceConfig {
+                endpoint: "http://unused".to_owned(),
+                worktree_id: None,
+                harness_home: None,
+                raise_inotify_limit: false,
+                allow_plaintext: false,
+                ca_pem: None,
+                ca_file: None,
+                object_ca_pem: None,
+                object_ca_file: None,
+                recovery: false,
+                launch_id: None,
+            },
+            &ws,
+            tmp.path(),
+        )
+        .unwrap();
+        let mut config = RuntimeConfig::new(new_runtime_id());
+        config.workspace_root = ws.clone();
+        let runtime = Runtime::new(config, Arc::new(ShutdownSignal::new(5_000)));
+        runtime.mark_healthy();
+        let capture = CaptureRuntime::new(boot);
+        assert!(runtime.install_capture(capture.clone()));
+
+        // The worktree it is assigned moved on, and its store cannot hold what a capture holds.
+        inner.set_worktree_id("wt-real");
+        inner.set_live_epoch(1);
+        std::fs::write(src.join("lib.rs"), "pub fn f() { g() }\n").unwrap();
+        source
+            .snap(SnapRequest {
+                kind: EngineKind::Checkpoint,
+                class: Class::Small,
+                seq: 2,
+            })
+            .unwrap();
+        shipper.ship_pending().unwrap();
+        registrar
+            .lossy
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let refused = capture.replan().expect_err("refused");
+        assert_eq!(
+            refused.code(),
+            sealant_protocol::ControlErrorCode::PolicyDenied
+        );
+        assert!(refused.message.contains("git_trees"), "{refused}");
+        assert_eq!(
+            refused.detail.as_ref().and_then(|d| d["reason"].as_str()),
+            Some("store-unfit")
+        );
+        // Nothing was materialized, and the standby is still the placeholder's.
+        assert_eq!(
+            std::fs::read_to_string(ws.join("lib.rs")).unwrap(),
+            "pub fn f() {}\n"
+        );
+        assert_eq!(capture.lease_epoch().worktree_id, "standby-1");
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn replan_moves_a_standby_onto_its_worktree() {
         let tmp = tempfile::tempdir().unwrap();

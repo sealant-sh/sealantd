@@ -61,6 +61,15 @@ pub enum BootError {
     /// ([`crate::boot::capture::never_materialized`]): nothing to save, and nothing was touched.
     #[error("nothing to save: never materialized ({0})")]
     NeverMaterialized(String),
+
+    /// The capture store cannot hold what a capture holds (it does not read every manifest
+    /// feature this daemon writes): no user code is admitted over it
+    /// ([`crate::runtime::EXIT_STORE_UNFIT`]). Nothing was materialized and nothing ran.
+    #[error(
+        "refused: {0}; no user code is admitted over this store (nothing was materialized, \
+         nothing ran, nothing is saved)"
+    )]
+    StoreUnfit(String),
 }
 
 impl BootError {

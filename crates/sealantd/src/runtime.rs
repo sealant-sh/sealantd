@@ -53,6 +53,18 @@ pub const EXIT_CAPTURE_INCOMPLETE: u8 = 75;
 /// [`EXIT_CAPTURE_INCOMPLETE`].
 pub const EXIT_NOTHING_TO_SAVE: u8 = 76;
 
+/// The exit code of a boot refused because its capture store cannot hold what a capture holds
+/// (`EX_CONFIG`, 78): the registrar's `plan.get` does not list every manifest feature this
+/// daemon writes (`git_trees`, `raw_names`, …), so every capture over it — the periodic ones a
+/// hard crash is picked up from as much as the final one — would restore less than the disk
+/// held (decision 16; review 2026-09-28, fifth pass, #5). Refused right after `plan.get`, before
+/// the materialize: nothing on the disk was written by this boot, no dotfiles, lifecycle step,
+/// harness, exec or session ran, and nothing is saved. A disk that already held work (a daemon
+/// restarting on its own staging) still holds it, untouched: the platform keeps it as for any
+/// exit it does not know to be complete. A recovery boot is never refused for this (it admits
+/// no writer); its final flush says incomplete and it exits [`EXIT_CAPTURE_INCOMPLETE`].
+pub const EXIT_STORE_UNFIT: u8 = 78;
+
 /// Collect the values captured I/O must redact (plan §18): the values of secret-looking env vars
 /// plus every launcher-provided secret literal, whatever its name.
 fn secret_env_values(config: &RuntimeConfig) -> Vec<String> {

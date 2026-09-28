@@ -93,28 +93,44 @@ pub fn run_boot(log_level: &str, recovery: bool) -> ExitCode {
         Err(error) => {
             tracing::error!(%error, "boot preparation failed");
             eprintln!("sealantd boot: {error}");
-            // A recovery boot on a disk that was never materialized: verified empty, nothing
-            // to save (76), which the platform may release. Never a clean 0: nothing was saved
-            // either.
-            if let BootError::NeverMaterialized(_) = error {
-                tracing::warn!(
-                    outcome = "never-materialized",
-                    exit_code = crate::runtime::EXIT_NOTHING_TO_SAVE,
-                    "recovery: nothing to save: never materialized"
-                );
-                return ExitCode::from(crate::runtime::EXIT_NOTHING_TO_SAVE);
-            }
-            // A recovery boot that could not start has not saved what the disk holds: it is
-            // still unsaved work, never a clean exit. Nor has a capture boot refused beside a
-            // daemon still running on its disk: that disk is the other daemon's to save.
-            if config.recovery || matches!(error, BootError::DiskInUse(_)) {
-                return ExitCode::from(crate::runtime::EXIT_CAPTURE_INCOMPLETE);
-            }
-            return ExitCode::FAILURE;
+            return ExitCode::from(prepare_exit_code(&error, config.recovery));
         }
     };
 
     run_supervised(config, secret_env, capture_boot)
+}
+
+/// The exit code of a boot whose preparation failed with `error`.
+fn prepare_exit_code(error: &BootError, recovery: bool) -> u8 {
+    match error {
+        // A recovery boot on a disk that was never materialized: verified empty, nothing to
+        // save (76), which the platform may release. Never a clean 0: nothing was saved either.
+        BootError::NeverMaterialized(_) => {
+            tracing::warn!(
+                outcome = "never-materialized",
+                exit_code = crate::runtime::EXIT_NOTHING_TO_SAVE,
+                "recovery: nothing to save: never materialized"
+            );
+            crate::runtime::EXIT_NOTHING_TO_SAVE
+        }
+        // A store that cannot hold what a capture holds: refused before the materialize, no
+        // user code ran, nothing is saved — its own code, so the platform can say why.
+        BootError::StoreUnfit(_) => {
+            tracing::error!(
+                outcome = "store-unfit",
+                exit_code = crate::runtime::EXIT_STORE_UNFIT,
+                "capture boot refused: the store cannot hold what a capture holds"
+            );
+            crate::runtime::EXIT_STORE_UNFIT
+        }
+        // A recovery boot that could not start has not saved what the disk holds: it is still
+        // unsaved work, never a clean exit. Nor has a capture boot refused beside a daemon
+        // still running on its disk: that disk is the other daemon's to save.
+        _ if recovery || matches!(error, BootError::DiskInUse(_)) => {
+            crate::runtime::EXIT_CAPTURE_INCOMPLETE
+        }
+        _ => 1,
+    }
 }
 
 fn init_tracing(log_level: &str) {
@@ -970,6 +986,35 @@ async fn shutdown_before_control(runtime: &Arc<Runtime>, code: ExitCode) -> Exit
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A boot refused because its store cannot hold what a capture holds exits with its own
+    /// code (78), never the 75 of unsaved work nor a bare failure: nothing ran, nothing is saved
+    /// (review 2026-09-28, fifth pass, #5). The other preparation failures keep their codes.
+    #[test]
+    fn a_store_that_cannot_hold_a_capture_exits_78() {
+        let unfit = BootError::StoreUnfit("the store does not read git_trees".to_owned());
+        assert_eq!(
+            prepare_exit_code(&unfit, false),
+            crate::runtime::EXIT_STORE_UNFIT
+        );
+        assert_eq!(crate::runtime::EXIT_STORE_UNFIT, 78);
+        let never = BootError::NeverMaterialized("/ws".to_owned());
+        assert_eq!(
+            prepare_exit_code(&never, true),
+            crate::runtime::EXIT_NOTHING_TO_SAVE
+        );
+        let busy = BootError::DiskInUse("held".to_owned());
+        assert_eq!(
+            prepare_exit_code(&busy, false),
+            crate::runtime::EXIT_CAPTURE_INCOMPLETE
+        );
+        let other = BootError::config("bad");
+        assert_eq!(
+            prepare_exit_code(&other, true),
+            crate::runtime::EXIT_CAPTURE_INCOMPLETE
+        );
+        assert_eq!(prepare_exit_code(&other, false), 1);
+    }
     use config::MapEnv;
 
     fn boot_config(pairs: &[(&str, &str)]) -> BootConfig {

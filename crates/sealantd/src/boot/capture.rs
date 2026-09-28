@@ -341,12 +341,27 @@ pub fn boot_from(
     // holds: captures still ship (crash protection), but no final flush over it is complete or
     // sealed (decision 12; review 2026-09-28, fourth pass, #7).
     config.set_store_features(&plan.manifest_features);
-    if !config.unread_features.is_empty() {
+    if let Some(gap) = config.fidelity_gap() {
+        // No writer admission without full fidelity (decision 16; review 2026-09-28, fifth
+        // pass, #5): every capture over such a store — the periodic ones a hard crash would be
+        // picked up from, not only the final one — restores less than the disk held, so no user
+        // code may write here. Refused before the disk is touched: nothing is materialized, no
+        // dotfiles, lifecycle step or harness runs. A recovery boot admits no writer at all: it
+        // ships what the store can take, and its final flush says incomplete (the executor is
+        // kept until a registrar that reads every feature saves it).
+        if !source.recovery {
+            tracing::error!(
+                %gap,
+                unread = %config.unread_features.join(", "),
+                "the registrar cannot hold what a capture holds; refusing to admit user code"
+            );
+            return Err(BootError::StoreUnfit(gap));
+        }
         tracing::error!(
+            %gap,
             unread = %config.unread_features.join(", "),
-            "the registrar does not read every manifest feature this daemon writes: what it \
-             would restore is less than a capture holds, so no final flush will say complete \
-             (the executor is kept until a registrar that reads them saves it)"
+            "recovery over a registrar that cannot hold what a capture holds: what ships is the \
+             most it can take, and no final flush will say complete"
         );
     }
     config.watch.raise_limit = source.raise_inotify_limit;
@@ -1406,11 +1421,16 @@ mod tests {
         assert_eq!(boot.engine.config().executor.as_deref(), Some("launch-7"));
     }
 
-    /// The git section's trees go in their own fields (`git_trees`) only for a registrar whose
-    /// plan lists that feature; for one that does not, they ride `refs` as before (an older
-    /// Mend reads the worktree tree only there).
+    /// The git section's trees go in their own fields (`git_trees`) for a registrar whose plan
+    /// lists that feature. A registrar that does not read every feature this daemon writes
+    /// cannot hold what a capture holds — a trees-less one normalizes attribute-converted
+    /// bytes and takes a user ref named like its pseudo-ref, in every periodic capture a hard
+    /// crash would be picked up from — so no user code is admitted over it (decision 16;
+    /// review 2026-09-28, fifth pass, #5): the boot is refused right after `plan.get`, before
+    /// the head is materialized, naming what the store leaves out. Before, it booted, ran
+    /// user code and captured it lossily until a final flush said `store-fidelity`.
     #[test]
-    fn git_trees_are_written_only_for_a_registrar_that_reads_them() {
+    fn a_store_that_cannot_hold_a_capture_admits_no_user_code() {
         let tmp = tempfile::tempdir().unwrap();
         let reads = Arc::new(InMemoryRegistrar::new("wt-boot", 1, None));
         let sink: Arc<dyn BlobSink> = capture_source(tmp.path(), &reads);
@@ -1423,7 +1443,57 @@ mod tests {
         )
         .unwrap();
         assert!(boot.engine.config().git_trees);
+        assert!(boot.engine.fidelity_gap().is_none());
         drop(boot);
+        for (name, features, unread) in [
+            (
+                "b",
+                &[
+                    "worktree_meta",
+                    "symrefs",
+                    "other_bulk",
+                    "raw_names",
+                    "final_seal",
+                ][..],
+                "git_trees",
+            ),
+            (
+                "c",
+                &[
+                    "worktree_meta",
+                    "symrefs",
+                    "other_bulk",
+                    "final_seal",
+                    "git_trees",
+                ][..],
+                "raw_names",
+            ),
+        ] {
+            let older = Arc::new(
+                InMemoryRegistrar::new("wt-boot", 1, None).with_manifest_features(features),
+            );
+            let sink: Arc<dyn BlobSink> = capture_source(&tmp.path().join(name), &older);
+            let disk = tmp.path().join(name).join("ws");
+            let Err(refused) = boot_from(older, Some(sink), &source(), &disk, tmp.path()) else {
+                panic!("a boot over a store that cannot hold a capture is refused");
+            };
+            let BootError::StoreUnfit(gap) = &refused else {
+                panic!("refused for another reason: {refused}");
+            };
+            assert!(gap.contains(unread), "{gap}");
+            assert!(refused.to_string().contains("nothing ran"), "{refused}");
+            // Refused before the materialize: the head's files are not on the disk.
+            assert!(!disk.join("lib.rs").exists());
+            assert!(!disk.join("node_modules").exists());
+        }
+    }
+
+    /// A recovery boot admits no writer, so a store that cannot hold what a capture holds does
+    /// not refuse it: it resumes the disk and ships what the store can take, and its final
+    /// flush never says complete (the executor is kept).
+    #[test]
+    fn a_recovery_boot_over_a_store_that_cannot_hold_a_capture_resumes() {
+        let tmp = tempfile::tempdir().unwrap();
         let older = Arc::new(
             InMemoryRegistrar::new("wt-boot", 1, None).with_manifest_features(&[
                 "worktree_meta",
@@ -1433,45 +1503,21 @@ mod tests {
                 "final_seal",
             ]),
         );
-        let sink: Arc<dyn BlobSink> = capture_source(&tmp.path().join("b"), &older);
-        let boot = boot_from(
-            older,
-            Some(sink),
-            &source(),
-            &tmp.path().join("b/ws"),
-            tmp.path(),
-        )
-        .unwrap();
+        let disk = tmp.path().join("ws");
+        std::fs::create_dir_all(&disk).unwrap();
+        git(&disk, &["init", "-q", "-b", "main"]);
+        let sink: Arc<dyn BlobSink> = Arc::new(LocalDir::new(&tmp.path().join("store")).unwrap());
+        let recovery = CaptureSourceConfig {
+            recovery: true,
+            ..source()
+        };
+        let boot = boot_from(older, Some(sink), &recovery, &disk, tmp.path()).unwrap();
         assert!(!boot.engine.config().git_trees);
-        // Such a store cannot hold what a capture holds: no final flush over it is complete
-        // (review 2026-09-28, fourth pass, #7). Every feature it leaves out counts.
         assert!(
             boot.engine
                 .fidelity_gap()
                 .is_some_and(|gap| gap.contains("git_trees"))
         );
-        drop(boot);
-        let no_raw_names = Arc::new(
-            InMemoryRegistrar::new("wt-boot", 1, None).with_manifest_features(&[
-                "worktree_meta",
-                "symrefs",
-                "other_bulk",
-                "final_seal",
-                "git_trees",
-            ]),
-        );
-        let sink: Arc<dyn BlobSink> = capture_source(&tmp.path().join("c"), &no_raw_names);
-        let boot = boot_from(
-            no_raw_names,
-            Some(sink),
-            &source(),
-            &tmp.path().join("c/ws"),
-            tmp.path(),
-        )
-        .unwrap();
-        assert!(boot.engine.config().git_trees);
-        assert_eq!(boot.engine.config().unread_features, ["raw_names"]);
-        assert!(boot.engine.fidelity_gap().is_some());
     }
 
     /// While another launch holds the worktree, `plan.get` answers 409 `worktree-leased` and
