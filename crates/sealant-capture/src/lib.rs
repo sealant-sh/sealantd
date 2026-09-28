@@ -29,8 +29,8 @@ pub mod watch;
 
 pub use cadence::{CadenceRunner, CadenceSnapshot, FinalFlush, Incomplete};
 pub use engine::{
-    Cadence, CaptureConfig, CaptureEngine, Class, EngineError, SnapOutcome, SnapRequest, SnapStats,
-    StagedCapture,
+    Cadence, CaptureConfig, CaptureEngine, Class, EngineError, ReadReport, ReadReports,
+    SnapOutcome, SnapRequest, SnapStats, StagedCapture, UNREADABLE_PATHS_CAP,
 };
 pub use manifest::{CaptureKind, EncodedManifest, FsckStatus, Manifest};
 pub use materialize::{

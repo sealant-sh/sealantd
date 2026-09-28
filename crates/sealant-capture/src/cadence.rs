@@ -632,6 +632,7 @@ impl CadenceRunner {
                 bulk_dirs: config.bulk_dirs.clone(),
                 capture_bulk: config.capture_bulk,
                 policy: config.watch.clone(),
+                invalidations: Some(engine.invalidations()),
             }
         };
         let weak: Weak<Shared> = Arc::downgrade(&self.shared);

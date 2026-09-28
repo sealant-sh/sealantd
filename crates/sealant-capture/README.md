@@ -32,7 +32,7 @@ ignored path makes `git add` exit 1).
 ## Materialize is a delta (`materialize.rs`, `roots.rs`)
 
 `Materializer::materialize` brings the disk to a manifest rather than writing it out: a file
-whose `(size, mtime, inode)` and chunk list in the `DiskState` index (the engine's
+whose stat key (see "What a snap reads") and chunk list in the `DiskState` index (the engine's
 `workspace.json` / `bulk.json` under `.sealantd/capture/index/`, written by the materializer
 for every file it lays down) match the plan entry is skipped, a symlink with the same text and
 a hardlink member already on the canonical inode likewise; git packs already installed are not
@@ -289,8 +289,9 @@ restore, byte for byte, so the user never notices the compute changed.
   3. the small class and, forced, the bulk class are snapped (`CadenceRunner::flush_final`),
      both as `final` snaps —
      whatever the bulk clocks say; a scheduled bulk build in progress yields to it at its next
-     chunk boundary and the forced snap resumes its progress, re-reading only files whose size,
-     mtime or inode moved;
+     chunk boundary and the forced snap resumes its progress, re-reading only files whose stat
+     key moved or whose last read was racy (see "What a snap reads"); a file or directory it
+     cannot read fails the snap (`EngineError::unreadable()`), it never becomes a deletion;
   4. everything ships, bulk included (`Shipper::flush_final`).
 
   The daemon used to snap first and terminate after, so what an agent wrote during the upload,
@@ -374,7 +375,106 @@ background and answering `complete` when asked again without a second quiesce;
 `crates/sealantd/src/boot/capture.rs` another platform's dependency tree carried through an
 executor's captures and restored on its own platform byte for byte.
 
+## What a snap reads (`index.rs`, `roots.rs`, `watch.rs`)
+
+A capture holds what is on disk, and says so when it cannot.
+
+- **Nothing is excluded by name but git's own transients.** Outside the daemon's paths and the
+  harness credential files, every regular file, directory and symlink under a class root is
+  captured whatever it is called: an ignored `Cargo.lock`, `tmp/pids/server.pid`, a SQLite
+  `-shm` (SQLite rebuilds a stale one when the first connection opens the database), a `.pack`
+  without an `.idx`. Only inside a git directory (a `.git` component; the workspace class mounts
+  the repository's git dir at `.git/`) are `*.lock`, `gc.pid`, `objects/**/tmp_*`,
+  `objects/**/incoming-*` and a `.pack` without its `.idx` left out (`index::is_git_transient`):
+  each is git's half-written state, made real by a rename the next snap sees, and a restored
+  `index.lock` would make every git command in the workspace fail. Sockets, fifos and devices
+  are not file content.
+- **Local git-lfs objects are captured.** `.git/lfs/` rides in the workspace class (restored to
+  `<root>/.git/lfs/`), so an object never pushed survives a replacement. The watcher does not
+  descend into it (its sharded object directories would spend the watch budget); git-lfs writes a
+  local object while `git add` writes the index, a watched change, and the snap it triggers walks
+  `lfs/`, as does every forced snap.
+- **Unreadable is not deleted.** The walk tells a path that vanished (`ENOENT`, `ENOTDIR`,
+  `EISDIR`: removed, left out) from one that is there and cannot be listed, stat'ed or read
+  (permission denied, an I/O error). A directory `git ls-files` could not open counts too (its
+  ignored files are unknown). A `final` snap with anything unreadable fails with
+  `index::UnreadableWork` naming every such path (`EngineError::unreadable`), so the flush is not
+  complete. Any other snap carries each unreadable path's last read content from the index
+  (content, size, mtime; the mode it has now), marks the entry `unread: true` (and a directory it
+  could not list, which then holds what the last reads under it found), and logs a warning; a
+  path never read before has nothing to carry and is left out of that automatic snap. The git
+  class holds the same rule: `git add -A` skips a directory it cannot open with only a warning (an
+  untracked one dropped out of the worktree tree; a tracked one fell back to the index's blobs,
+  not the edit the last capture held), so the engine runs it with `LC_ALL=C`, reads the paths off
+  its warnings, keeps those the filesystem confirms are unreadable
+  (`gitpack::WorktreeTree::unreadable`), and an automatic snap gives each the previous capture's
+  worktree-tree entry in the throwaway index (`GitRepo::worktree_tree_carrying`) while a `final`
+  snap fails naming it (`tree/<path>`). A snap that fails after packing no longer makes its git
+  tips the next pack's negatives (they once left the next capture's new objects out of every
+  pack). Each snap's `SnapStats` counts `unreadable` paths, the `carried` ones and names the
+  first 20 (`unreadable_paths`); `capture.status` reports the same for the last snap of each
+  class (see "Unreadable paths on `capture.status`"). A SQLite
+  `-wal` that vanishes mid-read no longer takes its database with it, and a hardlink group whose
+  first member vanished is carried by the next one.
+- **A file is read again unless its stat key says otherwise.** The key is size, mtime, ctime
+  (nanoseconds), inode, device and mode. ctime cannot be set from user space, so a same-size
+  overwrite that puts the mtime back is still seen (it used to be reported `unchanged`). A read
+  whose file's ctime lies within `CaptureConfig::racy_window` (2 s, `index::RACY_WINDOW`) of the
+  start of the read is racy: a write in the same timestamp tick would leave the stat unchanged,
+  so the next build reads the file again (git's "racily clean" rule). And a path the watcher saw
+  written or created since the last build of its class (`watch::Invalidations`, fed through
+  `WatchSpec::invalidations`) is read again whatever its stat says. An index written before the
+  key grew has no ctime and is read once more.
+- **Names are bytes.** A name or symlink text that is not UTF-8 keeps its bytes (see "Dir
+  entries: `raw_name`, `raw_target`, `unread`"); two names a lossy conversion would merge stay two
+  files. `git ls-files -z` output is taken as bytes too.
+
+`tests/read_fidelity.rs` holds each of these end to end (snap, ship, fresh materialize, compare
+bytes); `index.rs`, `tree.rs` and `watch.rs` unit tests hold the pieces.
+
 ## Wire additions
+
+### Unreadable paths on `capture.status`
+
+`CaptureStatusReport` gains `optional uint64 unreadable = 17`, `optional uint64 carried = 18` and
+`repeated string unreadable_paths = 19` (fields 15 and 16 are the final-flush report's
+`complete` and `incomplete_reason`). `unreadable` is the number of paths the last snap of each
+class could not read, summed over both (a directory counts once); `carried` how many of them had
+their last captured content carried forward; `unreadable_paths` the first 20, virtual
+(`tree/<path>` under the worktree, `.git/<path>`, `harness/<path>`), small class first. An older
+daemon sends none of them. A client can show `2 paths unreadable · carried` and name them; after
+a failed `final` snap they name what it could not read (`carried` 0).
+
+### Dir entries: `raw_name`, `raw_target`, `unread`
+
+Three optional dir-entry fields, written only when they apply, so every dir object that has none
+of them encodes byte for byte as before (same digest, same section `format`; no bump). A reader
+that predates them ignores them and keeps working, as Mend's `captures.ts` schema does (Effect
+`Schema.Struct` ignores excess keys).
+
+- `name` is a *key*: the name's bytes as UTF-8 when they are UTF-8 and hold no character in
+  `U+10FF80..=U+10FFFF`; otherwise every byte of an invalid sequence, and every byte of such a
+  character, becomes the character `U+10FF00 + byte` (all ≥ `0x80`). The mapping is a
+  bijection (`tree::key_of` / `tree::bytes_of`). When the key was escaped, `raw_name` carries the
+  name's bytes as lowercase hex, e.g. `{"name":"caf\u{10FFE9}","raw_name":"636166e9",…}` for
+  `caf\xe9`.
+- `raw_target`: the same for a symlink's `target` (its text, hex). A `hardlink-group` entry's
+  `target` is a virtual path of keys and carries no `raw_target`: decode it with the rule above,
+  or resolve it component by component through the entries' `name`s.
+- `unread: true`: the entry could not be read at this snap and holds what the last read found
+  (a file: its chunks, size, mtime), or is a directory that could not be listed. Only an
+  automatic capture carries it; a `final` capture with unreadable work fails instead.
+
+What Mend's reader (`packages/store/src/captures.ts`) needs: add
+`raw_name: Schema.optionalKey(Schema.String)`, `raw_target: Schema.optionalKey(Schema.String)`
+and `unread: Schema.optionalKey(Schema.Boolean)` to `DirEntry`; write a file, directory or
+symlink at `Buffer.from(raw_name, "hex")` when present (refusing one that is empty, `.`, `..`,
+or holds `/` or NUL, as sealantd does) and at `name` otherwise; create a symlink with
+`Buffer.from(raw_target, "hex")` when present; decode a hardlink `target` by mapping each
+character in `U+10FF80..=U+10FFFF` to the byte `codePoint - 0x10FF00` (Node's `fs` takes a
+`Buffer` path); and surface `unread` (a capture holding one is partial for that path, like
+`torn`). Until then such a name restores as its escaped key, as it restored lossily before.
+
 
 ### `manifest_format` on `plan.get`
 
@@ -585,6 +685,12 @@ A launcher that reaches the channel over plain HTTP on a private network (Docker
 Mend installs today) must now say so, or boot refuses.
 
 ## Deviations from ADR-0015 pending amendment
+
+- §"Snap rules", Excluded always: `*.lock`, `gc.pid`, `objects/tmp_*` and `objects/incoming-*`
+  are excluded only inside a git directory; SQLite `-shm` and pid files are captured; `.git/lfs`
+  is captured (see "What a snap reads"). A path that cannot be read fails a `final` snap and is
+  carried, marked `unread`, by any other. Change detection is by size, mtime, ctime, inode,
+  device and mode, plus the racy window and the watcher's written paths.
 
 - §"Capture format", Keys and Dir objects: dir objects travel in dir packs (the CDC pack
   container, `…/packs/<sha256>`) listed in a section's `dir_packs`, and name their children by

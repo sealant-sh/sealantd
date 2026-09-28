@@ -11,11 +11,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::chunk::ChunkId;
 use crate::gitpack::{self, GitError, GitRepo};
-use crate::index::{self, BuildStats, ChunkSink, DAEMON_DIR, Listing, TreeBuilder, TreeIndex};
+use crate::index::{
+    self, BuildStats, ChunkSink, DAEMON_DIR, Listing, Suspects, TreeBuilder, TreeIndex,
+    UnreadablePath, UnreadableWork,
+};
 use crate::keys::KeyPrefix;
 use crate::manifest::{
     BulkSection, BulkState, CaptureKind, DirFormat, EncodedManifest, GitSection, Manifest,
-    Sections, WorkspaceSection, rfc3339_now,
+    Sections, WORKTREE_TREE_REF, WorkspaceSection, rfc3339_now,
 };
 use crate::materialize::{
     DiskState, MaterializeClass, MaterializeError, MaterializeReport, MaterializeTargets,
@@ -30,7 +33,7 @@ use crate::ship::{
 };
 use crate::sink::BlobSink;
 use crate::tree::EncodedDir;
-use crate::watch::WatchPolicy;
+use crate::watch::{Invalidations, WatchPolicy};
 
 /// Snap cadence (ADR-0015 *Cadence and budgets*).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,6 +112,9 @@ pub struct CaptureConfig {
     pub dir_format: DirFormat,
     /// Single-PUT uploads in flight at once ([`crate::ship::DEFAULT_UPLOADS_IN_FLIGHT`]).
     pub uploads_in_flight: usize,
+    /// A file read this close to its last change is read again by the next build rather than
+    /// trusted by its stat ([`index::RACY_WINDOW`]; see `index` "When a file is re-read").
+    pub racy_window: Duration,
 }
 
 impl CaptureConfig {
@@ -134,6 +140,7 @@ impl CaptureConfig {
             pack_cap: MAX_PACK_BYTES,
             dir_format: DirFormat::Packs,
             uploads_in_flight: crate::ship::DEFAULT_UPLOADS_IN_FLIGHT,
+            racy_window: index::RACY_WINDOW,
         }
     }
 
@@ -188,6 +195,18 @@ pub enum EngineError {
     Incomplete(#[from] crate::cadence::Incomplete),
 }
 
+impl EngineError {
+    /// The work a `final` snap could not read, when that is why it failed: the snap does not
+    /// hold those paths, so the capture it would have made is not a complete one.
+    #[must_use]
+    pub fn unreadable(&self) -> Option<&UnreadableWork> {
+        match self {
+            Self::Io(e) => UnreadableWork::of(e),
+            _ => None,
+        }
+    }
+}
+
 /// Numbers from one snap.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapStats {
@@ -225,6 +244,97 @@ pub struct SnapStats {
     pub staged_bytes: u64,
     /// Files marked torn.
     pub torn: u64,
+    /// Paths this snap could not read (listed, stat'ed or opened; a directory counts once):
+    /// never taken as deleted. See `index` "Reading honestly".
+    #[serde(default)]
+    pub unreadable: u64,
+    /// Of `unreadable`, the paths whose last captured content this snap carried (marked
+    /// `unread` in the chunked class, the previous worktree tree's entry in the git class).
+    #[serde(default)]
+    pub carried: u64,
+    /// The first [`UNREADABLE_PATHS_CAP`] unreadable paths, in path order (`tree/…` under the
+    /// worktree, `.git/…`, `harness/…`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unreadable_paths: Vec<String>,
+}
+
+/// At most this many unreadable paths are named in [`SnapStats`] and [`ReadReport`].
+pub const UNREADABLE_PATHS_CAP: usize = 20;
+
+/// What a class's last snap could not read ([`ReadReports`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReadReport {
+    /// Paths that could not be read.
+    pub unreadable: u64,
+    /// Of those, the ones whose last captured content was carried.
+    pub carried: u64,
+    /// The first [`UNREADABLE_PATHS_CAP`] of them, in path order.
+    pub paths: Vec<String>,
+}
+
+impl ReadReport {
+    fn of(paths: &[UnreadablePath]) -> Self {
+        Self {
+            unreadable: paths.len() as u64,
+            carried: paths.iter().filter(|p| p.carried).count() as u64,
+            paths: paths
+                .iter()
+                .take(UNREADABLE_PATHS_CAP)
+                .map(|p| p.path.clone())
+                .collect(),
+        }
+    }
+}
+
+/// The last snap's [`ReadReport`] per class, shared with whoever reports status (it never
+/// waits on a build in progress).
+#[derive(Debug, Default)]
+pub struct ReadReports {
+    small: std::sync::Mutex<ReadReport>,
+    bulk: std::sync::Mutex<ReadReport>,
+}
+
+impl ReadReports {
+    fn slot(&self, class: Class) -> std::sync::MutexGuard<'_, ReadReport> {
+        match class {
+            Class::Small => &self.small,
+            Class::Bulk => &self.bulk,
+        }
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn set(&self, class: Class, report: ReadReport) {
+        *self.slot(class) = report;
+    }
+
+    /// Both classes' last snaps together.
+    #[must_use]
+    pub fn current(&self) -> ReadReport {
+        let small = self.slot(Class::Small).clone();
+        let bulk = self.slot(Class::Bulk).clone();
+        let mut paths = small.paths;
+        paths.extend(bulk.paths);
+        paths.truncate(UNREADABLE_PATHS_CAP);
+        ReadReport {
+            unreadable: small.unreadable + bulk.unreadable,
+            carried: small.carried + bulk.carried,
+            paths,
+        }
+    }
+}
+
+/// `a` and `b` as one list in path order, a path in both once (carried if either carried it).
+fn merge_unreadable(a: Vec<UnreadablePath>, b: Vec<UnreadablePath>) -> Vec<UnreadablePath> {
+    let mut by_path: std::collections::BTreeMap<String, UnreadablePath> =
+        std::collections::BTreeMap::new();
+    for p in a.into_iter().chain(b) {
+        by_path
+            .entry(p.path.clone())
+            .and_modify(|e| e.carried |= p.carried)
+            .or_insert(p);
+    }
+    by_path.into_values().collect()
 }
 
 /// A staged capture: its manifest, key and queue entry.
@@ -377,6 +487,8 @@ struct ClassWork {
     index: TreeIndex,
     packs: Vec<Upload>,
     chunks: HashMap<ChunkId, String>,
+    /// Paths the watcher reported written that this build has not read yet.
+    suspects: Suspects,
 }
 
 /// The outcome of a preemptible snap.
@@ -409,6 +521,10 @@ pub struct CaptureEngine {
     /// the chain with this manifest's bulk section, and the bulk capture moves on top of it. See
     /// [`CaptureEngine::snap_preemptible`].
     below: Option<EncodedManifest>,
+    /// Paths the watcher saw written, per class, not yet read again.
+    invalidations: Arc<Invalidations>,
+    /// What each class's last snap could not read.
+    reads: Arc<ReadReports>,
 }
 
 impl std::fmt::Debug for CaptureEngine {
@@ -515,6 +631,8 @@ impl CaptureEngine {
             dirs,
             last_tips,
             below: None,
+            invalidations: Arc::new(Invalidations::default()),
+            reads: Arc::new(ReadReports::default()),
         };
         // Captures staged under another identity (a lease that moved to a new epoch while the
         // daemon was down) can never register; left queued, a snap would coalesce with one and
@@ -725,6 +843,19 @@ impl CaptureEngine {
         &self.config
     }
 
+    /// Where the watcher notes written paths for this engine's builds
+    /// (`watch::WatchSpec::invalidations`).
+    #[must_use]
+    pub fn invalidations(&self) -> Arc<Invalidations> {
+        Arc::clone(&self.invalidations)
+    }
+
+    /// What each class's last snap could not read (`capture.status` reports it).
+    #[must_use]
+    pub fn read_reports(&self) -> Arc<ReadReports> {
+        Arc::clone(&self.reads)
+    }
+
     /// Staging area (shared with the shipper).
     #[must_use]
     pub fn staging(&self) -> Arc<Staging> {
@@ -798,7 +929,12 @@ impl CaptureEngine {
 
     /// Build a chunked class into new packs; returns what its section names (the root, the
     /// packs the tree needs, and in format 2 its dir packs), or `None` when a bulk build yielded
-    /// to `preempt` (its progress is kept in `bulk_work`; the next bulk build resumes it).
+    /// to `preempt` (its progress is kept in `bulk_work`; the next bulk build resumes it). A
+    /// `strict` build (a `final` snap) fails with [`UnreadableWork`] when anything it should
+    /// hold cannot be read; any other build carries such a path's last read content forward.
+    /// `also_unreadable` is what the git class could not read (the small class), reported and
+    /// failed on with the class's own.
+    #[allow(clippy::too_many_arguments)]
     fn build_class(
         &mut self,
         listing: &Listing,
@@ -806,6 +942,8 @@ impl CaptureEngine {
         uploads: &mut Vec<Upload>,
         stats: &mut SnapStats,
         preempt: &dyn Fn() -> bool,
+        strict: bool,
+        also_unreadable: Vec<UnreadablePath>,
     ) -> Result<Option<BuiltClass>, EngineError> {
         let objects = self.staging.objects_dir();
         let prefix = self.prefix.clone();
@@ -825,6 +963,7 @@ impl CaptureEngine {
                 ..ClassWork::default()
             }),
         };
+        work.suspects.extend(self.invalidations.take(class));
         let mut sink = PackSink {
             builder: PackBuilder::new(&objects, self.config.pack_cap),
             known: &self.chunks.packs,
@@ -832,16 +971,48 @@ impl CaptureEngine {
             cycle: DutyCycle::new(self.config.cpu_fraction),
             preempt: (class == Class::Bulk).then_some(preempt),
         };
-        let built = TreeBuilder::new(&mut work.index, &key_for_dir).build(listing, &mut sink);
-        let (built, packs) = match built {
+        let built = TreeBuilder::new(&mut work.index, &key_for_dir)
+            .strict(strict)
+            .racy_window(self.config.racy_window)
+            .suspects(&mut work.suspects)
+            .build(listing, &mut sink);
+        let (mut built, packs) = match built {
             Ok(built) => (built, sink.builder.finish()),
             Err(e) => {
+                // What was not read yet stays suspect for the next build.
+                self.invalidations
+                    .restore(class, std::mem::take(&mut work.suspects));
                 if class == Class::Small {
                     self.workspace_index = work.index;
+                }
+                if let Some(work) = UnreadableWork::of(&e) {
+                    let own = work
+                        .paths
+                        .iter()
+                        .map(|(path, error)| UnreadablePath {
+                            path: path.clone(),
+                            error: error.clone(),
+                            carried: false,
+                        })
+                        .collect();
+                    return Err(self.fail_unreadable(class, merge_unreadable(own, also_unreadable)));
                 }
                 return Err(e.into());
             }
         };
+        if let Some(built) = &mut built {
+            built.unreadable =
+                merge_unreadable(std::mem::take(&mut built.unreadable), also_unreadable);
+            if strict && !built.unreadable.is_empty() {
+                // The chunked class read everything; the git class did not.
+                self.invalidations
+                    .restore(class, std::mem::take(&mut work.suspects));
+                if class == Class::Small {
+                    self.workspace_index = work.index;
+                }
+                return Err(self.fail_unreadable(class, std::mem::take(&mut built.unreadable)));
+            }
+        }
         let packs = match packs {
             Ok(packs) => packs,
             Err(e) => {
@@ -874,7 +1045,9 @@ impl CaptureEngine {
             self.bulk_work = Some(work);
             return Ok(None);
         };
-        // Commit: the index, the chunk map and the pack uploads.
+        // Commit: the index, the chunk map and the pack uploads. A suspect the build did not
+        // read is not in this class's listing (removed, or another class's path).
+        work.suspects.clear();
         match class {
             Class::Small => self.workspace_index = work.index,
             Class::Bulk => self.bulk_index = work.index,
@@ -928,12 +1101,29 @@ impl CaptureEngine {
         stats.chunks += chunks;
         stats.chunks_new += chunks_new;
         stats.torn += torn;
+        let report = ReadReport::of(&built.unreadable);
+        stats.unreadable += report.unreadable;
+        stats.carried += report.carried;
+        stats.unreadable_paths.extend(report.paths.iter().cloned());
+        stats.unreadable_paths.truncate(UNREADABLE_PATHS_CAP);
+        self.reads.set(class, report);
         Ok(Some(BuiltClass {
             root,
             packs: needed.into_iter().collect(),
             format: dir_format.section_format(),
             dir_packs,
         }))
+    }
+
+    /// A strict snap that could not read `paths`: recorded for status, returned as the error.
+    fn fail_unreadable(&self, class: Class, paths: Vec<UnreadablePath>) -> EngineError {
+        self.reads.set(class, ReadReport::of(&paths));
+        EngineError::Io(
+            UnreadableWork {
+                paths: paths.into_iter().map(|p| (p.path, p.error)).collect(),
+            }
+            .into_io(),
+        )
     }
 
     /// Format 2: the dir packs a tree of `dirs` needs. A dir object this epoch already packed
@@ -1165,8 +1355,31 @@ impl CaptureEngine {
                 previous_tips.sort();
                 previous_tips.dedup();
                 let excludes = self.daemon_excludes();
-                let git = gitpack::build_git_pack(&repo, &objects, &previous_tips, &excludes)?;
-                self.last_tips = git.closure.tips.clone();
+                // An automatic snap gives what the worktree cannot read the previous capture's
+                // entry; a final one carries nothing and fails on it instead.
+                let strict = req.kind == CaptureKind::Final;
+                let carry_from = self
+                    .previous
+                    .as_ref()
+                    .and_then(|p| p.manifest.sections.git.refs.get(WORKTREE_TREE_REF).cloned())
+                    .filter(|_| !strict);
+                let git = gitpack::build_git_pack_carrying(
+                    &repo,
+                    &objects,
+                    &previous_tips,
+                    &excludes,
+                    carry_from.as_deref(),
+                )?;
+                let git_unreadable: Vec<UnreadablePath> = git
+                    .closure
+                    .unreadable
+                    .iter()
+                    .map(|(path, error)| UnreadablePath {
+                        path: format!("tree/{}", index::rel_key(Path::new(path))),
+                        error: error.clone(),
+                        carried: git.closure.carried.contains(path),
+                    })
+                    .collect();
                 stats.git_attempts = git.attempts;
                 let mut git_packs: Vec<String> = self
                     .previous
@@ -1192,11 +1405,22 @@ impl CaptureEngine {
                     git_packs.push(key);
                 }
                 let listing = self.workspace_listing(&repo, &git.closure.gitlinks)?;
-                let Some(built) =
-                    self.build_class(&listing, Class::Small, &mut uploads, &mut stats, preempt)?
+                let Some(built) = self.build_class(
+                    &listing,
+                    Class::Small,
+                    &mut uploads,
+                    &mut stats,
+                    preempt,
+                    strict,
+                    git_unreadable,
+                )?
                 else {
                     return Err(io::Error::other("small-class build yielded").into());
                 };
+                // Only a snap that goes on to stage its git pack makes that pack's tips the next
+                // pack's negatives: a snap that fails here (a final one that cannot read work)
+                // stages nothing, and its tips would leave objects out of every later pack.
+                self.last_tips = git.closure.tips.clone();
                 Sections {
                     git: GitSection {
                         packs: git_packs,
@@ -1224,8 +1448,15 @@ impl CaptureEngine {
             }
             Class::Bulk => {
                 let listing = self.bulk_listing();
-                let Some(built) =
-                    self.build_class(&listing, Class::Bulk, &mut uploads, &mut stats, preempt)?
+                let Some(built) = self.build_class(
+                    &listing,
+                    Class::Bulk,
+                    &mut uploads,
+                    &mut stats,
+                    preempt,
+                    req.kind == CaptureKind::Final,
+                    Vec::new(),
+                )?
                 else {
                     tracing::debug!(
                         files_read = stats.files_read,
