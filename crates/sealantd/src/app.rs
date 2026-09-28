@@ -76,8 +76,9 @@ struct ServeArgs {
     #[arg(long)]
     shell: Option<String>,
     /// Graceful-shutdown grace in milliseconds (default 10000): how long processes get after
-    /// `SIGTERM` before `SIGKILL`, and the bound of a suspend `capture.flush` sent without a
-    /// deadline. A final capture flush and a flush with a deadline are not bounded by it.
+    /// `SIGTERM` before `SIGKILL` (at shutdown, and when a final capture flush without a
+    /// `grace_ms` stops them), and the bound of a suspend `capture.flush` sent without a
+    /// deadline. A final flush's snaps and shipping are not bounded by it.
     #[arg(long)]
     shutdown_grace_ms: Option<u64>,
     /// Validate configuration, print a sanitized summary, and exit.
@@ -225,9 +226,11 @@ fn run_serve(cli: ServeArgs) -> ExitCode {
     tokio_runtime.block_on(serve(cli, wss, runtime))
 }
 
-/// On `SIGTERM` / `SIGINT`: flush captures (a final flush: both classes snapped, everything
-/// shipped and registered with no deadline; a no-op without a capture engine), then request
-/// graceful shutdown.
+/// On `SIGTERM` / `SIGINT`: the final capture flush (admission closed, every managed process
+/// terminated and awaited, then both classes snapped and everything registered, with no
+/// deadline; a no-op without a capture engine), then request graceful shutdown. The flush
+/// comes first because it stops the writers itself: a snap taken before they stop misses what
+/// they write after it.
 pub(crate) fn spawn_signal_listener(runtime: Arc<Runtime>) {
     tokio::spawn(async move {
         use tokio::signal::unix::{SignalKind, signal};
@@ -249,9 +252,7 @@ pub(crate) fn spawn_signal_listener(runtime: Arc<Runtime>) {
             _ = terminate.recv() => tracing::info!("received SIGTERM"),
             _ = interrupt.recv() => tracing::info!("received SIGINT"),
         }
-        runtime
-            .flush_captures(sealant_protocol::CaptureFlushKind::Final)
-            .await;
+        runtime.final_flush(None, None).await;
         runtime.shutdown().request_graceful(None);
     });
 }
@@ -336,6 +337,13 @@ async fn serve(cli: ServeArgs, wss: Option<WssConfig>, runtime: Arc<Runtime>) ->
         tracing::warn!(%error, "serve task join error");
     }
     runtime.finish_shutdown();
+    if runtime.capture_incomplete() {
+        tracing::error!(
+            code = crate::runtime::EXIT_CAPTURE_INCOMPLETE,
+            "sealantd stopped with its final capture incomplete; the staging directory is kept"
+        );
+        return ExitCode::from(crate::runtime::EXIT_CAPTURE_INCOMPLETE);
+    }
     tracing::info!("sealantd stopped");
     ExitCode::SUCCESS
 }

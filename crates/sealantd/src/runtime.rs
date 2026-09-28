@@ -3,7 +3,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use sealant_control::{ConnHandle, ControlService};
 use sealant_eventlog::{FsyncPolicy, Spool, SpoolConfig};
@@ -27,6 +28,20 @@ use crate::shutdown::ShutdownSignal;
 
 /// Daemon build version.
 pub const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// The environment entry a test marks its processes with, to narrow a sweep to them.
+pub const SWEEP_MARK_ENV: &str = "SEALANTD_SWEEP_MARK";
+
+/// A mark no process holds.
+fn new_unit_mark() -> u64 {
+    use std::sync::atomic::AtomicU64;
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+/// The exit code of a daemon whose final capture flush did not complete (`EX_TEMPFAIL`): what
+/// is on this disk is not all registered, and the staging directory is left as it is.
+pub const EXIT_CAPTURE_INCOMPLETE: u8 = 75;
 
 /// Collect the values captured I/O must redact (plan §18): the values of secret-looking env vars
 /// plus every launcher-provided secret literal, whatever its name.
@@ -128,9 +143,32 @@ pub struct Runtime {
     capture: std::sync::OnceLock<Arc<crate::capture::CaptureRuntime>>,
     extra_env: Arc<Mutex<Vec<(String, String)>>>,
     shutdown: Arc<ShutdownSignal>,
+    /// A final capture flush began: the executor is ending, and no new process, exec, session
+    /// or SFTP bridge is admitted, ever again.
+    admission_closed: AtomicBool,
+    /// One final capture flush at a time (the signal listener's, a control command's, and the
+    /// boot supervisor's after the harness exits can overlap).
+    final_lock: tokio::sync::Mutex<()>,
+    /// Narrows the final flush's sweep of processes outside the managed groups to those whose
+    /// environment holds `SEALANTD_SWEEP_MARK=<mark>`. `None` in a daemon: the sweep takes
+    /// every process in its scope ([`crate::sweep`]). Unit tests share one process, and every
+    /// runtime in it would take every other's processes, so a unit test's runtime starts with
+    /// a mark nobody holds.
+    sweep_mark: Mutex<Option<String>>,
+    /// The last quiesce's outcome (`None`: none ran; `Some(None)`: every writer stopped). A
+    /// final flush asked again after one that stopped every writer does not quiesce again:
+    /// admission is closed, and nothing is left to stop.
+    quiesced: Mutex<Option<Option<&'static str>>>,
+    /// Quiesces run (test observability).
+    quiesces: std::sync::atomic::AtomicU64,
     features: Mutex<HashMap<Feature, bool>>,
     pidfd_supported: bool,
-    subreaper: bool,
+    /// `PR_SET_CHILD_SUBREAPER` took effect: an orphan of anything sealantd started stays its
+    /// descendant, which the final capture's sweep relies on outside a PID namespace of its own.
+    subreaper: AtomicBool,
+    /// The workspace's own Docker daemon, whose containers the final capture stops
+    /// ([`crate::docker`]). Set by boot; none by default.
+    workspace_docker: Mutex<Option<crate::docker::DockerEndpoint>>,
 }
 
 impl Runtime {
@@ -213,9 +251,15 @@ impl Runtime {
             capture: std::sync::OnceLock::new(),
             extra_env,
             shutdown,
+            admission_closed: AtomicBool::new(false),
+            final_lock: tokio::sync::Mutex::new(()),
+            quiesced: Mutex::new(None),
+            quiesces: std::sync::atomic::AtomicU64::new(0),
+            sweep_mark: Mutex::new(cfg!(test).then(|| format!("unit-test-{}", new_unit_mark()))),
             features,
             pidfd_supported,
-            subreaper,
+            subreaper: AtomicBool::new(subreaper),
+            workspace_docker: Mutex::new(None),
         })
     }
 
@@ -236,46 +280,252 @@ impl Runtime {
         self.capture.get().cloned()
     }
 
-    /// Flush captures on the daemon's own way out (SIGTERM, SIGINT, `runtime.gracefulShutdown`,
-    /// the harness exiting): a `final` flush snaps both classes and returns only once everything
-    /// staged is registered, or the lease is fenced, or the chain conflicts — no deadline, since
-    /// the disk goes with the daemon and the process ending is what stops it. A no-op without a
-    /// capture engine; errors are logged, never fatal.
-    pub async fn flush_captures(&self, kind: sealant_protocol::CaptureFlushKind) {
-        let Some(capture) = self.capture() else {
-            return;
-        };
-        let deadline = self.flush_deadline(kind, None);
-        match tokio::task::spawn_blocking(move || capture.flush(kind, deadline)).await {
-            Ok(Ok(report)) => {
-                tracing::info!(
-                    head_n = ?report.head_n,
-                    pending = report.pending,
-                    pending_bulk = report.pending_bulk,
-                    pending_bytes = report.pending_bytes,
-                    "captures flushed"
-                );
+    /// The final capture flush: this executor is ending. In this order, because a writer that
+    /// runs past the last snap loses what it writes (an agent writing during the upload, or
+    /// from its SIGTERM handler, after the snap that was meant to be the last):
+    ///
+    /// 1. admission closes for good — no new process, exec, session, SFTP bridge, execution,
+    ///    bind or re-plan;
+    /// 2. every managed process and session is terminated (a process the fence paused is
+    ///    continued, then `SIGTERM`; `SIGKILL` after `grace_ms`, the shutdown grace when
+    ///    absent; a hard shutdown kills at once) and awaited, and SFTP bridges are closed;
+    /// 3. the small AND the bulk class are snapped — both must succeed;
+    /// 4. everything ships until nothing is pending.
+    ///
+    /// The report's `complete` is true only when all of that happened; every failure is
+    /// `complete: false` with its reason, logged at error, and the staging directory stays as
+    /// it is. `deadline_ms` bounds the whole of it (the grace included); none: until complete,
+    /// or until it never can be (a fence, a conflict, a failed snap). A flush that returned at
+    /// its deadline does not end the daemon: admission stays closed, the writers stay stopped,
+    /// the ship worker keeps uploading, and `capture.status` turns `complete` once it is done.
+    /// Idempotent: serialized, and a final flush asked again after one that stopped every
+    /// writer does not stop them again, and snaps only what changed (nothing, as a rule) before
+    /// it ships what is left. `None` without a capture engine.
+    pub async fn final_flush(
+        &self,
+        deadline_ms: Option<u64>,
+        grace_ms: Option<u64>,
+    ) -> Option<sealant_protocol::CaptureStatusReport> {
+        let capture = self.capture()?;
+        let _one = self.final_lock.lock().await;
+        let start = Instant::now();
+        let deadline = deadline_ms.map(Duration::from_millis);
+        let grace = Duration::from_millis(grace_ms.unwrap_or_else(|| self.shutdown.grace_ms()));
+        let grace = deadline.map_or(grace, |d| grace.min(d));
+        let previous = *self.quiesced.lock().unwrap_or_else(|e| e.into_inner());
+        let quiesced = match previous {
+            // Every writer stopped the last time, and admission has been closed since.
+            Some(None) => None,
+            _ => {
+                let quiesced = self.quiesce(grace).await;
+                *self.quiesced.lock().unwrap_or_else(|e| e.into_inner()) = Some(quiesced);
+                quiesced
             }
-            Ok(Err(error)) => tracing::warn!(%error, "capture flush failed"),
-            Err(error) => tracing::warn!(%error, "capture flush task failed"),
+        };
+        let left = deadline.map(|d| d.saturating_sub(start.elapsed()));
+        let flushing = Arc::clone(&capture);
+        let report =
+            match tokio::task::spawn_blocking(move || flushing.flush_final(left, quiesced)).await {
+                Ok(report) => report,
+                Err(error) => {
+                    tracing::error!(%error, "final capture flush task failed");
+                    capture.record_final_incomplete("internal");
+                    capture.status()
+                }
+            };
+        if report.complete {
+            tracing::info!(
+                head_n = ?report.head_n,
+                took_ms = start.elapsed().as_millis() as u64,
+                "final capture complete: everything on this disk is registered"
+            );
+        } else {
+            tracing::error!(
+                reason = report.incomplete_reason.as_deref().unwrap_or("unknown"),
+                pending = report.pending,
+                pending_bulk = report.pending_bulk,
+                pending_bytes = report.pending_bytes,
+                fenced = report.fenced,
+                "FINAL CAPTURE INCOMPLETE: work product is on this disk only; the staging \
+                 directory is kept"
+            );
         }
+        Some(report)
     }
 
-    /// The deadline a `capture.flush` of `kind` runs under: the caller's, as given; without one,
-    /// a suspend flush is bounded by the shutdown grace (as it always was) and a final flush by
-    /// nothing.
-    fn flush_deadline(
-        &self,
-        kind: sealant_protocol::CaptureFlushKind,
-        deadline_ms: Option<u64>,
-    ) -> Option<Duration> {
-        match (deadline_ms, kind) {
-            (Some(ms), _) => Some(Duration::from_millis(ms)),
-            (None, sealant_protocol::CaptureFlushKind::Suspend) => {
-                Some(Duration::from_millis(self.shutdown.grace_ms()))
-            }
-            (None, sealant_protocol::CaptureFlushKind::Final) => None,
+    /// Whether this is a capture-store workspace whose captures are not known complete: no
+    /// final flush completed, or something was staged after it. The daemon then exits with
+    /// [`EXIT_CAPTURE_INCOMPLETE`], never 0.
+    #[must_use]
+    pub fn capture_incomplete(&self) -> bool {
+        self.capture().is_some_and(|c| !c.status().complete)
+    }
+
+    /// Close admission and stop every writer in the workspace: SFTP bridges closed, paused
+    /// processes continued, then `SIGTERM` (or `SIGKILL` on a hard shutdown) to every managed
+    /// process group and `SIGHUP` to every session, `SIGKILL` after `grace`, and awaited; then
+    /// at the same time every process outside those groups ([`crate::sweep`]: the PID namespace
+    /// when sealantd is its PID 1, else sealantd's descendants) the same way.
+    /// Every container of the workspace's own Docker daemon is stopped at the same time. Returns
+    /// why the capture that follows cannot be complete (`processes-remain`,
+    /// `sweep-unavailable`), or `None`.
+    async fn quiesce(&self, grace: Duration) -> Option<&'static str> {
+        self.admission_closed.store(true, Ordering::SeqCst);
+        self.quiesces.fetch_add(1, Ordering::Relaxed);
+        let sftp = self.sftp.close_all();
+        let (signal, grace) = if self.shutdown.is_hard() {
+            (Signal::Kill, Duration::ZERO)
+        } else {
+            (Signal::Term, grace)
+        };
+        let running: Vec<_> = self
+            .processes
+            .list(None)
+            .into_iter()
+            .filter(|p| !matches!(p.state, ProcessState::Exited | ProcessState::Signaled))
+            .collect();
+        // A process group the capture fence stopped (`SIGSTOP`) would not act on `SIGTERM`
+        // until the `SIGKILL`: continue it first.
+        for process in &running {
+            let _ = self.processes.signal(&process.process_id, Signal::Cont);
         }
+        let sessions = self.sessions.registry.len();
+        // Every other writer at the same time, under the same grace: a process that left its
+        // group (`setsid`, a double fork, a daemon) is in none of the groups terminated here,
+        // and would write past the last snap. The sweep also sees the managed processes (they
+        // are sealantd's descendants); a second `SIGTERM` changes nothing for them.
+        let mark = self
+            .sweep_mark
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let admit = move |pid: i32| {
+            mark.as_deref()
+                .is_none_or(|m| crate::sweep::has_env_entry(pid, SWEEP_MARK_ENV, m))
+        };
+        let sweeper = crate::sweep::Sweeper::this_process();
+        let docker = self
+            .workspace_docker
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let started = Instant::now();
+        // And every container of the workspace's own Docker daemon: a container can bind-mount
+        // the worktree, and its processes are neither in sealantd's groups nor its descendants.
+        let stop_containers = async {
+            match &docker {
+                None => Ok(None),
+                Some(endpoint) => crate::docker::stop_all(endpoint, grace).await.map(Some),
+            }
+        };
+        let ((), (), (swept, sweep_left), containers) = tokio::join!(
+            self.sessions.terminate_all(grace),
+            self.processes.terminate_all(signal, grace),
+            sweeper.sweep(grace, self.shutdown.is_hard(), &admit),
+            stop_containers,
+        );
+        let managed_left = self.processes.registry.running().len() + self.sessions.registry.len();
+        let (containers_stopped, containers_left) = match &containers {
+            Ok(None) => (0, 0),
+            Ok(Some(stopped)) => (stopped.containers, stopped.running),
+            Err(error) => {
+                // Known to exist and not reached: nobody knows what still runs there.
+                tracing::error!(
+                    endpoint = %docker.as_ref().map(ToString::to_string).unwrap_or_default(),
+                    %error,
+                    "the workspace's Docker daemon could not be reached; its containers may \
+                     still be writing"
+                );
+                (0, 1)
+            }
+        };
+        let remaining = managed_left + sweep_left + containers_left;
+        let sweep_unavailable = self.sweep_unavailable();
+        tracing::info!(
+            processes = running.len(),
+            sessions,
+            sftp,
+            swept,
+            sweep_scope = ?sweeper.scope,
+            containers = containers_stopped,
+            remaining,
+            took_ms = started.elapsed().as_millis() as u64,
+            "admission closed; every writer terminated for the final capture"
+        );
+        if remaining > 0 {
+            tracing::error!(
+                remaining,
+                "processes or containers outlived SIGKILL; the final capture cannot be complete"
+            );
+            return Some("processes-remain");
+        }
+        if sweep_unavailable {
+            tracing::error!(
+                "this daemon is not a child subreaper: an orphan may have left its descendants \
+                 unseen; the final capture cannot be complete"
+            );
+            return Some("sweep-unavailable");
+        }
+        None
+    }
+
+    /// Whether the final capture's sweep cannot guarantee it sees every writer: outside a PID
+    /// namespace of its own it takes sealantd's descendants, and without
+    /// `PR_SET_CHILD_SUBREAPER` an orphan is re-parented away from sealantd, out of sight.
+    /// Every final flush on such a daemon is incomplete (`sweep-unavailable`).
+    #[must_use]
+    pub fn sweep_unavailable(&self) -> bool {
+        crate::sweep::Scope::detect() == crate::sweep::Scope::Descendants
+            && !self.subreaper.load(Ordering::Relaxed)
+    }
+
+    /// How many times a final flush stopped the writers (test observability).
+    #[doc(hidden)]
+    #[must_use]
+    pub fn quiesce_count(&self) -> u64 {
+        self.quiesces.load(Ordering::Relaxed)
+    }
+
+    /// Test hook: behave as if `PR_SET_CHILD_SUBREAPER` had (not) taken effect.
+    #[doc(hidden)]
+    pub fn set_subreaper_for_test(&self, subreaper: bool) {
+        self.subreaper.store(subreaper, Ordering::Relaxed);
+    }
+
+    /// The workspace's own Docker daemon, whose containers every final capture stops
+    /// ([`crate::docker::workspace_endpoint`]).
+    pub fn set_workspace_docker(&self, endpoint: Option<crate::docker::DockerEndpoint>) {
+        *self
+            .workspace_docker
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = endpoint;
+    }
+
+    /// Narrow the final flush's sweep to processes whose environment holds
+    /// `SEALANTD_SWEEP_MARK=<mark>` ([`SWEEP_MARK_ENV`]); `None` sweeps every process in scope,
+    /// as a daemon does. For tests that share a process with other runtimes.
+    #[doc(hidden)]
+    pub fn set_sweep_mark(&self, mark: Option<String>) {
+        *self.sweep_mark.lock().unwrap_or_else(|e| e.into_inner()) = mark;
+    }
+
+    /// The error for new work once a final capture flush closed admission.
+    fn admission_closed_error() -> ControlError {
+        ControlError::runtime_shutting_down(
+            "the executor is ending: a final capture flush closed admission".to_owned(),
+        )
+    }
+
+    /// Whether a final capture flush closed admission (the executor is ending).
+    #[must_use]
+    pub fn admission_is_closed(&self) -> bool {
+        self.admission_closed.load(Ordering::SeqCst)
+    }
+
+    /// The deadline a suspend `capture.flush` runs under: the caller's, as given; without one,
+    /// the shutdown grace (as it always was).
+    fn suspend_deadline(&self, deadline_ms: Option<u64>) -> Duration {
+        Duration::from_millis(deadline_ms.unwrap_or_else(|| self.shutdown.grace_ms()))
     }
 
     /// Deliver a signal to a managed process's group (the capture fence pauses the harness).
@@ -319,6 +569,9 @@ impl Runtime {
         &self,
         args: sealant_protocol::ExecArgs,
     ) -> Result<sealant_protocol::ExecAccepted, ControlError> {
+        if self.admission_is_closed() {
+            return Err(Self::admission_closed_error());
+        }
         self.processes.exec(args, None)
     }
 
@@ -437,7 +690,8 @@ impl Runtime {
         );
     }
 
-    /// Begin shutdown: announce, then terminate the managed process tree.
+    /// Begin shutdown: announce, then terminate the managed process tree (already gone when a
+    /// final capture flush ran: it terminates the tree before its snaps).
     pub async fn begin_shutdown(&self) {
         self.transition(
             RuntimeState::ShuttingDown,
@@ -531,7 +785,7 @@ impl Runtime {
                 network: self.network.capability_mode(),
                 privileged: false,
                 pidfd: self.pidfd_supported,
-                subreaper: self.subreaper,
+                subreaper: self.subreaper.load(Ordering::Relaxed),
                 pipe_sessions: true,
             },
             limits: self.config.limits,
@@ -574,6 +828,21 @@ impl Runtime {
             }
         }
 
+        // A final capture flush began: this executor admits no new writer (nor a re-plan or a
+        // bind, which would change what the last capture is taken of).
+        if self.admission_is_closed()
+            && matches!(
+                &request.command,
+                Command::Exec(_)
+                    | Command::OpenSession(_)
+                    | Command::ExecutionStart(_)
+                    | Command::BindMount { .. }
+                    | Command::CaptureReplan
+            )
+        {
+            return ControlResponse::error(rid, Self::admission_closed_error());
+        }
+
         match request.command {
             Command::RuntimeHealth => {
                 ControlResponse::ok_with(rid, CommandResult::Health(self.health_report()))
@@ -585,8 +854,8 @@ impl Runtime {
                 ControlResponse::ok_with(rid, CommandResult::Metrics(self.metrics()))
             }
             Command::RuntimeGracefulShutdown { grace_millis } => {
-                self.flush_captures(sealant_protocol::CaptureFlushKind::Final)
-                    .await;
+                // Writers stop, then the final capture, then the shutdown.
+                self.final_flush(None, grace_millis).await;
                 self.shutdown.request_graceful(grace_millis);
                 ControlResponse::ok_with(
                     rid,
@@ -736,11 +1005,25 @@ impl Runtime {
                     }
                 }
             },
-            Command::CaptureFlush { kind, deadline_ms } => match self.capture() {
+            Command::CaptureFlush {
+                kind: sealant_protocol::CaptureFlushKind::Final,
+                deadline_ms,
+                grace_ms,
+            } => match self.final_flush(deadline_ms, grace_ms).await {
+                // Answered whatever happened: `complete` and `incomplete_reason` say what.
+                Some(report) => ControlResponse::ok_with(rid, CommandResult::CaptureStatus(report)),
+                None => ControlResponse::error(rid, crate::capture::not_enabled()),
+            },
+            Command::CaptureFlush {
+                kind: sealant_protocol::CaptureFlushKind::Suspend,
+                deadline_ms,
+                grace_ms: _,
+            } => match self.capture() {
                 None => ControlResponse::error(rid, crate::capture::not_enabled()),
                 Some(capture) => {
-                    let deadline = self.flush_deadline(kind, deadline_ms);
-                    match tokio::task::spawn_blocking(move || capture.flush(kind, deadline)).await {
+                    let deadline = self.suspend_deadline(deadline_ms);
+                    match tokio::task::spawn_blocking(move || capture.flush_suspend(deadline)).await
+                    {
                         Ok(Ok(report)) => {
                             ControlResponse::ok_with(rid, CommandResult::CaptureStatus(report))
                         }
@@ -836,6 +1119,12 @@ impl Runtime {
                 rid,
                 ControlError::runtime_shutting_down("runtime is shutting down".to_owned()),
             );
+        }
+        // An exec-attach spawns a writer, and so does an `sftp-server`.
+        if self.admission_is_closed()
+            && matches!(&request.command, Command::Exec(_) | Command::OpenSftp(_))
+        {
+            return ControlResponse::error(rid, Self::admission_closed_error());
         }
 
         match request.command {

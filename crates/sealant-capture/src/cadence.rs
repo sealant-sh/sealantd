@@ -27,6 +27,90 @@ use crate::watch::{self, ChangeSignal, Mode, WatchHandle, WatchSpec};
 /// How often the ship worker polls when nothing woke it.
 pub const SHIP_TICK: Duration = Duration::from_secs(5);
 
+/// Why a final flush is not complete. [`Incomplete::reason`] is the code the daemon reports.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum Incomplete {
+    /// A final snap failed: what it would have captured is on the disk only.
+    #[error("the final {class:?}-class snap failed: {error}")]
+    SnapshotFailed {
+        /// The class whose snap failed (the first, when both did).
+        class: Class,
+        /// The engine's error.
+        error: String,
+    },
+    /// The lease is fenced: nothing staged can register any more.
+    #[error("{0}")]
+    Fenced(String),
+    /// The chain moved under this executor.
+    #[error("{0}")]
+    Conflict(String),
+    /// The caller's deadline passed with captures still staged.
+    #[error("deadline passed with {pending} captures pending")]
+    Deadline {
+        /// Captures still staged.
+        pending: usize,
+    },
+    /// Shipping kept failing until the deadline.
+    #[error("shipping failed: {0}")]
+    ShipFailed(String),
+    /// A final snap met work it could not read (it would have been left out of the capture).
+    #[error("unreadable work: {0}")]
+    Unreadable(String),
+}
+
+impl Incomplete {
+    /// The reason code: `snapshot-failed`, `fenced`, `conflict`, `deadline`, `ship-failed` or
+    /// `unreadable`.
+    #[must_use]
+    pub fn reason(&self) -> &'static str {
+        match self {
+            Self::SnapshotFailed { .. } => "snapshot-failed",
+            Self::Fenced(_) => "fenced",
+            Self::Conflict(_) => "conflict",
+            Self::Deadline { .. } => "deadline",
+            Self::ShipFailed(_) => "ship-failed",
+            Self::Unreadable(_) => "unreadable",
+        }
+    }
+
+    fn from_snap(class: Class, error: &EngineError) -> Self {
+        // SEAM(fix/capture-read-fidelity 2607672): `if error.unreadable().is_some() { return Self::Unreadable(error.to_string()); }`
+        Self::SnapshotFailed {
+            class,
+            error: error.to_string(),
+        }
+    }
+
+    fn from_ship(error: &ShipError) -> Self {
+        match error {
+            ShipError::Fenced(_) | ShipError::AlreadyFenced { .. } => {
+                Self::Fenced(error.to_string())
+            }
+            ShipError::Conflict(_) => Self::Conflict(error.to_string()),
+            ShipError::Deadline { pending } => Self::Deadline { pending: *pending },
+            _ => Self::ShipFailed(error.to_string()),
+        }
+    }
+}
+
+/// What a final flush did ([`CadenceRunner::flush_final`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FinalFlush {
+    /// Captures registered by its shipping.
+    pub shipped: usize,
+    /// Why it is not complete; `None` when both classes were snapped and everything staged is
+    /// registered.
+    pub incomplete: Option<Incomplete>,
+}
+
+impl FinalFlush {
+    /// Both final snaps succeeded and nothing is left staged.
+    #[must_use]
+    pub fn complete(&self) -> bool {
+        self.incomplete.is_none()
+    }
+}
+
 /// Why a scheduled snap fired.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Trigger {
@@ -301,7 +385,13 @@ impl Shared {
             }
             let outcome = self.engine().snap_preemptible(
                 SnapRequest {
-                    kind: CaptureKind::Auto,
+                    // A final flush's forced snap is a `final` one, as its small snap is: the
+                    // engine holds a final capture to stricter rules than a scheduled one.
+                    kind: if forced {
+                        CaptureKind::Final
+                    } else {
+                        CaptureKind::Auto
+                    },
                     class: Class::Bulk,
                     seq,
                 },
@@ -613,12 +703,8 @@ impl CadenceRunner {
     /// it and the flush returns once the snap is registered, while the worker keeps uploading
     /// the bulk capture (`capture.status` counts it in `pending` and `pending_bulk`).
     ///
-    /// A `final` flush — the executor is going away, and its disk with it — takes a bulk snap
-    /// as well, forced (the dependency tree as it is now, whatever the bulk clocks say; a
-    /// scheduled bulk build in progress yields to it), and ships and registers everything, bulk
-    /// included ([`Shipper::flush_final`]): it returns once the queue is empty, at `deadline`
-    /// when one is given, or on a fence or a chain conflict, when nothing staged can register
-    /// any more. Without a deadline only the process ending stops it.
+    /// `kind` [`CaptureKind::Final`] is [`CadenceRunner::flush_final`], and anything short of
+    /// complete is an error ([`EngineError::Incomplete`]).
     ///
     /// # Errors
     /// The engine's error, or the shipper's when shipping stops on a fence or a conflict.
@@ -627,19 +713,57 @@ impl CadenceRunner {
         kind: CaptureKind,
         deadline: Option<Duration>,
     ) -> Result<usize, EngineError> {
+        if kind == CaptureKind::Final {
+            let flushed = self.flush_final(deadline);
+            return match flushed.incomplete {
+                None => Ok(flushed.shipped),
+                Some(incomplete) => Err(EngineError::Incomplete(incomplete)),
+            };
+        }
+        let until = deadline.map(|d| Instant::now() + d);
+        self.snap(kind)?;
+        Ok(self
+            .shared
+            .shipper
+            .flush_small(until.map(|u| u.saturating_duration_since(Instant::now())))?)
+    }
+
+    /// The final flush — the executor is going away, and its disk with it; the caller has
+    /// stopped every writer first. A forced small-class snap AND a forced bulk-class snap (the
+    /// dependency tree as it is now, whatever the bulk clocks say; a scheduled bulk build in
+    /// progress yields to it and the forced snap resumes its progress), then ship and register
+    /// everything, bulk included ([`Shipper::flush_final`]). Complete only when both snaps
+    /// succeeded and nothing is left staged: a failed snap no longer passes for success because
+    /// older captures drained (a failed bulk snap was logged and ignored), and neither does a
+    /// fence, a conflict or the deadline. Whatever fails, what could be staged still ships
+    /// before this returns (bounded by `deadline`, none: until the process ends), and the rest
+    /// stays staged. Blocking.
+    pub fn flush_final(&self, deadline: Option<Duration>) -> FinalFlush {
         let until = deadline.map(|d| Instant::now() + d);
         let left = || until.map(|u| u.saturating_duration_since(Instant::now()));
-        self.snap(kind)?;
-        if kind != CaptureKind::Final {
-            return Ok(self.shared.shipper.flush_small(left())?);
+        let mut incomplete = None;
+        if let Err(error) = self.snap(CaptureKind::Final) {
+            tracing::error!(%error, "final small-class snap failed");
+            incomplete = Some(Incomplete::from_snap(Class::Small, &error));
         }
         if self.shared.capture_bulk
             && let Err(error) = self.shared.bulk_snap(true)
         {
-            // What the last bulk snap staged still ships; the error is the engine's (I/O).
-            tracing::warn!(%error, "final bulk snap failed");
+            tracing::error!(%error, "final bulk-class snap failed");
+            incomplete.get_or_insert(Incomplete::from_snap(Class::Bulk, &error));
         }
-        Ok(self.shared.shipper.flush_final(left())?)
+        let shipped = match self.shared.shipper.flush_final(left()) {
+            Ok(shipped) => shipped,
+            Err(error) => {
+                tracing::error!(%error, "final flush: shipping did not finish");
+                incomplete.get_or_insert(Incomplete::from_ship(&error));
+                0
+            }
+        };
+        FinalFlush {
+            shipped,
+            incomplete,
+        }
     }
 
     /// Ship everything pending now, bounded by `deadline`, without a snap.

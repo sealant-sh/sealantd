@@ -25,7 +25,9 @@ use crate::pack::{MAX_PACK_BYTES, PackBuilder, PackError};
 use crate::registrar::RegisterRequest;
 use crate::registrar::Registrar;
 use crate::roots::ClassRoots;
-use crate::ship::{DutyCycle, MultipartConfig, QueueEntry, ShipError, Shipper, Staging, Upload};
+use crate::ship::{
+    DutyCycle, MultipartConfig, QueueEntry, Restage, ShipError, Shipper, Staging, Upload,
+};
 use crate::sink::BlobSink;
 use crate::tree::EncodedDir;
 use crate::watch::WatchPolicy;
@@ -181,6 +183,9 @@ pub enum EngineError {
     /// I/O.
     #[error(transparent)]
     Io(#[from] io::Error),
+    /// A final flush did not complete ([`crate::cadence::CadenceRunner::flush_final`]).
+    #[error("final flush incomplete: {0}")]
+    Incomplete(#[from] crate::cadence::Incomplete),
 }
 
 /// Numbers from one snap.
@@ -1031,6 +1036,29 @@ impl CaptureEngine {
         Ok((staged_last && on_below).then(|| (bulk, below.clone())))
     }
 
+    /// After `journal` was applied: the bulk capture it wrote is the newest capture, and the
+    /// small capture staged ahead of it is the one a later small snap takes its place with.
+    fn follow_restage(&mut self, journal: &Restage) {
+        let encoded = |e: &QueueEntry| {
+            let m = e.register.manifest.clone().encode();
+            (m.capture_id == e.capture_id).then_some(m)
+        };
+        let bulk = journal
+            .write
+            .iter()
+            .find(|e| e.class == Some(Class::Bulk))
+            .and_then(encoded);
+        let small = journal
+            .write
+            .iter()
+            .find(|e| e.class != Some(Class::Bulk))
+            .and_then(encoded);
+        if let (Some(bulk), Some(small)) = (bulk, small) {
+            self.previous = Some(bulk);
+            self.below = Some(small);
+        }
+    }
+
     /// `bulk` staged again on top of `small` (a capture taking its place): the same objects, a
     /// new manifest at `small.n + 1` whose parent is `small` and whose git and workspace sections
     /// are `small`'s. Writes the manifest file and returns the queue entry and the manifest; the
@@ -1104,6 +1132,15 @@ impl CaptureEngine {
         req: SnapRequest,
         preempt: &dyn Fn() -> bool,
     ) -> Result<SnapOutcome, EngineError> {
+        // A restage this process did not finish (an I/O error after its journal was committed)
+        // is finished before this snap takes a chain position.
+        {
+            let staging = Arc::clone(&self.staging);
+            let _guard = staging.coalesce_guard();
+            if let Some(journal) = staging.recover()? {
+                self.follow_restage(&journal);
+            }
+        }
         if req.class == Class::Bulk && self.previous.is_none() {
             // A bulk capture copies the small sections from its predecessor; make one first.
             self.snap(SnapRequest {
@@ -1245,8 +1282,13 @@ impl CaptureEngine {
             None => self.previous.as_ref(),
         };
 
-        // Nothing changed: an `auto` snap stages nothing rather than growing the chain.
-        if req.kind == CaptureKind::Auto
+        // Nothing changed: an `auto` snap stages nothing rather than growing the chain, and nor
+        // does a final flush's bulk snap (its small snap is the capture that marks the end), or
+        // a final snap over a final capture (the same final flush asked again).
+        if (req.kind == CaptureKind::Auto
+            || (req.kind == CaptureKind::Final
+                && (req.class == Class::Bulk
+                    || follows.is_some_and(|p| p.manifest.kind == CaptureKind::Final))))
             && let Some(prev) = follows
             && prev.manifest.sections == sections
         {
@@ -1377,14 +1419,24 @@ impl CaptureEngine {
             Some((bulk, _)) => {
                 // The bulk capture first (at `n + 1`, over its own queue file when this capture
                 // coalesced the one below it), then this capture in its place, then the bulk
-                // capture's old manifest goes.
+                // capture's old manifest goes — as one journaled step, so a crash between the
+                // two queue writes never leaves the bulk capture naming a parent no entry holds.
                 let (moved, moved_manifest) = self.restage_bulk(bulk, &manifest)?;
-                self.staging.enqueue(&moved)?;
-                match &coalesce {
-                    Some(old) => self.staging.replace(old, &entry)?,
-                    None => self.staging.enqueue(&entry)?,
+                let mut superseded = vec![bulk.clone()];
+                superseded.extend(coalesce.iter().cloned());
+                if let Err(error) = self
+                    .staging
+                    .restage(&[moved.clone(), entry.clone()], &superseded)
+                {
+                    // Committed (the journal is on disk): finish it now, or the next snap
+                    // does. Not committed: the queue is as it was.
+                    if self.staging.restage_pending() {
+                        tracing::warn!(%error, "restage interrupted; finishing it from its journal");
+                        self.staging.recover()?;
+                    } else {
+                        return Err(error.into());
+                    }
                 }
-                self.staging.sweep(bulk)?;
                 self.below = Some(manifest.clone());
                 tracing::info!(
                     n,

@@ -64,6 +64,7 @@ const CONSUMED_KEYS: &[&str] = &[
     "SEALANT_DOTFILES_HTTP_TOKEN",
     "SEALANT_DOTFILES_ARCHIVE_DIR",
     "SEALANT_SECRET_ENV_FILE",
+    "SEALANT_WORKSPACE_DOCKER_HOST",
     "SEALANT_LIFECYCLE_SETUP_JSON",
     "SEALANT_LIFECYCLE_STARTUP_JSON",
     "SEALANT_FOREGROUND_COMMAND",
@@ -490,6 +491,9 @@ pub struct BootConfig {
     pub control: ControlConfig,
     /// Passthrough environment for the harness child (non-consumed, non-secret).
     pub passthrough_env: Vec<(String, String)>,
+    /// The workspace's own Docker daemon (`SEALANT_WORKSPACE_DOCKER_HOST`, or a `DOCKER_HOST`
+    /// Core reserves for one): the final capture stops its containers.
+    pub workspace_docker: Option<crate::docker::DockerEndpoint>,
 }
 
 /// Whether a string is one of the truthy tokens `1` / `true`.
@@ -649,6 +653,10 @@ impl BootConfig {
         };
 
         let passthrough_env = passthrough_env(env);
+        let workspace_docker = crate::docker::workspace_endpoint(
+            env.get(crate::docker::WORKSPACE_DOCKER_HOST_ENV).as_deref(),
+            env.get("DOCKER_HOST").as_deref(),
+        );
 
         Ok(Self {
             workspace,
@@ -667,6 +675,7 @@ impl BootConfig {
             shells,
             control,
             passthrough_env,
+            workspace_docker,
         })
     }
 

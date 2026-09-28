@@ -14,8 +14,8 @@ use sealant_capture::{
     Registrar,
 };
 use sealant_protocol::{
-    CaptureClass, CaptureFlushKind, CaptureKind, CaptureReplanned, CaptureStaged,
-    CaptureStatusReport, ControlError, LeaseEpochReport, ProcessId, Signal,
+    CaptureClass, CaptureKind, CaptureReplanned, CaptureStaged, CaptureStatusReport, ControlError,
+    LeaseEpochReport, ProcessId, Signal,
 };
 
 use crate::boot::capture::{CaptureBoot, SharedMinter, SourceLayout};
@@ -47,6 +47,20 @@ fn now_unix_ms() -> u64 {
         .map_or(0, |d| d.as_millis() as u64)
 }
 
+/// What the last final flush on this executor came to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FinalOutcome {
+    /// No final flush has run.
+    NotRun,
+    /// Every writer stopped and both classes snapped after that: complete once nothing is
+    /// pending (the ship worker keeps going after a flush that returned at its deadline).
+    /// `shipping` is why that flush returned with captures pending (`deadline`,
+    /// `ship-failed`), reported while they are.
+    Snapped { shipping: Option<&'static str> },
+    /// It cannot complete as it went; the reason code.
+    Incomplete(&'static str),
+}
+
 /// The capture engine and its background loops.
 pub struct CaptureRuntime {
     runner: CadenceRunner,
@@ -62,6 +76,8 @@ pub struct CaptureRuntime {
     harness: Mutex<Option<ProcessId>>,
     /// The boot left a disk that continued the chain as it was (`CaptureBoot::resumed`).
     resumed: bool,
+    /// The last final flush's outcome, reported as `complete` / `incomplete_reason`.
+    final_outcome: Mutex<FinalOutcome>,
 }
 
 impl std::fmt::Debug for CaptureRuntime {
@@ -95,6 +111,7 @@ impl CaptureRuntime {
             paused: AtomicBool::new(false),
             last_snap_unix_ms: AtomicU64::new(0),
             harness: Mutex::new(None),
+            final_outcome: Mutex::new(FinalOutcome::NotRun),
         })
     }
 
@@ -225,32 +242,67 @@ impl CaptureRuntime {
         })
     }
 
-    /// A forced snap, then ship and register what `kind` waits for, bounded by `deadline` as
-    /// the caller gave it — never clamped to the shutdown grace (it once was, to 10 s, which cut
-    /// every flush of a dependency tree short). `suspend`: a small-class snap; returns once
-    /// every capture ahead of a bulk capture still uploading is registered (none: until they
-    /// are). `final`: a small-class and a bulk-class snap; returns once nothing is pending, bulk
-    /// included, on a fence or a chain conflict, or at `deadline`; without one only the process
-    /// ending stops it, because what is staged on this disk is lost with it. The report says
-    /// what is left (`pending`, `pending_bulk`, `pending_bytes`, `refused`). Blocking.
+    /// A suspend flush: a forced small-class snap, then ship and register every capture ahead
+    /// of a bulk capture still uploading, bounded by `deadline` as the caller gave it (or the
+    /// shutdown grace) — never clamped to the grace when given (it once was, to 10 s, which cut
+    /// every flush of a dependency tree short). The report says what is left (`pending`,
+    /// `pending_bulk`, `pending_bytes`, `refused`). Blocking.
     ///
     /// # Errors
     /// Returns [`ControlError`] when the snap fails or shipping stops on a fence or a conflict.
-    pub fn flush(
-        &self,
-        kind: CaptureFlushKind,
-        deadline: Option<Duration>,
-    ) -> Result<CaptureStatusReport, ControlError> {
-        let snap_kind = match kind {
-            CaptureFlushKind::Suspend => EngineKind::Suspend,
-            CaptureFlushKind::Final => EngineKind::Final,
-        };
+    pub fn flush_suspend(&self, deadline: Duration) -> Result<CaptureStatusReport, ControlError> {
         self.runner
-            .flush(snap_kind, deadline)
+            .flush(EngineKind::Suspend, Some(deadline))
             .map_err(|error| ControlError::internal(error.to_string()))?;
         self.last_snap_unix_ms
             .store(now_unix_ms(), Ordering::Relaxed);
         Ok(self.status())
+    }
+
+    /// The capture half of a final flush ([`Runtime::final_flush`] stops the writers first; when
+    /// it could not stop them all, or cannot know it did, `quiesce` is why: `processes-remain`,
+    /// `sweep-unavailable`): a small-class and a bulk-class snap, both forced, then ship
+    /// everything, bulk included, bounded by `deadline` (none: until it is complete, or never
+    /// can be). Records the outcome and reports it as `complete` / `incomplete_reason`: the
+    /// quiesce's reason first, else `snapshot-failed`, `fenced`, `conflict`, `deadline` or
+    /// `ship-failed`. Never an error: an incomplete flush is an answer, not a failure to answer.
+    /// Blocking.
+    pub fn flush_final(
+        &self,
+        deadline: Option<Duration>,
+        quiesce: Option<&'static str>,
+    ) -> CaptureStatusReport {
+        let flushed = self.runner.flush_final(deadline);
+        self.last_snap_unix_ms
+            .store(now_unix_ms(), Ordering::Relaxed);
+        let outcome = match (quiesce, &flushed.incomplete) {
+            (Some(reason), _) => FinalOutcome::Incomplete(reason),
+            (None, None) => FinalOutcome::Snapped { shipping: None },
+            // Shipping did not finish by the deadline: the worker keeps shipping, and the
+            // flush is complete once it has (`capture.status`, or the same flush again).
+            (
+                None,
+                Some(
+                    incomplete @ (sealant_capture::Incomplete::Deadline { .. }
+                    | sealant_capture::Incomplete::ShipFailed(_)),
+                ),
+            ) => FinalOutcome::Snapped {
+                shipping: Some(incomplete.reason()),
+            },
+            (None, Some(incomplete)) => FinalOutcome::Incomplete(incomplete.reason()),
+        };
+        if let Some(incomplete) = &flushed.incomplete {
+            tracing::error!(reason = incomplete.reason(), %incomplete, "final capture flush incomplete");
+        }
+        *self.final_outcome.lock().unwrap_or_else(|e| e.into_inner()) = outcome;
+        self.status()
+    }
+
+    /// Record a final flush that could not finish for a reason outside the engine (its task
+    /// failed).
+    pub fn record_final_incomplete(&self, reason: &'static str) {
+        *self.final_outcome.lock().unwrap_or_else(|e| e.into_inner()) =
+            FinalOutcome::Incomplete(reason);
     }
 
     /// Fetch the plan again and bring the workspace to it (`capture.replan`). A standby booted
@@ -391,6 +443,18 @@ impl CaptureRuntime {
         let staged_bytes = staging.staged_bytes().unwrap_or(0);
         let last = self.last_snap_unix_ms.load(Ordering::Relaxed);
         let (worktree_id, epoch) = self.identity();
+        // Complete only after a final flush stopped every writer and snapped both classes, and
+        // only once everything is registered: nothing pending, the lease not fenced.
+        let outcome = *self.final_outcome.lock().unwrap_or_else(|e| e.into_inner());
+        let incomplete_reason = match outcome {
+            FinalOutcome::NotRun => Some("not-final"),
+            FinalOutcome::Incomplete(reason) => Some(reason),
+            FinalOutcome::Snapped { .. } if ship.fenced => Some("fenced"),
+            FinalOutcome::Snapped { shipping } if pending > 0 => {
+                Some(shipping.unwrap_or("pending"))
+            }
+            FinalOutcome::Snapped { .. } => None,
+        };
         CaptureStatusReport {
             epoch,
             worktree_id,
@@ -412,6 +476,8 @@ impl CaptureRuntime {
             .collect(),
             pending_bulk,
             pending_bytes,
+            complete: incomplete_reason.is_none(),
+            incomplete_reason: incomplete_reason.map(str::to_owned),
         }
     }
 
@@ -443,9 +509,11 @@ mod tests {
     use sealant_capture::sink::BlobSource;
     use sealant_capture::{
         BlobSink, CaptureConfig, CaptureEngine, CaptureKind as EngineKind, Class,
-        InMemoryRegistrar, LocalDir, SnapRequest,
+        InMemoryRegistrar, LocalDir, Materializer, SnapRequest,
     };
-    use sealant_protocol::{Command, CommandResult, ControlRequest, RequestId, ResponseOutcome};
+    use sealant_protocol::{
+        CaptureFlushKind, Command, CommandResult, ControlRequest, RequestId, ResponseOutcome,
+    };
     use sealant_runtime_core::{RuntimeConfig, new_runtime_id};
     use sha2::{Digest, Sha256};
 
@@ -574,6 +642,7 @@ mod tests {
                     Command::CaptureFlush {
                         kind: CaptureFlushKind::Suspend,
                         deadline_ms: Some(30_000),
+                        grace_ms: None,
                     },
                 ))
                 .await,
@@ -619,6 +688,7 @@ mod tests {
                     Command::CaptureFlush {
                         kind: CaptureFlushKind::Suspend,
                         deadline_ms: None,
+                        grace_ms: None,
                     },
                 ))
                 .await,
@@ -632,6 +702,8 @@ mod tests {
         assert_eq!(report.pending, 1, "{report:?}");
         assert_eq!(report.pending_bulk, 0, "{report:?}");
         assert!(report.pending_bytes > 0, "{report:?}");
+        assert!(!report.complete);
+        assert_eq!(report.incomplete_reason.as_deref(), Some("not-final"));
         assert_eq!(capture.status().pending_bytes, report.pending_bytes);
         assert!(registrar.chain().is_empty());
 
@@ -642,6 +714,7 @@ mod tests {
                     Command::CaptureFlush {
                         kind: CaptureFlushKind::Final,
                         deadline_ms: None,
+                        grace_ms: None,
                     },
                 ))
                 .await,
@@ -653,8 +726,9 @@ mod tests {
             "{report:?}"
         );
         assert!(report.refused.is_empty());
+        assert!(report.complete, "{report:?}");
         let chain = registrar.chain();
-        assert_eq!(chain.last().unwrap().manifest.kind, EngineKind::Auto);
+        assert_eq!(chain.last().unwrap().manifest.kind, EngineKind::Final);
         assert!(
             chain
                 .last()
@@ -685,7 +759,7 @@ mod tests {
     }
 
     /// `capture.now {kind: turn}`, `capture.flush`, `runtime.gracefulShutdown` and the signal
-    /// listener's `flush_captures` each force a small-class snap ahead of the timers (the tree
+    /// listener's `final_flush` each force a small-class snap ahead of the timers (the tree
     /// is quiet throughout: no scheduled snap would fire).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn control_hooks_force_a_small_snap_ahead_of_the_timers() {
@@ -729,6 +803,7 @@ mod tests {
                 Command::CaptureFlush {
                     kind: CaptureFlushKind::Suspend,
                     deadline_ms: None,
+                    grace_ms: None,
                 },
             ))
             .await;
@@ -747,15 +822,25 @@ mod tests {
         // The signal listener's path (SIGTERM / SIGINT): a final snap, and a bulk snap — the
         // bulk class had never been captured, so the chain now records it (empty here) — both
         // registered before the flush returns.
-        runtime.flush_captures(CaptureFlushKind::Final).await;
+        let report = runtime
+            .final_flush(None, None)
+            .await
+            .expect("a capture engine");
+        assert!(report.complete, "{report:?}");
+        assert_eq!(report.incomplete_reason, None);
         let chain = registrar.chain();
         assert_eq!(chain.len(), 4);
         assert_eq!(chain[2].manifest.kind, EngineKind::Final);
-        assert_eq!(chain[3].manifest.kind, EngineKind::Auto);
+        assert_eq!(
+            chain[3].manifest.kind,
+            EngineKind::Final,
+            "a final flush's bulk snap is a final one"
+        );
         assert!(chain[3].manifest.sections.bulk.section().is_some());
         assert!(capture.runner().staging().pending().unwrap().is_empty());
 
-        // `runtime.gracefulShutdown` flushes before requesting the shutdown.
+        // `runtime.gracefulShutdown` flushes before requesting the shutdown: the same final
+        // flush again, over a disk nothing changed since, so it stages nothing.
         let resp = runtime
             .dispatch(ControlRequest::new(
                 RequestId::new("r3"),
@@ -770,13 +855,12 @@ mod tests {
                 result: Some(CommandResult::ShutdownAccepted(_))
             }
         ));
-        let chain = registrar.chain();
         assert_eq!(
-            chain.len(),
-            5,
-            "the bulk class is unchanged: nothing more to stage"
+            registrar.chain().len(),
+            4,
+            "a final flush over a final capture of an unchanged disk stages nothing"
         );
-        assert_eq!(chain[4].manifest.kind, EngineKind::Final);
+        assert!(capture.status().complete);
         let snap = capture.runner().snapshot();
         assert_eq!(snap.forced, 4, "{snap:?}");
         assert_eq!(snap.small_snaps, 4, "no scheduled snap fired: {snap:?}");
@@ -1065,5 +1149,511 @@ mod tests {
         assert!(again.unchanged);
         assert_eq!(again.head_n, Some(4));
         assert_eq!(capture.status().pending, 0);
+    }
+
+    fn sh(script: &str, cwd: &Path) -> sealant_protocol::ExecArgs {
+        sealant_protocol::ExecArgs {
+            execution_id: None,
+            session_id: None,
+            executable: "/bin/sh".to_owned(),
+            args: vec!["-c".to_owned(), script.to_owned()],
+            cwd: Some(cwd.display().to_string()),
+            // `sleep` from this process's PATH (the child's base environment has none).
+            env: vec![sealant_protocol::EnvVar {
+                key: "PATH".to_owned(),
+                value: std::env::var("PATH").unwrap_or_default(),
+            }],
+            stdin: false,
+            attach: false,
+            timeout_millis: None,
+            background: false,
+            capture: None,
+            graceful_signal: None,
+        }
+    }
+
+    /// A writer that keeps writing (`counter.txt`, every 20 ms) and writes its last word from
+    /// its `SIGTERM` handler (`term.txt`).
+    const WRITER: &str = "trap 'echo last words > term.txt; exit 0' TERM; i=0; \
+                          while true; do i=$((i+1)); echo $i > counter.txt; sleep 0.02; done";
+
+    /// A runtime with a capture engine over a fresh workspace, and the writer running in it as
+    /// the harness. Returns the runtime, the capture, the registrar, and the workspace.
+    async fn with_writer(
+        base: &Path,
+    ) -> (
+        Arc<Runtime>,
+        Arc<CaptureRuntime>,
+        Arc<InMemoryRegistrar>,
+        std::path::PathBuf,
+    ) {
+        let (boot, registrar) = boot(base);
+        let ws = base.join("ws");
+        let mut config = RuntimeConfig::new(new_runtime_id());
+        config.workspace_root = ws.clone();
+        let runtime = Runtime::new(config, Arc::new(ShutdownSignal::new(5_000)));
+        runtime.mark_healthy();
+        let capture = CaptureRuntime::new(boot);
+        assert!(runtime.install_capture(capture.clone()));
+        let harness = runtime
+            .spawn_managed(sh(WRITER, &ws))
+            .expect("spawn the writer");
+        capture.start(runtime.clone(), harness.process_id);
+        let start = Instant::now();
+        while !ws.join("counter.txt").exists() {
+            assert!(start.elapsed() < Duration::from_secs(10), "the writer runs");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        (runtime, capture, registrar, ws)
+    }
+
+    /// The head, materialized into a fresh directory under `base`.
+    fn restore_head(base: &Path, registrar: &InMemoryRegistrar, name: &str) -> std::path::PathBuf {
+        let store = LocalDir::new(&base.join("store")).unwrap();
+        let fresh = base.join(name);
+        Materializer::new(
+            &store,
+            sealant_capture::MaterializeTargets::new(&fresh, None),
+        )
+        .materialize(
+            &registrar.head().expect("a head").manifest,
+            sealant_capture::MaterializeClass::All,
+        )
+        .unwrap();
+        fresh
+    }
+
+    /// Review finding #2: the daemon snapped, then terminated its processes, so a writer that
+    /// wrote during the upload or from its `SIGTERM` handler lost it. A final `capture.flush`
+    /// now closes admission, terminates every managed process and waits for it, and only then
+    /// snaps: the head holds the handler's file and the counter's last value, byte for byte,
+    /// nothing runs any more, and nothing new is admitted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_final_flush_stops_the_writers_before_it_snaps() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (runtime, _capture, registrar, ws) = with_writer(tmp.path()).await;
+
+        let report = flush_report(
+            runtime
+                .dispatch(ControlRequest::new(
+                    RequestId::new("r1"),
+                    Command::CaptureFlush {
+                        kind: CaptureFlushKind::Final,
+                        deadline_ms: None,
+                        grace_ms: Some(5_000),
+                    },
+                ))
+                .await,
+        );
+        assert!(report.complete, "{report:?}");
+        assert_eq!(report.incomplete_reason, None);
+        assert_eq!(report.pending, 0);
+        assert_eq!(
+            runtime.health_report().active_processes,
+            0,
+            "the writer is gone"
+        );
+        assert!(!runtime.capture_incomplete());
+
+        let fresh = restore_head(tmp.path(), &registrar, "fresh");
+        assert_eq!(
+            std::fs::read_to_string(fresh.join("term.txt"))
+                .ok()
+                .as_deref(),
+            Some("last words\n"),
+            "what the writer wrote on SIGTERM is in the head"
+        );
+        assert_eq!(
+            std::fs::read_to_string(fresh.join("counter.txt")).unwrap(),
+            std::fs::read_to_string(ws.join("counter.txt")).unwrap(),
+            "the head is the disk as the writer left it"
+        );
+
+        // Admission is closed for good: no exec, no session, no re-plan.
+        let refused = runtime
+            .dispatch(ControlRequest::new(
+                RequestId::new("r2"),
+                Command::Exec(sh("echo late > late.txt", &ws)),
+            ))
+            .await;
+        assert!(
+            matches!(refused.outcome, ResponseOutcome::Error { .. }),
+            "{:?}",
+            refused.outcome
+        );
+        assert!(runtime.spawn_managed(sh("true", &ws)).is_err());
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!ws.join("late.txt").exists());
+    }
+
+    /// Finding #2 on the daemon's own way out: `runtime.gracefulShutdown` (and SIGTERM/SIGINT,
+    /// and the harness exiting, which run the same `final_flush`) used to snap first and
+    /// terminate after. The writer's `SIGTERM` handler now runs before the last snap.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn graceful_shutdown_stops_the_writers_before_the_final_capture() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (runtime, capture, registrar, ws) = with_writer(tmp.path()).await;
+
+        let resp = runtime
+            .dispatch(ControlRequest::new(
+                RequestId::new("r1"),
+                Command::RuntimeGracefulShutdown {
+                    grace_millis: Some(5_000),
+                },
+            ))
+            .await;
+        assert!(matches!(
+            resp.outcome,
+            ResponseOutcome::Ok {
+                result: Some(CommandResult::ShutdownAccepted(_))
+            }
+        ));
+        assert!(capture.status().complete, "{:?}", capture.status());
+        assert!(!runtime.capture_incomplete());
+        let fresh = restore_head(tmp.path(), &registrar, "fresh");
+        assert_eq!(
+            std::fs::read_to_string(fresh.join("term.txt"))
+                .ok()
+                .as_deref(),
+            Some("last words\n")
+        );
+        assert_eq!(
+            std::fs::read_to_string(fresh.join("counter.txt")).unwrap(),
+            std::fs::read_to_string(ws.join("counter.txt")).unwrap()
+        );
+    }
+
+    /// Review finding #11: once the lease was fenced, a final flush answered success with a
+    /// capture still staged (the shipper read "fenced" as "done"). Every final flush on a
+    /// fenced lease now answers `complete: false`, `incomplete_reason: "fenced"`, the capture
+    /// stays staged, and the daemon would exit with `EXIT_CAPTURE_INCOMPLETE`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_final_flush_on_a_fenced_lease_is_incomplete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (boot, registrar) = boot(tmp.path());
+        let mut config = RuntimeConfig::new(new_runtime_id());
+        config.workspace_root = tmp.path().join("ws");
+        let runtime = Runtime::new(config, Arc::new(ShutdownSignal::new(1_000)));
+        runtime.mark_healthy();
+        let capture = CaptureRuntime::new(boot);
+        assert!(runtime.install_capture(capture.clone()));
+        registrar.set_live_epoch(2);
+
+        for rid in ["r1", "r2"] {
+            let report = flush_report(
+                runtime
+                    .dispatch(ControlRequest::new(
+                        RequestId::new(rid),
+                        Command::CaptureFlush {
+                            kind: CaptureFlushKind::Final,
+                            deadline_ms: None,
+                            grace_ms: None,
+                        },
+                    ))
+                    .await,
+            );
+            assert!(!report.complete, "{rid}: {report:?}");
+            assert_eq!(report.incomplete_reason.as_deref(), Some("fenced"), "{rid}");
+            assert!(report.pending > 0, "{rid}: still staged: {report:?}");
+        }
+        assert!(registrar.chain().is_empty());
+        assert!(runtime.capture_incomplete());
+        assert!(capture.status().fenced);
+    }
+
+    /// A final flush whose deadline passes while the store refuses every PUT is
+    /// `complete: false`, `incomplete_reason: "ship-failed"` (it answered like a finished flush
+    /// before, with the capture still staged), and a final flush without a deadline then
+    /// completes it once the store takes it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_final_flush_that_cannot_ship_by_its_deadline_is_incomplete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let opens = Instant::now() + Duration::from_millis(1_500);
+        let (boot, _registrar) = boot_with(tmp.path(), |inner| Arc::new(Gate { inner, opens }));
+        let mut config = RuntimeConfig::new(new_runtime_id());
+        config.workspace_root = tmp.path().join("ws");
+        let runtime = Runtime::new(config, Arc::new(ShutdownSignal::new(1_000)));
+        runtime.mark_healthy();
+        let capture = CaptureRuntime::new(boot);
+        assert!(runtime.install_capture(capture.clone()));
+
+        let flush = |rid: &'static str, deadline_ms| {
+            runtime.dispatch(ControlRequest::new(
+                RequestId::new(rid),
+                Command::CaptureFlush {
+                    kind: CaptureFlushKind::Final,
+                    deadline_ms,
+                    grace_ms: None,
+                },
+            ))
+        };
+        let report = flush_report(flush("r1", Some(300)).await);
+        assert!(!report.complete, "{report:?}");
+        assert_eq!(report.incomplete_reason.as_deref(), Some("ship-failed"));
+        assert!(report.pending > 0 && report.pending_bytes > 0, "{report:?}");
+        assert!(runtime.capture_incomplete());
+
+        let report = flush_report(flush("r2", None).await);
+        assert!(report.complete, "{report:?}");
+        assert_eq!(report.pending, 0);
+        assert!(!runtime.capture_incomplete());
+    }
+
+    /// A fake Docker Engine on a Unix socket: `GET /containers/json` lists what runs, `POST
+    /// /containers/{id}/stop?t=N` records the stop and, unless the container is `stubborn`,
+    /// stops it.
+    #[derive(Default)]
+    struct FakeDocker {
+        running: Vec<String>,
+        stubborn: Vec<String>,
+        stops: Vec<String>,
+    }
+
+    fn fake_docker(socket: &Path, running: &[&str], stubborn: &[&str]) -> Arc<Mutex<FakeDocker>> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let state = Arc::new(Mutex::new(FakeDocker {
+            running: running.iter().map(|s| (*s).to_owned()).collect(),
+            stubborn: stubborn.iter().map(|s| (*s).to_owned()).collect(),
+            stops: Vec::new(),
+        }));
+        let listener = tokio::net::UnixListener::bind(socket).unwrap();
+        let shared = state.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut conn, _)) = listener.accept().await else {
+                    return;
+                };
+                let state = shared.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 1024];
+                    while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match conn.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                        }
+                    }
+                    let head = String::from_utf8_lossy(&buf).to_string();
+                    let mut words = head.split_whitespace();
+                    let (method, path) = (words.next().unwrap_or(""), words.next().unwrap_or(""));
+                    let (status, body) = {
+                        let mut st = state.lock().unwrap();
+                        if method == "GET" && path == "/containers/json" {
+                            let list: Vec<_> = st
+                                .running
+                                .iter()
+                                .map(|id| serde_json::json!({"Id": id}))
+                                .collect();
+                            ("200 OK", serde_json::to_string(&list).unwrap())
+                        } else if method == "POST" && path.starts_with("/containers/") {
+                            st.stops.push(path.to_owned());
+                            let id = path.split('/').nth(2).unwrap_or("").to_owned();
+                            if !st.stubborn.contains(&id) {
+                                st.running.retain(|r| *r != id);
+                            }
+                            ("204 No Content", String::new())
+                        } else {
+                            ("404 Not Found", String::new())
+                        }
+                    };
+                    let answer = format!(
+                        "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = conn.write_all(answer.as_bytes()).await;
+                });
+            }
+        });
+        state
+    }
+
+    /// A runtime with a capture engine over a fresh workspace and nothing running.
+    fn quiet_runtime(base: &Path) -> (Arc<Runtime>, Arc<CaptureRuntime>, Arc<InMemoryRegistrar>) {
+        let (boot, registrar) = boot(base);
+        let mut config = RuntimeConfig::new(new_runtime_id());
+        config.workspace_root = base.join("ws");
+        let runtime = Runtime::new(config, Arc::new(ShutdownSignal::new(3_000)));
+        runtime.mark_healthy();
+        let capture = CaptureRuntime::new(boot);
+        assert!(runtime.install_capture(capture.clone()));
+        (runtime, capture, registrar)
+    }
+
+    /// A container of the workspace's own Docker daemon (Docker-in-MicroVM, a dind sidecar) can
+    /// bind-mount the worktree and keeps writing after the last snap unless it is stopped:
+    /// the final flush stops every running container (`docker stop -t <grace>`) before it
+    /// snaps, and is complete once the daemon reports none running.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_final_flush_stops_every_container_of_the_workspace_docker_daemon() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (runtime, _capture, _registrar) = quiet_runtime(tmp.path());
+        let socket = tmp.path().join("docker.sock");
+        let docker = fake_docker(&socket, &["c1", "c2"], &[]);
+        runtime.set_workspace_docker(Some(crate::docker::DockerEndpoint::Unix(socket)));
+
+        let report = runtime.final_flush(None, Some(3_000)).await.unwrap();
+        assert!(report.complete, "{report:?}");
+        let docker = docker.lock().unwrap();
+        let mut stops = docker.stops.clone();
+        stops.sort();
+        assert_eq!(
+            stops,
+            ["/containers/c1/stop?t=3", "/containers/c2/stop?t=3"],
+            "every container, with the flush's grace"
+        );
+        assert!(docker.running.is_empty());
+    }
+
+    /// A container that is still running after its stop, or a daemon that is known and cannot
+    /// be reached, leaves the flush incomplete (`processes-remain`): nobody knows it stopped
+    /// writing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_container_left_running_or_an_unreachable_daemon_is_incomplete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (runtime, _capture, _registrar) = quiet_runtime(tmp.path());
+        let socket = tmp.path().join("docker.sock");
+        let docker = fake_docker(&socket, &["c1", "stuck"], &["stuck"]);
+        runtime.set_workspace_docker(Some(crate::docker::DockerEndpoint::Unix(socket)));
+        let report = runtime.final_flush(None, Some(1_000)).await.unwrap();
+        assert!(!report.complete, "{report:?}");
+        assert_eq!(
+            report.incomplete_reason.as_deref(),
+            Some("processes-remain")
+        );
+        assert_eq!(docker.lock().unwrap().running, ["stuck"]);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (runtime, _capture, _registrar) = quiet_runtime(tmp.path());
+        runtime.set_workspace_docker(Some(crate::docker::DockerEndpoint::Unix(
+            tmp.path().join("no-daemon.sock"),
+        )));
+        let report = runtime.final_flush(None, Some(1_000)).await.unwrap();
+        assert!(!report.complete, "{report:?}");
+        assert_eq!(
+            report.incomplete_reason.as_deref(),
+            Some("processes-remain")
+        );
+    }
+
+    /// Without `PR_SET_CHILD_SUBREAPER`, and not PID 1 of its PID namespace, the daemon cannot
+    /// see an orphaned writer: every final flush is incomplete (`sweep-unavailable`), however
+    /// well everything else went.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn without_a_subreaper_every_final_flush_is_incomplete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (runtime, _capture, registrar) = quiet_runtime(tmp.path());
+        runtime.set_subreaper_for_test(false);
+        assert!(runtime.sweep_unavailable());
+        for _ in 0..2 {
+            let report = runtime.final_flush(None, None).await.unwrap();
+            assert!(!report.complete, "{report:?}");
+            assert_eq!(
+                report.incomplete_reason.as_deref(),
+                Some("sweep-unavailable")
+            );
+            assert_eq!(report.pending, 0, "everything still ships: {report:?}");
+        }
+        assert!(!registrar.chain().is_empty());
+        assert!(runtime.capture_incomplete());
+    }
+
+    /// A store that spends `delay` on every PUT.
+    struct Slow {
+        inner: Arc<dyn BlobSink>,
+        delay: Duration,
+    }
+
+    impl BlobSink for Slow {
+        fn put_if_absent(
+            &self,
+            key: &str,
+            source: BlobSource<'_>,
+        ) -> Result<sealant_capture::sink::PutOutcome, sealant_capture::sink::SinkError> {
+            std::thread::sleep(self.delay);
+            self.inner.put_if_absent(key, source)
+        }
+
+        fn get(&self, key: &str) -> Result<Vec<u8>, sealant_capture::sink::SinkError> {
+            self.inner.get(key)
+        }
+
+        fn exists(&self, key: &str) -> Result<bool, sealant_capture::sink::SinkError> {
+            self.inner.exists(key)
+        }
+    }
+
+    /// Core's drain sends a final flush with a deadline and polls. A final flush that returns at
+    /// its deadline with captures still uploading is `complete: false` (`deadline`) and ends
+    /// nothing: the daemon stays up, admission stays closed, the writers stay stopped, and the
+    /// ship worker keeps uploading until `capture.status` says `complete`. The same final flush
+    /// asked again then answers `complete` without stopping the writers again or taking a new
+    /// capture of the unchanged disk.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_final_flush_past_its_deadline_resumes_to_complete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (boot, registrar) = boot_with(tmp.path(), |inner| {
+            Arc::new(Slow {
+                inner,
+                delay: Duration::from_millis(150),
+            })
+        });
+        let ws = tmp.path().join("ws");
+        let mut config = RuntimeConfig::new(new_runtime_id());
+        config.workspace_root = ws.clone();
+        let runtime = Runtime::new(config, Arc::new(ShutdownSignal::new(3_000)));
+        runtime.mark_healthy();
+        let capture = CaptureRuntime::new(boot);
+        assert!(runtime.install_capture(capture.clone()));
+        let harness = runtime
+            .spawn_managed(sh("exec sleep 600", &ws))
+            .expect("spawn");
+        capture.start(runtime.clone(), harness.process_id);
+
+        let flush = |rid: &'static str, deadline_ms| {
+            runtime.dispatch(ControlRequest::new(
+                RequestId::new(rid),
+                Command::CaptureFlush {
+                    kind: CaptureFlushKind::Final,
+                    deadline_ms,
+                    grace_ms: Some(2_000),
+                },
+            ))
+        };
+        let report = flush_report(flush("r1", Some(100)).await);
+        assert!(!report.complete, "{report:?}");
+        assert_eq!(report.incomplete_reason.as_deref(), Some("deadline"));
+        assert!(report.pending > 0, "{report:?}");
+        assert_eq!(runtime.quiesce_count(), 1);
+
+        // Still up, still closed, and the worker ships the rest.
+        assert_eq!(runtime.state(), sealant_protocol::RuntimeState::Healthy);
+        assert!(runtime.admission_is_closed());
+        assert_eq!(runtime.health_report().active_processes, 0);
+        let start = Instant::now();
+        let status = loop {
+            let status = capture.status();
+            if status.complete {
+                break status;
+            }
+            assert_eq!(
+                status.incomplete_reason.as_deref(),
+                Some("deadline"),
+                "{status:?}"
+            );
+            assert!(start.elapsed() < Duration::from_secs(60), "{status:?}");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        assert_eq!(status.pending, 0);
+        let registered = registrar.chain().len();
+
+        let report = flush_report(flush("r2", Some(10_000)).await);
+        assert!(report.complete, "{report:?}");
+        assert_eq!(runtime.quiesce_count(), 1, "no second quiesce");
+        assert_eq!(
+            registrar.chain().len(),
+            registered,
+            "no new capture of an unchanged disk"
+        );
+        assert!(!runtime.capture_incomplete());
     }
 }
