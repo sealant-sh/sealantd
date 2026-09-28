@@ -2704,6 +2704,10 @@ mod tests {
         let runtime = Runtime::new(config, Arc::new(ShutdownSignal::new(3_000)));
         runtime.mark_healthy();
         runtime.close_admission();
+        // A recovery in Docker: sealantd is PID 1 of the container (the unit test's mark keeps
+        // the sweep to nothing). Not PID 1 and with no agent's helper list, a recovery cannot
+        // see the dead daemon's orphans and is never complete.
+        runtime.set_sweep_scope_for_test(crate::sweep::Scope::Namespace);
         let capture = CaptureRuntime::new(boot);
         assert!(runtime.install_capture(capture.clone()));
         capture.start_without_harness(runtime.clone());

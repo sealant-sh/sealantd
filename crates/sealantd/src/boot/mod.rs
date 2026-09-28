@@ -401,6 +401,18 @@ pub fn run_supervised(
     secret_env: Vec<(String, String)>,
     capture_boot: Option<capture::CaptureBoot>,
 ) -> ExitCode {
+    run_supervised_with(config, secret_env, capture_boot, |_| {})
+}
+
+/// [`run_supervised`], `prepare` given the runtime before anything runs on it (a test sweeps
+/// as PID 1 of a container does, narrowed to its own processes).
+#[doc(hidden)]
+pub fn run_supervised_with(
+    config: BootConfig,
+    secret_env: Vec<(String, String)>,
+    capture_boot: Option<capture::CaptureBoot>,
+    prepare: impl FnOnce(&Runtime),
+) -> ExitCode {
     let runtime_config = into_runtime_config(&config, &secret_env);
     // Nothing downstream needs the values in this form; the runtime config owns them now.
     drop(secret_env);
@@ -411,6 +423,7 @@ pub fn run_supervised(
     }
     let shutdown = Arc::new(ShutdownSignal::new(runtime_config.shutdown_grace_ms));
     let runtime = Runtime::new(runtime_config, shutdown);
+    prepare(&runtime);
 
     let tokio_runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -696,11 +709,17 @@ fn start_capture(
         None => tracing::info!("no workspace Docker daemon; no container to stop at the end"),
     }
     runtime.set_workspace_docker(config.workspace_docker.clone());
+    // The helpers the host's agent names: the final flush sweeps every other process on the
+    // machine ([`crate::sweep::Scope::Machine`]).
+    runtime.set_sweep_exempt_file(config.sweep_exempt_file.clone());
     if runtime.sweep_unavailable() {
         tracing::error!(
-            "PR_SET_CHILD_SUBREAPER did not take effect and sealantd is not PID 1 of its PID \
-             namespace: the final capture cannot see an orphaned writer, and every final \
-             flush will answer complete: false (sweep-unavailable)"
+            recovery = config.recovery,
+            "sealantd is not PID 1 of its PID namespace, no agent named its helpers \
+             (SEALANT_SWEEP_EXEMPT_FILE), and either PR_SET_CHILD_SUBREAPER did not take effect \
+             or this is a recovery boot (the daemon before it left its orphans to whatever \
+             adopted them): the final capture cannot see every writer, and every final flush \
+             will answer complete: false (sweep-unavailable)"
         );
     }
     tracing::info!("capture engine started before any user code");
