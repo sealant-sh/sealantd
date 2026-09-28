@@ -14,7 +14,7 @@ use sealant_capture::{
     Registrar,
 };
 use sealant_protocol::{
-    CaptureClass, CaptureClassSnaps, CaptureKind, CaptureReplanned, CaptureStaged,
+    CaptureClass, CaptureClassSnaps, CaptureKind, CaptureOverdue, CaptureReplanned, CaptureStaged,
     CaptureStatusReport, ControlError, ControlErrorCode, LeaseEpochReport, ProcessId, Signal,
 };
 
@@ -45,6 +45,18 @@ fn now_unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as u64)
+}
+
+/// The capture step running past its bound, if one is ([`CaptureStatusReport::overdue`]): a
+/// snap, or a `git` it waits on ([`sealant_process::activity`], [`sealant_capture::bounds`]).
+fn overdue() -> Option<CaptureOverdue> {
+    let ms = |d: Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
+    sealant_process::activity::overdue().map(|o| CaptureOverdue {
+        step: o.step,
+        started_unix_ms: o.started.duration_since(UNIX_EPOCH).map_or(0, &ms),
+        running_ms: ms(o.running),
+        bound_ms: ms(o.bound),
+    })
 }
 
 /// What the last final flush on this executor came to.
@@ -727,6 +739,7 @@ impl CaptureRuntime {
             boot_id: None,
             boot_generation: None,
             observation: None,
+            overdue: overdue(),
         }
     }
 

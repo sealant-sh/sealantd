@@ -7,6 +7,7 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 #![forbid(unsafe_code)]
 
+pub mod activity;
 pub mod platform;
 pub mod registry;
 pub mod runtime;
@@ -17,4 +18,4 @@ pub mod spawn;
 pub use registry::{ProcessEntry, ProcessRegistry};
 pub use runtime::ProcessRuntime;
 pub use sftp::SftpRuntime;
-pub use spawn::{CommandGateExt, GatedChild, SpawnedPid};
+pub use spawn::{Bound, CommandGateExt, GatedChild, SpawnedPid};

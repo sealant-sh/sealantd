@@ -10,12 +10,12 @@ use crate::ids::{
 use crate::wire;
 use crate::{
     ArtifactRef, AttachMode, AttachSessionArgs, Base64Bytes, Capabilities, CaptureClass,
-    CaptureClassSnaps, CaptureFlushKind, CaptureKind, CaptureMethod, CaptureMode, CapturePolicy,
-    CaptureReplanned, CaptureStaged, CaptureStatusReport, ClientMessage, Command, CommandResult,
-    Confidence, ControlError, ControlErrorCode, ControlRequest, ControlResponse, Encoding, EnvVar,
-    EventEnvelope, EventPayload, ExecAccepted, ExecArgs, ExecutionStartArgs, ExitReason, Feature,
-    FeatureMatrix, FeatureState, ForwardOpened, ForwardProtocol, HealthReport, IoChunk,
-    LeaseEpochReport, Limits, NetworkMode, OpenForwardArgs, OpenSessionArgs, OpenSftpArgs,
+    CaptureClassSnaps, CaptureFlushKind, CaptureKind, CaptureMethod, CaptureMode, CaptureOverdue,
+    CapturePolicy, CaptureReplanned, CaptureStaged, CaptureStatusReport, ClientMessage, Command,
+    CommandResult, Confidence, ControlError, ControlErrorCode, ControlRequest, ControlResponse,
+    Encoding, EnvVar, EventEnvelope, EventPayload, ExecAccepted, ExecArgs, ExecutionStartArgs,
+    ExitReason, Feature, FeatureMatrix, FeatureState, ForwardOpened, ForwardProtocol, HealthReport,
+    IoChunk, LeaseEpochReport, Limits, NetworkMode, OpenForwardArgs, OpenSessionArgs, OpenSftpArgs,
     ProcessAttached, ProcessExited, ProcessList, ProcessStarted, ProcessState, ProcessSummary,
     ResponseOutcome, RuntimeHeartbeat, RuntimeMetrics, RuntimeState, RuntimeStateChanged,
     ServerMessage, SessionList, SessionOpened, SessionSummary, SftpOpened, ShutdownAccepted,
@@ -1437,6 +1437,12 @@ impl From<CommandResult> for wire::command_result::Result {
                     boot_id: c.boot_id,
                     boot_generation: c.boot_generation,
                     observation: c.observation,
+                    overdue: c.overdue.map(|o| wire::CaptureOverdue {
+                        step: o.step,
+                        started_unix_ms: o.started_unix_ms,
+                        running_ms: o.running_ms,
+                        bound_ms: o.bound_ms,
+                    }),
                 }))
             }
             CommandResult::LeaseEpoch(l) => W::LeaseEpoch(wire::LeaseEpochReport {
@@ -1573,6 +1579,12 @@ impl TryFrom<wire::command_result::Result> for CommandResult {
                 boot_id: c.boot_id,
                 boot_generation: c.boot_generation,
                 observation: c.observation,
+                overdue: c.overdue.map(|o| CaptureOverdue {
+                    step: o.step,
+                    started_unix_ms: o.started_unix_ms,
+                    running_ms: o.running_ms,
+                    bound_ms: o.bound_ms,
+                }),
             })),
             W::LeaseEpoch(l) => CommandResult::LeaseEpoch(LeaseEpochReport {
                 epoch: l.epoch,
@@ -2183,6 +2195,12 @@ mod tests {
                 boot_id: Some("0123456789abcdef0123456789abcdef".to_owned()),
                 boot_generation: Some(2),
                 observation: Some(41),
+                overdue: Some(CaptureOverdue {
+                    step: "small snap › git cat-file --batch-check".to_owned(),
+                    started_unix_ms: 1_790_000_000_000,
+                    running_ms: 1_020_000,
+                    bound_ms: 120_000,
+                }),
             })),
             CommandResult::CaptureStatus(Box::new(CaptureStatusReport {
                 epoch: 2,
@@ -2215,6 +2233,7 @@ mod tests {
                 boot_id: None,
                 boot_generation: None,
                 observation: None,
+                overdue: None,
             })),
             CommandResult::LeaseEpoch(LeaseEpochReport {
                 epoch: 2,

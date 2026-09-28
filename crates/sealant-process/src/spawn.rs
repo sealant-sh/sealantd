@@ -19,9 +19,14 @@
 //! and the spawner's own `wait()` fails with `ECHILD` ("No child process").
 
 use std::collections::HashSet;
-use std::io;
+use std::io::{self, Read, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Output, Stdio};
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::mpsc;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+
+use crate::activity;
 
 /// OS pids this process has spawned and not yet reaped.
 pub type SpawnedPids = HashSet<i32>;
@@ -122,11 +127,185 @@ pub fn spawn_tokio(
     Ok((child, guard))
 }
 
+/// How long a helper may run ([`GatedChild::bound`]): past `overdue` it is reported
+/// ([`crate::activity::overdue`]) and logged; past `limit`, when there is one, it is killed
+/// (`SIGKILL`) and its wait fails with [`io::ErrorKind::TimedOut`].
+#[derive(Debug, Clone)]
+pub struct Bound {
+    /// What the helper is, for the report and the log (`git cat-file --batch-check`).
+    pub label: String,
+    /// How long it is expected to take at most.
+    pub overdue: Duration,
+    /// How long it may run before it is killed; `None`: never killed, only reported (a helper
+    /// that writes something in place a kill could leave half-written).
+    pub limit: Option<Duration>,
+}
+
+/// After a helper was killed, or its bound passed, how long its output may still take to end
+/// (a process it started can hold the pipes after it is gone).
+const OUTPUT_GRACE: Duration = Duration::from_secs(2);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Watch {
+    /// The child runs; the watchdog may kill it.
+    Running,
+    /// The child exited and is about to be reaped: nothing may signal its pid any more.
+    Reaping,
+    /// The watchdog killed it.
+    Killed,
+}
+
+/// Kills a helper that outlives its [`Bound`]. The kill is taken under the same lock the waiter
+/// takes once it has seen the child exit and before it reaps it, so the pid signalled is always
+/// this child's (alive, or a zombie nobody has reaped): never a pid the system gave to another
+/// process since.
+#[derive(Debug)]
+struct Watchdog {
+    shared: Arc<(Mutex<Watch>, Condvar)>,
+    thread: Option<JoinHandle<()>>,
+    started: Instant,
+    bound: Bound,
+    /// Registered for as long as the child runs (the thread holds the other handle).
+    _step: Arc<activity::Step>,
+}
+
+impl Watchdog {
+    fn arm(pid: i32, bound: Bound) -> Self {
+        let step = Arc::new(activity::enter(&bound.label, bound.overdue));
+        let shared = Arc::new((Mutex::new(Watch::Running), Condvar::new()));
+        let started = Instant::now();
+        let thread = {
+            let shared = Arc::clone(&shared);
+            let bound = bound.clone();
+            let step = Arc::clone(&step);
+            std::thread::Builder::new()
+                .name("helper-watchdog".to_owned())
+                .spawn(move || {
+                    let (lock, cv) = &*shared;
+                    let running = |w: &mut Watch| *w == Watch::Running;
+                    let guard = lock.lock().unwrap_or_else(PoisonError::into_inner);
+                    let (guard, _) = cv
+                        .wait_timeout_while(guard, bound.overdue, running)
+                        .unwrap_or_else(PoisonError::into_inner);
+                    if *guard == Watch::Running {
+                        step.report_if_overdue();
+                    }
+                    let Some(limit) = bound.limit else {
+                        drop(
+                            cv.wait_while(guard, running)
+                                .unwrap_or_else(PoisonError::into_inner),
+                        );
+                        return;
+                    };
+                    let rest = limit.saturating_sub(started.elapsed());
+                    let (mut guard, _) = cv
+                        .wait_timeout_while(guard, rest, running)
+                        .unwrap_or_else(PoisonError::into_inner);
+                    if *guard == Watch::Running {
+                        let _ = nix::sys::signal::kill(
+                            nix::unistd::Pid::from_raw(pid),
+                            nix::sys::signal::Signal::SIGKILL,
+                        );
+                        *guard = Watch::Killed;
+                        tracing::error!(
+                            pid,
+                            helper = %bound.label,
+                            limit_s = limit.as_secs(),
+                            "a helper was still running at its limit; killed"
+                        );
+                    }
+                })
+                .ok()
+        };
+        Self {
+            shared,
+            thread,
+            started,
+            bound,
+            _step: step,
+        }
+    }
+
+    /// The child exited (not reaped yet): stop the watchdog. Whether it had killed it.
+    fn disarm(&mut self) -> bool {
+        let killed = {
+            let (lock, cv) = &*self.shared;
+            let mut watch = lock.lock().unwrap_or_else(PoisonError::into_inner);
+            if *watch == Watch::Running {
+                *watch = Watch::Reaping;
+            }
+            cv.notify_all();
+            *watch == Watch::Killed
+        };
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+        killed
+    }
+
+    fn timed_out(&self) -> io::Error {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!(
+                "{}: still running after {} s; killed",
+                self.bound.label,
+                self.bound.limit.unwrap_or_default().as_secs()
+            ),
+        )
+    }
+
+    /// How long the output of a child that exited may still take to end.
+    fn output_wait(&self, killed: bool) -> Duration {
+        match self.bound.limit {
+            Some(_) if killed => OUTPUT_GRACE,
+            Some(limit) => limit
+                .saturating_sub(self.started.elapsed())
+                .max(OUTPUT_GRACE),
+            None => Duration::MAX,
+        }
+    }
+}
+
+impl Drop for Watchdog {
+    /// A child dropped without a wait goes back to the orphan reaper, and its pid can be reused:
+    /// the watchdog stops first ([`GatedChild`] drops it before the pid guard).
+    fn drop(&mut self) {
+        self.disarm();
+    }
+}
+
+/// Wait until `pid` (a child of this process) has exited, without reaping it (`WNOWAIT`).
+fn wait_exited(pid: i32) -> io::Result<()> {
+    use nix::sys::wait::{Id, WaitPidFlag, waitid};
+    loop {
+        match waitid(
+            Id::Pid(nix::unistd::Pid::from_raw(pid)),
+            WaitPidFlag::WEXITED | WaitPidFlag::WNOWAIT,
+        ) {
+            Ok(_) => return Ok(()),
+            Err(nix::errno::Errno::EINTR) => {}
+            Err(errno) => return Err(io::Error::from(errno)),
+        }
+    }
+}
+
+/// Read `pipe` to its end on its own thread.
+fn drain(mut pipe: impl Read + Send + 'static) -> mpsc::Receiver<io::Result<Vec<u8>>> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = tx.send(pipe.read_to_end(&mut bytes).map(|_| bytes));
+    });
+    rx
+}
+
 /// A blocking child spawned under the gate. Reaping it (`wait`/`wait_with_output`) releases its
 /// pid; so does dropping it without waiting, which is correct — nobody is left to `wait()`, so the
 /// orphan reaper should collect the zombie.
 #[derive(Debug)]
 pub struct GatedChild {
+    // Dropped first: a watchdog never outlives the pid guard.
+    watchdog: Option<Watchdog>,
     child: Child,
     spawned: SpawnedPid,
 }
@@ -136,6 +315,15 @@ impl GatedChild {
     #[must_use]
     pub fn pid(&self) -> i32 {
         self.spawned.pid()
+    }
+
+    /// Bound how long the child may run ([`Bound`]): reported once it runs past `overdue`,
+    /// killed at `limit`, when its wait then fails with [`io::ErrorKind::TimedOut`]. A second
+    /// call is ignored.
+    pub fn bound(&mut self, bound: Bound) {
+        if self.watchdog.is_none() {
+            self.watchdog = Some(Watchdog::arm(self.spawned.pid(), bound));
+        }
     }
 
     /// Take the child's stdin pipe (present only when the command asked for one).
@@ -149,25 +337,105 @@ impl GatedChild {
         self.child.stdout.take()
     }
 
-    /// Wait for the child, collecting its piped stdout/stderr.
+    /// Wait for the child, collecting its piped stdout/stderr. A stdin pipe still held is
+    /// closed first.
     ///
     /// # Errors
-    /// Returns whatever `Child::wait_with_output` returns.
+    /// Spawning a reader, waiting, reading; [`io::ErrorKind::TimedOut`] when a [`Bound`] killed
+    /// the child.
     pub fn wait_with_output(self) -> io::Result<Output> {
-        let Self { child, spawned } = self;
-        let out = child.wait_with_output();
+        self.communicate(None)
+    }
+
+    /// Write `input` to the child's stdin on a thread of its own while its stdout and stderr are
+    /// read on two more, then reap it. Nothing here waits for one pipe while the child waits on
+    /// another: written first and read after, a child whose answers fill its stdout pipe stops
+    /// reading, its stdin pipe fills, and both sides wait for good (Docker end to end, round 8:
+    /// `git cat-file --batch-check` with 8 KiB pipes). `None` (or no stdin pipe) closes stdin.
+    ///
+    /// # Errors
+    /// Waiting, reading; [`io::ErrorKind::TimedOut`] when a [`Bound`] killed the child, or its
+    /// output did not end within the bound after it exited.
+    pub fn communicate(self, input: Option<Vec<u8>>) -> io::Result<Output> {
+        let Self {
+            mut child,
+            spawned,
+            mut watchdog,
+        } = self;
+        // Detached: once the child is gone its stdin is closed and the write ends (EPIPE).
+        if let Some(mut pipe) = child.stdin.take()
+            && let Some(input) = input
+        {
+            std::thread::spawn(move || {
+                // A closed pipe (the child exited early) surfaces as its status.
+                let _ = pipe.write_all(&input);
+            });
+        }
+        let stdout = child.stdout.take().map(drain);
+        let stderr = child.stderr.take().map(drain);
+        let exited = wait_exited(spawned.pid());
+        let killed = watchdog.as_mut().is_some_and(Watchdog::disarm);
+        let status = child.wait();
         drop(spawned);
-        out
+        exited?;
+        let status = status?;
+        let deadline = watchdog
+            .as_ref()
+            .and_then(|w| Instant::now().checked_add(w.output_wait(killed)));
+        let collect = |rx: Option<mpsc::Receiver<io::Result<Vec<u8>>>>| -> io::Result<Vec<u8>> {
+            let Some(rx) = rx else {
+                return Ok(Vec::new());
+            };
+            match deadline {
+                Some(deadline) => rx
+                    .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                    .map_err(|_| {
+                        io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "a helper's output did not end after it exited",
+                        )
+                    })?,
+                None => rx
+                    .recv()
+                    .map_err(|_| io::Error::other("a helper's output reader stopped"))?,
+            }
+        };
+        let stdout = collect(stdout);
+        let stderr = collect(stderr);
+        if killed && let Some(watchdog) = &watchdog {
+            return Err(watchdog.timed_out());
+        }
+        Ok(Output {
+            status,
+            stdout: stdout?,
+            stderr: stderr?,
+        })
     }
 
     /// Wait for the child.
     ///
     /// # Errors
-    /// Returns whatever `Child::wait` returns.
+    /// Returns whatever `Child::wait` returns; [`io::ErrorKind::TimedOut`] when a [`Bound`]
+    /// killed the child.
     pub fn wait(self) -> io::Result<ExitStatus> {
-        let Self { mut child, spawned } = self;
+        let Self {
+            mut child,
+            spawned,
+            watchdog,
+        } = self;
+        let Some(mut watchdog) = watchdog else {
+            let status = child.wait();
+            drop(spawned);
+            return status;
+        };
+        let exited = wait_exited(spawned.pid());
+        let killed = watchdog.disarm();
         let status = child.wait();
         drop(spawned);
+        exited?;
+        if killed {
+            return Err(watchdog.timed_out());
+        }
         status
     }
 }
@@ -199,7 +467,11 @@ pub trait CommandGateExt {
 impl CommandGateExt for Command {
     fn spawn_gated(&mut self) -> io::Result<GatedChild> {
         let (child, spawned) = spawn_std(self)?;
-        Ok(GatedChild { child, spawned })
+        Ok(GatedChild {
+            child,
+            spawned,
+            watchdog: None,
+        })
     }
 
     fn output_gated(&mut self) -> io::Result<Output> {
@@ -252,6 +524,91 @@ mod tests {
         let pid = child.pid();
         drop(child);
         assert_eq!(decide(&lock_gate(), pid), ReapDecision::Reap);
+    }
+
+    /// Docker end to end, round 8 (F1): 4 MiB through `cat` is more than any pipe holds, in
+    /// either direction. Written first and read after, both sides would wait for good.
+    #[test]
+    fn communicate_feeds_stdin_while_it_reads_stdout() {
+        let input: Vec<u8> = (0..4 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
+        let child = Command::new("/bin/sh")
+            .args(["-c", "cat; printf done >&2"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn_gated()
+            .expect("spawn");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let fed = input.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(child.communicate(Some(fed)));
+        });
+        let out = rx
+            .recv_timeout(Duration::from_secs(60))
+            .expect("no pipe deadlock")
+            .expect("communicate");
+        assert!(out.status.success());
+        assert!(out.stdout == input, "every byte back, in order");
+        assert_eq!(out.stderr, b"done");
+    }
+
+    /// A helper that outlives its bound is reported past `overdue`, killed at `limit`, reaped,
+    /// and its wait says so; its pid goes back to the reaper.
+    #[test]
+    fn a_bounded_helper_is_reported_then_killed() {
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "exec sleep 30"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn_gated()
+            .expect("spawn");
+        let pid = child.pid();
+        child.bound(Bound {
+            label: "spawn-test sleep".to_owned(),
+            overdue: Duration::from_millis(50),
+            limit: Some(Duration::from_millis(600)),
+        });
+        let started = Instant::now();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(child.wait_with_output());
+        });
+        std::thread::sleep(Duration::from_millis(250));
+        let overdue = crate::activity::overdue().expect("reported past its bound");
+        assert!(overdue.bound <= Duration::from_millis(600), "{overdue:?}");
+        let waited = rx.recv_timeout(Duration::from_secs(20)).expect("killed");
+        let error = waited.expect_err("a killed helper is an error");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut, "{error}");
+        assert!(error.to_string().contains("spawn-test sleep"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert_eq!(decide(&lock_gate(), pid), ReapDecision::Reap);
+        assert!(
+            !std::path::Path::new(&format!("/proc/{pid}")).exists()
+                || std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                    .is_ok_and(|s| !s.contains("sleep")),
+            "the helper is gone"
+        );
+    }
+
+    /// A bound does not change what a helper that finishes in time answers.
+    #[test]
+    fn a_bounded_helper_that_finishes_answers_as_before() {
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "printf hello; exit 3"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn_gated()
+            .expect("spawn");
+        child.bound(Bound {
+            label: "spawn-test printf".to_owned(),
+            overdue: Duration::from_secs(60),
+            limit: Some(Duration::from_secs(120)),
+        });
+        let out = child.wait_with_output().expect("output");
+        assert_eq!(out.status.code(), Some(3));
+        assert_eq!(out.stdout, b"hello");
     }
 
     #[test]

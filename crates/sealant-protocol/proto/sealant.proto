@@ -708,6 +708,24 @@ message CaptureStatusReport {
   optional string boot_id = 28;
   optional uint64 boot_generation = 29;
   optional uint64 observation = 30;
+  // A capture step that has been running longer than it is expected to take at most, while it
+  // runs: a snap, or a `git` a snap waits on (Docker end to end, round 8: a snap waited on a
+  // `git cat-file` for 17 minutes, and every answer read like an idle, healthy capture). An
+  // observation, not a failure: the step may still finish. A `git` of a snap is killed at its
+  // own limit, and the snap fails (`snaps`) and is taken again. Of several, the innermost.
+  // Absent while nothing is past its bound, and from an older daemon.
+  CaptureOverdue overdue = 31;
+}
+// A capture step past its bound (`CaptureStatusReport.overdue`).
+message CaptureOverdue {
+  // What is running, outermost first, `›`-separated: `small snap › git cat-file --batch-check`.
+  string step = 1;
+  // When it started, Unix milliseconds (display only: order evidence by `observation`).
+  uint64 started_unix_ms = 2;
+  // How long it has been running when the answer was computed, milliseconds.
+  uint64 running_ms = 3;
+  // How long it is expected to take at most, milliseconds.
+  uint64 bound_ms = 4;
 }
 message LeaseEpochReport { uint64 epoch = 1; string worktree_id = 2; bool fenced = 3; }
 message CaptureReplanned {

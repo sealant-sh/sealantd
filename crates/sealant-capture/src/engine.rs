@@ -2310,6 +2310,15 @@ impl CaptureEngine {
         req: SnapRequest,
         preempt: &dyn Fn() -> bool,
     ) -> Result<SnapOutcome, EngineError> {
+        // Named in `capture.status` (`overdue`) while it runs past its bound, with the git it
+        // is waiting on (Docker end to end, round 8, F1: 17 minutes with nothing said).
+        let _running = sealant_process::activity::scope(
+            match req.class {
+                Class::Small => "small snap",
+                Class::Bulk => "bulk snap",
+            },
+            crate::bounds::current().snap_overdue,
+        );
         self.linked = None;
         let outcome = self.snap_staging(req, preempt);
         // The multi-link files a snap read stand for its class once it staged, or found the
