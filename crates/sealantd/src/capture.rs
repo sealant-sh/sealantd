@@ -1146,8 +1146,10 @@ mod tests {
         assert_eq!(report.incomplete_reason.as_deref(), Some("snapshot-failed"));
         assert_eq!(small(&report).snaps_failed, 3, "{report:?}");
 
-        // Once a snap succeeds, the class is healthy again; the count stays.
+        // Once a snap succeeds, the class is healthy again; the count stays. The watcher
+        // delivers the repair first: a final flush that raced it answered `changed`.
         std::fs::write(root.join(".git/HEAD"), &head).unwrap();
+        watcher_saw_small_change(&capture).await;
         let report = runtime.final_flush(None, Some(2_000)).await.unwrap();
         assert!(report.complete, "{report:?}");
         let healthy = small(&report);
