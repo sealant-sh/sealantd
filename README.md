@@ -84,10 +84,30 @@ the protocol details live in `crates/sealant-capture/src/registrar.rs` and `mani
   index drops `assume-unchanged`, and `skip-worktree` for every path on disk, and every git the
   capture runs has `core.ignorecase=false`, no fsmonitor, no untracked cache and full stat
   checks (`GIT_CONFIG_COUNT`); the user's `.git/index` and `.git/config` are never written.
-- **A store that cannot hold what a capture holds.** When `plan.get`'s `manifest_features`
-  leaves out one this daemon writes (`git_trees` above all), captures still ship, but no final
-  flush is complete: `incomplete_reason: "store-fidelity"`, no seal. The executor is kept until
-  a registrar that reads them recovers it.
+- **A capture runs none of the user's code.** Every git a capture runs has each filter driver the
+  configuration defines emptied (`filter.<driver>.clean`, `.smudge`, `.process` empty,
+  `.required=false`), `core.hooksPath=/dev/null` (no `post-index-change` hook), no fsmonitor,
+  `core.symlinks=true` and `core.safecrlf=false`. A path a filter's attribute names is read as
+  its bytes on disk (in `worktree_tree` too: a review of a changed LFS file diffs its content,
+  not a pointer); git's own line-end, `ident` and encoding conversions still apply to
+  `worktree_tree`, and `raw_tree` holds the bytes. A restore of a capture without `raw_tree` is
+  the one git that smudges. A tree path whose kind on disk is not the tree's (a regular file
+  where `core.symlinks=false` kept a symlink's mode) makes a final flush `snapshot-failed`,
+  never a capture that silently leaves its metadata out.
+- **No user code over a store that cannot hold what a capture holds.** When `plan.get`'s
+  `manifest_features` leaves out one this daemon writes (`git_trees`, `raw_names`, …), every
+  capture over that store — the periodic ones a hard crash would be picked up from, not only the
+  final one — restores less than the disk held. The boot is refused right after `plan.get`,
+  before the head is materialized: no dotfiles, lifecycle step, harness, exec or session runs,
+  and it exits **78** (`EX_CONFIG`, `EXIT_STORE_UNFIT`) with `refused: the store does not read
+  the manifest feature(s) …; no user code is admitted over this store (nothing was
+  materialized, nothing ran, nothing is saved)` on stderr (log field `outcome="store-unfit"`). A
+  disk that already held work (a daemon restarting on its own staging) is left as it was: the
+  platform keeps it as for any exit it does not know to be complete. A standby's `capture.replan`
+  onto such a store is refused the same way, before it touches the disk: `policy-denied`, detail
+  `{"reason":"store-unfit","unread":[…]}`. A recovery boot admits no writer and is not refused:
+  it ships what the store can take, and its final flush answers `incomplete_reason:
+  "store-fidelity"` and seals nothing, so it exits 75.
 - **Launch identity.** Core passes `SEALANT_CAPTURE_LAUNCH_ID` (the launch Mend minted and bound
   the session token to) in the boot environment. The first `plan.get` names it as `launch`
   (else the launch the disk last served, on a restart or a recovery boot); a plan answering
@@ -109,7 +129,11 @@ the protocol details live in `crates/sealant-capture/src/registrar.rs` and `mani
   directory it could not watch, a watcher overflow) nothing can vouch for it after the flush:
   the status reads `"unwatched"`, and a final flush asked again snaps that class and answers
   complete. A final flush's own answer is complete when its snaps, taken after every writer
-  stopped, captured every class, a polled one included.
+  stopped, captured every class, a polled one included. It seals under the same predicate: before
+  the sealing capture is staged the flush settles the watcher (a fence file through its event
+  stream, so every change made before is counted) and checks that nothing changed since its
+  first snap; when something did, it snaps every class again (three rounds at most), and a disk
+  that keeps changing answers `incomplete_reason: "changed"` with no seal.
 - **The exit code follows the daemon's own last final flush.** A daemon exits 0 only when the
   last final flush it ran to its end answered complete, else 75; a final flush another request
   just began does not change that.

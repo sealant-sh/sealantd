@@ -805,8 +805,13 @@ there is no raw tree, and a restore checks the worktree out as git converts it a
 ref of a pseudo-ref's name) would restore less than a capture holds. Its captures still stage
 and ship, as crash protection, but a final flush over it answers `complete: false`,
 `incomplete_reason: "store-fidelity"`, and seals nothing (`CaptureConfig::unread_features`,
-`CaptureEngine::fidelity_gap`). The executor is kept until a registrar that reads them recovers
-it.
+`CaptureConfig::fidelity_gap`). The executor is kept until a registrar that reads them recovers
+it. Nor is any user code admitted over such a store (decision 16; review 2026-09-28, fifth pass,
+#5): every periodic capture over it is lossy too — a hard crash's pickup restored CRLF work
+normalized and a user ref of a pseudo-ref's name gone, three successful rounds in — so sealantd
+refuses the boot right after `plan.get`, before the materialize, and exits 78, and refuses a
+standby's re-plan onto it (the repository README has the contract). Only a recovery boot, which
+admits no writer, runs over it.
 
 The answer's `executor` is the executor the session token was issued for: what a completed final
 flush's seal names (below). Absent from a registrar that does not say, and the daemon seals under
@@ -849,7 +854,17 @@ one, its sections unchanged, `kind: final`, `n` = head + 1, carrying a top-level
 and ships it (`CaptureEngine::seal_complete`, `CadenceRunner::flush_final_sealing`). `complete`
 is reported only once that register is acknowledged; a register refused and rebuilt in its
 place (which drops the seal) is followed by the seal staged again, at most three times
-(`sealing` otherwise). Absent from every other capture, so a manifest without it encodes exactly
+(`sealing` otherwise). The seal is staged under the predicate `complete` is answered by
+(decision 15; review 2026-09-28, fifth pass, #2): the flush first settles the watcher — it writes
+a fence file in a directory of its own under the staging directory, watched by the same inotify
+instance as the roots, and waits until the watcher thread has handled its event, so every change
+made before it is counted (`WatchHandle::settle`) — then checks that no change signal came since
+before its first snap, no repair is still asked for and no bulk build is paused. A change since
+means the captures are not the disk: every class is snapped again, at most three rounds, and a
+disk still changing answers `changed` (`Incomplete::Changed`) with no seal. Nothing the capture
+itself runs can be that change: no filter driver or hook of the user's runs in its git
+(`gitpack::git_command`). A clean filter that wrote a file git had already indexed changed the
+disk under the flush, which sealed the stale captures before its report said `changed`. Absent from every other capture, so a manifest without it encodes exactly
 as before. A final flush asked again over a sealed chain stages nothing; a capture staged after
 it (a turn boundary) carries no seal, so the chain is unsealed until the next final flush seals
 it again. A flush whose quiesce could not stop every writer (`processes-remain`,
@@ -902,7 +917,8 @@ snap did, whenever: `snaps`), `fenced`, `conflict`, `deadline`, `ship-failed`, `
 registered, but not the capture that seals the completed flush: the flush returned at its
 deadline before it could stage it — send the final flush again, which seals without a second
 quiesce), `sweep-unavailable`, `unreadable`, `store-fidelity` (the store does not read every manifest
-feature this build writes, below) or `internal`; absent when `complete`.
+feature this build writes, below), `changed` (the disk changed after the final snaps, or since
+the flush answered) or `internal`; absent when `complete`.
 
 Once `complete` is said, nothing more is captured. The final flush ends the chain as the disk
 is: when its bulk snap staged a capture and the small snap found tracked or ignored files with
@@ -1043,14 +1059,23 @@ for byte as before.
   class captured it, as before) lists inodes no tracked file names that the workspace and bulk
   classes both name: each group is two or more distinct `{class, member, raw_member?}` (as in
   `shared`, members plain relative and not empty), sorted, workspace names first; the first is
-  the one the others link to.
+  the one the others link to. A link names only members the captures hold as they are
+  (review 2026-09-28, fifth pass, #11): a bulk name is linked only while its stat on disk is the
+  one the last bulk snap read (size, mtime, ctime, inode); one that changed or gained a name
+  since is left out of the group and waits for a small snap after a bulk snap
+  (`CaptureEngine::links_deferred`). A final flush takes that snap, and is `snapshot-failed`
+  while a link is still left out.
 - Applying it (sealantd's `worktree_meta::apply`, after the worktree tree is checked out and every
   other class restored): create each `dir` that is missing; every other path must exist with its
   kind; remove the empty directories in scope that no entry names; link each group's members to
   its first path; link each `shared` member that holds exactly the tracked file's bytes to it
   (leave it otherwise); link each `cross_links` member on disk that holds exactly the bytes of
   its group's first member on disk to it (leave it otherwise); set files' and symlinks' mode and mtime (a symlink's own, never
-  followed), then directories' deepest first. A reader that only lists or reads a class's files (Mend's
+  followed), then directories' deepest first. A sealed final capture restored whole (every
+  class, its bulk section ready) promised its links: the materialize applies it strictly
+  (`worktree_meta::apply_strict`), and a `shared` or `cross_links` member that is missing, not a
+  file, or holds other bytes fails it with `MetaError::LinkUnfulfilled`, neither file written
+  over. A member whose class this restore does not place is passed over. A reader that only lists or reads a class's files (Mend's
   `listCaptureDir`, `statCaptureEntry`, `readCaptureFile`, `materialize` of the workspace or bulk
   class) is unaffected: the overlay describes the git class's working tree, not a chunked class.
 
