@@ -1059,6 +1059,28 @@ pub struct CaptureStatusReport {
     /// incomparable, and fails closed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observation: Option<u64>,
+    /// A capture step that has been running longer than it is expected to take at most (a
+    /// snap, or a `git` a snap waits on), while it runs: an observation, not a failure — the
+    /// step may still finish. The innermost one when several are. A `git` of a snap is killed
+    /// at its own limit and the snap fails (`snaps`) and is taken again. `None` while nothing
+    /// is past its bound, and from an older daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overdue: Option<CaptureOverdue>,
+}
+
+/// A capture step past its bound ([`CaptureStatusReport::overdue`]).
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CaptureOverdue {
+    /// What is running, outermost first, `›`-separated: `small snap › git cat-file
+    /// --batch-check`.
+    pub step: String,
+    /// When it started, Unix milliseconds (display only: order evidence by `observation`).
+    pub started_unix_ms: u64,
+    /// How long it has been running when this answer was computed, milliseconds.
+    pub running_ms: u64,
+    /// How long it is expected to take at most, milliseconds.
+    pub bound_ms: u64,
 }
 
 /// One class's snaps (`capture.status`): a snap that fails for any reason, scheduled or forced,

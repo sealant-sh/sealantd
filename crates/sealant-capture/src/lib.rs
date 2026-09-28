@@ -10,6 +10,7 @@
 #![forbid(unsafe_code)]
 
 pub mod aliases;
+pub mod bounds;
 pub mod cadence;
 pub mod chunk;
 mod cpu;

@@ -237,6 +237,28 @@ the protocol details live in `crates/sealant-capture/src/registrar.rs` and `mani
   stream, so every change made before is counted) and checks that nothing changed since its
   first snap; when something did, it snaps every class again (three rounds at most), and a disk
   that keeps changing answers `incomplete_reason: "changed"` with no seal.
+- **A step past its bound: `overdue` (`CaptureStatusReport` field 31).** While a capture step
+  runs longer than it is expected to take at most, every `capture.status` and `capture.flush`
+  answer names it: `overdue { step, started_unix_ms, running_ms, bound_ms }`, `step` being the
+  snap and the git it waits on (`small snap › git cat-file --batch-check`), the innermost when
+  several are. It is an observation, not a failure: the step may still finish, and it is absent
+  again once it does. A git of the capture past `SEALANT_CAPTURE_GIT_OVERDUE_SECS` (120) is
+  reported and logged; past `SEALANT_CAPTURE_GIT_LIMIT_SECS` (900) it is killed and the snap
+  that ran it fails (`snaps`: `last_snap_error` names the git and says `killed`), and is taken
+  again at the next tick or final round. A snap is reported past
+  `SEALANT_CAPTURE_SNAP_OVERDUE_SECS` (600) and never killed. What a killed git wrote is only
+  ever loose objects (through temporary files) and the snap's own scratch index, whose lock the
+  next snap removes. A git that writes the repository in place (a restore's refs, config, index
+  and checkout) is reported, never killed. Before, a snap that waited on a git for 17 minutes
+  answered `running`, nothing pending, no failed snap.
+- **Every helper is fed while it is read.** A git the capture writes to on stdin (`cat-file
+  --batch-check`, `rev-list --stdin`, `update-index`, `check-attr`, `hash-object`,
+  `pack-objects`, `update-ref`) gets its input from a thread of its own while its stdout and
+  stderr are read. `rev-list`'s and `cat-file --batch-check`'s questions were written whole
+  before the answer was read: once the answers filled the stdout pipe git stopped reading, the
+  question filled stdin, and both waited for good — with 8 KiB pipes (root over
+  `fs.pipe-user-pages-soft`, as in every container of a busy host) 1,349 cached blobs were
+  enough, and no capture was taken after the first.
 - **The exit code follows the daemon's own last final flush.** A daemon exits 0 only when the
   last final flush it ran to its end answered complete, else 75; a final flush another request
   just began does not change that.
@@ -281,6 +303,17 @@ the protocol details live in `crates/sealant-capture/src/registrar.rs` and `mani
   reconcile interval (`Cadence::reconcile`, 60 s small, 600 s bulk) with no event at all; a snap
   that finds nothing changed stages nothing. A hard crash can lose at most that much of such a
   write, never an unbounded amount.
+- **Links a tracked file shares with the bulk class survive a restart.** The small class's
+  overlay records the bulk names of a tracked file's inode (pnpm hardlinks a `file:` package's
+  tracked files into `node_modules`) as the bulk index holds them. A bulk name is matched by the
+  inode it is on disk now; the index's device number is not compared, because a restarted
+  container's overlay is mounted under another one while every inode stays. And a final flush
+  whose small snap depends on the bulk class snaps it again after the final bulk snap, whether
+  or not that one staged anything. Before, a recovery boot (a `docker start` of a killed
+  executor between its bulk snap and the small snap after it) read every bulk name as another
+  inode, left the links out without deferring them, found the bulk class unchanged, and sealed
+  the chain without them: 88 tracked↔bulk hardlink groups came back as separate files. A lost or
+  unreadable bulk index did the same.
 - **Remotes.** Plan remotes seed a base only: a repository built from an empty chain or from a
   capture without `.git/config` (Mend's capture 0) gets each one it lacks. A capture that carries
   `.git/config` is authoritative — a remote the user removed stays removed on a fresh executor —
