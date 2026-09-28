@@ -1458,13 +1458,64 @@ impl GitRepo {
     }
 
     /// Blobs the index references (the fallback tips when `write-tree` refuses an unmerged index).
+    /// None without an index; a bare repository's index is read all the same (`ls-files`
+    /// wants a work tree, and is given its git directory, which it does not read).
     pub fn index_blobs(&self) -> Result<Vec<String>, GitError> {
-        let out = self.run(&["ls-files", "-s"])?;
+        if !self.git_dir.join("index").exists() {
+            return Ok(Vec::new());
+        }
+        let bare = stdout_string(&self.run(&["rev-parse", "--is-bare-repository"])?) == "true";
+        let args = ["ls-files", "-s"];
+        let out = if bare {
+            check(
+                &args,
+                git_command(&self.root)?
+                    .arg("--work-tree")
+                    .arg(&self.git_dir)
+                    .args(args)
+                    .output_bounded()?,
+            )?
+        } else {
+            self.run(&args)?
+        };
         Ok(stdout_string(&out)
             .lines()
             .filter_map(|l| l.split_whitespace().nth(1))
             .map(str::to_owned)
             .collect())
+    }
+
+    /// The files named `HEAD` in the worktree tree — tracked, and untracked but not ignored —
+    /// worktree-relative, as bytes: where a bare repository the worktree tree carries as plain
+    /// files would have its `HEAD` (git never takes one for a nested repository, having no
+    /// `.git`; review 2026-09-28, eleventh pass, #1). Candidates only: [`is_git_directory`]
+    /// decides.
+    pub fn head_files(&self) -> Result<Vec<PathBuf>, GitError> {
+        let args = [
+            "ls-files",
+            "-z",
+            "-c",
+            "-o",
+            "--exclude-standard",
+            "--",
+            ":(glob)**/HEAD",
+        ];
+        let out = check(
+            &args,
+            git_command(&self.root)?
+                .env("LC_ALL", "C")
+                .args(args)
+                .output_bounded()?,
+        )?;
+        let mut found: Vec<PathBuf> = out
+            .stdout
+            .split(|b| *b == 0)
+            .filter(|rel| !rel.is_empty())
+            .map(|rel| PathBuf::from(OsStr::from_bytes(rel)))
+            .collect();
+        found.sort();
+        found.dedup();
+        Ok(found)
     }
 
     /// `git ls-files -o --exclude-standard -z` (untranslated) against `index` when given, else
@@ -2623,28 +2674,80 @@ pub enum NestedStorage {
 const ALTERNATE_DEPTH: usize = 5;
 
 /// How the nested repository at `dir` (a directory holding a `.git`) keeps its git storage,
-/// for a capture of `workspace` whose top-level repository is `top`. Its git directory (a
-/// `.git` directory, or the one a `.git` file names), that directory's common directory, and
-/// every object store its alternates name (followed as git follows them) must each be inside
-/// the workspace, where the chunked classes carry them as files; or be the top-level
-/// repository's own (a linked worktree's administrative directory, the top-level object
-/// store), which the git section carries. Anything else cannot come back from a capture of the
-/// workspace: [`NestedStorage::Unrepresentable`] (decision 29).
+/// for a capture of `workspace` whose top-level repository is `top`: its git directory (a
+/// `.git` directory, or the one a `.git` file names), classified by [`git_dir_storage`].
 #[must_use]
 pub fn nested_storage(top: &GitRepo, workspace: &Path, dir: &Path) -> NestedStorage {
     let dotgit = dir.join(".git");
-    let unreadable = |what: &str, e: &dyn std::fmt::Display| {
-        NestedStorage::Unrepresentable(format!("its {what} cannot be read ({e})"))
-    };
     let git_dir = match fs::symlink_metadata(&dotgit) {
         Ok(meta) if meta.is_file() => match pointer(&dotgit, b"gitdir: ", dir) {
             Ok(Some(target)) => target,
             Ok(None) => return NestedStorage::Carried,
-            Err(e) => return unreadable(".git file", &e),
+            Err(e) => {
+                return NestedStorage::Unrepresentable(format!(
+                    "its .git file cannot be read ({e})"
+                ));
+            }
         },
         Ok(_) => dotgit.clone(),
         Err(e) if index_vanished(&e) => return NestedStorage::Carried,
-        Err(e) => return unreadable(".git", &e),
+        Err(e) => return NestedStorage::Unrepresentable(format!("its .git cannot be read ({e})")),
+    };
+    git_dir_storage(top, workspace, &git_dir, Some(dir))
+}
+
+/// Whether `dir` is a git directory as git decides it (`is_git_directory`): a `HEAD` that is a
+/// symlink or reads as a symbolic ref or an object id, and an object store and a `refs`
+/// directory — in the common directory its `commondir` names, when it names one. A bare
+/// repository is one, and so is a submodule's git directory and a `.git` directory; a
+/// directory that merely holds a file called `HEAD` is not.
+#[must_use]
+pub fn is_git_directory(dir: &Path) -> bool {
+    // The directories first (a stat each): a reflog called `HEAD` (`logs/HEAD`) is never read.
+    let common = match pointer(&dir.join("commondir"), b"", dir) {
+        Ok(Some(common)) => Some(common),
+        Ok(None) => Some(dir.to_path_buf()),
+        // A `commondir` there that cannot be read: its storage is unknown, and the `HEAD`
+        // decides (classified, the unreadable file refuses a final flush).
+        Err(_) => None,
+    };
+    // Followed through symlinks, as git's `access(2)` does.
+    if common.is_some_and(|c| !c.join("objects").is_dir() || !c.join("refs").is_dir()) {
+        return false;
+    }
+    let head = dir.join("HEAD");
+    match fs::symlink_metadata(&head) {
+        Ok(meta) if meta.file_type().is_symlink() => true,
+        // A `HEAD` is one line: a symbolic ref or an object id.
+        Ok(meta) if meta.is_file() && meta.len() <= 4096 => fs::read(&head).is_ok_and(|bytes| {
+            let text = trim_newline(&bytes);
+            text.starts_with(b"ref:")
+                || (matches!(text.len(), 40 | 64) && text.iter().all(u8::is_ascii_hexdigit))
+        }),
+        _ => false,
+    }
+}
+
+/// How the git directory `git_dir` keeps its git storage, for a capture of `workspace` whose
+/// top-level repository is `top`; `worktree` is the directory whose `.git` names it, `None`
+/// for a bare repository (or a submodule's git directory with no checkout). The git directory,
+/// its common directory, its primary object store — where it is, followed through symlinks —
+/// and every object store its alternates name (followed as git follows them) must each be
+/// inside the workspace, where the chunked classes carry them as files; or be the top-level
+/// repository's own (a linked worktree's administrative directory, the top-level object
+/// store), which the git section carries. Anything else cannot come back from a capture of the
+/// workspace: [`NestedStorage::Unrepresentable`] (decision 29; review 2026-09-28, eleventh
+/// pass, #1: an `objects` symlink to the top-level store was taken for storage the chunked
+/// classes carry, and a bare repository was never looked at).
+#[must_use]
+pub fn git_dir_storage(
+    top: &GitRepo,
+    workspace: &Path,
+    git_dir: &Path,
+    worktree: Option<&Path>,
+) -> NestedStorage {
+    let unreadable = |what: &str, e: &dyn std::fmt::Display| {
+        NestedStorage::Unrepresentable(format!("its {what} cannot be read ({e})"))
     };
     let top_worktrees = resolved(&top.common_dir.join("worktrees"));
     let top_objects = resolved(&top.common_dir.join("objects"));
@@ -2662,16 +2765,33 @@ pub fn nested_storage(top: &GitRepo, workspace: &Path, dir: &Path) -> NestedStor
         }
         is_within(path, workspace)
     };
-    let git_dir_at = resolved(&git_dir);
+    // An object store the git section does not carry: the top-level one's insides (a store
+    // there is re-packed, not kept as files), or storage outside the workspace.
+    let uncarried_store = |store: &Path, what: &str| {
+        let at = resolved(store);
+        NestedStorage::Unrepresentable(if at.starts_with(&top_objects) {
+            format!(
+                "{what} {}, inside the top-level object store, which a capture re-packs rather \
+                 than keeps as files",
+                store.display()
+            )
+        } else {
+            format!("{what} {}, outside the workspace", store.display())
+        })
+    };
+    let git_dir_at = resolved(git_dir);
     if git_dir_at.starts_with(&top_worktrees) && git_dir_at != top_git_dirs[0] {
         // The top-level repository's own linked worktree: carried as such when its admin
         // names this directory as its worktree.
-        let names_dir = pointer(&git_dir.join("gitdir"), b"", &git_dir)
-            .ok()
-            .flatten()
-            .and_then(|p| p.parent().map(resolved))
-            .is_some_and(|wt| wt == resolved(dir));
-        return if names_dir && is_within(dir, workspace) {
+        let names_dir = worktree.is_some_and(|dir| {
+            pointer(&git_dir.join("gitdir"), b"", git_dir)
+                .ok()
+                .flatten()
+                .and_then(|p| p.parent().map(resolved))
+                .is_some_and(|wt| wt == resolved(dir))
+                && is_within(dir, workspace)
+        });
+        return if names_dir {
             NestedStorage::TopWorktree
         } else {
             NestedStorage::Unrepresentable(format!(
@@ -2681,15 +2801,15 @@ pub fn nested_storage(top: &GitRepo, workspace: &Path, dir: &Path) -> NestedStor
             ))
         };
     }
-    if !carried(&git_dir) {
+    if !carried(git_dir) {
         return NestedStorage::Unrepresentable(format!(
             "its git directory {} is outside the workspace",
             git_dir.display()
         ));
     }
-    let common = match pointer(&git_dir.join("commondir"), b"", &git_dir) {
+    let common = match pointer(&git_dir.join("commondir"), b"", git_dir) {
         Ok(Some(common)) => common,
-        Ok(None) => git_dir.clone(),
+        Ok(None) => git_dir.to_path_buf(),
         Err(e) => return unreadable("commondir file", &e),
     };
     if resolved(&common) == top_git_dirs[1] {
@@ -2704,8 +2824,22 @@ pub fn nested_storage(top: &GitRepo, workspace: &Path, dir: &Path) -> NestedStor
             common.display()
         ));
     }
-    // Every object store its alternates reach, as git follows them.
-    let mut stores = vec![(common.join("objects"), 0usize)];
+    // Its own object store, where it really is: an `objects` that is a symlink to the
+    // top-level store borrows it as surely as an alternate does, and one to storage the
+    // workspace does not hold is that storage.
+    let primary = common.join("objects");
+    if resolved(&primary) == top_objects {
+        borrows = true;
+    } else if !carried(&primary) {
+        return uncarried_store(&primary, "its object store is");
+    }
+    // Every object store its alternates reach, as git follows them. The top-level store's own
+    // alternates are the git section's.
+    let mut stores = if borrows {
+        Vec::new()
+    } else {
+        vec![(primary, 0usize)]
+    };
     let mut seen = BTreeSet::new();
     while let Some((store, depth)) = stores.pop() {
         if !seen.insert(resolved(&store)) {
@@ -2728,19 +2862,18 @@ pub fn nested_storage(top: &GitRepo, workspace: &Path, dir: &Path) -> NestedStor
                     String::from_utf8_lossy(line)
                 ));
             }
+            // A relative alternate is taken from the store's real path, as git takes it
+            // (`link_alt_odb_entry`: the relative base through `realpath`).
             let named = PathBuf::from(OsStr::from_bytes(line));
             let alternate = if named.is_absolute() {
                 normalized(&named)
             } else {
-                normalized(&store.join(named))
+                normalized(&resolved(&store).join(named))
             };
             if resolved(&alternate) == top_objects {
                 borrows = true;
             } else if !carried(&alternate) {
-                return NestedStorage::Unrepresentable(format!(
-                    "it borrows objects from {}, outside the workspace",
-                    alternate.display()
-                ));
+                return uncarried_store(&alternate, "it borrows objects from");
             } else if depth + 1 < ALTERNATE_DEPTH {
                 stores.push((alternate, depth + 1));
             }
@@ -3960,6 +4093,43 @@ mod tests {
         assert!(repo.reflog_tips().unwrap().is_empty());
         let (_dir, committed) = fixture();
         assert_eq!(committed.reflog_tips().unwrap().len(), 1);
+    }
+
+    /// A git directory as git decides it: a repository's `.git`, a bare repository, a linked
+    /// worktree's admin (through `commondir`); not a reflog directory, not a directory that
+    /// merely holds a `HEAD`, and not one whose `HEAD` is no ref (review 2026-09-28, eleventh
+    /// pass, #1).
+    #[test]
+    fn git_directories_are_decided_as_git_decides_them() {
+        let (dir, repo) = fixture();
+        assert!(is_git_directory(&repo.git_dir));
+        assert!(!is_git_directory(&repo.git_dir.join("logs")));
+        let bare = dir.path().join("b.git");
+        check(
+            &["init", "--bare"],
+            Command::new("git")
+                .args(["init", "--bare", "-q"])
+                .arg(&bare)
+                .output()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(is_git_directory(&bare));
+        let admin = dir.path().join("admin");
+        fs::create_dir_all(&admin).unwrap();
+        fs::write(admin.join("HEAD"), "ref: refs/heads/x\n").unwrap();
+        fs::write(admin.join("commondir"), format!("{}\n", bare.display())).unwrap();
+        assert!(is_git_directory(&admin));
+        let plain = dir.path().join("plain");
+        fs::create_dir_all(plain.join("objects")).unwrap();
+        fs::create_dir_all(plain.join("refs")).unwrap();
+        assert!(!is_git_directory(&plain), "no HEAD");
+        fs::write(plain.join("HEAD"), "not a ref\n").unwrap();
+        assert!(!is_git_directory(&plain), "a HEAD that is no ref");
+        let only_head = dir.path().join("only-head");
+        fs::create_dir_all(&only_head).unwrap();
+        fs::write(only_head.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        assert!(!is_git_directory(&only_head), "no object store");
     }
 
     #[test]

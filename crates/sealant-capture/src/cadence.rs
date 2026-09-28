@@ -1322,6 +1322,9 @@ impl CadenceRunner {
         deadline: Option<Duration>,
         writers_stopped: bool,
     ) -> FinalFlush {
+        // The executor is ending: everything it ships from now on preserves work it already
+        // admitted, and its requests say so (`flush: final`; decision 35).
+        self.shared.shipper.preserving().begin();
         let until = deadline.map(|d| Instant::now() + d);
         let mut shipped = 0;
         let mut round = 0;

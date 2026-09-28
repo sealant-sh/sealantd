@@ -90,6 +90,29 @@
 //! it): a registrar may bind the signature to the exact content length — Mend's upload length
 //! binding — and a stand-in size would mint a URL the PUT cannot use.
 //!
+//! # `flush` on `upload.urls` and `capture.register`: a preserving flush, named
+//!
+//! Preserving work already admitted is never refused for budget reasons (cross-repo decisions
+//! 30 and 35). Once this executor begins a final flush — whoever asked for it: a control
+//! plane draining the session, a runtime deadline, the daemon's own shutdown, a recovery
+//! boot — every `upload.urls` and `capture.register` it sends carries `"flush":"final"`
+//! ([`FlushMarker`], [`PreservingFlush`]), to the end of the process: the executor is ending,
+//! and everything it ships from then on (the final captures, a bulk capture the final flush's
+//! deadline left uploading) is the work it is ending with. A registrar exempts such a request
+//! from its byte and call quotas, bounded per launch against abuse but never refusing a first
+//! final flush. Before a final flush begins the field is absent.
+//!
+//! ```json
+//! → {"worktree_id":"wt","epoch":3,"keys":["captures/wt/3/packs/<sha>"],
+//!    "sizes":{"captures/wt/3/packs/<sha>":150000000},"flush":"final"}
+//! → {"worktree_id":"wt","epoch":3,"n":7,"parent":"…","capture_id":"…","manifest_key":"…",
+//!    "manifest":{…},"flush":"final"}
+//! ```
+//!
+//! Additive: a registrar from before it decodes the request as it always did and ignores the
+//! member (Mend's request schemas do not refuse an unknown property), metering the request as
+//! any other — what it did before. An executor from before it never sends it.
+//!
 //! # `platform` on `plan.get`
 //!
 //! The request names the executor's `<os>-<arch>-<libc>` (the key the bulk class stamps on its
@@ -501,6 +524,38 @@ fn default_read_only() -> bool {
     true
 }
 
+/// The flush a channel request serves (`flush` on `upload.urls` and `capture.register`): see
+/// the module docs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FlushMarker {
+    /// A final flush began on this executor: the request preserves work already admitted, and
+    /// a registrar does not refuse it for budget reasons.
+    Final,
+}
+
+/// Whether this executor began a final flush, shared by everything that sends a channel request
+/// for it (the shipper's registers, the URL minter's `upload.urls`). Once begun it stays begun:
+/// the executor is ending.
+#[derive(Debug, Clone, Default)]
+pub struct PreservingFlush(Arc<std::sync::atomic::AtomicBool>);
+
+impl PreservingFlush {
+    /// A final flush begins (or began): every request from now on is marked.
+    pub fn begin(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The marker a request sent now carries: [`FlushMarker::Final`] once a final flush began,
+    /// else none.
+    #[must_use]
+    pub fn marker(&self) -> Option<FlushMarker> {
+        self.0
+            .load(std::sync::atomic::Ordering::SeqCst)
+            .then_some(FlushMarker::Final)
+    }
+}
+
 /// `upload.urls`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UploadUrlsRequest {
@@ -514,6 +569,10 @@ pub struct UploadUrlsRequest {
     /// registrar prices the batch from these before it mints anything.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub sizes: BTreeMap<String, u64>,
+    /// `final` once this executor began a final flush ([`PreservingFlush`]): the upload
+    /// preserves work already admitted. Absent before, and from an older executor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flush: Option<FlushMarker>,
 }
 
 impl UploadUrlsRequest {
@@ -525,6 +584,7 @@ impl UploadUrlsRequest {
             epoch,
             keys,
             sizes: BTreeMap::new(),
+            flush: None,
         }
     }
 }
@@ -605,6 +665,22 @@ pub struct RegisterRequest {
     pub manifest_key: String,
     /// The manifest.
     pub manifest: Manifest,
+    /// `final` when this register is sent after this executor began a final flush
+    /// ([`PreservingFlush`]), whenever the capture was staged. Stamped at send, never stored
+    /// with a queued capture. Absent before, and from an older executor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flush: Option<FlushMarker>,
+}
+
+impl RegisterRequest {
+    /// This request as sent now, under `preserving` ([`Self::flush`]).
+    #[must_use]
+    pub fn marked(&self, preserving: &PreservingFlush) -> Self {
+        Self {
+            flush: preserving.marker(),
+            ..self.clone()
+        }
+    }
 }
 
 /// `capture.register` response.
@@ -877,6 +953,12 @@ struct InMemoryState {
     seal_answers_off: bool,
     /// `plan.get`s still to refuse with 409 `worktree-leased` (another launch holds the lease).
     leased_plans: usize,
+    /// The `flush` every `upload.urls` and `capture.register` carried, oldest first, with the
+    /// call's name.
+    flush_seen: Vec<(&'static str, Option<FlushMarker>)>,
+    /// Exempt `flush: final` requests from the byte quota, as a registrar that reads the field
+    /// does. Off: the field is ignored, as a registrar from before it ignores it.
+    exempt_final: bool,
 }
 
 /// In-memory registrar: one worktree, one chain, a live epoch, a lease flag.
@@ -939,6 +1021,8 @@ impl InMemoryRegistrar {
                 seals_withheld: 0,
                 seal_answers_off: false,
                 leased_plans: 0,
+                flush_seen: Vec::new(),
+                exempt_final: false,
                 completed: BTreeSet::new(),
                 completes: 0,
                 next_upload: 0,
@@ -1088,12 +1172,30 @@ impl InMemoryRegistrar {
         self.lock().sizes_seen.clone()
     }
 
+    /// The `flush` every `upload.urls` and `capture.register` carried, oldest first, with the
+    /// call's name (`upload.urls`, `capture.register`).
+    #[must_use]
+    pub fn flush_seen(&self) -> Vec<(&'static str, Option<FlushMarker>)> {
+        self.lock().flush_seen.clone()
+    }
+
+    /// Exempt a request marked `flush: final` from the byte quota (priced all the same), as a
+    /// registrar that reads the marker does (decision 35). Off by default: the marker is
+    /// ignored, as a registrar from before it ignores it.
+    #[must_use]
+    pub fn exempting_final_flushes(self) -> Self {
+        self.lock().exempt_final = true;
+        self
+    }
+
     /// Price `keys` (each at most once) and refuse the lot when the budget cannot take them.
     fn price(
         &self,
         state: &mut InMemoryState,
         keys: impl IntoIterator<Item = (String, u64)>,
+        flush: Option<FlushMarker>,
     ) -> Result<(), RegistrarError> {
+        let exempt = state.exempt_final && flush == Some(FlushMarker::Final);
         let new: Vec<(String, u64)> = keys
             .into_iter()
             .filter(|(k, _)| !state.priced.contains_key(k))
@@ -1102,7 +1204,7 @@ impl InMemoryRegistrar {
             .quota
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(quota) = guard.as_ref() {
+        if let Some(quota) = guard.as_ref().filter(|_| !exempt) {
             let used: u64 = state.priced.values().sum();
             let requested: u64 = new.iter().map(|(_, b)| *b).sum();
             if used.saturating_add(requested) > quota.limit {
@@ -1383,6 +1485,7 @@ impl Registrar for InMemoryRegistrar {
         }
         state.url_requests += 1;
         state.sizes_seen.extend(req.sizes.clone());
+        state.flush_seen.push(("upload.urls", req.flush));
         let prefix = format!("captures/{}/{}/", req.worktree_id, req.epoch);
         // Priced before anything is minted: a refused batch leaves no URL behind.
         let sized: Vec<(String, u64)> = req
@@ -1391,7 +1494,7 @@ impl Registrar for InMemoryRegistrar {
             .filter(|k| k.starts_with(&prefix))
             .filter_map(|k| req.sizes.get(k).map(|b| (k.clone(), *b)))
             .collect();
-        self.price(&mut state, sized)?;
+        self.price(&mut state, sized, req.flush)?;
         let mut urls = BTreeMap::new();
         let mut multipart = BTreeMap::new();
         for k in req.keys.iter().filter(|k| k.starts_with(&prefix)) {
@@ -1500,6 +1603,7 @@ impl Registrar for InMemoryRegistrar {
         if !state.lease_alive {
             return Err(RegistrarError::LeaseLost);
         }
+        state.flush_seen.push(("capture.register", req.flush));
         // The backstop: keys this capture names that no `upload.urls` call ever sized are priced
         // here, from what the store holds.
         let unsized_keys: Vec<(String, u64)> = manifest_keys(req)
@@ -1507,7 +1611,7 @@ impl Registrar for InMemoryRegistrar {
             .filter(|k| !state.priced.contains_key(k))
             .filter_map(|k| self.stored_size(&k).map(|b| (k, b)))
             .collect();
-        self.price(&mut state, unsized_keys)?;
+        self.price(&mut state, unsized_keys, req.flush)?;
         let head = state.chain.last();
         // Lost ack: the chain is already at n with this id — and where its seal stands now.
         if let Some(h) = head
@@ -1830,6 +1934,9 @@ pub struct RegistrarMinter<R: Registrar + ?Sized> {
     /// has not settled yet: nothing is PUT for them ([`crate::sink::PutTarget::Present`]).
     present: Mutex<BTreeSet<String>>,
     get_urls: Mutex<BTreeMap<String, String>>,
+    /// Whether this executor began a final flush: every `upload.urls` from then on says so
+    /// (`flush`; decision 35). Shared with the shipper ([`Self::preserving`]).
+    preserving: PreservingFlush,
 }
 
 /// How long a minted PUT URL is used before it is minted again. The registrar chooses the
@@ -1854,7 +1961,16 @@ impl<R: Registrar + ?Sized> RegistrarMinter<R> {
             multipart_cache: Mutex::new(BTreeMap::new()),
             present: Mutex::new(BTreeSet::new()),
             get_urls: Mutex::new(get_urls),
+            preserving: PreservingFlush::default(),
         }
+    }
+
+    /// Whether this executor began a final flush, as this minter marks its `upload.urls`: the
+    /// handle the shipper shares ([`crate::ship::Shipper::with_preserving`]), so that a final
+    /// flush that begins there marks the URLs minted for it.
+    #[must_use]
+    pub fn preserving(&self) -> PreservingFlush {
+        self.preserving.clone()
     }
 
     /// The worktree and epoch URLs are minted for.
@@ -1921,6 +2037,7 @@ impl<R: Registrar + ?Sized> RegistrarMinter<R> {
             wanted.iter().map(|(k, _)| k.clone()).collect(),
         );
         req.sizes = wanted.into_iter().collect();
+        req.flush = self.preserving.marker();
         let resp = self.registrar.upload_urls(&req)?;
         self.note_present(&req.keys, resp.present);
         self.cache_puts(resp.urls);
@@ -2080,6 +2197,7 @@ impl<R: Registrar + ?Sized> crate::sink::UrlMinter for RegistrarMinter<R> {
         let (worktree_id, epoch) = self.identity();
         let mut req = UploadUrlsRequest::new(&worktree_id, epoch, vec![key.to_owned()]);
         req.sizes.insert(key.to_owned(), size);
+        req.flush = self.preserving.marker();
         let mut resp = self
             .registrar
             .upload_urls(&req)
@@ -2243,6 +2361,7 @@ mod tests {
             capture_id: id.into(),
             manifest_key: format!("captures/wt/1/manifests/{id}"),
             manifest: manifest(n, parent),
+            flush: None,
         }
     }
 
@@ -2823,6 +2942,53 @@ mod tests {
             .sections
             .bulk;
         assert_eq!(riscv, BulkState::pending());
+    }
+
+    /// `flush` on the wire (decision 35): `"final"` once a final flush began, on `upload.urls`
+    /// from the minter and on `capture.register`; absent before, so a request of an executor
+    /// that never began one is byte for byte what it was. A request without it decodes.
+    #[test]
+    fn a_final_flush_marks_upload_urls_and_register_on_the_wire() {
+        let preserving = PreservingFlush::default();
+        let req = UploadUrlsRequest::new("wt", 1, vec!["captures/wt/1/packs/a".into()]);
+        let json = serde_json::to_value(&req).unwrap();
+        assert!(json.get("flush").is_none(), "{json}");
+        let reg = register(0, None, "a", 1);
+        assert!(
+            serde_json::to_value(reg.marked(&preserving))
+                .unwrap()
+                .get("flush")
+                .is_none()
+        );
+        preserving.begin();
+        let json = serde_json::to_value(reg.marked(&preserving)).unwrap();
+        assert_eq!(json["flush"], "final");
+        assert_eq!(reg.flush, None, "the queued request is not changed");
+        let back: UploadUrlsRequest = serde_json::from_value(serde_json::json!({
+            "worktree_id": "wt", "epoch": 1, "keys": [], "flush": "final"
+        }))
+        .unwrap();
+        assert_eq!(back.flush, Some(FlushMarker::Final));
+        let old: UploadUrlsRequest =
+            serde_json::from_value(serde_json::json!({"worktree_id":"wt","epoch":1,"keys":[]}))
+                .unwrap();
+        assert_eq!(old.flush, None);
+
+        // The minter marks what it mints once the handle it shares says so.
+        let r = Arc::new(InMemoryRegistrar::new("wt", 1, Some("http://x".into())));
+        let dyn_r: Arc<dyn Registrar> = r.clone();
+        let minter = RegistrarMinter::new(dyn_r, "wt", 1, BTreeMap::new());
+        let shared = minter.preserving();
+        crate::sink::UrlMinter::put_url(&minter, "captures/wt/1/packs/a", 3).unwrap();
+        shared.begin();
+        crate::sink::UrlMinter::put_url(&minter, "captures/wt/1/packs/b", 3).unwrap();
+        assert_eq!(
+            r.flush_seen(),
+            vec![
+                ("upload.urls", None),
+                ("upload.urls", Some(FlushMarker::Final))
+            ]
+        );
     }
 
     fn parts(n: u32) -> Vec<CompletedPart> {

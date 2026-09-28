@@ -78,16 +78,41 @@ pub const DAEMON_DIR: &str = ".sealantd";
 
 /// Whether a virtual path (`/`-separated) is git's transient bookkeeping inside a git directory
 /// (a `.git` component; the workspace class mounts the repository's git dir at `.git`). Only
-/// these are ever excluded by name, and none can be work product:
+/// the files git itself names for a transaction in progress are left out, each at the place
+/// git writes it; every other file in a git directory is the user's — a hook project's
+/// `hooks/Cargo.lock`, a config include called `personal.lock` — and is captured, in every
+/// class (review 2026-09-28, eleventh pass, #2; cross-repo decision 33: an allow-list, never a
+/// pattern). The transient ones ([`git_dir_transient`]):
 ///
-/// - `*.lock` — git's write protocol: the new content of a ref, the index, the config or a
-///   packed-refs file is written to `X.lock` and renamed over `X`; the rename is what makes it
-///   real, and the next snap sees `X`. An abandoned lock is a dead git process's half-write,
-///   and restoring one makes every later git command in the workspace fail.
-/// - `gc.pid` — the host and pid of a running `git gc`, meaningless on another executor.
-/// - `tmp_*` and `incoming-*` under `objects/` — objects being written or received (a pack
-///   mid-`index-pack`, a push's quarantine); git renames them in when they are complete.
-/// - a `.pack` under `objects/` without its `.idx` — a pack mid-`index-pack` rename.
+/// - a lock git takes to write a file of its own (`<file>.lock`, renamed over `<file>` when the
+///   write is done; the rename is what makes it real, and the next snap sees `<file>`): the
+///   index (`index.lock`, a partial commit's `next-index-<pid>.lock`), `HEAD` and the other
+///   root refs (`ORIG_HEAD.lock`, `*_HEAD.lock`, `AUTO_MERGE.lock`, `MERGE_RR.lock`, …),
+///   `config.lock`, `config.worktree.lock`, `packed-refs.lock`, `shallow.lock`,
+///   `gc.pid.lock`, `gc.log.lock`, any `.lock` under `refs/` or `logs/` (a ref name never ends
+///   in `.lock`: `git check-ref-format`), under `reftable/` (`tables.list.lock`), under an
+///   operation's directory (`rebase-merge/`, `rebase-apply/`, `sequencer/`), `info/refs.lock`,
+///   `info/sparse-checkout.lock`, and in the object store `objects/maintenance.lock`,
+///   `objects/schedule.lock`, `objects/info/*.lock` (`alternates`, `packs`, `commit-graph`),
+///   `objects/info/commit-graphs/*.lock`, `objects/pack/multi-pack-index.lock` and
+///   `objects/pack/multi-pack-index.d/*.lock`;
+/// - `gc.pid`, the host and pid of a running `git gc`, meaningless on another executor;
+/// - under `objects/`, whatever git is still writing or receiving: a `tmp_*` or `incoming-*`
+///   name (a loose object mid-write, a pack mid-`index-pack`, a push's quarantine) and a
+///   `.tmp-*` name in `objects/pack/` (a `git repack` in progress). A `.pack` without its `.idx`
+///   in `objects/pack/` is left out by the listing ([`Listing::mount`]).
+///
+/// The same names in a linked worktree's administrative directory (`worktrees/<name>/`: its
+/// `index`, `HEAD`, pseudo-refs, `refs/`, `logs/`, operation directories and
+/// `config.worktree`) and in a submodule's git directory (`modules/<name>/`, all of them) are
+/// transient too.
+///
+/// A final flush drops them as well. It runs after every writer was stopped, so a lock found
+/// then is stale: the git that took it is gone and nothing will rename it. Its content is a
+/// write git never made real — the file beside it is what git reads — and git's own recovery
+/// is to remove it. Captured, it would come back and make every later git command of that kind
+/// fail; refusing the final flush over it would keep an executor a killed git left a lock on
+/// from ever completing. So neither: the lock is not work product, and a restore has none.
 ///
 /// A file with any of these names outside a git directory is a user's file and is captured.
 #[must_use]
@@ -96,21 +121,117 @@ pub fn is_git_transient(v: &str) -> bool {
     let Some(git_at) = comps.iter().rposition(|c| *c == ".git") else {
         return false;
     };
-    let inside = &comps[git_at + 1..];
-    let Some(name) = inside.last() else {
+    git_dir_transient(&comps[git_at + 1..], GitDirKind::Repository)
+}
+
+/// What a directory holding git state is: a repository's git directory, or a linked worktree's
+/// administrative directory (per-worktree state only).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GitDirKind {
+    Repository,
+    Worktree,
+}
+
+/// Names under a git directory that are git's own and never a submodule's name component:
+/// where a `modules/<name>/` prefix cannot end.
+const GIT_DIR_NAMES: &[&str] = &[
+    "hooks",
+    "info",
+    "logs",
+    "lfs",
+    "modules",
+    "objects",
+    "refs",
+    "reftable",
+    "rebase-apply",
+    "rebase-merge",
+    "rr-cache",
+    "sequencer",
+    "worktrees",
+];
+
+/// Root refs git writes through a lock whose names do not end in `_HEAD`.
+const ROOT_REFS: &[&str] = &[
+    "HEAD",
+    "AUTO_MERGE",
+    "BISECT_EXPECTED_REV",
+    "MERGE_AUTOSTASH",
+    "MERGE_RR",
+    "NOTES_MERGE_PARTIAL",
+    "NOTES_MERGE_REF",
+];
+
+/// [`is_git_transient`] for `rel`, a path's components relative to a git directory of `kind`.
+fn git_dir_transient(rel: &[&str], kind: GitDirKind) -> bool {
+    let Some((name, dirs)) = rel.split_last() else {
         return false;
     };
-    if name.ends_with(".lock") || *name == "gc.pid" {
+    let repository = kind == GitDirKind::Repository;
+    let lock = name.strip_suffix(".lock");
+    match dirs {
+        [] => {
+            let Some(file) = lock else {
+                return repository && *name == "gc.pid";
+            };
+            let root_ref = ROOT_REFS.contains(&file)
+                || file.strip_suffix("_HEAD").is_some_and(|stem| {
+                    !stem.is_empty()
+                        && stem
+                            .bytes()
+                            .all(|b| b.is_ascii_uppercase() || b == b'_' || b == b'-')
+                });
+            let next_index = file
+                .strip_prefix("next-index-")
+                .is_some_and(|pid| !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()));
+            root_ref
+                || next_index
+                || matches!(file, "index" | "config.worktree")
+                || (repository
+                    && matches!(
+                        file,
+                        "config" | "packed-refs" | "shallow" | "gc.pid" | "gc.log"
+                    ))
+        }
+        ["refs", ..] | ["logs", ..] | ["rebase-merge"] | ["rebase-apply"] | ["sequencer"] => {
+            lock.is_some()
+        }
+        ["reftable"] => repository && lock.is_some(),
+        ["info"] => repository && matches!(*name, "refs.lock" | "sparse-checkout.lock"),
+        ["objects", within @ ..] => repository && objects_transient(within, name),
+        ["worktrees", _, ..] if repository => git_dir_transient(&rel[2..], GitDirKind::Worktree),
+        ["modules", ..] if repository => (2..rel.len()).any(|end| {
+            rel[1..end].iter().all(|c| !GIT_DIR_NAMES.contains(c))
+                && git_dir_transient(&rel[end..], GitDirKind::Repository)
+        }),
+        _ => false,
+    }
+}
+
+/// [`git_dir_transient`] under `objects/`: `within` the directories below it, `name` the file.
+fn objects_transient(within: &[&str], name: &str) -> bool {
+    let writing = |c: &str| c.starts_with("tmp_") || c.starts_with("incoming-");
+    if within.iter().any(|c| writing(c)) || writing(name) {
         return true;
     }
-    inside
-        .iter()
-        .position(|c| *c == "objects")
-        .is_some_and(|o| {
-            inside[o + 1..]
-                .iter()
-                .any(|c| c.starts_with("tmp_") || c.starts_with("incoming-"))
-        })
+    let lock = name.ends_with(".lock");
+    match within {
+        [] => matches!(name, "maintenance.lock" | "schedule.lock"),
+        ["info"] | ["info", "commit-graphs"] | ["pack", "multi-pack-index.d"] => lock,
+        ["pack"] => name == "multi-pack-index.lock" || name.starts_with(".tmp-"),
+        _ => false,
+    }
+}
+
+/// Whether a virtual path is a pack in a git directory's `objects/pack/` (whose `.idx` decides
+/// whether git has finished writing it).
+fn in_git_pack_dir(v: &str) -> bool {
+    let comps: Vec<&str> = v.split('/').filter(|c| !c.is_empty()).collect();
+    let Some(git_at) = comps.iter().rposition(|c| *c == ".git") else {
+        return false;
+    };
+    let rel = &comps[git_at + 1..];
+    let n = rel.len();
+    n >= 3 && rel[n - 3] == "objects" && rel[n - 2] == "pack" && (n == 3 || rel[0] == "modules")
 }
 
 /// Whether a virtual path lies inside a git directory.
@@ -459,7 +580,9 @@ impl Listing {
                 if is_git_transient(&v) {
                     return false;
                 }
-                if let Some(stem) = name.strip_suffix(".pack") {
+                if let Some(stem) = name.strip_suffix(".pack")
+                    && in_git_pack_dir(&v)
+                {
                     let parent = path.parent().map(Path::to_path_buf).unwrap_or_default();
                     let names = dir_names.entry(parent.clone()).or_insert_with(|| {
                         longpath::read_dir(&parent)
@@ -1560,6 +1683,96 @@ mod tests {
         assert!(is_git_transient(".git/objects/ab/tmp_obj_1"));
         assert!(!is_git_transient("tree/Cargo.lock"));
         assert!(!is_git_transient(".git/lfs/objects/ab/cd/abcd"));
+    }
+
+    /// Only git's own transaction files, where git writes them, are transient; every other
+    /// `.lock` in a git directory is the user's (review 2026-09-28, eleventh pass, #2; decision
+    /// 33).
+    #[test]
+    fn git_transients_are_an_allow_list() {
+        for transient in [
+            ".git/index.lock",
+            ".git/HEAD.lock",
+            ".git/ORIG_HEAD.lock",
+            ".git/CHERRY_PICK_HEAD.lock",
+            ".git/AUTO_MERGE.lock",
+            ".git/MERGE_RR.lock",
+            ".git/next-index-4242.lock",
+            ".git/config.lock",
+            ".git/config.worktree.lock",
+            ".git/packed-refs.lock",
+            ".git/shallow.lock",
+            ".git/gc.pid",
+            ".git/gc.pid.lock",
+            ".git/gc.log.lock",
+            ".git/refs/heads/main.lock",
+            ".git/refs/remotes/origin/feature/x.lock",
+            ".git/logs/HEAD.lock",
+            ".git/logs/refs/heads/main.lock",
+            ".git/reftable/tables.list.lock",
+            ".git/rebase-merge/git-rebase-todo.lock",
+            ".git/sequencer/todo.lock",
+            ".git/info/sparse-checkout.lock",
+            ".git/info/refs.lock",
+            ".git/objects/maintenance.lock",
+            ".git/objects/info/commit-graph.lock",
+            ".git/objects/info/alternates.lock",
+            ".git/objects/info/commit-graphs/commit-graph-chain.lock",
+            ".git/objects/pack/multi-pack-index.lock",
+            ".git/objects/pack/multi-pack-index.d/multi-pack-index-chain.lock",
+            ".git/objects/pack/.tmp-77-pack-abc.pack",
+            ".git/objects/pack/tmp_pack_x",
+            ".git/objects/ab/tmp_obj_1",
+            ".git/objects/tmp_objdir-incoming-x/ab/cd",
+            ".git/worktrees/wt/index.lock",
+            ".git/worktrees/wt/HEAD.lock",
+            ".git/worktrees/wt/logs/HEAD.lock",
+            ".git/worktrees/wt/refs/bisect/bad.lock",
+            ".git/modules/sub/index.lock",
+            ".git/modules/lib/sub/refs/heads/main.lock",
+            ".git/modules/sub/objects/ab/tmp_obj_2",
+            "tree/vendor/x/.git/index.lock",
+            "node_modules/pkg/.git/packed-refs.lock",
+        ] {
+            assert!(
+                is_git_transient(transient),
+                "{transient} is git's transient"
+            );
+        }
+        for kept in [
+            ".git/hooks/Cargo.lock",
+            ".git/hooks/project/Cargo.lock",
+            ".git/personal.lock",
+            ".git/my-index.lock",
+            ".git/next-index-.lock",
+            ".git/Head.lock",
+            ".git/_HEAD.lock",
+            ".git/gc.log",
+            ".git/info/exclude.lock",
+            ".git/info/Cargo.lock",
+            ".git/lfs/tmp/x.lock",
+            ".git/rr-cache/ab/postimage.lock",
+            ".git/objects/Cargo.lock",
+            ".git/objects/pack/pack-a.keep",
+            ".git/objects/pack/user.lock",
+            ".git/worktrees/wt/config.lock",
+            ".git/worktrees/wt/objects/tmp_obj_3",
+            ".git/worktrees/wt/hooks/Cargo.lock",
+            ".git/modules/sub/hooks/Cargo.lock",
+            ".git/modules/sub/personal.lock",
+            "tree/ignored/nested/.git/hooks/Cargo.lock",
+            "node_modules/nested/.git/hooks/Cargo.lock",
+            "tree/Cargo.lock",
+            "tree/index.lock",
+            "harness/.claude/config.lock",
+        ] {
+            assert!(!is_git_transient(kept), "{kept} is the user's");
+        }
+        // A pack is judged by its `.idx` only where git keeps packs.
+        assert!(in_git_pack_dir(".git/objects/pack/p.pack"));
+        assert!(in_git_pack_dir(".git/modules/sub/objects/pack/p.pack"));
+        assert!(!in_git_pack_dir(".git/hooks/p.pack"));
+        assert!(!in_git_pack_dir(".git/lfs/objects/pack/p.pack"));
     }
 
     #[test]

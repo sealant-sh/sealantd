@@ -896,29 +896,71 @@ fn daemon_excludes(config: &CaptureConfig) -> Vec<String> {
     excludes
 }
 
-/// The nested repositories `listing` carries (a `.git` entry under `prefix`, not inside
-/// another `.git`), keyed by the virtual path of their directory, with how each keeps its git
-/// storage ([`gitpack::nested_storage`]).
+/// The nested repositories a capture carries, keyed by the virtual path of their directory,
+/// with the directory git is run in and how each keeps its git storage (review 2026-09-28,
+/// tenth pass, #2, and eleventh pass, #1; decision 29):
+///
+/// - a repository with a worktree: a `.git` entry of `listing` under one of `prefixes`, not
+///   inside another `.git` ([`gitpack::nested_storage`]);
+/// - a git directory with none — a bare repository, a submodule's git directory: a `HEAD`
+///   entry of `listing` under one of `prefixes`, or one of `worktree_heads` (the worktree
+///   tree's, [`GitRepo::head_files`]), whose directory git takes for a git directory
+///   ([`gitpack::is_git_directory`]; [`gitpack::git_dir_storage`]). A `.git` directory is its
+///   worktree's, and the top-level git directory and its linked worktrees' administrative
+///   directories are the git section's.
 fn nested_repositories(
     repo: &GitRepo,
     workspace: &Path,
     listing: &Listing,
-    prefix: &str,
+    prefixes: &[&str],
+    worktree_heads: &[PathBuf],
 ) -> Vec<(String, PathBuf, gitpack::NestedStorage)> {
-    listing
-        .entries
-        .iter()
-        .filter_map(|(key, src)| {
-            let rel = key.strip_prefix(prefix)?;
-            let dir_key = rel.strip_suffix("/.git")?;
-            if dir_key.split('/').any(|c| c == ".git") {
-                return None;
+    let mut found = Vec::new();
+    let mut git_dirs: Vec<(String, PathBuf)> = Vec::new();
+    for (key, src) in &listing.entries {
+        let Some(prefix) = prefixes.iter().find(|p| key.starts_with(**p)) else {
+            continue;
+        };
+        let rel = &key[prefix.len()..];
+        if let Some(dir_key) = rel.strip_suffix("/.git") {
+            if !dir_key.split('/').any(|c| c == ".git")
+                && let Some(dir) = src.abs.parent()
+            {
+                let storage = gitpack::nested_storage(repo, workspace, dir);
+                found.push((format!("{prefix}{dir_key}"), dir.to_path_buf(), storage));
             }
-            let dir = src.abs.parent()?.to_path_buf();
-            let storage = gitpack::nested_storage(repo, workspace, &dir);
-            Some((format!("{prefix}{dir_key}"), dir, storage))
-        })
-        .collect()
+            continue;
+        }
+        let Some(dir_key) = key.strip_suffix("/HEAD") else {
+            continue;
+        };
+        if dir_key == ".git" || dir_key.ends_with("/.git") || dir_key.starts_with(".git/worktrees/")
+        {
+            continue;
+        }
+        if let Some(dir) = src.abs.parent()
+            && gitpack::is_git_directory(dir)
+        {
+            git_dirs.push((dir_key.to_owned(), dir.to_path_buf()));
+        }
+    }
+    for head in worktree_heads {
+        let Some(rel) = head.parent().filter(|rel| !rel.as_os_str().is_empty()) else {
+            continue;
+        };
+        let dir = workspace.join(rel);
+        if gitpack::is_git_directory(&dir) {
+            git_dirs.push((index::rel_key(rel), dir));
+        }
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for (key, dir) in git_dirs {
+        if seen.insert(fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone())) {
+            let storage = gitpack::git_dir_storage(repo, workspace, &dir, None);
+            found.push((key, dir, storage));
+        }
+    }
+    found
 }
 
 impl CaptureEngine {
@@ -2314,6 +2356,7 @@ impl CaptureEngine {
                 capture_id: manifest.capture_id.clone(),
                 manifest_key,
                 manifest: manifest.manifest.clone(),
+                flush: None,
             },
         };
         Ok((entry, manifest))
@@ -2526,22 +2569,41 @@ impl CaptureEngine {
                 // storage outside the workspace cannot come back from this capture.
                 let mut borrowed: Vec<String> = Vec::new();
                 let mut unrepresentable: Vec<String> = Vec::new();
-                for (key, dir, storage) in
-                    nested_repositories(&repo, &self.config.root, &listing, "tree/")
-                {
+                // A bare repository in the worktree tree (tracked, or untracked and not
+                // ignored) is plain files to git: found by its `HEAD` (review 2026-09-28,
+                // eleventh pass, #1).
+                let worktree_heads = repo.head_files()?;
+                for (key, dir, storage) in nested_repositories(
+                    &repo,
+                    &self.config.root,
+                    &listing,
+                    &["tree/", ".git/"],
+                    &worktree_heads,
+                ) {
                     match storage {
                         gitpack::NestedStorage::BorrowsTop => {
-                            let nested = GitRepo::open(&dir)?;
-                            let (tips, unresolved) = gitpack::borrowed_objects(
-                                &repo,
-                                &nested,
-                                &objects,
-                                &git.closure.tips,
-                            )?;
-                            borrowed.extend(tips);
-                            unrepresentable.extend(unresolved.into_iter().map(|u| {
-                                format!("{key}: an operation in progress there names {u}")
-                            }));
+                            // What git there cannot be asked is what the capture cannot show
+                            // it holds: named, never a snap failed for every class.
+                            let read = GitRepo::open(&dir).and_then(|nested| {
+                                gitpack::borrowed_objects(
+                                    &repo,
+                                    &nested,
+                                    &objects,
+                                    &git.closure.tips,
+                                )
+                            });
+                            match read {
+                                Ok((tips, unresolved)) => {
+                                    borrowed.extend(tips);
+                                    unrepresentable.extend(unresolved.into_iter().map(|u| {
+                                        format!("{key}: an operation in progress there names {u}")
+                                    }));
+                                }
+                                Err(error) => unrepresentable.push(format!(
+                                    "{key}: it borrows objects from the top-level object store, \
+                                     and git cannot read what its state reaches there ({error})"
+                                )),
+                            }
                         }
                         gitpack::NestedStorage::Unrepresentable(why) => {
                             unrepresentable.push(format!("{key}: {why}"));
@@ -2551,7 +2613,8 @@ impl CaptureEngine {
                 }
                 if !unrepresentable.is_empty() {
                     let gap = format!(
-                        "{} nested repositor{} keep git state a capture of the workspace cannot                          bring back: {}",
+                        "{} nested repositor{} keep git state a capture of the workspace cannot \
+                         bring back: {}",
                         unrepresentable.len(),
                         if unrepresentable.len() == 1 {
                             "y"
@@ -2877,13 +2940,14 @@ impl CaptureEngine {
                 // (review 2026-09-28, tenth pass, #2; decision 29).
                 if let Ok(repo) = GitRepo::open(&self.config.root) {
                     let shared: Vec<String> =
-                        nested_repositories(&repo, &self.config.root, &listing, "")
+                        nested_repositories(&repo, &self.config.root, &listing, &[""], &[])
                             .into_iter()
                             .filter_map(|(key, _, storage)| match storage {
                                 gitpack::NestedStorage::Carried
                                 | gitpack::NestedStorage::TopWorktree => None,
                                 gitpack::NestedStorage::BorrowsTop => Some(format!(
-                                    "{key}: it borrows objects from the top-level object store,                                      which a bulk capture does not join to the git section"
+                                    "{key}: it borrows objects from the top-level object store, \
+                                     which a bulk capture does not join to the git section"
                                 )),
                                 gitpack::NestedStorage::Unrepresentable(why) => {
                                     Some(format!("{key}: {why}"))
@@ -2892,7 +2956,8 @@ impl CaptureEngine {
                             .collect();
                     if !shared.is_empty() {
                         let gap = format!(
-                            "{} nested repositor{} under a bulk directory keep git state a                              capture of the workspace cannot bring back: {}",
+                            "{} nested repositor{} under a bulk directory keep git state a \
+                             capture of the workspace cannot bring back: {}",
                             shared.len(),
                             if shared.len() == 1 { "y" } else { "ies" },
                             shared.join("; ")
@@ -3128,6 +3193,7 @@ impl CaptureEngine {
                 capture_id: manifest.capture_id.clone(),
                 manifest_key: manifest_key.clone(),
                 manifest: manifest.manifest.clone(),
+                flush: None,
             },
         };
         if repairing.is_some() {
@@ -3328,6 +3394,7 @@ impl CaptureEngine {
                 capture_id: prev.capture_id.clone(),
                 manifest_key: self.prefix.manifest(&prev.capture_id),
                 manifest: prev.manifest.clone(),
+                flush: None,
             })
     }
 
@@ -3422,6 +3489,7 @@ impl CaptureEngine {
                 capture_id: manifest.capture_id.clone(),
                 manifest_key: manifest_key.clone(),
                 manifest: manifest.manifest.clone(),
+                flush: None,
             },
         };
         self.staging.enqueue(&entry)?;
