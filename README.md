@@ -102,6 +102,18 @@ the protocol details live in `crates/sealant-capture/src/registrar.rs` and `mani
   the restore runs `git init --ref-format=reftable` and writes the refs through `update-ref` and
   `symbolic-ref`, and the workspace class brings the tables themselves back, reflogs included; a
   store that does not read `ref_format` gets no complete final flush of a reftable repository).
+  A base whose workspace class carries no `.git/config` (Mend's capture 0) restores in its own
+  formats too: the workspace sweep leaves the `.git/config` `git init` wrote, and a reftable
+  repository's `reftable/`, to a plan that does not carry them, and after every class the
+  restore writes `core.repositoryformatversion`, `extensions.objectformat` and
+  `extensions.refstorage` back when the repository no longer reads in the git section's formats
+  (`GitRepo::assert_formats`), before the boot adds remotes or seeds the engine. Before, the sweep
+  removed that config, the boot's remotes wrote a new one without `extensions.objectformat`, and
+  `git for-each-ref` failed on the 64-hex `packed-refs` (a reftable base lost every ref). **Not
+  supported:** a repository that changes object format mid-session (its `.git` replaced by a
+  SHA-256 one): the next git section still lists the packs of the previous format, and the
+  registrar refuses the seal as `unrestorable`, so the executor is kept and never sealed. Mend
+  refuses SHA-256 and reftable projects at adoption.
   Every symlink under `.git/refs/` or at `.git/HEAD` rides the workspace class as the symlink it
   was, whatever its link text: an alias git reads through to another ref's file
   (`refs/heads/alias -> main`) comes back as that symlink, and the restore writes the ref file it
@@ -377,6 +389,36 @@ the protocol details live in `crates/sealant-capture/src/registrar.rs` and `mani
   `<worktree>/.sealantd/boot.lock`, and a second boot beside a live one exits 75 without touching
   anything. On a still-running MicroVM, Core's agent stops every process the dead daemon left,
   then spawns `sealantd boot --recovery` exactly as it spawned `sealantd boot`.
+- **A standby no session claimed has nothing to save.** A boot whose launch is a standby's (the
+  plan's executor is `standby:<id>`, as Mend names it and Core delivers it in
+  `SEALANT_CAPTURE_LAUNCH_ID`) and whose launcher named no worktree (`SEALANT_CAPTURE_WORKTREE_ID`
+  unset: the channel answers the project's base under a placeholder and refuses every write for
+  it) writes `<worktree>/.sealantd/capture/unclaimed.json` (the placeholder's worktree, epoch and
+  launch) once its base is materialized, before any user code runs — on the disk's first boot only
+  (a restart keeps the marker it has, or none). The first claim or writer removes it, durably,
+  before it acts: a `capture.replan` whose plan names another identity or head (before it touches
+  the disk, whether it then succeeds or not), or a control command that admits a writer — `exec`,
+  `writeStdin`, `openSession`, `attachSession`, `openForward`, `openSftp`, `bindMount`,
+  `execution.start` (refused when the marker cannot be removed). A final flush that finds the
+  marker still there does not snap, ship or wait: it stops the capture loops, drops the
+  placeholder's queue and staged objects, and answers **`complete: true`, `pending: 0`, no
+  `incomplete_reason`**, under the placeholder's `worktree_id`, `epoch` and `launch`; the daemon
+  then ends by itself and exits **76** (`EXIT_NOTHING_TO_SAVE`, log `nothing to save: a standby no
+  session claimed`), and from then on nothing is admitted (a claim, a writer or a snap is
+  refused). The marker stays, so a recovery boot on that disk exits 76 at once, before `plan.get`,
+  with `sealantd boot: nothing to save: a standby no session claimed (<worktree>, placeholder <id>
+  at epoch <n>)` on stderr (log field `outcome="never-claimed"`). Once any claim or writer was
+  admitted none of this applies again: the marker is gone for good, and a disk without it (an
+  older daemon's, a session's launch — one that names no worktree included, whose harness writes
+  the session's work) is never nothing to save. Before, a claimed standby whose re-plan failed
+  (Docker end to end, round 8, F7: its `plan.get` timed out) kept its placeholder captures queued
+  forever (`lease-lost`), its final flush never completed, and the launch waited 12 minutes,
+  failed and needed a discard. What the control plane reads: Core's recovery sweep already
+  releases on the recovery boot's 76 (`nothing-to-save`), and Core's own observation of the
+  `complete: true` answer is `observed-complete`. Mend's evidence binds a `complete` to the lease
+  epoch its claim took, which the placeholder's answer does not carry: until Mend reads a claimed
+  standby's answer under its placeholder epoch and launch (`standby:<id>`) as nothing to save, it
+  sees the executor end (Core's `stopped` after the 76) instead.
 
 ## Build & validate
 
