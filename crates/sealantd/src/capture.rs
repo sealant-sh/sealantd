@@ -591,17 +591,22 @@ mod tests {
     }
 
     /// Without a deadline a suspend flush is bounded by the shutdown grace, as it always was
-    /// (here configured to 300 ms), and reports what is left, `pending_bytes` included. A final
+    /// (here configured to 2 s), and reports what is left, `pending_bytes` included. A final
     /// flush without a deadline is bounded by nothing: it snaps the bulk class too and returns
     /// once everything is registered, however long the store refuses.
+    ///
+    /// The grace has to hold the suspend flush's snap and its first refused pass: a pass that
+    /// ends past the grace answers with its error (on a loaded runner a 300 ms grace was spent
+    /// before the pass ended, and the flush answered the store's 403). The store opens well
+    /// after the grace.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn without_a_deadline_suspend_takes_the_grace_and_final_takes_what_it_needs() {
         let tmp = tempfile::tempdir().unwrap();
-        let opens = Instant::now() + Duration::from_millis(1_500);
+        let opens = Instant::now() + Duration::from_secs(6);
         let (boot, registrar) = boot_with(tmp.path(), |inner| Arc::new(Gate { inner, opens }));
         let mut config = RuntimeConfig::new(new_runtime_id());
         config.workspace_root = tmp.path().join("ws");
-        let runtime = Runtime::new(config, Arc::new(ShutdownSignal::new(300)));
+        let runtime = Runtime::new(config, Arc::new(ShutdownSignal::new(2_000)));
         runtime.mark_healthy();
         let capture = CaptureRuntime::new(boot);
         assert!(runtime.install_capture(capture.clone()));
@@ -620,9 +625,10 @@ mod tests {
         );
         let took = start.elapsed();
         assert!(
-            took < Duration::from_millis(1_400),
+            took < Duration::from_millis(4_500),
             "the grace bounds it: {took:?}"
         );
+        assert!(Instant::now() < opens, "the store still refuses");
         assert_eq!(report.pending, 1, "{report:?}");
         assert_eq!(report.pending_bulk, 0, "{report:?}");
         assert!(report.pending_bytes > 0, "{report:?}");
