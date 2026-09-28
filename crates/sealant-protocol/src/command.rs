@@ -938,9 +938,10 @@ pub struct CaptureStatusReport {
     /// Wall-clock time of the last snap, Unix milliseconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_snap_unix_ms: Option<u64>,
-    /// Classes the registrar refused for the session's byte quota: the capture was dropped with
-    /// its staged bytes, and nothing of that class is snapped or shipped again until the next
-    /// epoch or `capture.replan`.
+    /// Classes with a capture the registrar refused for the session's byte quota. Nothing is
+    /// dropped: the capture stays queued (counted in `pending`) with its staged bytes, the class
+    /// keeps snapping (a newer capture replaces the held one), and the executor asks again after
+    /// a backoff until the budget allows. Cleared when the class registers.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub refused: Vec<CaptureClass>,
     /// Of `pending`, the bulk captures whose objects are still uploading. `capture.flush`

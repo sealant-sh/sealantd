@@ -14,8 +14,8 @@ use crate::gitpack::{self, GitError, GitRepo};
 use crate::index::{self, BuildStats, ChunkSink, DAEMON_DIR, Listing, TreeBuilder, TreeIndex};
 use crate::keys::KeyPrefix;
 use crate::manifest::{
-    BulkSection, BulkState, CaptureKind, EncodedManifest, GitSection, Manifest, Sections,
-    WorkspaceSection, rfc3339_now,
+    BulkSection, BulkState, CaptureKind, DirFormat, EncodedManifest, GitSection, Manifest,
+    Sections, WorkspaceSection, rfc3339_now,
 };
 use crate::materialize::{
     DiskState, MaterializeClass, MaterializeError, MaterializeReport, MaterializeTargets,
@@ -27,6 +27,7 @@ use crate::registrar::Registrar;
 use crate::roots::ClassRoots;
 use crate::ship::{DutyCycle, MultipartConfig, QueueEntry, ShipError, Shipper, Staging, Upload};
 use crate::sink::BlobSink;
+use crate::tree::EncodedDir;
 use crate::watch::WatchPolicy;
 
 /// Snap cadence (ADR-0015 *Cadence and budgets*).
@@ -98,8 +99,14 @@ pub struct CaptureConfig {
     pub multipart: MultipartConfig,
     /// `<os>-<arch>-<libc>` stamped on bulk captures.
     pub platform: String,
-    /// CDC pack cap.
+    /// CDC pack cap (dir packs too).
     pub pack_cap: u64,
+    /// How dir objects travel: in dir packs (format 2), or one object per directory for a
+    /// registrar that does not read dir packs (its `plan.get` announces no `manifest_format`
+    /// ≥ 2; [`DirFormat::for_registrar`]).
+    pub dir_format: DirFormat,
+    /// Single-PUT uploads in flight at once ([`crate::ship::DEFAULT_UPLOADS_IN_FLIGHT`]).
+    pub uploads_in_flight: usize,
 }
 
 impl CaptureConfig {
@@ -123,6 +130,8 @@ impl CaptureConfig {
             multipart: MultipartConfig::DEFAULT,
             platform: default_platform(),
             pack_cap: MAX_PACK_BYTES,
+            dir_format: DirFormat::Packs,
+            uploads_in_flight: crate::ship::DEFAULT_UPLOADS_IN_FLIGHT,
         }
     }
 
@@ -185,7 +194,7 @@ pub struct SnapStats {
     pub git_objects: u32,
     /// pack-objects attempts.
     pub git_attempts: u32,
-    /// New CDC packs.
+    /// New CDC packs (content chunks; dir packs are counted in `dir_packs`).
     pub cdc_packs: u64,
     /// Bytes of new CDC packs.
     pub cdc_pack_bytes: u64,
@@ -199,8 +208,14 @@ pub struct SnapStats {
     pub chunks: u64,
     /// Chunks new this snap.
     pub chunks_new: u64,
-    /// Dir objects new this snap.
+    /// Dir objects new this snap (staged on their own, or written into a dir pack).
     pub dirs_new: u64,
+    /// New dir packs.
+    #[serde(default)]
+    pub dir_packs: u64,
+    /// Bytes of new dir packs.
+    #[serde(default)]
+    pub dir_pack_bytes: u64,
     /// Bytes staged for upload by this snap (all object files).
     pub staged_bytes: u64,
     /// Files marked torn.
@@ -242,6 +257,84 @@ pub struct SnapRequest {
 struct ChunkMap {
     /// chunk → pack key.
     packs: HashMap<ChunkId, String>,
+}
+
+/// A section needs at most this many dir packs: past it, the snap writes every dir object of the
+/// tree into fresh packs instead of adding one more. Each capture that changes a class adds a
+/// small pack (the dir objects on the paths of what changed); a restore fetches every pack the
+/// section lists, so without a bound the number of GETs would grow with the chain.
+pub const MAX_DIR_PACKS: usize = 16;
+
+/// Where this epoch's dir objects are (format 2), per class: dir object sha256 → dir pack key.
+/// Kept per class so a small capture staged ahead of a bulk capture never names a dir pack only
+/// that bulk capture uploads.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct DirMap {
+    #[serde(default)]
+    workspace: HashMap<String, String>,
+    #[serde(default)]
+    bulk: HashMap<String, String>,
+}
+
+impl DirMap {
+    fn class(&mut self, class: Class) -> &mut HashMap<String, String> {
+        match class {
+            Class::Small => &mut self.workspace,
+            Class::Bulk => &mut self.bulk,
+        }
+    }
+
+    fn retain(&mut self, keep: impl Fn(&String) -> bool) {
+        self.workspace.retain(|_, k| keep(k));
+        self.bulk.retain(|_, k| keep(k));
+    }
+}
+
+/// What a boot does with the disk it finds ([`CaptureEngine::pickup`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pickup {
+    /// Nothing on this disk continues the chain: materialize the head.
+    Materialize,
+    /// The disk is this executor's own, at or past the head: leave it as it is, open the
+    /// engine on the head (it continues from the captures still queued) and snap both classes.
+    Resume {
+        /// Captures staged under this worktree and not shipped.
+        queued: usize,
+        /// They were staged under another epoch (the lease lapsed while the daemon was down):
+        /// they cannot register and are dropped; the next snaps capture the disk afresh.
+        epoch_changed: bool,
+    },
+}
+
+/// The capture this staging directory staged last (`index/last.json`), for [`Pickup`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LastStaged {
+    worktree_id: String,
+    epoch: u64,
+    n: u64,
+    capture_id: String,
+}
+
+impl LastStaged {
+    fn load(index_dir: &Path) -> Option<Self> {
+        fs::read(index_dir.join("last.json"))
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+    }
+
+    fn save(&self, index_dir: &Path) -> io::Result<()> {
+        let tmp = index_dir.join("last.tmp");
+        fs::write(&tmp, serde_json::to_vec(self)?)?;
+        fs::rename(tmp, index_dir.join("last.json"))
+    }
+}
+
+/// A built chunked class: what its section names.
+struct BuiltClass {
+    root: String,
+    packs: Vec<String>,
+    format: u32,
+    dir_packs: Vec<String>,
 }
 
 /// Chunk sink over a pack builder plus the known-chunk map (and, for a resumed bulk build, the
@@ -300,21 +393,17 @@ pub struct CaptureEngine {
     bulk_index: TreeIndex,
     bulk_work: Option<ClassWork>,
     chunks: ChunkMap,
+    /// Format 2: where this epoch's dir objects are.
+    dirs: DirMap,
     /// Every tip the last git pack covered (refs, reflog entries, index and worktree trees):
     /// the negatives of the next pack. The manifest only carries refs, so reflog-only history
     /// would otherwise be packed again on every snap.
     last_tips: Vec<String>,
-    /// The manifest the oldest queued capture names as its parent — the chain head as far as
-    /// this executor knows — and the tips as of that capture. A capture the registrar refuses
-    /// for good is dropped with everything staged after it, and the chain continues from here.
-    base: Option<EncodedManifest>,
-    base_tips: Vec<String>,
-    /// The manifest the queued bulk capture was staged on (its parent), and the tips as of it.
-    /// A small snap while that bulk capture's objects upload is staged ahead of it: it takes
-    /// the bulk capture's place on the chain with this manifest's bulk section, and the bulk
-    /// capture moves on top of it. See [`CaptureEngine::snap_preemptible`].
+    /// The manifest the queued bulk capture was staged on (its parent). A small snap while that
+    /// bulk capture's objects upload is staged ahead of it: it takes the bulk capture's place on
+    /// the chain with this manifest's bulk section, and the bulk capture moves on top of it. See
+    /// [`CaptureEngine::snap_preemptible`].
     below: Option<EncodedManifest>,
-    below_tips: Vec<String>,
 }
 
 impl std::fmt::Debug for CaptureEngine {
@@ -381,10 +470,22 @@ impl CaptureEngine {
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok())
             .unwrap_or_default();
-        let last_tips: Vec<String> = fs::read(index_dir.join("git-tips.json"))
+        let mut dirs: DirMap = fs::read(index_dir.join("dirs.json"))
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok())
             .unwrap_or_default();
+        let mut last_tips: Vec<String> = fs::read(index_dir.join("git-tips.json"))
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default();
+        // The tips of captures staged under another identity (the lease moved to a new epoch
+        // while the daemon was down) are not the chain's: those captures never register, and
+        // negatives taken from them would leave their objects out of every later pack.
+        if LastStaged::load(&index_dir)
+            .is_some_and(|l| l.worktree_id != config.worktree_id || l.epoch != config.epoch)
+        {
+            last_tips.clear();
+        }
         let prefix = config.prefix();
         // Chunk locations from another epoch are never reused (ADR-0015: a new epoch never skips
         // an upload because a prior epoch holds the bytes).
@@ -396,21 +497,121 @@ impl CaptureEngine {
                 .filter(|(_, k)| k.starts_with(&base))
                 .collect(),
         };
-        Ok(Self {
+        dirs.retain(|k| k.starts_with(&base));
+        let mut engine = Self {
             config,
             prefix,
             staging,
-            base: previous.clone(),
-            base_tips: last_tips.clone(),
             previous,
             workspace_index,
             bulk_index,
             bulk_work: None,
             chunks,
+            dirs,
             last_tips,
             below: None,
-            below_tips: Vec::new(),
+        };
+        // Captures staged under another identity (a lease that moved to a new epoch while the
+        // daemon was down) can never register; left queued, a snap would coalesce with one and
+        // take its parent. The disk they were taken from is still here and is snapped again.
+        let dropped = engine.staging.discard_foreign()?;
+        if dropped > 0 {
+            tracing::warn!(
+                dropped,
+                "captures staged under another epoch dropped; the disk is captured again"
+            );
+        }
+        engine.resume_queue()?;
+        Ok(engine)
+    }
+
+    /// Whether this disk continues the chain at `head` on its own: its staging names this
+    /// worktree, and the capture it staged last is the head or descends from it through the
+    /// captures still queued. Then the disk is at least as new as the head — it holds every
+    /// staged capture and whatever changed after the last snap — and materializing the head
+    /// over it would take that work back. Boot asks this before it materializes (a daemon that
+    /// restarts on its own disk); a fresh disk, a standby's placeholder staging or a chain that
+    /// moved on without this disk answers [`Pickup::Materialize`].
+    pub fn pickup(config: &CaptureConfig, head_capture_id: Option<&str>) -> io::Result<Pickup> {
+        let staging_dir = config.staging_dir();
+        let index_dir = staging_dir.join("index");
+        let Some(last) = LastStaged::load(&index_dir) else {
+            return Ok(Pickup::Materialize);
+        };
+        if last.worktree_id != config.worktree_id {
+            return Ok(Pickup::Materialize);
+        }
+        let staging = Staging::open(&staging_dir, &last.worktree_id, last.epoch)?;
+        let queued: Vec<QueueEntry> = staging
+            .pending()?
+            .into_iter()
+            .filter(|e| e.register.worktree_id == config.worktree_id)
+            .collect();
+        let continues = head_capture_id == Some(last.capture_id.as_str())
+            || queued.iter().any(|e| {
+                e.register.parent.as_deref() == head_capture_id
+                    || Some(e.capture_id.as_str()) == head_capture_id
+            });
+        if !continues {
+            return Ok(Pickup::Materialize);
+        }
+        Ok(Pickup::Resume {
+            queued: queued.len(),
+            epoch_changed: last.epoch != config.epoch,
         })
+    }
+
+    /// Continue from the captures this identity staged and has not shipped (a daemon restarted
+    /// on its own disk): when the queue descends from `previous`, the newest queued capture is
+    /// the one the next snap names as its parent, and a queued bulk capture can again have a
+    /// small one staged ahead of it.
+    fn resume_queue(&mut self) -> Result<(), EngineError> {
+        let queued: Vec<QueueEntry> = self
+            .staging
+            .pending()?
+            .into_iter()
+            .filter(|e| !self.staging.is_foreign(e))
+            .collect();
+        let Some(newest) = queued.last() else {
+            return Ok(());
+        };
+        let from = self.previous.as_ref().map(|p| p.capture_id.as_str());
+        let descends = queued
+            .iter()
+            .any(|e| e.register.parent.as_deref() == from || Some(e.capture_id.as_str()) == from);
+        if !descends {
+            return Ok(());
+        }
+        let encoded = |e: &QueueEntry| {
+            let m = e.register.manifest.clone().encode();
+            (m.capture_id == e.capture_id).then_some(m)
+        };
+        let Some(manifest) = encoded(newest) else {
+            tracing::warn!(
+                n = newest.n,
+                "queued manifest does not re-encode to its id; not resumed"
+            );
+            return Ok(());
+        };
+        if newest.class == Some(Class::Bulk) {
+            let parent = newest.register.parent.as_deref();
+            self.below = queued
+                .iter()
+                .find(|e| Some(e.capture_id.as_str()) == parent)
+                .and_then(encoded)
+                .or_else(|| {
+                    self.previous
+                        .clone()
+                        .filter(|p| Some(p.capture_id.as_str()) == parent)
+                });
+        }
+        tracing::info!(
+            queued = queued.len(),
+            n = manifest.manifest.n,
+            "capture queue resumed from staging"
+        );
+        self.previous = Some(manifest);
+        Ok(())
     }
 
     /// After materializing `previous` into the root: record the tips the repository got from
@@ -450,6 +651,7 @@ impl CaptureEngine {
         let dropped = self.staging.discard_foreign()?;
         let base = format!("{}/", self.prefix.base());
         self.chunks.packs.retain(|_, k| k.starts_with(&base));
+        self.dirs.retain(|k| k.starts_with(&base));
         self.bulk_work = None;
         let seeded = previous.is_some();
         self.previous = previous;
@@ -459,11 +661,7 @@ impl CaptureEngine {
             self.last_tips.clear();
             self.persist()?;
         }
-        let _ = self.staging.take_refusals();
-        self.base = self.previous.clone();
-        self.base_tips = self.last_tips.clone();
         self.below = None;
-        self.below_tips.clear();
         tracing::info!(
             worktree = worktree_id,
             epoch,
@@ -508,6 +706,14 @@ impl CaptureEngine {
         Ok(report)
     }
 
+    /// Write dir objects as `format` from the next snap on (a re-plan names a registrar that
+    /// reads dir packs, or one that does not). The two formats never share a dir object — a
+    /// format-2 dir object names its children by digest, a format-1 one by key — so nothing
+    /// staged in the other format is reused or disturbed.
+    pub fn set_dir_format(&mut self, format: DirFormat) {
+        self.config.dir_format = format;
+    }
+
     /// Configuration.
     #[must_use]
     pub fn config(&self) -> &CaptureConfig {
@@ -532,15 +738,28 @@ impl CaptureEngine {
         Shipper::new(self.staging(), sink, registrar)
             .with_cpu_fraction(self.config.cpu_fraction)
             .with_multipart(self.config.multipart)
+            .with_uploads_in_flight(self.config.uploads_in_flight)
     }
 
     fn persist(&self) -> io::Result<()> {
         let dir = self.staging.index_dir();
+        if let Some(previous) = &self.previous {
+            LastStaged {
+                worktree_id: self.config.worktree_id.clone(),
+                epoch: self.config.epoch,
+                n: previous.manifest.n,
+                capture_id: previous.capture_id.clone(),
+            }
+            .save(&dir)?;
+        }
         self.workspace_index.save(&dir.join("workspace.json"))?;
         self.bulk_index.save(&dir.join("bulk.json"))?;
         let tmp = dir.join("chunks.tmp");
         fs::write(&tmp, serde_json::to_vec(&self.chunks)?)?;
         fs::rename(tmp, dir.join("chunks.json"))?;
+        let tmp = dir.join("dirs.tmp");
+        fs::write(&tmp, serde_json::to_vec(&self.dirs)?)?;
+        fs::rename(tmp, dir.join("dirs.json"))?;
         let tmp = dir.join("git-tips.tmp");
         fs::write(&tmp, serde_json::to_vec(&self.last_tips)?)?;
         fs::rename(tmp, dir.join("git-tips.json"))
@@ -572,9 +791,9 @@ impl CaptureEngine {
         self.roots().bulk_listing()
     }
 
-    /// Build a chunked class into new packs; returns the root key and the pack keys the tree
-    /// needs, or `None` when a bulk build yielded to `preempt` (its progress is kept in
-    /// `bulk_work`; the next bulk build resumes it).
+    /// Build a chunked class into new packs; returns what its section names (the root, the
+    /// packs the tree needs, and in format 2 its dir packs), or `None` when a bulk build yielded
+    /// to `preempt` (its progress is kept in `bulk_work`; the next bulk build resumes it).
     fn build_class(
         &mut self,
         listing: &Listing,
@@ -582,10 +801,15 @@ impl CaptureEngine {
         uploads: &mut Vec<Upload>,
         stats: &mut SnapStats,
         preempt: &dyn Fn() -> bool,
-    ) -> Result<Option<(String, Vec<String>)>, EngineError> {
+    ) -> Result<Option<BuiltClass>, EngineError> {
         let objects = self.staging.objects_dir();
         let prefix = self.prefix.clone();
-        let key_for_dir = move |sha: &str| prefix.tree(sha);
+        let dir_format = self.config.dir_format;
+        // Format 1 names a child dir object by its key, format 2 by its digest.
+        let key_for_dir = move |sha: &str| match dir_format {
+            DirFormat::Objects => prefix.tree(sha),
+            DirFormat::Packs => sha.to_owned(),
+        };
         let mut work = match class {
             Class::Small => ClassWork {
                 index: std::mem::take(&mut self.workspace_index),
@@ -660,21 +884,30 @@ impl CaptureEngine {
                 tracing::error!(chunk = %c, "chunk referenced by tree but in no pack");
             }
         }
-        for (sha, dir) in &built.dirs {
-            let file = format!("tree-{sha}");
-            let path = objects.join(&file);
-            if !path.exists() && !self.staging.is_uploaded(&file) {
-                fs::write(&path, &dir.bytes)?;
-                stats.dirs_new += 1;
+        let (root, dir_packs) = match dir_format {
+            DirFormat::Objects => {
+                for (sha, dir) in &built.dirs {
+                    let file = format!("tree-{sha}");
+                    let path = objects.join(&file);
+                    if !path.exists() && !self.staging.is_uploaded(&file) {
+                        fs::write(&path, &dir.bytes)?;
+                        stats.dirs_new += 1;
+                    }
+                    if !self.staging.is_uploaded(&file) {
+                        uploads.push(Upload {
+                            key: self.prefix.tree(sha),
+                            file,
+                            bytes: dir.bytes.len() as u64,
+                        });
+                    }
+                }
+                (self.prefix.tree(&built.root.sha256), Vec::new())
             }
-            if !self.staging.is_uploaded(&file) {
-                uploads.push(Upload {
-                    key: self.prefix.tree(sha),
-                    file,
-                    bytes: dir.bytes.len() as u64,
-                });
-            }
-        }
+            DirFormat::Packs => (
+                built.root.sha256.clone(),
+                self.pack_dirs(class, &built.dirs, uploads, stats)?,
+            ),
+        };
         let BuildStats {
             files,
             files_read,
@@ -690,10 +923,79 @@ impl CaptureEngine {
         stats.chunks += chunks;
         stats.chunks_new += chunks_new;
         stats.torn += torn;
-        Ok(Some((
-            self.prefix.tree(&built.root.sha256),
-            needed.into_iter().collect(),
-        )))
+        Ok(Some(BuiltClass {
+            root,
+            packs: needed.into_iter().collect(),
+            format: dir_format.section_format(),
+            dir_packs,
+        }))
+    }
+
+    /// Format 2: the dir packs a tree of `dirs` needs. A dir object this epoch already packed
+    /// for the class is found where it is; the rest go into new dir packs, staged in `uploads`.
+    /// A tree that would need more than [`MAX_DIR_PACKS`] packs is packed whole instead, so a
+    /// section never lists more than that and a restore stays a handful of GETs. Dir objects are
+    /// packed in digest order, so a tree packs to the same bytes whatever order it was built in.
+    fn pack_dirs(
+        &mut self,
+        class: Class,
+        dirs: &HashMap<String, EncodedDir>,
+        uploads: &mut Vec<Upload>,
+        stats: &mut SnapStats,
+    ) -> Result<Vec<String>, EngineError> {
+        let known = self.dirs.class(class);
+        let mut needed: BTreeSet<String> = BTreeSet::new();
+        let mut fresh: Vec<&String> = Vec::new();
+        for sha in dirs.keys() {
+            match known.get(sha) {
+                Some(key) => {
+                    needed.insert(key.clone());
+                }
+                None => fresh.push(sha),
+            }
+        }
+        let whole = needed.len() + usize::from(!fresh.is_empty()) > MAX_DIR_PACKS;
+        let mut to_pack: Vec<&String> = if whole {
+            needed.clear();
+            dirs.keys().collect()
+        } else {
+            fresh
+        };
+        if to_pack.is_empty() {
+            return Ok(needed.into_iter().collect());
+        }
+        to_pack.sort();
+        let mut builder = PackBuilder::new(&self.staging.objects_dir(), self.config.pack_cap);
+        for sha in &to_pack {
+            let id = ChunkId::parse(sha)
+                .ok_or_else(|| io::Error::other(format!("dir object digest {sha} is not hex")))?;
+            builder.add(id, &dirs[*sha].bytes)?;
+        }
+        let known = self.dirs.class(class);
+        for p in builder.finish()? {
+            let key = self.prefix.pack(&p.sha256);
+            for e in &p.entries {
+                known.insert(e.hash.to_hex(), key.clone());
+            }
+            stats.dirs_new += p.entries.len() as u64;
+            stats.dir_packs += 1;
+            stats.dir_pack_bytes += p.bytes;
+            uploads.push(Upload {
+                key: key.clone(),
+                file: p.sha256.clone(),
+                bytes: p.bytes,
+            });
+            needed.insert(key);
+        }
+        if whole {
+            tracing::debug!(
+                ?class,
+                dirs = to_pack.len(),
+                packs = needed.len(),
+                "dir packs compacted: the tree is packed whole"
+            );
+        }
+        Ok(needed.into_iter().collect())
     }
 
     /// Take a snap and stage it.
@@ -710,89 +1012,6 @@ impl CaptureEngine {
     #[must_use]
     pub fn bulk_in_progress(&self) -> bool {
         self.bulk_work.is_some()
-    }
-
-    /// Apply what the shipper dropped as refused (the registrar answered `byte-quota`): continue
-    /// the chain from the refused capture's parent, and forget everything that pointed at its
-    /// staged objects — the chunk locations of packs that never went up, and the indexed files
-    /// that reference those chunks, which would otherwise be listed in the next tree and packed
-    /// into nothing. Called at the head of every snap.
-    fn apply_refusals(&mut self) -> Result<(), EngineError> {
-        let refusals = self.staging.take_refusals();
-        if refusals.is_empty() {
-            return Ok(());
-        }
-        for refusal in &refusals {
-            // The refused capture was the oldest queued one, so its parent is the chain head
-            // this executor knows: `base`, kept from the snap that emptied the queue.
-            let base_is_parent =
-                self.base.as_ref().map(|b| b.capture_id.as_str()) == refusal.parent.as_deref();
-            // A refused bulk capture sits on top of the small captures staged ahead of it: its
-            // parent is the manifest it was staged on, not the oldest queued capture's.
-            let below_is_parent =
-                self.below.as_ref().map(|b| b.capture_id.as_str()) == refusal.parent.as_deref();
-            let continue_from = if base_is_parent {
-                Some((self.base.clone(), self.base_tips.clone()))
-            } else if below_is_parent {
-                Some((self.below.clone(), self.below_tips.clone()))
-            } else {
-                None
-            };
-            match continue_from {
-                None => tracing::warn!(
-                    n = refusal.n,
-                    parent = ?refusal.parent,
-                    base = ?self.base.as_ref().map(|b| b.manifest.n),
-                    "refused capture's parent is not the chain head this executor kept; the next \
-                     capture may find a wrong parent until a re-plan"
-                ),
-                Some((manifest, tips))
-                    if self
-                        .previous
-                        .as_ref()
-                        .is_some_and(|p| p.manifest.n >= refusal.n) =>
-                {
-                    self.previous = manifest;
-                    self.last_tips = tips;
-                }
-                Some(_) => {}
-            }
-            let gone: HashSet<&String> = refusal
-                .uploads
-                .iter()
-                .filter(|u| !self.staging.is_uploaded(&u.file))
-                .map(|u| &u.key)
-                .collect();
-            let orphaned: HashSet<ChunkId> = self
-                .chunks
-                .packs
-                .iter()
-                .filter(|(_, key)| gone.contains(key))
-                .map(|(chunk, _)| *chunk)
-                .collect();
-            self.chunks.packs.retain(|_, key| !gone.contains(key));
-            for index in [&mut self.workspace_index, &mut self.bulk_index] {
-                index
-                    .files
-                    .retain(|_, f| !f.chunks.iter().any(|c| orphaned.contains(c)));
-            }
-            tracing::warn!(
-                n = refusal.n,
-                capture = %refusal.capture_id,
-                class = ?refusal.class,
-                reason = %refusal.reason,
-                limit = ?refusal.limit,
-                used = ?refusal.used,
-                requested = ?refusal.requested,
-                continuing_from = ?self.previous.as_ref().map(|p| p.manifest.n),
-                "refused capture dropped; chain continues from its parent"
-            );
-        }
-        self.bulk_work = None;
-        self.below = None;
-        self.below_tips.clear();
-        self.persist()?;
-        Ok(())
     }
 
     /// The queued bulk capture a small snap is staged ahead of, with the manifest it was staged
@@ -884,7 +1103,6 @@ impl CaptureEngine {
         req: SnapRequest,
         preempt: &dyn Fn() -> bool,
     ) -> Result<SnapOutcome, EngineError> {
-        self.apply_refusals()?;
         if req.class == Class::Bulk && self.previous.is_none() {
             // A bulk capture copies the small sections from its predecessor; make one first.
             self.snap(SnapRequest {
@@ -896,8 +1114,6 @@ impl CaptureEngine {
         let mut stats = SnapStats::default();
         let mut uploads: Vec<Upload> = Vec::new();
         let objects = self.staging.objects_dir();
-        // The tips as of `previous`, before this snap's pack moves them on.
-        let tips_before = self.last_tips.clone();
 
         let mut sections = match req.class {
             Class::Small => {
@@ -938,7 +1154,7 @@ impl CaptureEngine {
                     git_packs.push(key);
                 }
                 let listing = self.workspace_listing(&repo, &git.closure.gitlinks)?;
-                let Some((root, packs)) =
+                let Some(built) =
                     self.build_class(&listing, Class::Small, &mut uploads, &mut stats, preempt)?
                 else {
                     return Err(io::Error::other("small-class build yielded").into());
@@ -950,7 +1166,12 @@ impl CaptureEngine {
                         head: git.closure.head,
                         fsck: git.fsck,
                     },
-                    workspace: WorkspaceSection { root, packs },
+                    workspace: WorkspaceSection {
+                        root: built.root,
+                        packs: built.packs,
+                        format: built.format,
+                        dir_packs: built.dir_packs,
+                    },
                     bulk: self
                         .previous
                         .as_ref()
@@ -959,7 +1180,7 @@ impl CaptureEngine {
             }
             Class::Bulk => {
                 let listing = self.bulk_listing();
-                let Some((root, packs)) =
+                let Some(built) =
                     self.build_class(&listing, Class::Bulk, &mut uploads, &mut stats, preempt)?
                 else {
                     tracing::debug!(
@@ -978,9 +1199,11 @@ impl CaptureEngine {
                     git: prev.git,
                     workspace: prev.workspace,
                     bulk: BulkState::Ready(BulkSection {
-                        root,
-                        packs,
+                        root: built.root,
+                        packs: built.packs,
                         platform: self.config.platform.clone(),
+                        format: built.format,
+                        dir_packs: built.dir_packs,
                     }),
                 }
             }
@@ -1028,6 +1251,7 @@ impl CaptureEngine {
                 .map(|u| &u.key)
                 .collect();
             self.chunks.packs.retain(|_, k| !dropped.contains(k));
+            self.dirs.retain(|k| !dropped.contains(k));
             stats.elapsed_ms = start.elapsed().as_millis() as u64;
             return Ok(SnapOutcome::Staged(Box::new(StagedCapture {
                 n: prev.manifest.n,
@@ -1040,12 +1264,6 @@ impl CaptureEngine {
             })));
         }
 
-        // Nothing queued: this capture becomes the oldest queued one, so its parent is the
-        // chain head a refusal would send the engine back to.
-        if self.staging.pending()?.is_empty() {
-            self.base = self.previous.clone();
-            self.base_tips = tips_before;
-        }
         // Coalesce with a pending, not-yet-shipping `auto` capture of the same class: a small
         // snap never folds into a bulk capture (it would wait for that upload), nor a bulk
         // snap into a small one. The guard keeps the shipper from claiming that capture until
@@ -1133,7 +1351,6 @@ impl CaptureEngine {
                 // bulk capture's place with.
                 None => {
                     self.below = self.previous.clone();
-                    self.below_tips = self.last_tips.clone();
                 }
                 // It replaces a queued bulk capture and keeps that one's parent.
                 Some(old) => {
@@ -1156,7 +1373,6 @@ impl CaptureEngine {
                 }
                 self.staging.sweep(bulk)?;
                 self.below = Some(manifest.clone());
-                self.below_tips = self.last_tips.clone();
                 tracing::info!(
                     n,
                     bulk_n = moved.n,

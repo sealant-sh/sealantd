@@ -2344,8 +2344,9 @@ export type CaptureStatusReport = Message<"sealant.v1.CaptureStatusReport"> & {
   lastSnapUnixMs?: bigint | undefined;
 
   /**
-   * Classes the registrar refused for the session's byte quota; nothing of such a class ships
-   * again until the next epoch or capture.replan.
+   * Classes with a capture the registrar refused for the session's byte quota. Nothing is
+   * dropped: the capture stays queued (counted in `pending`) with its staged bytes, the class
+   * keeps snapping, and the executor asks again after a backoff until the budget allows.
    *
    * @generated from field: repeated sealant.v1.CaptureClass refused = 12;
    */

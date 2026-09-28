@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use sealant_capture::manifest::BulkState;
+use sealant_capture::manifest::{BulkState, DirFormat};
 use sealant_capture::registrar::{HeartbeatRequest, PlanGetRequest, RegistrarError};
 use sealant_capture::{
     BlobSink, CadenceRunner, CaptureKind as EngineKind, Class, MaterializeClass, Materializer,
@@ -61,6 +61,8 @@ pub struct CaptureRuntime {
     paused: AtomicBool,
     last_snap_unix_ms: AtomicU64,
     harness: Mutex<Option<ProcessId>>,
+    /// The boot left a disk that continued the chain as it was (`CaptureBoot::resumed`).
+    resumed: bool,
 }
 
 impl std::fmt::Debug for CaptureRuntime {
@@ -82,8 +84,10 @@ impl CaptureRuntime {
             boot.engine
                 .shipper(boot.sink.clone(), boot.registrar.clone()),
         );
+        let resumed = boot.resumed;
         Arc::new(Self {
             runner: CadenceRunner::new(boot.engine, shipper),
+            resumed,
             registrar: boot.registrar,
             sink: boot.sink,
             minter: boot.minter,
@@ -113,6 +117,14 @@ impl CaptureRuntime {
         let rt = runtime.clone();
         self.runner
             .start(Some(Arc::new(move || !rt.shutdown().is_hard())));
+        // A disk the boot resumed may have changed after its last snap, while no watcher ran:
+        // both classes are snapped on their quiet clocks, as after any change.
+        if self.resumed {
+            self.runner
+                .signal(sealant_capture::ChangeSignal::Changed(Class::Small));
+            self.runner
+                .signal(sealant_capture::ChangeSignal::Changed(Class::Bulk));
+        }
 
         // Heartbeat and fence (amendment decision 8): pause on a 409 or once the lease TTL
         // elapses without a successful heartbeat; resume when a later heartbeat succeeds with
@@ -215,8 +227,10 @@ impl CaptureRuntime {
         })
     }
 
-    /// Final snap of `kind`, then ship and register everything pending, bounded by
-    /// `min(deadline, grace)`. Blocking.
+    /// Forced snap of `kind`, then ship and register what it needs, bounded by
+    /// `min(deadline, grace)`. A `final` flush is not bounded: it snaps the bulk class too and
+    /// returns once everything staged is registered (or the lease is fenced), because what is
+    /// staged on this disk is lost with it; the process ending is what stops it. Blocking.
     ///
     /// # Errors
     /// Returns [`ControlError`] when the snap fails or shipping stops on a fence.
@@ -325,6 +339,9 @@ impl CaptureRuntime {
             engine
                 .rebase(&plan.worktree_id, plan.epoch, previous)
                 .map_err(|e| internal(&format!("capture engine rebase: {e}")))?;
+            // The registrar of the assigned worktree decides whether dir objects travel in
+            // dir packs from the next snap on.
+            engine.set_dir_format(DirFormat::for_registrar(plan.manifest_format));
             // A standby executor boots under a placeholder worktree, so the sources of the
             // session it is assigned arrive with this plan, not the boot's.
             sources::apply(self.sink.as_ref(), &plan.sources, &self.layout)
@@ -463,6 +480,7 @@ mod tests {
                     working_directory: root.clone(),
                     staging_dir: root.join(".sealantd/capture"),
                 },
+                resumed: false,
             },
             registrar,
         )
@@ -540,11 +558,16 @@ mod tests {
         assert_eq!(chain.len(), 2);
         assert_eq!(chain[1].manifest.kind, EngineKind::Suspend);
 
-        // The signal listener's path (SIGTERM / SIGINT): a final snap, flushed.
+        // The signal listener's path (SIGTERM / SIGINT): a final snap, and a bulk snap — the
+        // bulk class had never been captured, so the chain now records it (empty here) — both
+        // registered before the flush returns.
         runtime.flush_captures(CaptureKind::Final).await;
         let chain = registrar.chain();
-        assert_eq!(chain.len(), 3);
+        assert_eq!(chain.len(), 4);
         assert_eq!(chain[2].manifest.kind, EngineKind::Final);
+        assert_eq!(chain[3].manifest.kind, EngineKind::Auto);
+        assert!(chain[3].manifest.sections.bulk.section().is_some());
+        assert!(capture.runner().staging().pending().unwrap().is_empty());
 
         // `runtime.gracefulShutdown` flushes before requesting the shutdown.
         let resp = runtime
@@ -562,8 +585,12 @@ mod tests {
             }
         ));
         let chain = registrar.chain();
-        assert_eq!(chain.len(), 4);
-        assert_eq!(chain[3].manifest.kind, EngineKind::Final);
+        assert_eq!(
+            chain.len(),
+            5,
+            "the bulk class is unchanged: nothing more to stage"
+        );
+        assert_eq!(chain[4].manifest.kind, EngineKind::Final);
         let snap = capture.runner().snapshot();
         assert_eq!(snap.forced, 4, "{snap:?}");
         assert_eq!(snap.small_snaps, 4, "no scheduled snap fired: {snap:?}");

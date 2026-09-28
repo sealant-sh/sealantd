@@ -6,8 +6,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use sealant_capture::engine::Pickup;
 use sealant_capture::gitpack::GitRepo;
-use sealant_capture::manifest::BulkState;
+use sealant_capture::manifest::{BulkState, DirFormat};
 use sealant_capture::registrar::{PlanGetRequest, RegistrarMinter};
 use sealant_capture::{
     BlobSink, CaptureConfig, CaptureEngine, ChannelTransport, HttpRegistrar, MaterializeClass,
@@ -49,6 +50,10 @@ pub struct CaptureBoot {
     /// re-plan lays down the sources of the worktree it is assigned (a standby executor boots
     /// under a placeholder and only then learns whose session it is).
     pub layout: SourceLayout,
+    /// The disk was this executor's own continuation of the chain (a daemon restart): it was
+    /// left as it is, and both classes are snapped once the cadence starts, so whatever changed
+    /// after the last snap is captured.
+    pub resumed: bool,
 }
 
 /// The paths `sources` are resolved against.
@@ -159,6 +164,7 @@ pub(crate) fn boot_from(
         worktree = %worktree_id,
         epoch,
         head = ?plan.head.as_ref().map(|h| h.n),
+        manifest_format = plan.manifest_format,
         bulk_pending = plan
             .head
             .as_ref()
@@ -188,6 +194,8 @@ pub(crate) fn boot_from(
 
     let mut config = CaptureConfig::new(&worktree_id, epoch, working_directory);
     config.harness_home = source.harness_home.clone();
+    // Dir packs only for a registrar that reads them; either format materializes here.
+    config.dir_format = DirFormat::for_registrar(plan.manifest_format);
     config.watch.raise_limit = source.raise_inotify_limit;
     let layout = SourceLayout {
         workspace_root: workspace_root.to_path_buf(),
@@ -195,7 +203,34 @@ pub(crate) fn boot_from(
         staging_dir: config.staging_dir(),
     };
 
+    // A daemon restarting on its own disk finds it at or past the head: staged captures not
+    // shipped yet, and whatever changed after the last snap. Materializing the head over it
+    // would take that work back, so the disk is left as it is and the queue resumes.
+    let pickup = CaptureEngine::pickup(&config, plan.head.as_ref().map(|h| h.capture_id.as_str()))
+        .map_err(|error| BootError::config(format!("capture staging: {error}")))?;
+    let resumed = matches!(pickup, Pickup::Resume { .. });
+    if let Pickup::Resume {
+        queued,
+        epoch_changed,
+    } = pickup
+    {
+        tracing::info!(
+            queued,
+            epoch_changed,
+            "capture resumed on this disk: the head is not materialized over it"
+        );
+    }
     let previous = match &plan.head {
+        Some(head) if resumed => {
+            let manifest = Materializer::new(
+                sink.as_ref(),
+                MaterializeTargets::new(working_directory, source.harness_home.clone()),
+            )
+            .fetch_manifest(&head.manifest_key, &head.capture_id)
+            .map_err(|error| BootError::config(format!("capture head manifest: {error}")))?;
+            Some(manifest)
+        }
+        None if resumed => None,
         Some(head) => {
             let mut targets =
                 MaterializeTargets::new(working_directory, source.harness_home.clone());
@@ -244,7 +279,9 @@ pub(crate) fn boot_from(
     // The repository above was built here, so it has no remotes until the plan names them.
     remotes::apply(working_directory, &plan.remotes)?;
 
-    let seeded = previous.is_some();
+    // A resumed disk's repository holds objects no registered capture carries yet: its tips are
+    // not the chain's, and the engine keeps the ones it staged under this identity.
+    let seeded = previous.is_some() && !resumed;
     let mut engine = CaptureEngine::open(config, previous)
         .map_err(|error| BootError::config(format!("capture engine: {error}")))?;
     if seeded {
@@ -260,6 +297,7 @@ pub(crate) fn boot_from(
         worktree_id,
         epoch,
         layout,
+        resumed,
     })
 }
 
@@ -567,5 +605,99 @@ mod tests {
             format!("{error}").contains("outside the worktree"),
             "{error}"
         );
+    }
+
+    /// A daemon that restarts on its own disk finds a capture staged and not shipped and an
+    /// edit made after it. The boot leaves the disk as it is (materializing the head would take
+    /// both back), the engine continues from the staged capture, and the queue ships.
+    #[test]
+    fn a_restart_on_its_own_disk_is_not_materialized_over() {
+        let tmp = tempfile::tempdir().unwrap();
+        let registrar = Arc::new(InMemoryRegistrar::new("wt-boot", 1, None));
+        let sink = capture_source(tmp.path(), &registrar);
+        let dyn_sink: Arc<dyn BlobSink> = sink.clone();
+        let ws = tmp.path().join("ws");
+        let boot = boot_from(
+            registrar.clone(),
+            Some(dyn_sink.clone()),
+            &source(),
+            &ws,
+            tmp.path(),
+        )
+        .unwrap();
+        assert!(!boot.resumed, "a fresh disk is materialized");
+        assert_eq!(
+            boot.engine.config().dir_format,
+            DirFormat::Packs,
+            "the registrar reads dir packs"
+        );
+        let mut engine = boot.engine;
+        std::fs::write(ws.join("lib.rs"), "pub fn f() { staged() }\n").unwrap();
+        let staged = engine
+            .snap(SnapRequest {
+                kind: CaptureKind::Turn,
+                class: Class::Small,
+                seq: 3,
+            })
+            .unwrap();
+        drop(engine);
+        std::fs::write(
+            ws.join("node_modules/pkg/index.js"),
+            "after the last snap\n",
+        )
+        .unwrap();
+
+        let boot = boot_from(
+            registrar.clone(),
+            Some(dyn_sink),
+            &source(),
+            &ws,
+            tmp.path(),
+        )
+        .unwrap();
+        assert!(boot.resumed);
+        assert_eq!(
+            std::fs::read_to_string(ws.join("lib.rs")).unwrap(),
+            "pub fn f() { staged() }\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(ws.join("node_modules/pkg/index.js")).unwrap(),
+            "after the last snap\n"
+        );
+        assert_eq!(
+            boot.engine.previous().unwrap().capture_id,
+            staged.manifest.capture_id
+        );
+        let dyn_registrar: Arc<dyn Registrar> = registrar.clone();
+        let sink: Arc<dyn BlobSink> = sink;
+        assert_eq!(
+            boot.engine
+                .shipper(sink, dyn_registrar)
+                .ship_pending()
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            registrar.head().unwrap().capture_id,
+            staged.manifest.capture_id
+        );
+    }
+
+    /// A registrar that does not announce `manifest_format` 2 gets one object per directory.
+    #[test]
+    fn a_registrar_without_dir_packs_gets_dir_objects() {
+        let tmp = tempfile::tempdir().unwrap();
+        let registrar =
+            Arc::new(InMemoryRegistrar::new("wt-boot", 1, None).with_manifest_format(1));
+        let sink: Arc<dyn BlobSink> = capture_source(tmp.path(), &registrar);
+        let boot = boot_from(
+            registrar,
+            Some(sink),
+            &source(),
+            &tmp.path().join("ws"),
+            tmp.path(),
+        )
+        .unwrap();
+        assert_eq!(boot.engine.config().dir_format, DirFormat::Objects);
     }
 }

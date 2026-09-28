@@ -195,8 +195,8 @@ pub trait BlobSink: Send + Sync {
     /// Prepare to store `keys` (each `(key, bytes)`) with single PUTs: a presigned sink mints
     /// their URLs in one channel call instead of one per key, and the sizes let the registrar
     /// price the batch before it mints. Advisory — a PUT of a key that was not (or could not be)
-    /// prepared mints on its own — except a [`SinkError::QuotaRefused`], which is terminal. The
-    /// default does nothing.
+    /// prepared mints on its own — except a [`SinkError::QuotaRefused`], which holds the capture
+    /// until a later ask. The default does nothing.
     fn prefetch_put(&self, keys: &[(String, u64)]) -> Result<(), SinkError> {
         let _ = keys;
         Ok(())
@@ -210,6 +210,19 @@ pub trait BlobSink: Send + Sync {
     fn helper_cpu(&self) -> Duration {
         Duration::ZERO
     }
+}
+
+/// A temporary name beside `path`, unique within the process. Writes to one directory run in
+/// parallel (the shipper keeps several PUTs in flight), and a name derived from the key alone
+/// collides: `<sha>` and `<sha>.idx` shared `<sha>.tmp-<pid>`, so the index was copied into the
+/// hard link of the pack it was uploaded beside.
+fn temp_beside(path: &Path) -> PathBuf {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let name = path
+        .file_name()
+        .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+    path.with_file_name(format!(".{name}.tmp-{}-{n}", std::process::id()))
 }
 
 /// A directory: `key` → `<dir>/<key>`.
@@ -251,7 +264,7 @@ impl BlobSink for LocalDir {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
+        let tmp = temp_beside(&path);
         match source {
             BlobSource::Bytes(b) => fs::write(&tmp, b)?,
             BlobSource::File(f) => {
@@ -280,7 +293,7 @@ impl BlobSink for LocalDir {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
+        let tmp = temp_beside(&path);
         let mut src = fs::File::open(file)?;
         let mut out = fs::File::create(&tmp)?;
         loop {

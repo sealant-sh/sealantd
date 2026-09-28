@@ -138,10 +138,7 @@ fn control_plane_base(
                 head: "refs/heads/main".into(),
                 fsck: FsckStatus::Verified,
             },
-            workspace: WorkspaceSection {
-                root: root_key,
-                packs: vec![],
-            },
+            workspace: WorkspaceSection::objects(root_key, vec![]),
             bulk: BulkState::pending(),
         },
         checkpoint: None,

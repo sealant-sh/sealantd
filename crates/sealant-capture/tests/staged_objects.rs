@@ -4,6 +4,10 @@
 //! small snaps, each of which deleted the dir objects the bulk entry had yet to upload; every
 //! ship pass then failed on `upload …/trees/<sha>: no GET url in plan` (the file was gone, and
 //! the existence probe needs a GET URL the plan never carries for a new key).
+//!
+//! These captures are written for a registrar that does not read dir packs
+//! (`DirFormat::Objects`, one object per directory): the shape of that session, and still what
+//! an executor writes for such a registrar. Dir packs have their own tests (`tests/dir_packs.rs`).
 
 mod common;
 
@@ -13,7 +17,7 @@ use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use sealant_capture::manifest::BulkState;
+use sealant_capture::manifest::{BulkState, DirFormat};
 use sealant_capture::registrar::{CompletedPart, MultipartUrls, RegistrarMinter};
 use sealant_capture::ship::{PREFETCH_BATCH, ShipError};
 use sealant_capture::sink::{Completed, SinkError, UrlMinter};
@@ -85,6 +89,7 @@ impl Fixture {
     fn config(&self) -> CaptureConfig {
         let mut c = CaptureConfig::new("wt", 1, &self.root);
         c.harness_home = Some(self.home.clone());
+        c.dir_format = DirFormat::Objects;
         c
     }
 }

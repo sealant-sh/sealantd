@@ -12,7 +12,7 @@
 The executor-side half of the session capture store (ADR-0015). A workspace is captured as two
 classes of content-addressed objects in a bucket-shaped `BlobSink`: git objects as self-contained
 git packs (`gitpack`), everything else as content-defined chunks in CDC packs (`chunk`, `pack`)
-described by dir objects (`tree`). A `Manifest` ties one capture together; `ship` stages, uploads
+described by dir objects (`tree`), which travel in dir packs (see "Dir packs"). A `Manifest` ties one capture together; `ship` stages, uploads
 and registers it through a `Registrar`; `materialize` rebuilds a workspace from a manifest.
 `CaptureEngine` is the front door: `snap(class, kind)` stages a capture, `snap_preemptible` lets a
 bulk build yield.
@@ -39,7 +39,9 @@ pseudo-ref through a two-tree `read-tree --reset -u` (a full `checkout-index` wh
 known about the disk). Files, symlinks and emptied directories the plan no longer names are
 removed, and only inside what a capture would list (`ClassRoots`, the same policy the engine's
 listings use): never the staging directory, excluded names, credentials, or the bulk
-directories of a `"pending"` bulk section. `tests/delta.rs` measures it: a head applied over a
+directories of a `"pending"` bulk section. Content and dir packs are fetched up front, eight GETs in flight (`PACK_GETS_IN_FLIGHT`), into
+the pack cache (`.sealantd/capture/cache/`), and a pack already there is not fetched again.
+`tests/delta.rs` measures it: a head applied over a
 materialized base wrote 9 files / 213 KB where a fresh materialize writes 427 files / 1.7 MB,
 the two trees compare identical (bytes, modes, mtimes, links), and the head over itself writes
 nothing. This is what lets a standby executor pre-materialize the project base and apply the
@@ -144,19 +146,20 @@ chain head stayed at the capture before the agent's edits, `capture.flush` timed
   registered** (`Shipper::flush_small`): the git pack, the worktree tree and the workspace class,
   which is what a change or a diff needs. The bulk capture keeps uploading in the worker and
   registers on top; `capture.status` reports it in `pending` and in `pending_bulk`, so a caller
-  reads `pending == pending_bulk` as flushed. A `final` flush (the daemon is going away, the
-  worker with it) spends what is left of its deadline on the bulk capture too.
+  reads `pending == pending_bulk` as flushed for a change or a diff. A `final` flush does not
+  return before the bulk capture is registered (see "No work product is lost").
 - **Materialize is unchanged.** A head staged ahead of a bulk capture carries the older bulk
   section or `"pending"`; a materialize from a `"pending"` head neither restores nor sweeps the
   bulk directories.
-- **Refusals.** A bulk capture refused for the byte quota is dropped alone (it is the newest
-  queued capture); the chain continues from the manifest it was staged on. A refused small
-  capture drops everything after it, the bulk capture included, as before.
+- **Refusals.** A capture refused for the byte quota is held, never dropped (see "No work
+  product is lost"); a small capture is staged ahead of a held bulk capture as ahead of any
+  queued one.
 
-`tests/small_ahead_of_bulk.rs` holds it against a sink that spends 40 ms per object on 164 bulk
-objects: a turn capture registers in ≈ 0.2 s and a flush returns in ≈ 0.2 s while the bulk upload
-runs, the head materializes the edit without the dependency tree, and the bulk capture registers
-on top. Before the change the turn capture did not register within 5 s.
+`tests/small_ahead_of_bulk.rs` holds it against a sink that spends 250 ms per object on 164 bulk
+objects, eight in flight (one object per directory, as for a registrar without dir packs): a
+turn capture registers in ≈ 0.5 s and a flush returns in ≈ 0.5 s while the bulk upload runs, the
+head materializes the edit without the dependency tree, and the bulk capture registers on top.
+Before #98 the turn capture did not register within 5 s (40 ms per object, one at a time).
 
 ### PUT URLs: one pass, reused, and a 429 is transient
 
@@ -175,7 +178,115 @@ within `PUT_URL_REUSE` (5 minutes), so a bulk upload that stopped mid-batch resu
 it holds. A key the registrar answers without is still `NoUrl` ("the registrar answered
 upload.urls without this key").
 
+## Dir packs (`engine.rs`, `pack.rs`, `materialize.rs`)
+
+Measured on alpha (2026-09-27, AWS Lambda MicroVM → S3 presigned PUTs): a pnpm `node_modules` of
+≈ 800 MB was 20,878 objects — ≈ 13 CDC packs and ≈ 20,860 dir objects, one per directory, each
+its own PUT at ≈ 70 ms. The upload took ≈ 24 minutes at 0.55 MB/s and ≈ 40–160 `upload.urls`
+calls, and a restore would have been as many GETs, one at a time. A capture's dir objects now
+travel in packs, so a capture is O(packs) objects and a restore O(packs) GETs.
+
+- **Format.** A dir pack is the CDC pack container (`SLCP0001`): one zstd entry per dir object,
+  the entry's `hash` being the dir object's sha256, keyed `captures/<wt>/<epoch>/packs/<sha256>`
+  like any pack. In a format-2 section a dir entry's `child` and the section's `root` are dir
+  object digests instead of keys, so a dir object's bytes do not depend on where it is stored,
+  and the section lists its dir packs:
+
+  ```json
+  "bulk": {"root":"<sha256>","packs":["captures/wt/3/packs/<sha>",…],"platform":"linux-x86_64-gnu",
+           "format":2,"dir_packs":["captures/wt/3/packs/<sha>",…]}
+  ```
+
+  A reader fetches the listed dir packs and resolves every digest through their trailing
+  indexes (verifying each dir object against its digest), as it resolves chunks.
+- **Versioning.** Each chunked section carries `format` (`manifest.rs`): absent = 1, one object
+  per directory at `…/trees/<sha256>`, `root` and `child` being keys — every capture before this
+  change, byte for byte (a format-1 section serializes exactly as before); 2 = dir packs. A
+  materializer refuses a format above the one it reads before writing anything. Sections are
+  versioned one by one because one manifest can hold both: a capture staged by this build over a
+  head an older executor (or the control plane) wrote carries that head's bulk section as it is
+  until the next bulk snap.
+- **The registrar decides.** `plan.get` answers `manifest_format` (see "Wire additions"); the
+  engine writes format 2 only when it is ≥ 2 (`DirFormat::for_registrar`, `CaptureConfig::dir_format`,
+  set at boot and at `capture.replan`), and format 1 otherwise, so an executor never writes a
+  capture its control plane cannot restore. Either format materializes here.
+- **Dedup.** The engine keeps, per class and per epoch, where each dir object it packed is
+  (`index/dirs.json`); a snap packs only the dir objects it has not packed before — for an edit,
+  the path from the changed directory to the root — into one new dir pack, and lists the packs
+  holding the rest. Per class, so a small capture staged ahead of a bulk one never names a pack
+  only that bulk capture uploads.
+- **Bound.** A section lists at most `MAX_DIR_PACKS` (16): past it the snap packs the whole tree
+  into fresh packs, so a restore stays a couple of rounds of GETs however long the chain.
+
+`tests/node_modules_measure.rs` (`--ignored`; public API only, so the same file ran on the
+previous commit) captures a pnpm-shaped tree — 1000 packages, 6002 directories, 20,003 files,
+three 6 MiB binaries — behind a sink that spends 40 ms on every request, then one edit deep in
+the tree, then a fresh materialize of the head (release build; the materialize's wall time is
+mostly writing 20k files, and varied between runs):
+
+| step | before: requests | before: wall | after: requests | after: wall |
+|---|---|---|---|---|
+| first bulk capture, ship | 6018 (6005 PUT, 13 mint) | 241.5 s | 4 (3 PUT, 1 mint) | 0.12 s |
+| one edit, ship | 11 | 0.44 s | 4 | 0.08 s |
+| full materialize | 6016 GET | 241.9 s | 8 GET | 0.65–1.1 s |
+
+The first bulk capture's 6003 dir objects are one 2.5 MB dir pack; the edit's 8 (the path to the
+root) are one 53 KB pack; the restore fetches 6 packs and no dir object on its own.
+`tests/dir_packs.rs` holds the counts, the bound, an old-format head and a mixed manifest.
+
+## Uploads in flight (`ship.rs`)
+
+Every object below the multipart threshold goes up eight at a time (`DEFAULT_UPLOADS_IN_FLIGHT`,
+`CaptureConfig::uploads_in_flight`): a batch of up to 500 has its URLs minted in one
+`upload.urls` call, then its PUTs share eight workers. Each worker asks the pass's stop condition
+before it takes an object (a capture staged ahead, a waiting flush, the deadline), so a bulk
+upload still yields between objects — at most eight in flight finish first. Each worker charges
+its CPU to the pass's duty cycle and sleeps what the cycle owes, outside the lock. A byte-quota
+refusal is reported over any other failure of the batch. Minted URLs are reused as before.
+
+## No work product is lost (`ship.rs`, `cadence.rs`, `engine.rs`)
+
+Dependency trees, build outputs and every other ignored file are work product: they come back on
+restore, byte for byte, so the user never notices the compute changed.
+
+- **A refusal holds, never drops.** A capture refused for the byte quota stays queued with its
+  bytes, is reported in `capture.status`'s `refused`, and is asked for again after a backoff;
+  the class keeps snapping (see "`sizes` on every `upload.urls`, and byte-quota refusals").
+- **`"pending"` is not "nothing".** A head whose bulk section is `"pending"` restores the other
+  classes and leaves the bulk directories on disk as they are — never swept — and the next bulk
+  snap captures them.
+- **A `final` flush finishes.** `capture.flush` of kind `final` and the SIGTERM / SIGINT /
+  `runtime.gracefulShutdown` paths snap the bulk class too and ship everything, bulk included,
+  with no deadline (`Shipper::flush_final`): they return once the queue is empty, or on a fence
+  or a chain conflict, when nothing staged can register any more. A transport failure is retried
+  with backoff and a held capture is waited for; the process ending is what stops it. The
+  control plane's `capture.flush` (kind `suspend`) keeps its deadline: the daemon lives on.
+- **A restart resumes its disk.** The engine records the capture it staged last
+  (`index/last.json`). A boot whose staging names the plan's worktree and whose last capture is
+  the head, or descends from it through the captures still queued (`CaptureEngine::pickup`),
+  does not materialize the head — that would take back the queued captures and whatever changed
+  after the last snap. The engine continues from the newest queued capture (a queued bulk capture
+  can again have a small one staged ahead of it), the queue ships, and both classes are snapped
+  once the cadence starts. When the lease moved to a new epoch while the daemon was down, the
+  queued captures can never register and are dropped, but the disk holds everything they held:
+  the tips they recorded are forgotten and the next snaps capture the disk afresh. A disk whose
+  staging does not continue the chain (none, another worktree, a chain that moved on without it)
+  is materialized over, as before.
+
+`tests/no_loss.rs` holds each of these; `tests/quota_refusals.rs` the refusals.
+
 ## Wire additions
+
+### `manifest_format` on `plan.get`
+
+The highest section format the registrar reads — walks to presign a plan, HEADs and prices at
+register, keeps alive in retention. Absent = 1. At 2 the executor writes dir packs (see "Dir
+packs"). Additive: an older executor ignores it, and a registrar that never answers it gets
+format 1, as today.
+
+```json
+← {"worktree_id":"wt","epoch":3,"head":{…},"get_urls":{…},"manifest_format":2}
+```
 
 ### `pending_bulk` on `capture.status` / `capture.flush`
 
@@ -219,20 +330,22 @@ backstop for a registrar that priced a key some other way. Both bodies carry the
 ← 409 {"reason":"byte-quota","limit":8589934592,"used":8570000000,"requested":775000000}
 ```
 
-Executor side, both answers are `RegistrarError::QuotaRefused` — terminal, never retried. The
-shipper drops that queue entry with its staged bytes (and every queued capture that descends from
-it: they name it as their parent), logs the capture's `n`, class and the numbers, and marks the
-class `refused` in `capture.status`. A refused bulk class takes no further snap until the next
-epoch or `capture.replan` (`Shipper::is_refused`, checked by the cadence's bulk loop); the small
-class keeps snapping and shipping — its batches are small enough to fit what is left. The engine
-reads the refusal at its next snap: the chain continues from the refused capture's parent, and
-the chunk locations of packs that never went up — with the indexed files that reference them —
-are forgotten, so the next capture packs those bytes again instead of naming a pack that does not
-exist. Before this, a 409 was classified as a wrong parent and a 413 as a protocol error: both
-stopped the pass, neither dropped the entry, and the ship worker re-ran the same call every 5 s
-for good (observed on the cluster, 2026-09-14: a 775 MB bulk capture uploaded in full, then
-`ship pass failed error=register n=4: … http 413` on every tick). `InMemoryRegistrar` takes a
-byte quota (`with_byte_quota`) so both refusal points are tested (`tests/quota_refusals.rs`).
+Executor side, both answers are `RegistrarError::QuotaRefused`, and the capture is held
+(`Shipper::held`, `HeldCapture`): it keeps its place in the queue and every staged byte, the
+class is named in `capture.status`'s `refused` (the capture is counted in `pending`), the
+shipper logs the capture's `n`, class and the numbers at warn, and it asks again after a backoff
+— 30 s, doubling per refusal in a row, 10 minutes at most (`HOLD_BACKOFF`) — one `upload.urls`
+or `capture.register` call per ask, not one per ship tick. Nothing behind a held capture
+registers first (the chain is ordered), but a small capture is staged ahead of a held bulk
+capture, and a held class keeps snapping: a newer bulk capture replaces the held one in the queue.
+Once the budget allows (retention retired packs, or the control plane raised it), the capture
+registers and `refused` clears. Before #79 a 409 was classified as a wrong parent and a 413 as a
+protocol error, and the ship worker re-ran the same call every 5 s for good (observed on the
+cluster, 2026-09-14: a 775 MB bulk capture uploaded in full, then `ship pass failed
+error=register n=4: … http 413` on every tick); from #79 until this change a refusal dropped the
+capture and everything staged after it — a dependency tree, or an agent's edits, discarded for a
+quota. `InMemoryRegistrar` takes a byte quota (`with_byte_quota`) so both refusal points are
+tested (`tests/quota_refusals.rs`).
 
 ### Multipart uploads
 
@@ -303,6 +416,14 @@ A launcher that reaches the channel over plain HTTP on a private network (Docker
 Mend installs today) must now say so, or boot refuses.
 
 ## Deviations from ADR-0015 pending amendment
+
+- §"Capture format", Keys and Dir objects: dir objects travel in dir packs (the CDC pack
+  container, `…/packs/<sha256>`) listed in a section's `dir_packs`, and name their children by
+  digest, when the registrar announces `manifest_format` 2; `…/trees/<sha256>` objects remain
+  format 1. Sections carry `format`.
+- §"Write order": packs → dir packs → manifest → register.
+- Byte-quota refusals (amendment of the capture channel): a refused capture is held and asked for
+  again, never dropped.
 
 - §"Capture format", CDC packs: "≤ 64 MiB, one PUT, never multipart" → packs stay ≤ 64 MiB but
   are uploaded as multipart at or above the shipper's threshold (default 16 MiB); git packs may
