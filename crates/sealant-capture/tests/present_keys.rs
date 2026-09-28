@@ -122,6 +122,7 @@ fn entry(uploads: Vec<Upload>) -> QueueEntry {
                         index_tree: None,
                         raw_tree: None,
                         object_format: None,
+                        ref_format: None,
                     },
                     workspace: WorkspaceSection::objects(String::new(), Vec::new()),
                     bulk: BulkState::pending(),

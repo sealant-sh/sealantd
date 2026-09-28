@@ -2474,6 +2474,7 @@ mod tests {
                             index_tree: None,
                             raw_tree: None,
                             object_format: None,
+                            ref_format: None,
                         },
                         workspace: crate::manifest::WorkspaceSection::objects(
                             String::new(),

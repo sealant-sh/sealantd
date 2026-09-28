@@ -579,6 +579,140 @@ fn collect_loose_symrefs(
     Ok(())
 }
 
+/// A symlink standing for `HEAD` or a loose ref ([`GitRepo::ref_symlinks`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefSymlink {
+    /// The name git reads it by: `HEAD`, or `refs/…` as bytes.
+    pub name: Vec<u8>,
+    /// Where it is.
+    pub path: PathBuf,
+}
+
+/// Add every symlink under `dir` (a `refs/` directory; `name` is its ref name) to `found`. A
+/// symlink to a directory is one too; it is not descended.
+fn collect_ref_symlinks(
+    dir: &Path,
+    name: &[u8],
+    found: &mut Vec<RefSymlink>,
+) -> Result<(), GitError> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e)
+            if e.kind() == io::ErrorKind::NotFound || e.kind() == io::ErrorKind::NotADirectory =>
+        {
+            return Ok(());
+        }
+        Err(e) => return Err(at("list", dir)(e)),
+    };
+    for entry in entries {
+        let entry = entry.map_err(at("list", dir))?;
+        let path = entry.path();
+        let mut child = name.to_vec();
+        child.push(b'/');
+        child.extend_from_slice(entry.file_name().as_bytes());
+        let kind = entry.file_type().map_err(at("stat", &path))?;
+        if kind.is_dir() {
+            collect_ref_symlinks(&path, &child, found)?;
+        } else if kind.is_symlink() {
+            found.push(RefSymlink { name: child, path });
+        }
+    }
+    Ok(())
+}
+
+/// `path` with its `.` and `..` components taken lexically.
+fn normalized(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in path.components() {
+        match c {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// Where the chain of symlinks starting at `path` ends, as git follows it: each link's text
+/// taken from the directory it is in. The path it ends on need not exist. `None` for a chain
+/// of more than 40 links (a loop) or a link that cannot be read.
+#[must_use]
+pub fn link_terminal(path: &Path) -> Option<PathBuf> {
+    let real = |p: &Path| -> PathBuf {
+        match (p.parent(), p.file_name()) {
+            (Some(parent), Some(name)) => fs::canonicalize(parent)
+                .map_or_else(|_| p.to_path_buf(), |parent| parent.join(name)),
+            _ => p.to_path_buf(),
+        }
+    };
+    let mut at = real(path);
+    for _ in 0..40 {
+        match fs::symlink_metadata(&at) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                let text = fs::read_link(&at).ok()?;
+                let parent = at.parent()?.to_path_buf();
+                at = real(&normalized(&parent.join(text)));
+            }
+            _ => return Some(at),
+        }
+    }
+    None
+}
+
+/// Where a path is, as a restore of the repository sees it ([`RefDirs::place`]).
+enum Place {
+    /// The loose file of this ref, in the directory git keeps it in.
+    Ref(Vec<u8>),
+    /// A file of the git directory the restore writes (the workspace class, `HEAD`).
+    GitFile,
+    /// Anywhere else.
+    Elsewhere,
+}
+
+/// A repository's git directories, their real paths.
+struct RefDirs {
+    git_dir: Option<PathBuf>,
+    common_dir: Option<PathBuf>,
+}
+
+impl RefDirs {
+    fn of(repo: &GitRepo) -> Self {
+        Self {
+            git_dir: fs::canonicalize(&repo.git_dir).ok(),
+            common_dir: fs::canonicalize(&repo.common_dir).ok(),
+        }
+    }
+
+    fn place(&self, path: &Path) -> Place {
+        let per_worktree = |name: &[u8]| {
+            [&b"refs/bisect/"[..], b"refs/worktree/", b"refs/rewritten/"]
+                .iter()
+                .any(|p| name.starts_with(p))
+        };
+        for (dir, own) in [(&self.git_dir, true), (&self.common_dir, false)] {
+            let Some(rel) = dir.as_ref().and_then(|d| path.strip_prefix(d).ok()) else {
+                continue;
+            };
+            let rel = rel.as_os_str().as_bytes();
+            if rel.starts_with(b"refs/") {
+                // The file of a ref only in the directory git reads that ref from.
+                let keeps = self.git_dir == self.common_dir || own == per_worktree(rel);
+                if keeps && is_safe_ref_name(rel) {
+                    return Place::Ref(rel.to_vec());
+                }
+                continue;
+            }
+            let first = rel.split(|b| *b == b'/').next().unwrap_or_default();
+            if first != b"objects" && first != b"worktrees" && first != b"packed-refs" {
+                return Place::GitFile;
+            }
+        }
+        Place::Elsewhere
+    }
+}
+
 impl GitRepo {
     /// Open the repository whose working tree is `root`.
     pub fn open(root: &Path) -> Result<Self, GitError> {
@@ -608,11 +742,29 @@ impl GitRepo {
     /// open it; one that exists must already be of `format` (its objects cannot be read as
     /// another's), else [`GitError::Command`].
     pub fn init_with_format(root: &Path, format: &str) -> Result<Self, GitError> {
+        Self::init_with_formats(root, format, "files")
+    }
+
+    /// [`Self::init_with_format`], a repository made here keeping its refs in the `ref_format`
+    /// backend (`files`, `reftable`; `git init --ref-format`, asked for only when it is not
+    /// `files`, so a git that predates the option makes a files repository as it always did;
+    /// review 2026-09-28, ninth pass, #1). One that exists keeps its backend: the refs a
+    /// restore writes through git go into whichever it is, and the workspace class then brings
+    /// back the captured `.git/config` naming the backend and that backend's own files.
+    pub fn init_with_formats(
+        root: &Path,
+        format: &str,
+        ref_format: &str,
+    ) -> Result<Self, GitError> {
         fs::create_dir_all(root).map_err(at("mkdir -p", root))?;
         if !root.join(".git").exists() {
             let flag = format!("--object-format={format}");
-            let args = ["init", "-q", flag.as_str()];
-            check(&args, git_command(root)?.args(args).output_gated()?)?;
+            let refs_flag = format!("--ref-format={ref_format}");
+            let mut args = vec!["init", "-q", flag.as_str()];
+            if ref_format != "files" {
+                args.push(refs_flag.as_str());
+            }
+            check(&args, git_command(root)?.args(&args).output_gated()?)?;
         }
         let repo = Self::open(root)?;
         let found = repo.object_format()?;
@@ -633,6 +785,29 @@ impl GitRepo {
     pub fn object_format(&self) -> Result<String, GitError> {
         let out = self.run(&["rev-parse", "--show-object-format"])?;
         Ok(stdout_string(&out))
+    }
+
+    /// The backend the repository keeps its refs in, as git names it: `files` or `reftable`
+    /// (`git rev-parse --show-ref-format`). A git before 2.45 does not know the option (it
+    /// echoes it back) and reads only the files backend; the repository then names its
+    /// backend in `extensions.refStorage`, `files` when unset.
+    pub fn ref_format(&self) -> Result<String, GitError> {
+        let out = self.run(&["rev-parse", "--show-ref-format"])?;
+        let said = stdout_string(&out);
+        if !said.is_empty() && !said.starts_with('-') {
+            return Ok(said);
+        }
+        let out = git_command(&self.root)?
+            .args(["config", "--get", "extensions.refstorage"])
+            .output_gated()?;
+        match out.status.code() {
+            Some(0) => Ok(stdout_string(&out).to_ascii_lowercase()),
+            Some(1) => Ok("files".to_owned()),
+            _ => Err(GitError::Command {
+                args: "config --get extensions.refstorage".to_owned(),
+                stderr: String::from_utf8_lossy(&out.stderr).trim().to_owned(),
+            }),
+        }
     }
 
     /// Add `pattern` to the repository's local excludes (`info/exclude` in the common dir) unless
@@ -746,8 +921,48 @@ impl GitRepo {
     /// `refs/remotes/origin/HEAD`), which is still a ref the repository holds. `packed-refs`
     /// cannot hold a symbolic ref, so the loose files and symlinks under `refs/` (the common
     /// directory's, and a linked worktree's own) are all of them.
+    ///
+    /// A reftable repository holds its symbolic refs in its tables: they are listed through
+    /// git ([`Self::symrefs_in`]).
     pub fn symrefs(&self) -> Result<BTreeMap<String, String>, GitError> {
+        self.symrefs_in(&self.ref_format()?)
+    }
+
+    /// [`Self::symrefs`] of a repository whose refs are in the `ref_format` backend. In a
+    /// reftable repository every symbolic ref whose chain resolves is listed by `git
+    /// for-each-ref` (its `%(symref)` is the end of the chain), and its immediate target is
+    /// `git symbolic-ref --no-recurse`. One whose chain does not resolve is not listed by any
+    /// git command: the tables, which the workspace class carries byte for byte, bring it back
+    /// on a restore of every class.
+    pub fn symrefs_in(&self, ref_format: &str) -> Result<BTreeMap<String, String>, GitError> {
         let mut found = BTreeMap::new();
+        if ref_format != "files" {
+            let out = self.run(&["for-each-ref", "--format=%(refname)%00%(symref)"])?;
+            for line in out.stdout.split(|b| *b == b'\n') {
+                let Some(nul) = line.iter().position(|b| *b == 0) else {
+                    continue;
+                };
+                let (name, chain_end) = (&line[..nul], &line[nul + 1..]);
+                if name.is_empty() || chain_end.is_empty() {
+                    continue;
+                }
+                let out = git_command(&self.root)?
+                    .args(["symbolic-ref", "-q", "--no-recurse", "--"])
+                    .arg(OsStr::from_bytes(name))
+                    .output_gated()?;
+                if !out.status.success() {
+                    return Err(GitError::Command {
+                        args: format!("symbolic-ref --no-recurse {}", key_of(name)),
+                        stderr: String::from_utf8_lossy(&out.stderr).trim().to_owned(),
+                    });
+                }
+                found.insert(
+                    key_of(name).into_owned(),
+                    key_of(trim_newline(&out.stdout)).into_owned(),
+                );
+            }
+            return Ok(found);
+        }
         let mut dirs = vec![&self.common_dir];
         if self.git_dir != self.common_dir {
             dirs.push(&self.git_dir);
@@ -764,7 +979,26 @@ impl GitRepo {
     /// refs/heads/alias -> refs/heads/main` is `refs/heads/alias` (the chain's next link is in
     /// [`Self::symrefs`]). `git symbolic-ref -q HEAD` follows the whole chain, and a restore
     /// then pointed `HEAD` at the branch the chain ended on.
+    ///
+    /// A reftable repository's `HEAD` file is a compatibility marker (`ref: refs/heads/.invalid`,
+    /// detached or not): its `HEAD` is read through git ([`Self::head_in`]; review 2026-09-28,
+    /// ninth pass, #1).
     pub fn head(&self) -> Result<String, GitError> {
+        self.head_in(&self.ref_format()?)
+    }
+
+    /// [`Self::head`] of a repository whose refs are in the `ref_format` backend.
+    pub fn head_in(&self, ref_format: &str) -> Result<String, GitError> {
+        if ref_format != "files" {
+            let out = git_command(&self.root)?
+                .args(["symbolic-ref", "-q", "--no-recurse", "HEAD"])
+                .output_gated()?;
+            if out.status.success() {
+                return Ok(key_of(trim_newline(&out.stdout)).into_owned());
+            }
+            let out = self.run(&["rev-parse", "--verify", "-q", "HEAD"])?;
+            return Ok(stdout_string(&out));
+        }
         // A `HEAD` stored as a symlink (`core.preferSymlinkRefs`) names its target in the link
         // text; reading through it would read the target's file, and skip a link of a chain.
         if let Some(target) = symlinked_symref(&self.git_dir.join("HEAD")) {
@@ -805,14 +1039,115 @@ impl GitRepo {
         Ok(out.status.success().then(|| stdout_string(&out)))
     }
 
-    /// Every sha a reflog entry points at; empty when the repository has no reflog at all (a
-    /// freshly materialized one), where `git rev-list --reflog` exits with its usage text.
+    /// Every sha a reflog entry points at (its old and its new value), in whichever backend
+    /// the repository keeps its reflogs, every worktree's. Asked of git, never inferred from a
+    /// `logs/` directory: a reftable repository has none, and its reflog-only commits were left
+    /// out of a complete capture (review 2026-09-28, ninth pass, #1). The empty `--stdin` makes
+    /// a repository with no reflog at all answer nothing instead of the usage text.
     pub fn reflog_tips(&self) -> Result<Vec<String>, GitError> {
-        if !self.git_dir.join("logs").exists() {
-            return Ok(Vec::new());
-        }
-        let out = self.run(&["rev-list", "--no-walk=unsorted", "--reflog"])?;
+        let out = self.run_with_stdin(
+            &["rev-list", "--no-walk=unsorted", "--reflog", "--stdin"],
+            b"",
+        )?;
         Ok(stdout_string(&out).lines().map(str::to_owned).collect())
+    }
+
+    /// The objects the refs outside `refs/` name, as the repository's backend holds them:
+    /// `HEAD` (resolved, detached or not) and, in a reftable repository, every root ref its
+    /// tables hold (`ORIG_HEAD`, `CHERRY_PICK_HEAD`, `REBASE_HEAD`, `BISECT_EXPECTED_REV`, …:
+    /// files in a files repository, which [`Self::operation_objects`] reads) — `git
+    /// for-each-ref --include-root-refs` (review 2026-09-28, ninth pass, #1).
+    pub fn root_ref_tips(&self, ref_format: &str) -> Result<Vec<String>, GitError> {
+        if ref_format != "files" {
+            let out = self.run(&[
+                "for-each-ref",
+                "--include-root-refs",
+                "--format=%(objectname)",
+            ])?;
+            return Ok(stdout_string(&out)
+                .lines()
+                .filter(|l| !l.is_empty())
+                .map(str::to_owned)
+                .collect());
+        }
+        let out = git_command(&self.root)?
+            .args(["rev-parse", "--verify", "-q", "HEAD"])
+            .output_gated()?;
+        Ok(if out.status.success() {
+            vec![stdout_string(&out)]
+        } else {
+            Vec::new()
+        })
+    }
+
+    /// Every symlink of a files repository that stands for `HEAD` or a loose ref: `HEAD` in
+    /// the worktree's git directory, and every symlink under `refs/` of the common directory
+    /// and of the worktree's own git directory, with the name git reads it by. Whatever its
+    /// link text: a symbolic ref stored as a symlink (`core.preferSymlinkRefs`), and an alias
+    /// git reads through to the file it reaches (`refs/heads/alias -> main`).
+    pub fn ref_symlinks(&self) -> Result<Vec<RefSymlink>, GitError> {
+        let mut found = Vec::new();
+        let head = self.git_dir.join("HEAD");
+        if fs::symlink_metadata(&head).is_ok_and(|m| m.file_type().is_symlink()) {
+            found.push(RefSymlink {
+                name: b"HEAD".to_vec(),
+                path: head,
+            });
+        }
+        let mut dirs = vec![&self.common_dir];
+        if self.git_dir != self.common_dir {
+            dirs.push(&self.git_dir);
+        }
+        for dir in dirs {
+            collect_ref_symlinks(&dir.join("refs"), b"refs", &mut found)?;
+        }
+        Ok(found)
+    }
+
+    /// The symlinks of [`Self::ref_symlinks`] that git reads as `HEAD` or a ref here and that
+    /// a restore could not make resolve the same way (review 2026-09-28, ninth pass, #2). The
+    /// restore writes every ref `packed-refs` and every symbolic ref loose, puts each symlink
+    /// back as it was, and writes loose the ref file a symlink reaches
+    /// ([`ground_ref_symlinks`]). That holds for a link whose text is a ref name (a symbolic
+    /// ref), and for one whose chain ends on the file of a ref the capture holds, in the
+    /// directory git keeps that ref in, or on a file of the git directory the workspace class
+    /// carries. A chain that ends anywhere else — outside the repository, in the object store,
+    /// on a file under `refs/` that is no ref — or that does not end, cannot come back: a final
+    /// capture over it is not complete (decision 23).
+    pub fn unrestorable_ref_links(
+        &self,
+        refs: &BTreeMap<String, String>,
+        symrefs: &BTreeMap<String, String>,
+    ) -> Result<Vec<String>, GitError> {
+        let dirs = RefDirs::of(self);
+        let mut problems = Vec::new();
+        for link in self.ref_symlinks()? {
+            if symlinked_symref(&link.path).is_some() {
+                continue;
+            }
+            let name = key_of(&link.name).into_owned();
+            // A link git does not read as a ref (it reaches nothing a ref can be) is carried as
+            // it is and comes back reaching the same nothing.
+            if link.name != b"HEAD" && !refs.contains_key(&name) && !symrefs.contains_key(&name) {
+                continue;
+            }
+            let fine = match link_terminal(&link.path) {
+                None => false,
+                Some(end) => match dirs.place(&end) {
+                    Place::Ref(target) => {
+                        let target = key_of(&target).into_owned();
+                        refs.contains_key(&target) || symrefs.contains_key(&target)
+                    }
+                    Place::GitFile => true,
+                    Place::Elsewhere => false,
+                },
+            };
+            if !fine {
+                problems.push(name);
+            }
+        }
+        problems.sort();
+        Ok(problems)
     }
 
     /// Every object a pseudo-ref or an in-progress operation's state names, which no ref or
@@ -2166,6 +2501,11 @@ pub struct Closure {
     /// What an operation in progress needs that git cannot resolve to exactly one object
     /// ([`OperationObjects::unresolved`]).
     pub unresolved_operations: Vec<String>,
+    /// The backend the repository keeps its refs in ([`GitRepo::ref_format`]).
+    pub ref_format: String,
+    /// Symlinks standing for `HEAD` or a ref that a restore cannot make resolve as they do
+    /// here ([`GitRepo::unrestorable_ref_links`]).
+    pub unrestorable_ref_links: Vec<String>,
 }
 
 /// Read the closure (refs, `HEAD`, index, stash, reflog, worktree) in that order. `excludes` are
@@ -2204,13 +2544,20 @@ pub fn read_closure_with(
     excludes: &[String],
     options: TreeOptions<'_>,
 ) -> Result<Closure, GitError> {
+    let ref_format = repo.ref_format()?;
     let refs = repo.refs()?;
-    let symrefs = repo.symrefs()?;
-    let head = repo.head()?;
+    let symrefs = repo.symrefs_in(&ref_format)?;
+    let head = repo.head_in(&ref_format)?;
     let mut tips: Vec<String> = refs.values().cloned().collect();
     if !head.starts_with("refs/") {
         tips.push(head.clone());
     }
+    tips.extend(repo.root_ref_tips(&ref_format)?);
+    let unrestorable_ref_links = if ref_format == "files" {
+        repo.unrestorable_ref_links(&refs, &symrefs)?
+    } else {
+        Vec::new()
+    };
     let index_tree = repo.index_tree(scratch_dir)?;
     match &index_tree {
         Some(tree) => tips.push(tree.clone()),
@@ -2242,6 +2589,8 @@ pub fn read_closure_with(
         unreadable,
         carried,
         unresolved_operations: operations.unresolved,
+        ref_format,
+        unrestorable_ref_links,
     })
 }
 
@@ -2650,6 +2999,140 @@ pub fn write_head(repo: &GitRepo, head: &str) -> Result<(), GitError> {
     let tmp = repo.git_dir.join("HEAD.capture-tmp");
     fs::write(&tmp, text).map_err(at("write", &tmp))?;
     fs::rename(&tmp, &path).map_err(at("rename into", &path))?;
+    Ok(())
+}
+
+/// Make every symlink of [`GitRepo::ref_symlinks`] that git read as a ref (its name in `refs`,
+/// or `HEAD`) resolve as it did: a restore writes the refs `packed-refs`, and a symlink that
+/// reached a loose ref file (`refs/heads/alias -> main`) came back reaching nothing — git then
+/// reads no such ref, and falls back to no packed one (review 2026-09-28, ninth pass, #2). The
+/// ref file its chain ends on is written loose with the value `refs` gives it. Returns the
+/// names of the links it could not make resolve (their chain ends on no ref `refs` holds).
+pub fn ground_ref_symlinks(
+    repo: &GitRepo,
+    refs: &BTreeMap<String, String>,
+) -> Result<Vec<String>, GitError> {
+    let dirs = RefDirs::of(repo);
+    let mut left = Vec::new();
+    for link in repo.ref_symlinks()? {
+        if symlinked_symref(&link.path).is_some() || fs::metadata(&link.path).is_ok() {
+            continue;
+        }
+        let name = key_of(&link.name).into_owned();
+        if link.name != b"HEAD" && !refs.contains_key(&name) {
+            continue;
+        }
+        let end = link_terminal(&link.path);
+        let target = match end.as_deref().map(|end| dirs.place(end)) {
+            Some(Place::Ref(target)) => target,
+            _ => {
+                left.push(name);
+                continue;
+            }
+        };
+        let (Some(end), Some(sha)) = (end, refs.get(key_of(&target).as_ref())) else {
+            left.push(name);
+            continue;
+        };
+        if let Some(parent) = end.parent() {
+            fs::create_dir_all(parent).map_err(at("mkdir -p", parent))?;
+        }
+        fs::write(&end, format!("{sha}\n")).map_err(at("write", &end))?;
+    }
+    left.sort();
+    Ok(left)
+}
+
+/// Write the refs, the symbolic refs and `HEAD` of a repository whose refs are not in the
+/// files backend (reftable) through git, as [`write_packed_refs`] and [`write_head`] write a
+/// files repository's: the repository ends with exactly `refs` (every other ref git lists is
+/// deleted), `symrefs` and `head`. No reflog entry is written for any of it. A restore of
+/// every class then puts the captured tables themselves in place, reflogs and all.
+pub fn write_refs_through_git(
+    repo: &GitRepo,
+    refs: &BTreeMap<String, String>,
+    symrefs: &BTreeMap<String, String>,
+    head: &str,
+) -> Result<(), GitError> {
+    let quiet = |args: &[&OsStr]| -> Result<Command, GitError> {
+        let mut c = git_command(&repo.root)?;
+        c.args(["-c", "core.logAllRefUpdates=false"]).args(args);
+        Ok(c)
+    };
+    let present = repo.run(&["for-each-ref", "--format=%(refname)"])?;
+    let mut script: Vec<u8> = b"option no-deref\n".to_vec();
+    for name in present
+        .stdout
+        .split(|b| *b == b'\n')
+        .filter(|n| !n.is_empty())
+    {
+        let key = key_of(name);
+        if !refs.contains_key(key.as_ref()) && !symrefs.contains_key(key.as_ref()) {
+            script.extend_from_slice(b"delete ");
+            script.extend_from_slice(name);
+            script.push(b'\n');
+        }
+    }
+    for (name, sha) in refs.iter().filter(|(n, _)| !symrefs.contains_key(*n)) {
+        let name = bytes_of(name);
+        if !is_safe_ref_name(&name) {
+            return Err(GitError::Command {
+                args: "update-ref".to_owned(),
+                stderr: format!("refusing ref {:?}", key_of(&name)),
+            });
+        }
+        script.extend_from_slice(b"update ");
+        script.extend_from_slice(&name);
+        script.push(b' ');
+        script.extend_from_slice(sha.as_bytes());
+        script.push(b'\n');
+    }
+    let mut child = quiet(&[OsStr::new("update-ref"), OsStr::new("--stdin")])?
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn_gated()?;
+    if let Some(mut pipe) = child.take_stdin() {
+        let _ = pipe.write_all(&script);
+    }
+    check(&["update-ref", "--stdin"], child.wait_with_output()?)?;
+    for (name, target) in symrefs {
+        let (name, target) = (bytes_of(name), bytes_of(target));
+        if !is_safe_ref_name(&name) || !is_safe_symref_target(&target) {
+            return Err(GitError::Command {
+                args: "symbolic-ref".to_owned(),
+                stderr: format!(
+                    "refusing symbolic ref {:?} -> {:?}",
+                    key_of(&name),
+                    key_of(&target)
+                ),
+            });
+        }
+        let out = quiet(&[
+            OsStr::new("symbolic-ref"),
+            OsStr::from_bytes(&name),
+            OsStr::from_bytes(&target),
+        ])?
+        .output_gated()?;
+        check(&["symbolic-ref"], out)?;
+    }
+    let out = if head.starts_with("refs/") {
+        quiet(&[
+            OsStr::new("symbolic-ref"),
+            OsStr::new("HEAD"),
+            OsStr::from_bytes(&bytes_of(head)),
+        ])?
+        .output_gated()?
+    } else {
+        quiet(&[
+            OsStr::new("update-ref"),
+            OsStr::new("--no-deref"),
+            OsStr::new("HEAD"),
+            OsStr::new(head),
+        ])?
+        .output_gated()?
+    };
+    check(&["HEAD"], out)?;
     Ok(())
 }
 
