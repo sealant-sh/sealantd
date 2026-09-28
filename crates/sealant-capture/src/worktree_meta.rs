@@ -692,6 +692,11 @@ pub struct Captured {
     /// Every regular file of the worktree tree with more than one name, as read here
     /// ([`crate::aliases`]).
     pub linked: Vec<crate::aliases::LinkedName>,
+    /// Symlinks of the worktree tree whose inode has more than one name, as keys. No tree and
+    /// no document carries one inode for a symlink's names: a checkout makes each its own, so
+    /// a capture that must be the disk (a final one) fails on them (review 2026-09-28, eighth
+    /// pass, #3).
+    pub linked_symlinks: Vec<String>,
 }
 
 /// A path of the worktree tree whose metadata could not be read.
@@ -729,6 +734,7 @@ pub fn capture(
     type Named = (String, Vec<u8>, u64);
     let mut inodes: BTreeMap<(u64, u64), Vec<Named>> = BTreeMap::new();
     let mut linked = Vec::new();
+    let mut linked_symlinks = Vec::new();
     for tp in tree_paths(repo, worktree_tree)? {
         let meta = match longpath::symlink_metadata(&abs_of(&scope.root, &tp.path)) {
             Ok(meta) => meta,
@@ -757,6 +763,9 @@ pub fn capture(
             continue;
         }
         let entry = entry_of(&tp.path, tp.kind, &meta);
+        if tp.kind == MetaKind::Symlink && meta.nlink() > 1 {
+            linked_symlinks.push(entry.path.clone());
+        }
         if tp.kind == MetaKind::File
             && let Some(name) =
                 crate::aliases::LinkedName::of(&abs_of(&scope.root, &tp.path), &meta)
@@ -829,6 +838,7 @@ pub fn capture(
         unreadable,
         changed_kind,
         linked,
+        linked_symlinks,
     })
 }
 

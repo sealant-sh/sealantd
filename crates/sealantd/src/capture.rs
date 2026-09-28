@@ -3513,4 +3513,43 @@ mod tests {
         .unwrap();
         assert_eq!(text, "two\n");
     }
+
+    /// A final flush is complete only once the registrar says it recorded the seal (decision
+    /// 22): withheld past every ask, the flush answers `sealing` and so does `capture.status`;
+    /// asked again once the registrar lets it stand, it answers complete.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_withheld_seal_is_not_complete_until_the_registrar_records_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (boot, registrar) = boot_tuned(
+            tmp.path(),
+            |store| store,
+            |config| config.executor = Some(EXECUTOR.to_owned()),
+        );
+        registrar.withhold_seals(usize::MAX);
+        let mut config = RuntimeConfig::new(new_runtime_id());
+        config.workspace_root = tmp.path().join("ws");
+        let runtime = Runtime::new(config, Arc::new(ShutdownSignal::new(5_000)));
+        runtime.mark_healthy();
+        let capture = CaptureRuntime::new(boot);
+        assert!(runtime.install_capture(capture.clone()));
+        capture.start_without_harness(runtime.clone());
+
+        let report = runtime.final_flush(None, None).await.unwrap();
+        assert!(!report.complete, "{report:?}");
+        assert_eq!(report.incomplete_reason.as_deref(), Some("sealing"));
+        assert!(
+            registrar.head().unwrap().manifest.final_seal.is_some(),
+            "the sealing capture registered"
+        );
+        assert!(registrar.seals().is_empty());
+        let status = capture.status();
+        assert!(!status.complete, "{status:?}");
+        assert_eq!(status.incomplete_reason.as_deref(), Some("sealing"));
+
+        registrar.withhold_seals(0);
+        let report = runtime.final_flush(None, None).await.unwrap();
+        assert!(report.complete, "{report:?}");
+        assert_eq!(registrar.seals().len(), 1);
+        assert!(capture.status().complete);
+    }
 }

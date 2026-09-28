@@ -37,6 +37,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, Metadata};
 use std::io;
+use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -261,6 +262,11 @@ pub struct Listing {
     /// Paths that exist but could not be listed (a directory) or stat'ed, by virtual path.
     /// What is under them is unknown, never absent.
     pub unreadable: BTreeMap<String, Unreadable>,
+    /// Mount roots that are symlinks to a directory (a `.git` moved aside and linked back, a
+    /// harness home configured as a link), by virtual path: the link text, as bytes. The walk
+    /// goes through the link, and the root's entry is the directory it names (review
+    /// 2026-09-28, eighth pass, #1).
+    pub root_links: BTreeMap<String, Vec<u8>>,
 }
 
 fn join_virtual(prefix: &str, rel: &str) -> String {
@@ -358,23 +364,30 @@ impl Listing {
             abs_base.join(rel)
         };
         let virtual_root = join_virtual(virtual_base, rel_v);
-        let root_meta = match longpath::symlink_metadata(&abs_dir) {
-            Ok(meta) => meta,
-            Err(error) => {
-                if !is_vanished(&error) {
-                    self.note_unreadable(virtual_root, abs_dir, &error);
+        // The base is a configured root (`.git`, the worktree, the harness home): walked through
+        // a link when it is one, and one that cannot be walked as a directory is unreadable —
+        // never an empty listing (review 2026-09-28, eighth pass, #1).
+        let Some(base_meta) = self.root_dir_meta(virtual_base, abs_base) else {
+            return;
+        };
+        let root_meta = if rel_v.is_empty() {
+            base_meta.clone()
+        } else {
+            match longpath::symlink_metadata(&abs_dir) {
+                Ok(meta) => meta,
+                Err(error) => {
+                    if !is_vanished(&error) {
+                        self.note_unreadable(virtual_root, abs_dir, &error);
+                    }
+                    return;
                 }
-                return;
             }
         };
         if !root_meta.is_dir() {
             return;
         }
-        if !virtual_base.is_empty()
-            && !self.entries.contains_key(virtual_base)
-            && let Ok(meta) = longpath::symlink_metadata(abs_base)
-        {
-            self.add(virtual_base.to_owned(), abs_base.to_path_buf(), meta);
+        if !virtual_base.is_empty() && !self.entries.contains_key(virtual_base) {
+            self.add(virtual_base.to_owned(), abs_base.to_path_buf(), base_meta);
         }
         if !virtual_root.is_empty() && !self.entries.contains_key(&virtual_root) {
             self.ensure_ancestors(&virtual_root, virtual_base, abs_base);
@@ -445,6 +458,51 @@ impl Listing {
             self.add(v, path.to_path_buf(), meta);
             true
         });
+    }
+
+    /// The metadata a mount's base is walked by: its own when it is a directory; the directory
+    /// it names when it is a symlink to one (a `.git` moved beside the worktree and linked
+    /// back, a harness home configured as a link) — git and the harness read through the link,
+    /// and so does the walk, with the link text kept in [`Self::root_links`]. `None` when there
+    /// is nothing to walk: the base (or the target of its link) does not exist, or it cannot be
+    /// walked as the directory the class holds (a file, a link to one, a loop, a permission
+    /// error), which is recorded unreadable — what is there is not captured, and a final snap
+    /// says so instead of listing nothing (review 2026-09-28, eighth pass, #1).
+    fn root_dir_meta(&mut self, virtual_base: &str, abs_base: &Path) -> Option<Metadata> {
+        let meta = match longpath::symlink_metadata(abs_base) {
+            Ok(meta) => meta,
+            Err(error) => {
+                if !is_vanished(&error) {
+                    self.note_unreadable(virtual_base.to_owned(), abs_base.to_path_buf(), &error);
+                }
+                return None;
+            }
+        };
+        if meta.is_dir() {
+            return Some(meta);
+        }
+        let error = if meta.is_symlink() {
+            match longpath::metadata(abs_base) {
+                Ok(target) if target.is_dir() => {
+                    if let Ok(link) = longpath::read_link(abs_base) {
+                        self.root_links
+                            .insert(virtual_base.to_owned(), link.into_os_string().into_vec());
+                    }
+                    return Some(target);
+                }
+                // A dangling link: nothing is there to capture.
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return None,
+                Err(error) => error,
+                Ok(_) => io::Error::other(
+                    "a symlink to something other than a directory, where the class holds a \
+                     directory",
+                ),
+            }
+        } else {
+            io::Error::other("not a directory, where the class holds a directory")
+        };
+        self.note_unreadable(virtual_base.to_owned(), abs_base.to_path_buf(), &error);
+        None
     }
 
     /// A walk error: a vanished path is skipped, anything else `include` keeps is unreadable.

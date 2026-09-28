@@ -369,13 +369,19 @@ fn nothing_is_sealed_unless_the_writers_stopped_and_the_executor_is_known() {
 }
 
 /// The registrar records a seal only for the executor its token is scoped to (Mend's rule):
-/// one naming another executor registers as a capture and seals nothing.
+/// one naming another executor registers as a capture and seals nothing — and the register's
+/// answer says it refused the seal, so the final flush is not complete (decision 22; before,
+/// a registered sealing capture was taken as complete whatever the registrar recorded).
 #[test]
 fn a_seal_naming_another_executor_is_registered_but_not_recorded() {
     let fx = fixture(1);
     let (runner, registrar) = sealing_runner(&fx, "exec-other", "exec-1");
     runner.start(None);
-    assert!(runner.flush_final(None).complete());
+    let flushed = runner.flush_final(None);
+    let incomplete = flushed.incomplete.expect("not complete");
+    assert_eq!(incomplete.reason(), "sealing");
+    assert!(incomplete.to_string().contains("refused"), "{incomplete}");
+    assert!(!runner.final_sealed());
     assert_eq!(
         identity(registrar.head().unwrap().manifest.final_seal.as_ref()),
         seal("exec-other")

@@ -60,6 +60,23 @@ fn at_or_under(rel: &[u8], dir: &[u8]) -> bool {
 /// The files of a git directory (a worktree's own) whose text names objects no ref or reflog
 /// may reach: the pseudo-refs a fetch, merge, cherry-pick, revert, rebase, reset or bisect
 /// writes, and the state such an operation keeps while it is in progress.
+/// An operation document's bytes, read as git reads it: through a symlink wherever it points.
+/// `None` when there is none (missing, or a dangling link). Only a regular file is read: one
+/// that is something else (a directory, a fifo that would block) cannot be the document git
+/// would read, and is an error.
+fn read_document(path: &Path) -> io::Result<Option<Vec<u8>>> {
+    match fs::metadata(path) {
+        Ok(meta) if meta.is_file() => match fs::read(path) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        },
+        Ok(_) => Err(io::Error::other("not a regular file")),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
 fn names_operation_objects(name: &[u8]) -> bool {
     name.ends_with(b"_HEAD")
         || name == b"AUTO_MERGE"
@@ -584,12 +601,38 @@ impl GitRepo {
 
     /// `git init` a repository at `root` if none exists there, then open it.
     pub fn init(root: &Path) -> Result<Self, GitError> {
+        Self::init_with_format(root, "sha1")
+    }
+
+    /// `git init --object-format=<format>` a repository at `root` if none exists there, then
+    /// open it; one that exists must already be of `format` (its objects cannot be read as
+    /// another's), else [`GitError::Command`].
+    pub fn init_with_format(root: &Path, format: &str) -> Result<Self, GitError> {
         fs::create_dir_all(root).map_err(at("mkdir -p", root))?;
         if !root.join(".git").exists() {
-            let args = ["init", "-q"];
+            let flag = format!("--object-format={format}");
+            let args = ["init", "-q", flag.as_str()];
             check(&args, git_command(root)?.args(args).output_gated()?)?;
         }
-        Self::open(root)
+        let repo = Self::open(root)?;
+        let found = repo.object_format()?;
+        if found != format {
+            return Err(GitError::Command {
+                args: "rev-parse --show-object-format".to_owned(),
+                stderr: format!(
+                    "the repository at {} holds {found} objects; the capture holds {format}",
+                    root.display()
+                ),
+            });
+        }
+        Ok(repo)
+    }
+
+    /// The repository's object format (`git rev-parse --show-object-format`): `sha1` or
+    /// `sha256`.
+    pub fn object_format(&self) -> Result<String, GitError> {
+        let out = self.run(&["rev-parse", "--show-object-format"])?;
+        Ok(stdout_string(&out))
     }
 
     /// Add `pattern` to the repository's local excludes (`info/exclude` in the common dir) unless
@@ -800,8 +843,15 @@ impl GitRepo {
         let mut words = BTreeSet::new();
         // (file, name as written) for each dependency.
         let mut needed: Vec<(String, String)> = Vec::new();
-        let mut read = |path: &Path, label: &str, kind: Kind| match fs::read(path) {
-            Ok(bytes) => {
+        // Documents that could not be read: what they name is unknown.
+        let mut unreadable: Vec<String> = Vec::new();
+        let mut read = |path: &Path, label: &str, kind: Kind| match read_document(path) {
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "cannot read git operation state");
+                unreadable.push(format!("{label}: cannot be read ({e})"));
+            }
+            Ok(Some(bytes)) => {
                 hex_tokens(&bytes, &mut words);
                 let mut found = Vec::new();
                 match kind {
@@ -819,10 +869,6 @@ impl GitRepo {
                     needed.push((label.to_owned(), word));
                 }
             }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => {
-                tracing::warn!(path = %path.display(), error = %e, "cannot read git operation state")
-            }
         };
         let mut dirs = vec![self.git_dir.clone()];
         if self.common_dir != self.git_dir {
@@ -834,7 +880,13 @@ impl GitRepo {
             };
             for entry in entries.flatten() {
                 let name = entry.file_name();
-                let is_file = entry.file_type().is_ok_and(|t| t.is_file());
+                // A symlinked pseudo-ref is read as git reads it: through the link (a link
+                // whose text is a ref name is that symbolic ref, whose objects the refs carry;
+                // reading through it only adds them again). Skipped, its commit was left out of
+                // a complete capture that kept the link (review 2026-09-28, eighth pass, #2).
+                let is_file = entry
+                    .file_type()
+                    .is_ok_and(|t| t.is_file() || t.is_symlink());
                 if is_file && names_operation_objects(name.as_bytes()) {
                     let kind = if PENDING_REFS.contains(&name.as_bytes()) {
                         Kind::Lines
@@ -851,7 +903,12 @@ impl GitRepo {
                 }
                 longpath::walk(&base, &mut |visit| match visit {
                     longpath::Visit::Entry { path, kind, .. } => {
-                        if kind == longpath::Kind::File {
+                        // A symlinked document is read through the link, as git reads it; a
+                        // link to a directory is not a document.
+                        let document = kind == longpath::Kind::File
+                            || (kind == longpath::Kind::Symlink
+                                && !fs::metadata(path).is_ok_and(|m| m.is_dir()));
+                        if document {
                             let name = path.file_name().map_or(&b""[..], |n| n.as_bytes());
                             // Only the directory's own files have git's meaning.
                             let top = path.parent() == Some(base.as_path());
@@ -872,7 +929,12 @@ impl GitRepo {
             }
         }
         if words.is_empty() {
-            return Ok(OperationObjects::default());
+            unreadable.sort();
+            unreadable.dedup();
+            return Ok(OperationObjects {
+                tips: Vec::new(),
+                unresolved: unreadable,
+            });
         }
         let asked: Vec<&String> = words.iter().collect();
         let input: String = asked.iter().map(|w| format!("{w}\n")).collect();
@@ -926,6 +988,7 @@ impl GitRepo {
                 None => Some(format!("{file}: {word} (missing)")),
             })
             .collect();
+        unresolved.extend(unreadable);
         unresolved.sort();
         unresolved.dedup();
         Ok(OperationObjects { tips, unresolved })

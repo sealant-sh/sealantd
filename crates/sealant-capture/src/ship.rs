@@ -26,7 +26,7 @@ use crate::cpu::thread_cpu;
 use crate::engine::Class;
 use crate::io_at::IoAt;
 use crate::manifest::CaptureKind;
-use crate::registrar::{RegisterRequest, Registrar, RegistrarError, opt};
+use crate::registrar::{RegisterRequest, Registrar, RegistrarError, SealAnswer, SealState, opt};
 use crate::sink::{BlobSink, BlobSource, SinkError};
 
 /// Lock, taking the value of a poisoned lock as it is.
@@ -1180,9 +1180,16 @@ pub struct Shipper {
     /// Called when a refused capture needs the engine ([`RepairRequest`]): the cadence runner
     /// wakes its small-class loop, whose next snap rebuilds it.
     repair_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// The last capture carrying a final seal that registered, and what the registrar said of
+    /// its seal (`None`: it did not say) — [`Self::seal_standing`].
+    seal_answer: Mutex<Option<(String, Option<SealAnswer>)>>,
     /// Counters.
     pub status: Arc<ShipStatus>,
 }
+
+/// Registers of a sealing capture a final flush sends again while the registrar withholds its
+/// seal ([`Shipper::seal_standing`]), backing off between them.
+pub const SEAL_REASKS: u32 = 6;
 
 impl std::fmt::Debug for Shipper {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1221,7 +1228,86 @@ impl Shipper {
             cutoff: Mutex::new(None),
             refusal: Mutex::new(None),
             repair_hook: Mutex::new(None),
+            seal_answer: Mutex::new(None),
             status,
+        }
+    }
+
+    /// Whether the final seal the sealing capture `req` carries stands (cross-repo decision
+    /// 22): the registrar recorded it, and says so. Its register's answer decides when it is
+    /// this capture's and `recorded` or `refused`; otherwise — withheld, or not asked in this
+    /// process (a daemon that restarted over a sealed chain) — the same register is sent
+    /// again, which the registrar answers as a lost ack saying where the seal stands now:
+    /// while `withheld`, at most [`SEAL_REASKS`] times, backing off, never past `until` or the
+    /// cutoff. An answer with no `seal` is a registrar that does not say, and a seal that does
+    /// not stand (decision 9).
+    ///
+    /// # Errors
+    /// Why the seal does not stand: withheld (with the registrar's reason), refused, not said,
+    /// the chain moved past the sealing capture, or the registrar could not be asked.
+    pub fn seal_standing(
+        &self,
+        req: &RegisterRequest,
+        until: Option<Instant>,
+    ) -> Result<(), String> {
+        let describe = |answer: &SealAnswer| {
+            let reason = answer.reason.as_deref().unwrap_or("no reason given");
+            match answer.state {
+                SealState::Recorded => "recorded".to_owned(),
+                SealState::Withheld => format!("the registrar withheld the seal ({reason})"),
+                SealState::Refused => format!("the registrar refused the seal ({reason})"),
+            }
+        };
+        let mut answer: Option<Option<SealAnswer>> = lock(&self.seal_answer)
+            .as_ref()
+            .filter(|(id, _)| *id == req.capture_id)
+            .map(|(_, answer)| answer.clone());
+        let mut why = "the registrar has not said whether it recorded the seal".to_owned();
+        let mut asks = 0;
+        loop {
+            match &answer {
+                Some(Some(a)) if a.state == SealState::Recorded => return Ok(()),
+                Some(Some(a)) if a.state == SealState::Refused => return Err(describe(a)),
+                Some(None) => {
+                    return Err(
+                        "the registrar did not say whether it recorded the seal (a registrar \
+                         from before seal answers)"
+                            .to_owned(),
+                    );
+                }
+                Some(Some(a)) => why = describe(a),
+                None => {}
+            }
+            // Withheld (or unanswered): ask again, after a wait once it has been asked.
+            if answer.is_some() || asks > 0 {
+                if asks >= SEAL_REASKS {
+                    return Err(why);
+                }
+                let wait = self.backoff(asks);
+                match self.bound(until) {
+                    Some(at) if Instant::now() + wait >= at => return Err(why),
+                    _ => thread::sleep(wait),
+                }
+            }
+            asks += 1;
+            match self.registrar.capture_register(req) {
+                Ok(resp) if resp.head_capture_id == req.capture_id => {
+                    *lock(&self.seal_answer) = Some((req.capture_id.clone(), resp.seal.clone()));
+                    answer = Some(resp.seal);
+                }
+                Ok(resp) => {
+                    return Err(format!(
+                        "the chain moved past the sealing capture (head n={} {})",
+                        resp.head_n, resp.head_capture_id
+                    ));
+                }
+                Err(e) if e.is_retryable() => {
+                    tracing::warn!(error = %e, "asking where the final seal stands failed; again");
+                    why = format!("asking where the seal stands failed: {e}");
+                    answer = None;
+                }
+                Err(e) => return Err(format!("asking where the seal stands failed: {e}")),
+            }
         }
     }
 
@@ -1785,6 +1871,14 @@ impl Shipper {
                 Ok(resp) => {
                     self.status.registered.fetch_add(1, Ordering::Relaxed);
                     self.status.head_n.store(resp.head_n, Ordering::Relaxed);
+                    // What the registrar did with a final seal (decision 22): a final flush is
+                    // complete only on `recorded` ([`Self::seal_standing`]).
+                    if entry.register.manifest.final_seal.is_some() {
+                        if resp.seal.as_ref().map(|a| a.state) != Some(SealState::Recorded) {
+                            tracing::warn!(n = entry.n, seal = ?resp.seal, "the sealing capture registered; its seal does not stand");
+                        }
+                        *lock(&self.seal_answer) = Some((entry.capture_id.clone(), resp.seal));
+                    }
                     self.lease_ok();
                     return Ok(());
                 }
@@ -2379,6 +2473,7 @@ mod tests {
                             worktree_tree: None,
                             index_tree: None,
                             raw_tree: None,
+                            object_format: None,
                         },
                         workspace: crate::manifest::WorkspaceSection::objects(
                             String::new(),

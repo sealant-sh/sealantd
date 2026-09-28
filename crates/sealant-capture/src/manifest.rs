@@ -153,9 +153,27 @@ pub struct GitSection {
     /// `worktree_tree`, whose restore checks the worktree tree out as git would.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub raw_tree: Option<String>,
+    /// The repository's object format (`extensions.objectFormat`, the `object_format`
+    /// manifest feature) when it is not `sha1`: `sha256`. A restore initializes its repository
+    /// with it before it installs a pack — a SHA-1 repository cannot read a SHA-256 pack, and
+    /// the `.git/config` saying so comes back only with the workspace class, after the checkout
+    /// (review 2026-09-28, eighth pass, #10). Absent for `sha1`, so a SHA-1 section encodes
+    /// exactly as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub object_format: Option<String>,
 }
 
+/// The object formats this build captures and restores: `sha1` (a section without
+/// [`GitSection::object_format`]) and `sha256`.
+pub const OBJECT_FORMATS: [&str; 2] = ["sha1", "sha256"];
+
 impl GitSection {
+    /// The repository's object format: [`Self::object_format`], `sha1` when absent.
+    #[must_use]
+    pub fn object_format(&self) -> &str {
+        self.object_format.as_deref().unwrap_or("sha1")
+    }
+
     /// Whether this section names its trees in their own fields (`git_trees`) rather than as
     /// pseudo-refs in `refs`.
     #[must_use]
@@ -320,6 +338,15 @@ pub struct WorkspaceSection {
     /// so such a section encodes exactly as before).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree_meta: Option<WorktreeMeta>,
+    /// The class's roots that were symlinks to a directory when captured (`.git` moved beside
+    /// the worktree and linked back, a harness home configured as a link, the worktree itself
+    /// as `tree`), by root name: the link text, as a key ([`crate::tree::key_of`]). The class
+    /// holds what the link named, read through it; a restore writes it at the root as a
+    /// directory, since the link's target is outside what was captured (review 2026-09-28,
+    /// eighth pass, #1). Absent when none was (and then not written, so such a section encodes
+    /// exactly as before).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub root_links: BTreeMap<String, String>,
 }
 
 impl WorkspaceSection {
@@ -332,6 +359,7 @@ impl WorkspaceSection {
             format: FORMAT_DIR_OBJECTS,
             dir_packs: Vec::new(),
             worktree_meta: None,
+            root_links: BTreeMap::new(),
         }
     }
 
@@ -675,6 +703,7 @@ mod tests {
                     worktree_tree: None,
                     index_tree: None,
                     raw_tree: None,
+                    object_format: None,
                 },
                 workspace: WorkspaceSection::objects("captures/wt/1/trees/t", vec![]),
                 bulk: BulkState::pending(),
@@ -800,6 +829,7 @@ mod tests {
             format: FORMAT_DIR_PACKS,
             dir_packs: vec!["captures/wt/1/packs/p".into()],
             worktree_meta: None,
+            root_links: BTreeMap::new(),
         };
         let e = m.clone().encode();
         let text = String::from_utf8(e.bytes.clone()).unwrap();

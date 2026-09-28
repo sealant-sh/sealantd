@@ -1424,8 +1424,21 @@ impl CadenceRunner {
             }
             shipped += self.ship_final(until, &mut incomplete);
         }
+        // Registered is not recorded: complete only once the registrar says it recorded the
+        // seal and it stands (decision 22). Withheld, it is asked again, bounded; still
+        // withheld — or refused, or not said — the flush is incomplete (`sealing`), and a final
+        // flush asked again asks again.
+        if incomplete.is_none() && writers_stopped {
+            let request = self.shared.engine().sealing_register();
+            if let Some(request) = request
+                && let Err(why) = self.shared.shipper.seal_standing(&request, until)
+            {
+                tracing::error!(n = request.n, %why, "final flush: the seal does not stand");
+                incomplete = Some(Incomplete::Sealing(why));
+            }
+        }
         // Sealed: nothing to seal under (no executor), or this flush completed with the
-        // writers stopped and the newest capture carries the seal, registered.
+        // writers stopped and the newest capture carries the seal, registered and recorded.
         let sealed = {
             let engine = self.shared.engine();
             engine.final_seal().is_none()

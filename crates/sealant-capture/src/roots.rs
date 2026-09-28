@@ -128,9 +128,10 @@ impl ClassRoots {
                 listing.mount_file(&format!("tree/{}", rel_key(&rel)), "tree", root, &abs);
             }
         }
-        if let Some(home) = &self.harness_home
-            && home.is_dir()
-        {
+        // Mounted whatever it is: a home that is a symlink to a directory is walked through
+        // the link, and one that is not a directory is unreadable, never nothing (review
+        // 2026-09-28, eighth pass, #1). One that does not exist holds nothing.
+        if let Some(home) = &self.harness_home {
             let creds: Vec<PathBuf> = index::CREDENTIAL_FILES
                 .iter()
                 .map(|c| home.join(c))

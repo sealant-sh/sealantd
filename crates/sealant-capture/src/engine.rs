@@ -82,6 +82,28 @@ impl Default for Cadence {
     }
 }
 
+/// The symlinks of `listing` whose inode has more than one name (`ln` of a symlink, `cp -al`
+/// over a tree holding one), as its virtual paths.
+fn multi_named_symlinks(listing: &Listing) -> Vec<String> {
+    use std::os::unix::fs::MetadataExt;
+    listing
+        .entries
+        .iter()
+        .filter(|(_, src)| src.meta.is_symlink() && src.meta.nlink() > 1)
+        .map(|(v, _)| v.clone())
+        .collect()
+}
+
+/// Why a final snap over symlinks with more than one name fails.
+fn multi_named_error(paths: &[String]) -> String {
+    format!(
+        "{} symlink(s) share an inode with another name, which no capture carries as one inode \
+         (a restore would make each name its own symlink): {}",
+        paths.len(),
+        paths.join(", ")
+    )
+}
+
 /// `<os>-<arch>-<libc>` of the workspace this daemon captures, the key its bulk class stamps on
 /// its captures and names on `plan.get`: the C library of the userland the dependency tree was
 /// built for, never this build's own. sealantd ships as a static musl binary into glibc
@@ -190,6 +212,11 @@ pub struct CaptureConfig {
     /// less than was captured, so while any is missing a final flush is never complete and
     /// seals nothing (review 2026-09-28, fourth pass, #7).
     pub unread_features: Vec<String>,
+    /// The store reads the `object_format` manifest feature (`plan.get`'s
+    /// `manifest_features`). Only a repository that is not SHA-1 needs it: a final snap of one
+    /// fails without it ([`CaptureEngine::snap`]), and a SHA-1 repository's captures are what
+    /// they always were.
+    pub reads_object_format: bool,
 }
 
 impl CaptureConfig {
@@ -219,6 +246,7 @@ impl CaptureConfig {
             executor: None,
             git_trees: true,
             unread_features: Vec::new(),
+            reads_object_format: true,
         }
     }
 
@@ -227,9 +255,12 @@ impl CaptureConfig {
     /// [`crate::registrar::MANIFEST_FEATURES`] it leaves out noted as unread.
     pub fn set_store_features(&mut self, reads: &[String]) {
         self.git_trees = reads.iter().any(|f| f == "git_trees");
+        self.reads_object_format = reads.iter().any(|f| f == "object_format");
+        // `object_format` is written only for a repository that is not SHA-1, and decided
+        // there ([`Self::reads_object_format`]).
         self.unread_features = crate::registrar::MANIFEST_FEATURES
             .iter()
-            .filter(|f| !reads.iter().any(|r| r == *f))
+            .filter(|f| **f != "object_format" && !reads.iter().any(|r| r == *f))
             .map(|f| (*f).to_owned())
             .collect();
     }
@@ -1188,6 +1219,36 @@ impl CaptureEngine {
     /// a standby claimed for a session). See [`CaptureConfig::executor`].
     pub fn set_executor(&mut self, executor: Option<String>) {
         self.config.executor = executor;
+    }
+
+    /// The repository's object format as the git section names it: `None` for `sha1`, else
+    /// the format (review 2026-09-28, eighth pass, #10). One this build does not restore, or
+    /// one the store does not read (`object_format`), fails a final snap — a capture over it
+    /// would register and not restore — and an automatic one names it all the same.
+    fn object_format(&self, repo: &GitRepo, strict: bool) -> Result<Option<String>, EngineError> {
+        let format = repo.object_format()?;
+        if format == "sha1" {
+            return Ok(None);
+        }
+        let gap = if !crate::manifest::OBJECT_FORMATS.contains(&format.as_str()) {
+            Some(format!(
+                "the repository's object format {format} is not one this build restores"
+            ))
+        } else if !self.config.reads_object_format {
+            Some(format!(
+                "the repository's object format is {format}, and the store does not read the \
+                 manifest feature object_format: what it would restore is not the repository"
+            ))
+        } else {
+            None
+        };
+        if let Some(gap) = gap {
+            if strict {
+                return Err(io::Error::other(gap).into());
+            }
+            tracing::warn!(%gap, "a final flush over this repository is not complete");
+        }
+        Ok(Some(format))
     }
 
     /// Configuration.
@@ -2157,6 +2218,7 @@ impl CaptureEngine {
                 // An automatic snap gives what the worktree cannot read the previous capture's
                 // entry; a final one carries nothing and fails on it instead.
                 let strict = req.kind == CaptureKind::Final;
+                let object_format = self.object_format(&repo, strict)?;
                 let previous_git = self
                     .previous
                     .as_ref()
@@ -2189,7 +2251,7 @@ impl CaptureEngine {
                     if strict {
                         return Err(io::Error::other(format!(
                             "an operation in progress names objects git cannot resolve to \
-                             exactly one: {}",
+                             exactly one, or has state that cannot be read: {}",
                             unresolved.join(", ")
                         ))
                         .into());
@@ -2316,6 +2378,22 @@ impl CaptureEngine {
                             })
                             .collect();
                         git_unreadable = merge_unreadable(git_unreadable, meta_unreadable);
+                        // A symlink inode with more than one name: no class carries one
+                        // inode for its names, and a restore would make each its own
+                        // symlink. A final snap cannot say it holds the disk (review
+                        // 2026-09-28, eighth pass, #3; decision 23).
+                        let mut multi = captured.linked_symlinks.clone();
+                        multi.extend(multi_named_symlinks(&listing));
+                        if !multi.is_empty() {
+                            if strict {
+                                return Err(io::Error::other(multi_named_error(&multi)).into());
+                            }
+                            tracing::warn!(
+                                paths = %multi.join(", "),
+                                "symlinks with more than one name are captured as separate \
+                                 symlinks; a final flush over them is not complete"
+                            );
+                        }
                         let mut linked = captured.linked.clone();
                         linked.extend(
                             listing
@@ -2424,6 +2502,7 @@ impl CaptureEngine {
                         worktree_tree: Some(closure.worktree_tree),
                         index_tree: closure.index_tree,
                         raw_tree: Some(closure.raw_tree),
+                        object_format: object_format.clone(),
                     }
                 } else {
                     // A registrar that does not read `git_trees`: the trees ride `refs` as the
@@ -2457,6 +2536,7 @@ impl CaptureEngine {
                         worktree_tree: None,
                         index_tree: None,
                         raw_tree: None,
+                        object_format: object_format.clone(),
                     }
                 };
                 Sections {
@@ -2467,6 +2547,13 @@ impl CaptureEngine {
                         format: built.format,
                         dir_packs: built.dir_packs,
                         worktree_meta,
+                        root_links: listing
+                            .root_links
+                            .iter()
+                            .map(|(root, link)| {
+                                (root.clone(), crate::tree::key_of(link).into_owned())
+                            })
+                            .collect(),
                     },
                     bulk: self
                         .previous
@@ -2482,6 +2569,17 @@ impl CaptureEngine {
             }
             Class::Bulk => {
                 let listing = self.bulk_listing();
+                let multi = multi_named_symlinks(&listing);
+                if !multi.is_empty() {
+                    if req.kind == CaptureKind::Final {
+                        return Err(io::Error::other(multi_named_error(&multi)).into());
+                    }
+                    tracing::warn!(
+                        paths = %multi.join(", "),
+                        "symlinks with more than one name are captured as separate symlinks; a \
+                         final flush over them is not complete"
+                    );
+                }
                 self.linked = Some((
                     Class::Bulk,
                     listing
@@ -2874,6 +2972,29 @@ impl CaptureEngine {
                     .is_some_and(|s| s.same_executor(&seal))
             }),
         }
+    }
+
+    /// The register of the newest capture when it carries this engine's seal
+    /// ([`Self::completion_sealed`]): sent again, it asks the registrar where the seal stands
+    /// ([`crate::ship::Shipper::seal_standing`], decision 22). `None` when there is no such
+    /// capture (or no executor to seal under).
+    #[must_use]
+    pub fn sealing_register(&self) -> Option<RegisterRequest> {
+        let seal = self.final_seal()?;
+        let prev = self.previous.as_ref()?;
+        prev.manifest
+            .final_seal
+            .as_ref()
+            .is_some_and(|s| s.same_executor(&seal))
+            .then(|| RegisterRequest {
+                worktree_id: prev.manifest.worktree_id.clone(),
+                epoch: prev.manifest.epoch,
+                n: prev.manifest.n,
+                parent: prev.manifest.parent.clone(),
+                capture_id: prev.capture_id.clone(),
+                manifest_key: self.prefix.manifest(&prev.capture_id),
+                manifest: prev.manifest.clone(),
+            })
     }
 
     /// Seal a completed final flush on the chain ([`crate::manifest::FinalSeal`]): stage one

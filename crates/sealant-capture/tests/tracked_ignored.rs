@@ -144,6 +144,7 @@ fn control_plane_base(
                 worktree_tree: None,
                 index_tree: None,
                 raw_tree: None,
+                object_format: None,
             },
             workspace: WorkspaceSection::objects(root_key, vec![]),
             bulk: BulkState::pending(),
