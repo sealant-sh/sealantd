@@ -82,6 +82,13 @@ pub struct RuntimeConfig {
     pub heartbeat_interval_ms: u64,
     /// Shutdown grace period in milliseconds.
     pub shutdown_grace_ms: u64,
+    /// How long the final capture flush of a shutdown (`SIGTERM`, `SIGINT`,
+    /// `runtime.gracefulShutdown`) may take, from the moment the shutdown began, before the
+    /// daemon gives up on it and exits `75` with its staging directory kept. `None`: until it
+    /// completes. Set from `SEALANT_SHUTDOWN_FINAL_DEADLINE_MS`: the platform's stop grace less
+    /// a margin, so the daemon reports "not saved" itself before it is killed.
+    #[serde(default)]
+    pub shutdown_final_deadline_ms: Option<u64>,
     /// I/O capture chunk size in bytes.
     pub io_chunk_bytes: usize,
     /// Durable spool directory (telemetry pipeline; populated in a later phase).
@@ -150,6 +157,7 @@ impl RuntimeConfig {
             capture: CapturePolicy::default(),
             heartbeat_interval_ms: 15_000,
             shutdown_grace_ms: 10_000,
+            shutdown_final_deadline_ms: None,
             io_chunk_bytes: 64 * 1024,
             spool_dir: None,
             session_journal_dir: None,
@@ -250,6 +258,7 @@ impl RuntimeConfig {
             "capture": self.capture,
             "heartbeatIntervalMs": self.heartbeat_interval_ms,
             "shutdownGraceMs": self.shutdown_grace_ms,
+            "shutdownFinalDeadlineMs": self.shutdown_final_deadline_ms,
             "ioChunkBytes": self.io_chunk_bytes,
             "logLevel": self.log_level,
         })

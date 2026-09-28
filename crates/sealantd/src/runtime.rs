@@ -163,6 +163,15 @@ pub struct Runtime {
     quiesced: Mutex<Option<Option<&'static str>>>,
     /// Quiesces run (test observability).
     quiesces: std::sync::atomic::AtomicU64,
+    /// Whether the last final flush this daemon ran to its end answered complete (`None`: none
+    /// has). The exit decision reads this, never the live status: a final flush queued behind
+    /// the daemon's own resets that to `in-progress` the moment it begins (Docker end to end,
+    /// round 5: a sealed, complete executor exited 75 in the same millisecond).
+    last_final: Mutex<Option<bool>>,
+    /// When a shutdown's final flush must be done by ([`RuntimeConfig::shutdown_final_deadline_ms`]
+    /// after the shutdown began): set once, by the first shutdown. `None` while no shutdown
+    /// began, or without a configured deadline.
+    shutdown_cutoff: tokio::sync::watch::Sender<Option<Instant>>,
     features: Mutex<HashMap<Feature, bool>>,
     pidfd_supported: bool,
     /// `PR_SET_CHILD_SUBREAPER` took effect: an orphan of anything sealantd started stays its
@@ -257,6 +266,8 @@ impl Runtime {
             final_lock: tokio::sync::Mutex::new(()),
             quiesced: Mutex::new(None),
             quiesces: std::sync::atomic::AtomicU64::new(0),
+            last_final: Mutex::new(None),
+            shutdown_cutoff: tokio::sync::watch::Sender::new(None),
             sweep_mark: Mutex::new(cfg!(test).then(|| format!("unit-test-{}", new_unit_mark()))),
             sweep_scope: Mutex::new(None),
             features,
@@ -341,6 +352,7 @@ impl Runtime {
                     capture.status()
                 }
             };
+        *self.last_final.lock().unwrap_or_else(|e| e.into_inner()) = Some(report.complete);
         if report.complete {
             tracing::info!(
                 head_n = ?report.head_n,
@@ -361,12 +373,100 @@ impl Runtime {
         Some(report)
     }
 
+    /// A shutdown began (`SIGTERM`, `SIGINT`, `runtime.gracefulShutdown`): its final flush must be
+    /// done by [`RuntimeConfig::shutdown_final_deadline_ms`] from now. Set once, by the first
+    /// shutdown; every final flush still running or begun after it — a control plane's without a
+    /// deadline, the one after the harness exited — ships no longer than that
+    /// ([`crate::capture::CaptureRuntime::set_shutdown_cutoff`]). The cutoff, or `None` without
+    /// a configured deadline.
+    fn begin_shutdown_deadline(&self) -> Option<Instant> {
+        let deadline = Duration::from_millis(self.config.shutdown_final_deadline_ms?);
+        self.shutdown_cutoff.send_if_modified(|cutoff| {
+            if cutoff.is_some() {
+                return false;
+            }
+            *cutoff = Some(Instant::now() + deadline);
+            true
+        });
+        let cutoff = *self.shutdown_cutoff.borrow();
+        if let (Some(at), Some(capture)) = (cutoff, self.capture()) {
+            capture.set_shutdown_cutoff(at);
+        }
+        cutoff
+    }
+
+    /// Resolves once a shutdown began and its final flush's deadline passed; never without one.
+    async fn shutdown_cutoff_passed(&self) {
+        let mut cutoff = self.shutdown_cutoff.subscribe();
+        let at = match cutoff.wait_for(Option::is_some).await {
+            Ok(at) => *at,
+            Err(_) => None,
+        };
+        match at {
+            Some(at) => tokio::time::sleep_until(at.into()).await,
+            None => std::future::pending().await,
+        }
+    }
+
+    /// The final flush of a shutdown (`SIGTERM`, `SIGINT`, `runtime.gracefulShutdown`): the
+    /// shutdown's deadline starts now ([`Self::begin_shutdown_deadline`]), and the flush —
+    /// waiting for one already running included — takes no longer
+    /// ([`Self::exit_final_flush`]).
+    pub async fn shutdown_final_flush(
+        &self,
+        grace_ms: Option<u64>,
+    ) -> Option<sealant_protocol::CaptureStatusReport> {
+        self.begin_shutdown_deadline();
+        self.exit_final_flush(grace_ms).await
+    }
+
+    /// The final flush every exit runs. Bounded by the shutdown's deadline when a shutdown began,
+    /// before it or while it runs (a `SIGTERM` during the flush after the harness exited); once
+    /// that passes, the daemon stops waiting — for the lock, the writers, the snaps or the
+    /// store — and records the flush incomplete: the exit is 75 and the staging directory stays
+    /// as it is, for the platform to keep the disk and recover it. Nothing is lost: what is not
+    /// registered is still staged on the disk. Without a shutdown, or without a configured
+    /// deadline, it runs until it completes (or never can).
+    pub async fn exit_final_flush(
+        &self,
+        grace_ms: Option<u64>,
+    ) -> Option<sealant_protocol::CaptureStatusReport> {
+        let capture = self.capture()?;
+        let cutoff = *self.shutdown_cutoff.borrow();
+        let deadline_ms = cutoff.map(|at| {
+            u64::try_from(at.saturating_duration_since(Instant::now()).as_millis())
+                .unwrap_or(u64::MAX)
+        });
+        tokio::select! {
+            biased;
+            report = self.final_flush(deadline_ms, grace_ms) => report,
+            () = self.shutdown_cutoff_passed() => {
+                *self.last_final.lock().unwrap_or_else(|e| e.into_inner()) = Some(false);
+                let report = capture.status();
+                tracing::error!(
+                    deadline_ms = self.config.shutdown_final_deadline_ms,
+                    pending = report.pending,
+                    pending_bytes = report.pending_bytes,
+                    "FINAL CAPTURE INCOMPLETE: the shutdown's final flush did not finish within \
+                     SEALANT_SHUTDOWN_FINAL_DEADLINE_MS; what is not registered stays staged on \
+                     this disk, and the daemon exits 75"
+                );
+                Some(report)
+            }
+        }
+    }
+
     /// Whether this is a capture-store workspace whose captures are not known complete: no
-    /// final flush completed, or something was staged after it. The daemon then exits with
-    /// [`EXIT_CAPTURE_INCOMPLETE`], never 0.
+    /// final flush ran to its end, or the last one that did answered incomplete. The daemon
+    /// then exits with [`EXIT_CAPTURE_INCOMPLETE`], never 0. The outcome of the daemon's own
+    /// last completed final flush decides, not the live status: another final flush that just
+    /// began reads `in-progress` there, and one that answered complete over a class that polls
+    /// reads `unwatched` a moment later. Every exit runs a final flush first
+    /// ([`crate::boot`]), so a capture staged after an earlier complete one is judged by it.
     #[must_use]
     pub fn capture_incomplete(&self) -> bool {
-        self.capture().is_some_and(|c| !c.status().complete)
+        self.capture().is_some()
+            && *self.last_final.lock().unwrap_or_else(|e| e.into_inner()) != Some(true)
     }
 
     /// Close admission and stop every writer in the workspace, admission closed throughout:
@@ -913,8 +1013,9 @@ impl Runtime {
                 ControlResponse::ok_with(rid, CommandResult::Metrics(self.metrics()))
             }
             Command::RuntimeGracefulShutdown { grace_millis } => {
-                // Writers stop, then the final capture, then the shutdown.
-                self.final_flush(None, grace_millis).await;
+                // Writers stop, then the final capture (within the shutdown's deadline), then
+                // the shutdown.
+                self.shutdown_final_flush(grace_millis).await;
                 self.shutdown.request_graceful(grace_millis);
                 ControlResponse::ok_with(
                     rid,

@@ -30,6 +30,10 @@ pub struct Counters {
     pub fail_part_once: AtomicU64,
     /// Whether that failure was served.
     pub failed_once: AtomicBool,
+    /// The store is down: every PUT (single or part) answers 503 while set, and is counted.
+    pub down: AtomicBool,
+    /// PUTs answered 503 because the store was down.
+    pub refused: AtomicU64,
 }
 
 pub struct Server {
@@ -102,6 +106,10 @@ pub fn serve_with(part_delay: Duration) -> Server {
                         .and_then(|(n, id)| n.parse::<u32>().ok().map(|n| (n, id)));
                     let mut extra = String::new();
                     let (status, out): (&str, Vec<u8>) = match (method.as_str(), part) {
+                        ("PUT", _) if counters.down.load(Ordering::SeqCst) => {
+                            counters.refused.fetch_add(1, Ordering::SeqCst);
+                            ("503 Service Unavailable", Vec::new())
+                        }
                         ("PUT", Some((n, upload_id))) => {
                             counters.part_puts.fetch_add(1, Ordering::SeqCst);
                             let now = counters.in_flight.fetch_add(1, Ordering::SeqCst) + 1;

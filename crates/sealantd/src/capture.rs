@@ -64,6 +64,15 @@ enum FinalOutcome {
     Incomplete(&'static str),
 }
 
+/// How a report judges whether the disk is still as the last final flush captured it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Currency {
+    /// As that flush's own answer: its snaps read every class after every writer stopped.
+    AsSnapped,
+    /// Now: only a class the watcher sees can be vouched for since those snaps.
+    Now,
+}
+
 /// The capture engine and its background loops.
 pub struct CaptureRuntime {
     runner: CadenceRunner,
@@ -336,7 +345,10 @@ impl CaptureRuntime {
             tracing::error!(reason = incomplete.reason(), %incomplete, "final capture flush incomplete");
         }
         *self.final_outcome.lock().unwrap_or_else(|e| e.into_inner()) = outcome;
-        self.status()
+        // The flush's own answer: its snaps, taken after every writer stopped, read every
+        // class as it was — a class that polls included (before, a polled class made every
+        // final flush answer `changed`, and a daemon whose bulk class polled never exited 0).
+        self.report(Currency::AsSnapped)
     }
 
     /// A final flush begins ([`Runtime::final_flush`], before it stops the writers):
@@ -352,6 +364,13 @@ impl CaptureRuntime {
         if !current {
             *outcome = FinalOutcome::Running;
         }
+    }
+
+    /// The daemon's shutdown deadline ([`Runtime::shutdown_final_flush`]): no flush ships past
+    /// `at`, whatever deadline its caller gave (a control plane's final flush without one
+    /// included), and what is left stays staged.
+    pub fn set_shutdown_cutoff(&self, at: Instant) {
+        self.runner.shipper().set_cutoff(at);
     }
 
     /// Record a final flush that could not finish for a reason outside the engine (its task
@@ -502,6 +521,11 @@ impl CaptureRuntime {
     /// Current state.
     #[must_use]
     pub fn status(&self) -> CaptureStatusReport {
+        self.report(Currency::Now)
+    }
+
+    /// The state, its currency judged as `currency` says.
+    fn report(&self, currency: Currency) -> CaptureStatusReport {
         // The final flush's outcome first, then the queue: a flush sets its outcome once it has
         // shipped, so the queue read after it is at least as new. Read the other way round, a
         // queue read while the flush ran met the outcome it set on its way out, and the report
@@ -574,7 +598,17 @@ impl CaptureRuntime {
             // for, a bulk build paused mid-way — anything that makes a final flush asked again
             // snap again — and what is on this disk is no longer all in the store. The same
             // predicate the repeated final flush decides by; it snaps and answers complete.
-            FinalOutcome::Snapped { .. } if !self.runner.final_is_current() => Some("changed"),
+            FinalOutcome::Snapped { .. } if !self.runner.final_is_current_as_snapped() => {
+                Some("changed")
+            }
+            // Nothing seen changed, but a class polls (a directory it could not watch, an
+            // overflow): read after the flush that snapped it, whether it is still as that
+            // flush captured it is unknown until a final flush asked again snaps it.
+            FinalOutcome::Snapped { .. }
+                if currency == Currency::Now && !self.runner.every_class_watched() =>
+            {
+                Some("unwatched")
+            }
             FinalOutcome::Snapped { .. } => None,
         };
         let reads = self.reads.current();
@@ -2927,6 +2961,158 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    /// Docker end to end, round 5 (session A0): the bulk class polled (a directory `pnpm install`
+    /// renamed away before its watch was added), a final flush answered complete, and in the
+    /// same millisecond the daemon exited 75: its exit decision re-read the live status, which
+    /// a final flush queued behind its own had just reset to `in-progress`. On the review-3
+    /// head it was worse: a class that polls made every final flush answer `changed`, so a
+    /// daemon whose bulk class polled could never exit 0. The exit follows the outcome of the
+    /// daemon's own last completed final flush; a final flush's own answer is complete when
+    /// its snaps, taken after every writer stopped, captured the disk; and the status after it
+    /// says the polled class leaves currency unknown (`unwatched`), not complete.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_exit_follows_the_daemons_own_final_flush_when_a_class_polls() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (boot, registrar) = boot_tuned(
+            tmp.path(),
+            |store| store,
+            |config| config.executor = Some(EXECUTOR.to_owned()),
+        );
+        let ws = boot.layout.working_directory.clone();
+        std::fs::write(ws.join(".gitignore"), "node_modules/\n").unwrap();
+        std::fs::create_dir_all(ws.join("node_modules/pkg")).unwrap();
+        std::fs::write(ws.join("node_modules/pkg/index.js"), "// one\n").unwrap();
+        let mut config = RuntimeConfig::new(new_runtime_id());
+        config.workspace_root = ws.clone();
+        let runtime = Runtime::new(config, Arc::new(ShutdownSignal::new(3_000)));
+        runtime.mark_healthy();
+        let capture = CaptureRuntime::new(boot);
+        assert!(runtime.install_capture(capture.clone()));
+        let harness = runtime
+            .spawn_managed(sh("exec sleep 3600", &ws))
+            .expect("spawn");
+        capture.start(runtime.clone(), harness.process_id);
+        // A directory of the bulk class could not be watched: the class polls.
+        capture
+            .runner()
+            .signal(sealant_capture::ChangeSignal::Unwatched(Class::Bulk));
+        assert_eq!(
+            capture.runner().snapshot().bulk_mode,
+            sealant_capture::WatchMode::Polled
+        );
+
+        let first = runtime.final_flush(None, Some(3_000)).await.unwrap();
+        assert!(
+            first.complete,
+            "a final flush over a polled class: {first:?}"
+        );
+        assert!(!runtime.capture_incomplete());
+        assert_eq!(registrar.seals().len(), 1, "sealed");
+
+        // A final flush queued behind that one begins: it cannot know the polled class is as
+        // it was, so it snaps again, and the live status reads `in-progress` meanwhile.
+        capture.begin_final();
+        assert_eq!(
+            capture.status().incomplete_reason.as_deref(),
+            Some("in-progress")
+        );
+        assert!(
+            !runtime.capture_incomplete(),
+            "the exit follows the daemon's own last completed final flush"
+        );
+        let again = runtime.final_flush(None, Some(3_000)).await.unwrap();
+        assert!(again.complete, "{again:?}");
+        assert!(!runtime.capture_incomplete());
+
+        // Read later, the status cannot claim the polled class is as the flush left it.
+        let status = capture.status();
+        assert!(!status.complete, "{status:?}");
+        assert_eq!(status.incomplete_reason.as_deref(), Some("unwatched"));
+        let fresh = restore_head(tmp.path(), &registrar, "fresh");
+        assert_eq!(
+            std::fs::read_to_string(fresh.join("node_modules/pkg/index.js")).unwrap(),
+            "// one\n"
+        );
+    }
+
+    /// Docker end to end, round 5: after `pnpm install` in a fresh session the bulk class
+    /// polled for the executor's life (a package's `_tmp_` directory was renamed into place
+    /// before its watch was added), ~750 MB stayed uncaptured for minutes, and every repeat
+    /// final flush walked the dependency tree again (~2.6 s each). An install as `pnpm` does
+    /// it — unpack into `<name>_tmp_<pid>_<n>`, rename into place, link from the top — leaves
+    /// both classes watched, the final flush's answer stays current, and a repeat final flush
+    /// snaps nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pnpm_install_keeps_the_bulk_class_watched_and_a_repeat_final_snaps_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (boot, registrar) = boot(tmp.path());
+        let ws = boot.layout.working_directory.clone();
+        std::fs::write(ws.join(".gitignore"), "node_modules/\n").unwrap();
+        std::fs::create_dir_all(ws.join("node_modules/.pnpm")).unwrap();
+        let mut config = RuntimeConfig::new(new_runtime_id());
+        config.workspace_root = ws.clone();
+        let runtime = Runtime::new(config, Arc::new(ShutdownSignal::new(3_000)));
+        runtime.mark_healthy();
+        let capture = CaptureRuntime::new(boot);
+        assert!(runtime.install_capture(capture.clone()));
+        let harness = runtime
+            .spawn_managed(sh("exec sleep 3600", &ws))
+            .expect("spawn");
+        capture.start(runtime.clone(), harness.process_id);
+
+        let modules = ws.join("node_modules");
+        for i in 0..300 {
+            let store = modules.join(format!(".pnpm/p{i}@1.0.0/node_modules"));
+            let staged = store.join(format!("p{i}_tmp_4242_{i}"));
+            for sub in [
+                "dist/cjs/internal",
+                "dist/esm/internal",
+                "dist/dts",
+                "src/internal",
+            ] {
+                std::fs::create_dir_all(staged.join(sub)).unwrap();
+                std::fs::write(staged.join(sub).join("index.js"), format!("// {i}\n")).unwrap();
+            }
+            std::fs::rename(&staged, store.join(format!("p{i}"))).unwrap();
+            std::os::unix::fs::symlink(
+                format!(".pnpm/p{i}@1.0.0/node_modules/p{i}"),
+                modules.join(format!("p{i}")),
+            )
+            .unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let modes = capture.runner().snapshot();
+        assert_eq!(
+            (modes.small_mode, modes.bulk_mode),
+            (
+                sealant_capture::WatchMode::Watched,
+                sealant_capture::WatchMode::Watched
+            ),
+            "both classes are watched after the install"
+        );
+
+        let first = runtime.final_flush(None, Some(3_000)).await.unwrap();
+        assert!(first.complete, "{first:?}");
+        assert!(capture.status().complete, "{:?}", capture.status());
+        let before = capture.runner().snapshot();
+        let again = runtime.final_flush(None, Some(3_000)).await.unwrap();
+        assert!(again.complete, "{again:?}");
+        let after = capture.runner().snapshot();
+        assert_eq!(
+            (after.small_snaps, after.bulk_snaps),
+            (before.small_snaps, before.bulk_snaps),
+            "a repeat final flush snaps nothing"
+        );
+        let fresh = restore_head(tmp.path(), &registrar, "fresh");
+        assert_eq!(
+            std::fs::read_to_string(
+                fresh.join("node_modules/.pnpm/p299@1.0.0/node_modules/p299/dist/dts/index.js")
+            )
+            .unwrap(),
+            "// 299\n"
+        );
     }
 
     /// Docker end to end, round 4: a directory past `PATH_MAX` cannot be named to

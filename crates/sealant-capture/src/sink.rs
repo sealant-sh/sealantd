@@ -350,6 +350,14 @@ pub trait UrlMinter: Send + Sync {
     }
     /// A GET URL for `key`.
     fn get_url(&self, key: &str) -> Result<String, SinkError>;
+    /// The upload of `key` is done with the URLs minted for it: the object is stored (or was
+    /// there), or the store refused those URLs for good (an expired or bad signature). Until
+    /// then a minter may answer [`UrlMinter::put_url`] / [`UrlMinter::multipart_urls`] with the
+    /// URLs it minted before: a PUT that failed on the store's side (unreachable, 5xx, 429)
+    /// retries on the same URL instead of minting another. The default keeps nothing.
+    fn settled(&self, key: &str) {
+        let _ = key;
+    }
     /// Part URLs for a multipart upload of `key` (`size` bytes), or none when the store takes
     /// the key as a single PUT (below the registrar's threshold, or no multipart support).
     fn multipart_urls(&self, key: &str, size: u64) -> Result<Option<MultipartUrls>, SinkError> {
@@ -385,6 +393,10 @@ impl<M: UrlMinter + ?Sized> UrlMinter for Arc<M> {
 
     fn get_url(&self, key: &str) -> Result<String, SinkError> {
         (**self).get_url(key)
+    }
+
+    fn settled(&self, key: &str) {
+        (**self).settled(key);
     }
 
     fn multipart_urls(&self, key: &str, size: u64) -> Result<Option<MultipartUrls>, SinkError> {
@@ -434,6 +446,10 @@ impl UrlMinter for CheckedMinter {
     fn get_url(&self, key: &str) -> Result<String, SinkError> {
         let url = self.inner.get_url(key)?;
         self.checked(key, url)
+    }
+
+    fn settled(&self, key: &str) {
+        self.inner.settled(key);
     }
 
     fn multipart_urls(&self, key: &str, size: u64) -> Result<Option<MultipartUrls>, SinkError> {
@@ -690,7 +706,7 @@ impl BlobSink for PresignedHttp {
             BlobSource::File(p) => req.send(fs::File::open(p)?),
         }
         .map_err(|e| transport("PUT", key, e))?;
-        match resp.status().as_u16() {
+        let result = match resp.status().as_u16() {
             200..=299 => Ok(PutOutcome::Stored),
             412 => Ok(PutOutcome::AlreadyPresent),
             status => Err(SinkError::Http {
@@ -698,7 +714,13 @@ impl BlobSink for PresignedHttp {
                 key: key.to_owned(),
                 status,
             }),
+        };
+        // A failure on the store's side (unreachable, 5xx, 429) leaves the URL good: the retry
+        // uses it again. Anything else is the URL's end.
+        if result.as_ref().is_ok() || result.as_ref().is_err_and(|e| !e.is_retryable()) {
+            self.minter.settled(key);
         }
+        result
     }
 
     fn put_multipart(
@@ -783,6 +805,11 @@ impl BlobSink for PresignedHttp {
             .into_inner()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
         {
+            // Parts the store did not take for now (unreachable, 5xx, 429) go up again under
+            // the same upload and part URLs; any other refusal ends them.
+            if !e.is_retryable() {
+                self.minter.settled(key);
+            }
             return Err(e);
         }
         let parts: Vec<CompletedPart> = etags
@@ -799,6 +826,7 @@ impl BlobSink for PresignedHttp {
             })
             .collect::<Result<_, _>>()?;
         let completed = self.complete(key, &plan.upload_id, &parts)?;
+        self.minter.settled(key);
         if completed.outcome == PutOutcome::Stored {
             let reported = match completed.size {
                 Some(n) => Some(n),
