@@ -93,7 +93,21 @@ the protocol details live in `crates/sealant-capture/src/registrar.rs` and `mani
   with more than one name (a hardlinked symlink, `cp -al`) cannot come back as one inode: a final
   flush over one is `snapshot-failed`. A SHA-256 repository is captured and restored as one (the
   git section's `object_format`, a manifest feature; a store that does not read it gets no
-  complete final flush of a SHA-256 repository). What an operation in progress needs to go on (a pending
+  complete final flush of a SHA-256 repository). `HEAD`, the refs, the reflogs and the root refs
+  (`ORIG_HEAD`, `CHERRY_PICK_HEAD`, …) are read through git in whichever backend holds them,
+  never through `.git/HEAD` or a `logs/` directory: a reftable repository's `HEAD` file only says
+  `ref: refs/heads/.invalid` and it has no `logs/`, and a commit only its reflog, a detached
+  `HEAD` or its `ORIG_HEAD` reached was left out of a sealed capture. A reftable repository is
+  captured and restored as one (the git section's `ref_format: "reftable"`, a manifest feature;
+  the restore runs `git init --ref-format=reftable` and writes the refs through `update-ref` and
+  `symbolic-ref`, and the workspace class brings the tables themselves back, reflogs included; a
+  store that does not read `ref_format` gets no complete final flush of a reftable repository).
+  Every symlink under `.git/refs/` or at `.git/HEAD` rides the workspace class as the symlink it
+  was, whatever its link text: an alias git reads through to another ref's file
+  (`refs/heads/alias -> main`) comes back as that symlink, and the restore writes the ref file it
+  reaches loose again so it still resolves (the git section packs every ref). One whose chain
+  ends where a restore cannot bring a file back (outside the repository, on no ref the capture
+  holds) makes a final flush `snapshot-failed`. What an operation in progress needs to go on (a pending
   pseudo-ref, a todo list's `pick`-like operands, a rebase's `onto`) must resolve to exactly one
   object; one that is missing or ambiguous makes the final flush `snapshot-failed`, never
   complete. The working tree is read from disk past the user's index shortcuts: the scratch
@@ -119,7 +133,14 @@ the protocol details live in `crates/sealant-capture/src/registrar.rs` and `mani
   `worktree_tree`, and `raw_tree` holds the bytes. A restore of a capture without `raw_tree` is
   the one git that smudges. A tree path whose kind on disk is not the tree's (a regular file
   where `core.symlinks=false` kept a symlink's mode) makes a final flush `snapshot-failed`,
-  never a capture that silently leaves its metadata out.
+  never a capture that silently leaves its metadata out. A modification time is recorded as
+  signed 64-bit nanoseconds (1677 to 2262); a path whose time is outside that range, in any class
+  and a directory as much as a file, makes a final flush `unreadable`, naming the path — before,
+  the time saturated to the last nanosecond of 2262 and the flush sealed. An automatic capture
+  still carries the path's bytes, its time saturated. A restore of a sealed capture never relinks
+  a tracked hardlink group whose names hold different bytes (a workspace overlay can hold newer
+  bytes for one of them than the tree): it fails naming the member instead of writing one
+  name's bytes over the other's; any other restore leaves the two apart.
 - **No user code over a store that cannot hold what a capture holds.** When `plan.get`'s
   `manifest_features` leaves out one this daemon writes (`git_trees`, `raw_names`, …), every
   capture over that store — the periodic ones a hard crash would be picked up from, not only the
