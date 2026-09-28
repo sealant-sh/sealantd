@@ -276,13 +276,22 @@ fn a_preempted_scheduled_bulk_build_does_not_resume_after_the_final_flush() {
     let gate = allowed.clone();
     runner.start(Some(Arc::new(move || gate.load(Ordering::SeqCst))));
     runner.snap(CaptureKind::Checkpoint).unwrap();
-    runner.signal(sealant_capture::ChangeSignal::Changed(Class::Bulk));
+    // The bulk loop reads its clock, lets go of the state lock and takes it again to wait: a
+    // signal in between wakes nobody, and the build waits for the next one (on a loaded runner
+    // it waited out the whole 10 s). What this test is about is the build once it runs, so the
+    // change is signalled again until it does.
     let start = Instant::now();
+    let mut signalled: Option<Instant> = None;
     while !runner.snapshot().bulk_running {
         assert!(
             start.elapsed() < Duration::from_secs(10),
-            "a scheduled bulk build starts"
+            "a scheduled bulk build starts: {:?}",
+            runner.snapshot()
         );
+        if signalled.is_none_or(|at| at.elapsed() >= Duration::from_millis(500)) {
+            runner.signal(sealant_capture::ChangeSignal::Changed(Class::Bulk));
+            signalled = Some(Instant::now());
+        }
         std::thread::sleep(Duration::from_millis(5));
     }
 
