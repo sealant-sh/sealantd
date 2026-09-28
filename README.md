@@ -82,9 +82,18 @@ the protocol details live in `crates/sealant-capture/src/registrar.rs` and `mani
   symbolic ref chain is kept link by link). A symbolic ref or `HEAD` stored as a symlink
   (`core.preferSymlinkRefs`) is kept as a symbolic ref — name and target bytes, dangling and
   chained — and as the symlink it was, its link text and mtime riding the workspace class. The
-  `.git` directory and the harness home keep their mode and nanosecond mtime. Every object `FETCH_HEAD`, `ORIG_HEAD`,
+  `.git` directory and the harness home keep their mode and nanosecond mtime. A `.git` or a
+  harness home that is a symlink to a directory is read through the link, as git and the harness
+  read it (the link text rides `workspace.root_links`; a restore writes the directory it named),
+  and one that is not a directory at all (a file, a link to one, a loop) makes a final flush
+  `unreadable` — before, either was captured as nothing and the flush still sealed. Every object `FETCH_HEAD`, `ORIG_HEAD`,
   `MERGE_HEAD`, a rebase, a cherry-pick sequence or a bisect names is in the packs — down to
-  git's four-digit abbreviations. What an operation in progress needs to go on (a pending
+  git's four-digit abbreviations, and through a symlinked pseudo-ref or operation document, read
+  as git reads it; one that cannot be read makes the final flush `snapshot-failed`. A symlink
+  with more than one name (a hardlinked symlink, `cp -al`) cannot come back as one inode: a final
+  flush over one is `snapshot-failed`. A SHA-256 repository is captured and restored as one (the
+  git section's `object_format`, a manifest feature; a store that does not read it gets no
+  complete final flush of a SHA-256 repository). What an operation in progress needs to go on (a pending
   pseudo-ref, a todo list's `pick`-like operands, a rebase's `onto`) must resolve to exactly one
   object; one that is missing or ambiguous makes the final flush `snapshot-failed`, never
   complete. The working tree is read from disk past the user's index shortcuts: the scratch
@@ -140,6 +149,24 @@ the protocol details live in `crates/sealant-capture/src/registrar.rs` and `mani
   heartbeat under the same identity succeeds.
 - **The final seal** (`final_seal.executor`) is `plan.get`'s `executor`, the launch the session
   token was issued for, and nothing else. A plan that names no executor gets no seal.
+- **Complete means the registrar recorded the seal (decision 22).** A registered sealing capture
+  is not enough: `capture.register` answers what it did with the seal the capture carries,
+
+  ```json
+  ← {"head_n":7,"head_capture_id":"…","seal":{"state":"recorded"}}
+  ← {"head_n":7,"head_capture_id":"…","seal":{"state":"withheld","reason":"write-authority"}}
+  ← {"head_n":7,"head_capture_id":"…","seal":{"state":"refused","reason":"executor"}}
+  ```
+
+  and a final flush answers `complete` only on `recorded` — the seal is recorded and stands, and
+  the registrar attests the executor's completion on it. `withheld` (the registrar is still
+  verifying what the seal names, or write authority over those objects is outstanding): the
+  daemon sends the same register again — the registrar answers it as a lost ack, with where the
+  seal stands now — up to six times, backing off (≈ 11 s), and still withheld the flush answers
+  `incomplete_reason: "sealing"`; a final flush asked again asks again. `refused`, or an answer
+  with no `seal` (a registrar from before this), is `sealing` too: fail closed. The registrar
+  answers `seal` whenever the registered capture (`n`, `capture_id`) carries `final_seal`,
+  including on the lost-ack path; it is absent otherwise.
 - **Where an answer stands: order evidence by the executor, never by a clock (decision 17).**
   Every `capture.status` answer and every final `capture.flush` answer carries, beside `epoch`
   and `head_n`, `CaptureStatusReport` fields 27–30: `launch` (optional string: `plan.get`'s

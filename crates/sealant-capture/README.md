@@ -208,6 +208,33 @@ and empty directories and every tracked mtime were lost.
   restore writes the bytes each key stands for (`packed-refs` sorted by those bytes). Decoded
   lossily, `refs/heads/caf\xe8` and `refs/heads/caf\xe9` were both `refs/heads/caf\u{fffd}`: one
   overwrote the other in `refs`, its commit was no pack tip, and a complete final capture lost it.
+- **A symlinked pseudo-ref or operation document is read through the link** (review 2026-09-28,
+  eighth pass, #2). Git reads `FETCH_HEAD`, `MERGE_HEAD`, `ORIG_HEAD` and the files of
+  `rebase-merge/`, `rebase-apply/` and `sequencer/` through a symlink (one whose text is a
+  well-formed ref name is that symbolic ref, whose objects the refs carry). The collector of what
+  they name (`GitRepo::operation_objects`) read regular files only: a `FETCH_HEAD` symlinked to
+  `held/fetched` inside `.git` came back byte-exact, and the commit and unique file it named did
+  not. It now reads a symlinked document through its link, as git does; one that cannot be read
+  (a link to a directory or a fifo, permission denied, a loop) is unresolved, and a final snap
+  over it fails (`snapshot-failed`) — what it names is unknown. A dangling one names nothing, as
+  a missing one does. `tests/review8_fidelity.rs` restores the commits of a symlinked
+  `FETCH_HEAD`, `MERGE_HEAD` and `sequencer/abort-safety`.
+- **A symlink with more than one name makes a final flush incomplete** (review 2026-09-28, eighth
+  pass, #3; decision 23). Linux lets a symlink inode have several names (`ln` of a symlink,
+  `cp -al` over a tree holding one). Hardlink groups, `shared` and `cross_links` are regular files
+  only, so such names came back as separate symlinks from a sealed capture. Until a group of
+  symlink names is carried, a final snap that reads a symlink whose link count is above one — in
+  the worktree tree (`worktree_meta::Captured::linked_symlinks`), the workspace class or the bulk
+  class — fails naming it (`snapshot-failed`, no seal); an automatic snap carries each name as its
+  own symlink and warns.
+- **A SHA-256 repository** (review 2026-09-28, eighth pass, #10). The materializer made a SHA-1
+  repository, installed the SHA-256 pack into it and failed `read-tree` (`wrong index v2 file
+  size`) before the workspace class brought `.git/config`'s `objectformat` back. The git section
+  now names a format that is not SHA-1 (`object_format`, below), and the restore runs `git init
+  --object-format=<format>` (`GitRepo::init_with_format`) before any pack goes in; a repository
+  already there must be of that format. A section without it is SHA-1, restored with an explicit
+  `--object-format=sha1` whatever `init.defaultObjectFormat` says. `tests/review8_fidelity.rs`
+  round-trips a SHA-1 and a SHA-256 repository (committed, modified and untracked work, `fsck`).
 
 `tests/restore_metadata.rs` writes a worktree with all of it (modes, ns mtimes of files,
 directories, symlinks and the root, empty directories, a hardlink pair, names that are not UTF-8,
@@ -684,6 +711,18 @@ A capture holds what is on disk, and says so when it cannot.
   descend into it (its sharded object directories would spend the watch budget); git-lfs writes a
   local object while `git add` writes the index, a watched change, and the snap it triggers walks
   `lfs/`, as does every forced snap.
+- **A root reached through a symlink is read through it** (review 2026-09-28, eighth pass, #1).
+  The configured roots — the worktree, its git dir (`.git`, `.git/` of the workspace class), the
+  harness home — are read as git and the harness read them: a root that is a symlink to a
+  directory (`.git` moved beside the worktree and linked back, a harness home configured as a
+  link) is walked through the link, its entry is the directory it names, and its link text is
+  kept in `workspace.root_links` (below). Before, `Listing::mount` saw a symlink where a
+  directory was expected and returned an empty listing: `.git`'s bookkeeping (`config`,
+  `MERGE_MSG`) and the harness transcript were captured as nothing, and the final flush sealed. A
+  root that exists and is not a directory (a file, a link to one, a loop, permission denied) is
+  unreadable, and a final flush over it answers `unreadable`; a root that does not exist (or a
+  dangling link) holds nothing. Credential files are left out through the link as without it.
+  The watcher watches a symlinked `.git` as a root of its own, through the link.
 - **Unreadable is not deleted.** The walk tells a path that vanished (`ENOENT`, `ENOTDIR`,
   `EISDIR`: removed, left out) from one that is there and cannot be listed, stat'ed or read
   (permission denied, an I/O error). A directory `git ls-files` could not open counts too (its
@@ -826,7 +865,8 @@ lists every manifest feature this build reads, validates and carries on
 
 ```json
 → {…,"manifest_format":2,
-   "manifest_features":["worktree_meta","symrefs","other_bulk","raw_names","final_seal"]}
+   "manifest_features":["worktree_meta","symrefs","other_bulk","raw_names","final_seal",
+                        "git_trees","object_format"]}
 ← {…,"manifest_format":2,"manifest_features":[…],"executor":"<executor id>"}
 ← 409 {"reason":"manifest-features","message":"…","missing":["final_seal"]}
 ```
@@ -839,7 +879,8 @@ held when: `worktree_meta` — the answered workspace section has `worktree_meta
 git section has a non-empty `symrefs`; `other_bulk` — the stored head has a non-empty
 `other_bulk`, or its ready `bulk` was captured on another platform than the request names;
 `raw_names` — a dir entry of the answered workspace or bulk section carries `raw_name` or
-`raw_target`; `final_seal` — the head carries `final_seal`. The daemon reads a 409
+`raw_target`; `final_seal` — the head carries `final_seal`; `object_format` — the git section
+names one (a repository that is not SHA-1). The daemon reads a 409
 `manifest-features` as a protocol error naming the missing features and what it reads (never a
 chain conflict, never retried). `InMemoryRegistrar` refuses the same way (raw names aside: it
 does not walk dir objects; `registrar::missing_manifest_features`). A request without the list
@@ -858,7 +899,11 @@ it. Nor is any user code admitted over such a store (decision 16; review 2026-09
 normalized and a user ref of a pseudo-ref's name gone, three successful rounds in — so sealantd
 refuses the boot right after `plan.get`, before the materialize, and exits 78, and refuses a
 standby's re-plan onto it (the repository README has the contract). Only a recovery boot, which
-admits no writer, runs over it.
+admits no writer, runs over it. `object_format` is the exception: only a repository that is not
+SHA-1 needs it, so a store that leaves it out is no fidelity gap for a SHA-1 repository
+(`CaptureConfig::reads_object_format`); a final snap of a SHA-256 repository over such a store
+fails (`snapshot-failed`, naming `object_format`), and an automatic one names the format all the
+same.
 
 ### `upload_answers` on `plan.get`
 
@@ -916,7 +961,8 @@ one, its sections unchanged, `kind: final`, `n` = head + 1, carrying a top-level
 ```
 
 and ships it (`CaptureEngine::seal_complete`, `CadenceRunner::flush_final_sealing`). `complete`
-is reported only once that register is acknowledged; a register refused and rebuilt in its
+is reported only once that register is acknowledged and says the seal is `recorded` (`seal` on
+`capture.register`, below); a register refused and rebuilt in its
 place (which drops the seal) is followed by the seal staged again, at most three times
 (`sealing` otherwise). The seal is staged under the predicate `complete` is answered by
 (decision 15; review 2026-09-28, fifth pass, #2): the flush first settles the watcher — it writes
@@ -936,6 +982,68 @@ it again. A flush whose quiesce could not stop every writer (`processes-remain`,
 boot) and `complete` is the reply alone, as before. Mend's register records a seal only when it
 is complete, names the epoch the capture registers under and the executor the token is scoped
 to; `InMemoryRegistrar::with_executor` does the same (`seals()`).
+
+### `seal` on `capture.register`
+
+Cross-repo decision 22 (review 2026-09-28, eighth pass, #5): a registered sealing capture is not
+a recorded seal. A registrar may register the capture and withhold its seal (it is still
+verifying what the seal names, or write authority it issued over those objects is still
+outstanding) or refuse it (another executor or epoch). The register's answer says which
+(`registrar::RegisterResponse::seal`, `SealAnswer`, `SealState`):
+
+```json
+← {"head_n":7,"head_capture_id":"<id>","seal":{"state":"recorded"}}
+← {"head_n":7,"head_capture_id":"<id>","seal":{"state":"withheld","reason":"verifying"}}
+← {"head_n":7,"head_capture_id":"<id>","seal":{"state":"refused","reason":"executor"}}
+```
+
+`seal` is answered whenever the registered capture (`n`, `capture_id`) carries `final_seal` —
+on a lost-ack answer too (the chain already at `n` with that id), which then says where the seal
+stands now — and is absent otherwise. `reason` is a short code, for logs and the flush's report.
+`recorded` means recorded and standing: the registrar's plans and stop attestations may name
+it. A final flush is complete only on `recorded` (`Shipper::seal_standing`, after the sealing
+loop of `CadenceRunner::flush_final_sealing`). On `withheld` the daemon sends the same register
+again, backing off (`RetryPolicy` backoff, doubling: ≈ 11 s over six asks, `ship::SEAL_REASKS`),
+never past the flush's deadline or the shutdown cutoff; still withheld, the flush answers
+`sealing` with the reason, and so does `capture.status` (`final_sealed` is false). A final flush
+asked again asks again, without a new snap or seal when the disk is as it was — a daemon that
+restarted over a sealed chain asks too (`CaptureEngine::sealing_register`). `refused`, and an
+answer with no `seal` (a registrar from before this: decision 9, fail closed), are `sealing`
+at once. `InMemoryRegistrar` answers as Mend does (`withhold_seals`, `without_seal_answers`
+stand in for a registrar still verifying and one from before).
+
+### `root_links` in a manifest
+
+The workspace section names each of its roots that was a symlink to a directory when captured
+(`.git`, `harness`, `tree` for the worktree itself), by root name, with its link text as a
+`tree::key_of` key (review 2026-09-28, eighth pass, #1):
+
+```json
+"workspace": {…,"root_links":{".git":"/work/real-git","harness":"real-harness"}}
+```
+
+The class holds what the link named, read through it. The link's target is outside what was
+captured (on another executor it names nothing, or someone else's directory), so a restore
+writes the root as a directory holding those bytes and leaves the link to the configuration;
+`root_links` records that it was one. Absent when no root was a link, so a section without one
+encodes exactly as before. Informational: no reader needs it to restore.
+
+### `object_format` in a manifest
+
+The git section names the repository's object format when it is not `sha1` (`git rev-parse
+--show-object-format`; `GitSection::object_format`, `manifest::OBJECT_FORMATS`):
+
+```json
+"git": {…,"object_format":"sha256"}
+```
+
+A restore initializes its repository with it before it installs a pack (above). Absent for SHA-1,
+so a SHA-1 section encodes exactly as before. It is a manifest feature (`object_format`): a
+registrar refuses a head holding one to an executor whose `plan.get` does not list it, and a
+store that does not list it gets no complete final flush of a SHA-256 repository. A format this
+build does not restore fails a final snap. Every object id the section holds (refs, trees,
+`HEAD`) is then 64 hex digits: a reader that checks a tip's width takes the section's format,
+never 40.
 
 ### `pending_bulk` on `capture.status` / `capture.flush`
 
@@ -980,7 +1088,8 @@ snap did, whenever: `snaps`), `fenced`, `conflict`, `deadline`, `ship-failed`, `
 (staged, or a bulk capture being built, after the final flush), `sealing` (everything
 registered, but not the capture that seals the completed flush: the flush returned at its
 deadline before it could stage it — send the final flush again, which seals without a second
-quiesce), `sweep-unavailable`, `unreadable`, `store-fidelity` (the store does not read every manifest
+quiesce; or the sealing capture registered and the registrar withheld or refused its seal, or
+did not say: `seal` on `capture.register`, above), `sweep-unavailable`, `unreadable`, `store-fidelity` (the store does not read every manifest
 feature this build writes, below), `changed` (the disk changed after the final snaps, or since
 the flush answered) or `internal`; absent when `complete`.
 
