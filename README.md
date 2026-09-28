@@ -116,11 +116,21 @@ the protocol details live in `crates/sealant-capture/src/registrar.rs` and `mani
   (`.git/worktrees/<name>`: its `index`, `HEAD`, `ORIG_HEAD`, reflog and per-worktree refs, in the
   workspace class), and its `HEAD`, refs, reflogs, every index stage and operation state join
   the top-level closure; a nested repository whose `objects/info/alternates` (or common
-  directory) is the top-level object store gets the objects its own state reaches there packed
-  beside the closure. A nested repository whose git directory, common directory or alternates
-  live outside the workspace cannot come back from a capture of it: a final flush over one is
-  `snapshot-failed`, naming it (an automatic capture ships all the same); one under a bulk
-  directory that borrows the top-level store is refused the same way. What an operation in progress needs to go on (a pending
+  directory, or `objects` itself, through a symlink) is the top-level object store gets the
+  objects its own state reaches there packed beside the closure. Bare repositories count: a git
+  directory with no worktree (`HEAD`, `objects`, `refs`, as git decides it) anywhere in the
+  worktree tree, an ignored directory, a bulk directory or `.git/modules/` is found by its `HEAD`
+  and classified the same way. Its primary object store is resolved through symlinks before its
+  alternates are followed (relative alternates from the store's real path, as git takes them).
+  Before, a bare `child.git` borrowing the top-level store was never looked at, and an `objects`
+  symlink to the top-level store counted as storage the chunked classes carry (they carry only
+  the symlink): both sealed and restored refs naming objects the restore did not hold. A nested
+  repository whose git directory, common directory, object store or alternates live outside the
+  workspace cannot come back from a capture of it: a final flush over one is `snapshot-failed`,
+  naming it (an automatic capture ships all the same); so is one that borrows the top-level
+  store when git cannot be asked what its state reaches there (a bare repository under
+  `safe.bareRepository=explicit`), and one under a bulk directory that borrows the top-level
+  store is refused the same way. What an operation in progress needs to go on (a pending
   pseudo-ref, a todo list's `pick`-like operands, a rebase's `onto`) must resolve to exactly one
   object; one that is missing or ambiguous makes the final flush `snapshot-failed`, never
   complete. The working tree is read from disk past the user's index shortcuts: the scratch
@@ -284,6 +294,26 @@ the protocol details live in `crates/sealant-capture/src/registrar.rs` and `mani
   binary on a retained disk a recovery boots) it mints a conditional URL as before, whose 412 the
   older daemon already takes as uploaded. An older daemon answered `present` failed with `no url`
   on every retry.
+- **Only git's own transaction files are left out (decision 33).** Inside a git directory the
+  exclusions are an allow-list of the files git names for a transaction in progress, where git
+  writes them: `index.lock`, `HEAD.lock` and the other root refs' locks, `config.lock`,
+  `packed-refs.lock`, `shallow.lock`, any `.lock` under `refs/`, `logs/`, `reftable/` or an
+  operation's directory, the object store's own locks and its `tmp_*`/`incoming-*` files, and
+  the same in `worktrees/<name>/` and `modules/<name>/`. Everything else is captured in every
+  class: a hook project's `.git/hooks/Cargo.lock`, a config include called `.git/personal.lock`
+  (before, every `*.lock` under a `.git` was dropped and a sealed restore lost both). A final
+  flush drops a transaction lock as well: after every writer is stopped a lock is stale, its
+  content a write git never made real, and git's recovery is to remove it; captured, it would
+  make every later git command of its kind fail, and refusing the flush over it would keep an
+  executor a killed git left a lock on from ever completing.
+- **A preserving flush is named on the wire: `flush: "final"` (decision 35).** Once a final
+  flush begins on the executor — a drain, Core's deadline, `SIGTERM`, a recovery boot — every
+  `upload.urls` and `capture.register` it sends carries `"flush":"final"` until the process
+  ends, so the registrar can exempt it from its byte and call quotas (before, only a Mend drain
+  it had marked itself was exempt, and a final flush Core or the daemon asked for got 413 at
+  `upload.urls`). Additive: absent before a final flush and from an older daemon; an older
+  registrar ignores the member (Mend's request schemas drop unknown properties) and meters the
+  request as before.
 - **Uploads while the store or the registrar refuses.** A URL minted for a key is used again
   until that key's upload settles (stored, already there, or the URL refused) or it is five
   minutes old, and a multipart upload resumes under the same upload and part URLs. A pass that
