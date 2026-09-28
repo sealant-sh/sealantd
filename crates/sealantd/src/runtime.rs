@@ -51,6 +51,11 @@ pub const EXIT_CAPTURE_INCOMPLETE: u8 = 75;
 /// materialize and before any user code (cross-repo decision 8), so no user code ever ran on
 /// such a disk, and the platform may release it. Anything else a recovery cannot save stays
 /// [`EXIT_CAPTURE_INCOMPLETE`].
+///
+/// Also the exit of a standby no session claimed and no writer was admitted on
+/// ([`crate::unclaimed`], Docker end to end, round 8, F7): its final flush answers nothing to
+/// save and the daemon ends at once with 76, and a recovery boot on its disk exits 76 before it
+/// dials the channel (`sealantd boot: nothing to save: a standby no session claimed (…)`).
 pub const EXIT_NOTHING_TO_SAVE: u8 = 76;
 
 /// The exit code of a boot refused because its capture store cannot hold what a capture holds
@@ -384,6 +389,15 @@ impl Runtime {
                 }
             };
         *self.last_final.lock().unwrap_or_else(|e| e.into_inner()) = Some(report.complete);
+        // Nothing to save (a standby no session claimed): the executor lets go at once — the
+        // daemon ends, exiting 76, whoever asked for the flush ([`crate::unclaimed`]).
+        if capture.nothing_to_save() {
+            tracing::warn!(
+                "final capture: nothing to save on this standby; the daemon ends and exits 76"
+            );
+            self.shutdown.request_graceful(None);
+            return Some(report);
+        }
         if report.complete {
             tracing::info!(
                 head_n = ?report.head_n,
@@ -790,6 +804,38 @@ impl Runtime {
         *self.sweep_mark.lock().unwrap_or_else(|e| e.into_inner()) = mark;
     }
 
+    /// A command that can write the disk through a process, a session, a bridge, a forward or
+    /// a bind — or starts a run — makes this executor a session's writer: a standby no session
+    /// claimed says so on its disk first ([`crate::unclaimed`]), and a standby released with
+    /// nothing to save admits none. `capture.replan` claims inside the re-plan, once the plan
+    /// names another identity. Reads, the capture's own commands, signals, closes and the
+    /// shutdown admit nothing.
+    fn admit_writer(&self, command: &Command) -> Result<(), ControlError> {
+        let admits = matches!(
+            command,
+            Command::Exec(_)
+                | Command::WriteStdin(_)
+                | Command::OpenSession(_)
+                | Command::AttachSession(_)
+                | Command::OpenForward(_)
+                | Command::OpenSftp(_)
+                | Command::BindMount { .. }
+                | Command::ExecutionStart(_)
+        );
+        match self.capture() {
+            Some(capture) if admits => capture.admit_writer(command.name()),
+            _ => Ok(()),
+        }
+    }
+
+    /// Whether the last final flush found nothing to save: a standby no session claimed and no
+    /// writer was admitted on ([`crate::unclaimed`]). The daemon exits [`EXIT_NOTHING_TO_SAVE`].
+    #[must_use]
+    pub fn capture_nothing_to_save(&self) -> bool {
+        self.capture()
+            .is_some_and(|capture| capture.nothing_to_save())
+    }
+
     /// The error for new work once a final capture flush closed admission.
     fn admission_closed_error() -> ControlError {
         ControlError::runtime_shutting_down(
@@ -1142,6 +1188,9 @@ impl Runtime {
         {
             return ControlResponse::error(rid, Self::admission_closed_error());
         }
+        if let Err(error) = self.admit_writer(&request.command) {
+            return ControlResponse::error(rid, error);
+        }
 
         match request.command {
             Command::RuntimeHealth => {
@@ -1430,6 +1479,9 @@ impl Runtime {
             && matches!(&request.command, Command::Exec(_) | Command::OpenSftp(_))
         {
             return ControlResponse::error(rid, Self::admission_closed_error());
+        }
+        if let Err(error) = self.admit_writer(&request.command) {
+            return ControlResponse::error(rid, error);
         }
 
         match request.command {

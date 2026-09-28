@@ -14,6 +14,7 @@ pub mod docker;
 pub mod runtime;
 pub mod shutdown;
 pub mod sweep;
+pub mod unclaimed;
 
 pub use app::run;
 pub use boot::{BootConfig, run_boot};
