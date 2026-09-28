@@ -543,6 +543,7 @@ fn fence_stops_shipping_and_a_new_epoch_continues_the_chain() {
             manifest_format: Some(sealant_capture::manifest::MAX_SECTION_FORMAT),
             manifest_features: sealant_capture::registrar::PlanGetRequest::booting(None)
                 .manifest_features,
+            launch: None,
         })
         .unwrap();
     assert_eq!(plan.worktree_id, "wt-fixture");

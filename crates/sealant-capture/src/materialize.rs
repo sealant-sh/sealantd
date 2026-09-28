@@ -211,6 +211,11 @@ pub struct MaterializeReport {
     /// made, modes and mtimes set (0 when the plan carries no overlay, or the disk already
     /// matched it).
     pub worktree_meta: u64,
+    /// The workspace class names the repository's `.git/config`: the capture carries a
+    /// session's own configuration, remotes included (or their absence), and it is the
+    /// repository's. `false` for a base (Mend's capture 0 carries none) or when the workspace
+    /// class was not asked for.
+    pub git_config: bool,
 }
 
 /// Where the workspace class's virtual roots land.
@@ -575,6 +580,7 @@ impl<'a> Materializer<'a> {
                     &mut report,
                 )?;
             }
+            report.git_config = write.planned.contains(".git/config");
             let resolve = |v: &str| roots.workspace_path(&git_dir, v);
             Self::link_all(&write.links, &resolve, &mut report)?;
             if let Some(repo) = &repo {

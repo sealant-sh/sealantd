@@ -57,6 +57,7 @@ fn source(recovery: bool) -> CaptureSourceConfig {
         object_ca_pem: None,
         object_ca_file: None,
         recovery,
+        launch_id: None,
     }
 }
 

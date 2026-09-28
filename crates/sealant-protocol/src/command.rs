@@ -995,8 +995,10 @@ pub struct CaptureStatusReport {
     /// class's last snap did: `snaps`), `unreadable`, `fenced`, `conflict`, `deadline`,
     /// `ship-failed`, `pending`, `sealing`, `changed` (the disk changed after the final flush,
     /// or its changes can no longer be observed — a watcher overflow, a class that polls: a
-    /// final flush asked again snaps again and can answer complete) or `internal`. Absent when
-    /// `complete`.
+    /// final flush asked again snaps again and can answer complete), `unwatched`,
+    /// `store-fidelity` (the store does not read every manifest feature this daemon writes: it
+    /// would restore less than was captured, so no final flush over it completes) or `internal`.
+    /// Absent when `complete`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub incomplete_reason: Option<String>,
     /// Paths the last snap of each class could not read, summed over both classes (a

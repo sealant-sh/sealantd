@@ -190,8 +190,9 @@
 //! The executor builds the worktree's repository itself (`git init`, then the head's packs), so
 //! it has no remotes: the ones the control plane's own copy carries never travel in a capture.
 //! A harness that runs `git push origin` would find no `origin`. The plan therefore names the
-//! remotes the repository should have, and the executor sets each one after it materializes the
-//! head. Only the name and the URL travel; how the remote is authenticated stays the control
+//! remotes the repository should have, and the executor sets each one it lacks after it
+//! materializes a base (an empty chain, or a head that carries no `.git/config`); a head that
+//! carries one is a session's own configuration and is left as it is. Only the name and the URL travel; how the remote is authenticated stays the control
 //! plane's business (Mend routes git's ssh through the session channel).
 //!
 //! ```json
@@ -250,6 +251,15 @@ pub struct PlanGetRequest {
     /// (an executor from before the list).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manifest_features: Option<Vec<String>>,
+    /// The launch this executor is (cross-repo decision 11), from its first `plan.get` on: as
+    /// its launcher named it (`SEALANT_CAPTURE_LAUNCH_ID`), else as its own disk last recorded
+    /// it (a restart or a recovery boot of a launch that predates the variable). The session
+    /// token binds the launch already; a registrar refuses a request whose `launch` is not the
+    /// token's (409 `launch-mismatch`), and binds the lease to that launch, so an old launch's
+    /// executor never joins a newer launch's epoch. Absent = the executor does not know (an
+    /// older daemon, or a first boot with no launch named): the token alone decides.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch: Option<String>,
 }
 
 impl PlanGetRequest {
@@ -263,7 +273,15 @@ impl PlanGetRequest {
             platform: Some(crate::engine::default_platform()),
             manifest_format: Some(MAX_SECTION_FORMAT),
             manifest_features: Some(MANIFEST_FEATURES.iter().map(|f| (*f).to_owned()).collect()),
+            launch: None,
         }
+    }
+
+    /// This request naming the launch the executor is ([`Self::launch`]).
+    #[must_use]
+    pub fn with_launch(mut self, launch: Option<String>) -> Self {
+        self.launch = launch;
+        self
     }
 }
 
@@ -614,6 +632,11 @@ pub enum RegistrarError {
         /// The registrar's message.
         message: String,
     },
+    /// 409 `worktree-leased` on `plan.get`: another launch holds the worktree's lease, and this
+    /// executor is given no epoch. It adopts none: a boot waits and asks again, a re-plan keeps
+    /// the identity it has (Mend round 4).
+    #[error("worktree leased by another launch: no epoch is given to this one")]
+    WorktreeLeased,
     /// Transport failure (retryable).
     #[error("transport: {0}")]
     Transport(String),
@@ -716,6 +739,10 @@ struct InMemoryState {
     /// Final seals recorded on the chain: the capture's `n` and the seal, as Mend records them
     /// (complete, the registering epoch, this registrar's executor).
     seals: Vec<(u64, FinalSeal)>,
+    /// Every `plan.get` asked, oldest first.
+    plan_requests: Vec<PlanGetRequest>,
+    /// `plan.get`s still to refuse with 409 `worktree-leased` (another launch holds the lease).
+    leased_plans: usize,
 }
 
 /// In-memory registrar: one worktree, one chain, a live epoch, a lease flag.
@@ -774,6 +801,8 @@ impl InMemoryRegistrar {
                 sources: Vec::new(),
                 remotes: Vec::new(),
                 seals: Vec::new(),
+                plan_requests: Vec::new(),
+                leased_plans: 0,
                 completed: BTreeSet::new(),
                 completes: 0,
                 next_upload: 0,
@@ -799,6 +828,18 @@ impl InMemoryRegistrar {
     #[must_use]
     pub fn seals(&self) -> Vec<(u64, FinalSeal)> {
         self.lock().seals.clone()
+    }
+
+    /// Refuse the next `count` `plan.get`s as Mend does while another launch holds the lease
+    /// (409 `worktree-leased`, no epoch given).
+    pub fn refuse_plans_leased(&self, count: usize) {
+        self.lock().leased_plans = count;
+    }
+
+    /// Every `plan.get` this registrar was asked, oldest first.
+    #[must_use]
+    pub fn plan_requests(&self) -> Vec<PlanGetRequest> {
+        self.lock().plan_requests.clone()
     }
 
     /// Answer `manifest_features` on `plan.get` (default: every one this build reads): a
@@ -1044,7 +1085,22 @@ fn manifest_keys(req: &RegisterRequest) -> Vec<String> {
 
 impl Registrar for InMemoryRegistrar {
     fn plan_get(&self, req: &PlanGetRequest) -> Result<PlanGetResponse, RegistrarError> {
-        let state = self.lock();
+        let mut state = self.lock();
+        state.plan_requests.push(req.clone());
+        if state.leased_plans > 0 {
+            state.leased_plans -= 1;
+            return Err(RegistrarError::WorktreeLeased);
+        }
+        // Mend's launch gate (cross-repo decision 11): the token is scoped to `executor`, and a
+        // request naming another launch is refused before anything is claimed.
+        if let (Some(launch), Some(executor)) = (&req.launch, &self.executor)
+            && launch != executor
+        {
+            return Err(RegistrarError::Protocol(format!(
+                "plan.get refused: launch-mismatch (the token is launch {executor}; the executor \
+                 says it is {launch})"
+            )));
+        }
         if req.epoch != 0 {
             Self::check_epoch(&state, req.epoch)?;
         }
@@ -1471,7 +1527,11 @@ fn refusal(name: &str, status: u16, bytes: &[u8], epoch: u64) -> RegistrarError 
         409 => {
             let c: ConflictBody =
                 serde_json::from_slice(bytes).unwrap_or_else(|_| ConflictBody::empty());
-            if let Some(live) = c.live_epoch.filter(|l| *l != epoch) {
+            if c.reason == "worktree-leased" {
+                // Another launch holds the lease: no epoch is this executor's, whatever a
+                // `live_epoch` says (it is the holder's, never one to adopt).
+                RegistrarError::WorktreeLeased
+            } else if let Some(live) = c.live_epoch.filter(|l| *l != epoch) {
                 RegistrarError::Fenced { epoch, live }
             } else if c.reason == "stale-epoch" {
                 RegistrarError::Fenced { epoch, live: 0 }
@@ -1968,6 +2028,7 @@ mod tests {
                 platform: None,
                 manifest_format: Some(MAX_SECTION_FORMAT),
                 manifest_features: None,
+                launch: None,
             })
             .unwrap();
         assert_eq!(plan.head.unwrap().capture_id, "a");
@@ -1999,6 +2060,7 @@ mod tests {
                 platform: platform.map(str::to_owned),
                 manifest_format: Some(MAX_SECTION_FORMAT),
                 manifest_features: PlanGetRequest::booting(None).manifest_features,
+                launch: None,
             })
             .unwrap()
         };
@@ -2040,6 +2102,7 @@ mod tests {
             platform: None,
             manifest_format: None,
             manifest_features: None,
+            launch: None,
         })
         .unwrap();
         assert!(bare.get("platform").is_none());
@@ -2102,6 +2165,7 @@ mod tests {
             platform: None,
             manifest_format: None,
             manifest_features: None,
+            launch: None,
         };
         assert!(
             serde_json::to_value(&bare)
@@ -2165,6 +2229,7 @@ mod tests {
             platform: None,
             manifest_format: Some(MAX_SECTION_FORMAT),
             manifest_features: None,
+            launch: None,
         };
         assert!(
             serde_json::to_value(&bare)
@@ -2205,6 +2270,7 @@ mod tests {
         );
         let only_some = PlanGetRequest {
             manifest_features: Some(vec!["symrefs".into()]),
+            launch: None,
             ..bare.clone()
         };
         let text = r.plan_get(&only_some).unwrap_err().to_string();
@@ -2358,6 +2424,26 @@ mod tests {
             refusal("lease.heartbeat", 404, b"", 3),
             RegistrarError::LeaseLost
         );
+        assert_eq!(
+            refusal(
+                "lease.heartbeat",
+                404,
+                br#"{"reason":"lease-lost","message":"m"}"#,
+                3
+            ),
+            RegistrarError::LeaseLost
+        );
+        // Mend round 4: another launch holds the worktree. No epoch is given — not even the
+        // holder's `live_epoch`, which is never one to adopt (nor a fence of this executor).
+        for body in [
+            &br#"{"reason":"worktree-leased","message":"m"}"#[..],
+            br#"{"reason":"worktree-leased","live_epoch":7}"#,
+        ] {
+            assert_eq!(
+                refusal("plan.get", 409, body, 0),
+                RegistrarError::WorktreeLeased
+            );
+        }
         assert!(matches!(
             refusal(
                 "capture.register",
@@ -2404,6 +2490,7 @@ mod tests {
                 platform: Some(platform.into()),
                 manifest_format: Some(MAX_SECTION_FORMAT),
                 manifest_features: PlanGetRequest::booting(None).manifest_features,
+                launch: None,
             })
             .unwrap()
         };

@@ -220,6 +220,16 @@ impl CaptureRuntime {
                             .store(true, Ordering::Relaxed);
                         this.pause(&runtime);
                     }
+                    // 404 (or 409) `lease-lost`: the lease is not live. Pause now, adopt no
+                    // epoch, and resume when a heartbeat under this identity succeeds again
+                    // (Mend round 4).
+                    Ok(Err(error @ RegistrarError::LeaseLost)) => {
+                        if this.identity().1 != epoch {
+                            continue;
+                        }
+                        tracing::warn!(%error, "lease lost; pausing the harness");
+                        this.pause(&runtime);
+                    }
                     Ok(Err(error)) => {
                         tracing::warn!(%error, "lease heartbeat failed");
                         if last_ok.elapsed() >= cadence.lease_ttl {
@@ -489,17 +499,22 @@ impl CaptureRuntime {
             // launch (cross-repo decision 5). A plan that names none seals nothing.
             engine.set_executor(plan.executor.clone());
             // The registrar of the assigned worktree decides whether dir objects travel in
-            // dir packs from the next snap on.
+            // dir packs from the next snap on, and whether it can hold what a capture holds
+            // (a final flush over a store that cannot is never complete).
             engine.set_dir_format(DirFormat::for_registrar(plan.manifest_format));
+            engine.set_store_features(&plan.manifest_features);
             // A standby executor boots under a placeholder worktree, so the sources of the
             // session it is assigned arrive with this plan, not the boot's.
             sources::apply(self.sink.as_ref(), &plan.sources, &self.layout)
                 .map_err(|e| internal(&format!("capture sources: {e}")))?;
             // Likewise its remotes: the placeholder has none, and the repository here was built
-            // by this executor, never cloned. Only the ones it lacks are added: a remote the
-            // materialized head's `.git/config` carries is the user's.
-            remotes::apply(&self.layout.working_directory, &plan.remotes)
-                .map_err(|e| internal(&format!("capture remotes: {e}")))?;
+            // by this executor, never cloned. A base (a head that carries no `.git/config`) gets
+            // the ones it lacks; a head that carries one is a session's own configuration, and
+            // it is authoritative (review 2026-09-28, fourth pass, #8).
+            if !report.git_config {
+                remotes::apply(&self.layout.working_directory, &plan.remotes)
+                    .map_err(|e| internal(&format!("capture remotes: {e}")))?;
+            }
             self.runner.shipper().reset_after_replan(head_n);
             *self.identity.lock().unwrap_or_else(|e| e.into_inner()) =
                 (plan.worktree_id.clone(), plan.epoch);
@@ -1334,6 +1349,9 @@ mod tests {
         }
         git(&src, &["add", "-A"]);
         git(&src, &["commit", "-q", "-m", "one"]);
+        // A base as Mend registers one carries no repository configuration of a session's (so
+        // the plan's remotes are the ones a re-plan sets).
+        std::fs::remove_file(src.join(".git/config")).unwrap();
         let store = Arc::new(LocalDir::new(&tmp.path().join("store")).unwrap());
         let sink: Arc<dyn BlobSink> = store.clone();
         // The base chain belongs to wt-real at epoch 1.
@@ -1372,6 +1390,7 @@ mod tests {
                 object_ca_pem: None,
                 object_ca_file: None,
                 recovery: false,
+                launch_id: None,
             },
             &ws,
             tmp.path(),
@@ -1396,7 +1415,19 @@ mod tests {
         registrar.set_worktree_id("wt-real");
         registrar.set_live_epoch(1);
         std::fs::write(src.join("lib.rs"), "pub fn f() { g() }\n").unwrap();
-        git(&src, &["commit", "-q", "-am", "two"]);
+        git(
+            &src,
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-q",
+                "-am",
+                "two",
+            ],
+        );
         std::fs::write(src.join("node_modules/pkg/extra.js"), "extra\n").unwrap();
         std::fs::remove_file(src.join("node_modules/pkg/m0.js")).unwrap();
         for (class, seq) in [(Class::Small, 3), (Class::Bulk, 4)] {
@@ -2594,6 +2625,60 @@ mod tests {
         assert!(report.complete, "{report:?}");
         assert_eq!(registrar.chain().len(), registered);
         assert_eq!(registrar.seals().len(), 1);
+    }
+
+    /// A heartbeat answered `lease-lost` (404, Mend round 4) pauses at once — not after the lease
+    /// TTL, as any other heartbeat failure — and adopts no epoch; a heartbeat that succeeds again
+    /// under the same identity resumes. A re-plan refused as `worktree-leased` changes nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_lost_lease_pauses_at_once_and_a_leased_replan_changes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (boot, registrar) = boot_tuned(
+            tmp.path(),
+            |store| store,
+            |config| {
+                config.cadence.heartbeat = Duration::from_millis(50);
+                config.cadence.lease_ttl = Duration::from_secs(600);
+            },
+        );
+        let ws = boot.layout.working_directory.clone();
+        let mut config = RuntimeConfig::new(new_runtime_id());
+        config.workspace_root = ws;
+        let runtime = Runtime::new(config, Arc::new(ShutdownSignal::new(3_000)));
+        runtime.mark_healthy();
+        let capture = CaptureRuntime::new(boot);
+        assert!(runtime.install_capture(capture.clone()));
+        capture.start_without_harness(runtime.clone());
+        let until = |want: bool| {
+            let capture = capture.clone();
+            async move {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while capture.status().paused != want {
+                    assert!(Instant::now() < deadline, "paused never became {want}");
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }
+        };
+        registrar.set_lease_alive(false);
+        until(true).await;
+        let status = capture.status();
+        assert!(!status.fenced);
+        assert_eq!((status.worktree_id.as_str(), status.epoch), ("wt-hooks", 1));
+        registrar.set_lease_alive(true);
+        until(false).await;
+        assert_eq!(capture.status().epoch, 1);
+
+        registrar.set_live_epoch(9);
+        registrar.refuse_plans_leased(1);
+        let refused = tokio::task::spawn_blocking({
+            let capture = capture.clone();
+            move || capture.replan()
+        })
+        .await
+        .unwrap();
+        assert!(refused.is_err());
+        assert_eq!(capture.status().epoch, 1, "no epoch adopted");
+        capture.runner().stop();
     }
 
     /// A recovery boot (Core restarted a retained executor): admission is closed from the start

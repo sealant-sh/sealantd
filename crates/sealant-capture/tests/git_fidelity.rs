@@ -411,6 +411,9 @@ fn a_nested_repository_with_a_raw_name_is_restored() {
 /// A registrar that does not read `git_trees` gets the trees as the two pseudo-refs, as before,
 /// and the capture still restores; a user ref under `refs/sealant/capture/` other than those two
 /// names is restored as the ref it is (a reader drops only the two names it reads as trees).
+/// But such a store cannot hold what the capture read — the raw bytes, a user ref named like a
+/// pseudo-ref — so its final flush is never complete and seals nothing (review 2026-09-28,
+/// fourth pass, #7: it said `complete` over a lossy capture and sealed it).
 #[test]
 fn a_registrar_without_git_trees_gets_the_pseudo_refs() {
     let fx = Fixture::new();
@@ -422,8 +425,18 @@ fn a_registrar_without_git_trees_gets_the_pseudo_refs() {
     let engine = CaptureEngine::open(config, None).unwrap();
     let shipper = Arc::new(engine.shipper(fx.store.clone(), fx.registrar.clone()));
     let runner = CadenceRunner::new(engine, shipper);
-    assert!(runner.flush_final(None).complete());
+    let result = runner.flush_final(None);
+    assert_eq!(
+        result.incomplete.as_ref().map(|i| i.reason()),
+        Some("store-fidelity"),
+        "{result:?}"
+    );
+    assert!(
+        fx.registrar.seals().is_empty(),
+        "a lossy capture is never sealed"
+    );
     let head = fx.registrar.head().unwrap();
+    assert!(head.manifest.final_seal.is_none());
     let section = &head.manifest.sections.git;
     assert!(section.worktree_tree.is_none() && section.raw_tree.is_none());
     assert!(
@@ -647,5 +660,32 @@ fn an_unresolvable_rebase_dependency_is_never_complete() {
         )
         .unwrap();
         fx.final_flush_and_restore();
+    }
+}
+
+/// The lossy fallback that review found (#7): `text eol=lf` over a CRLF file, and a user ref
+/// under the exact name the old format reads a tree from. The store would restore LF and drop
+/// the ref, so the final flush over it is not complete and nothing is sealed — the executor is
+/// kept, never stopped as saved. Asked again, it still is not.
+#[test]
+fn a_lossy_store_never_completes_a_final_flush() {
+    let fx = Fixture::new();
+    fx.ref_with_own_commit(
+        "refs/sealant/capture/worktree",
+        "user branch under the old name",
+    );
+    fs::write(fx.root.join(".gitattributes"), "*.txt text eol=lf\n").unwrap();
+    fs::write(fx.root.join("draft.txt"), b"first\r\nsecond\r\n").unwrap();
+    let mut config = CaptureConfig::new("wt", 1, &fx.root);
+    config.executor = Some("exec-r3".to_owned());
+    config.git_trees = false;
+    let engine = CaptureEngine::open(config, None).unwrap();
+    let shipper = Arc::new(engine.shipper(fx.store.clone(), fx.registrar.clone()));
+    let runner = CadenceRunner::new(engine, shipper);
+    for _ in 0..2 {
+        let result = runner.flush_final(None);
+        assert!(!result.complete(), "{result:?}");
+        assert!(fx.registrar.seals().is_empty());
+        assert!(!runner.final_sealed());
     }
 }

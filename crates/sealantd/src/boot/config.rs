@@ -45,6 +45,7 @@ const CONSUMED_KEYS: &[&str] = &[
     "SEALANT_CAPTURE_CA_FILE",
     "SEALANT_CAPTURE_OBJECT_CA_PEM",
     "SEALANT_CAPTURE_OBJECT_CA_FILE",
+    "SEALANT_CAPTURE_LAUNCH_ID",
     "SEALANT_WORKSPACE_MOUNT_HOST_PATH",
     "SEALANT_MOUNT_ALLOWED_STORE_ROOTS",
     "SEALANT_WORKSPACE_REPO_URL",
@@ -249,6 +250,11 @@ pub struct CaptureSourceConfig {
     /// A recovery boot ([`BootConfig::recovery`]): the disk is resumed as it is, never
     /// materialized over.
     pub recovery: bool,
+    /// `SEALANT_CAPTURE_LAUNCH_ID`: the launch this executor is (cross-repo decisions 5 and
+    /// 11), as the control plane minted it for the session token. The first `plan.get` names
+    /// it (`launch`), and a plan that answers another `executor` refuses the boot. Unset, the
+    /// first `plan.get` names the launch this disk last served, when it recorded one.
+    pub launch_id: Option<String>,
 }
 
 /// How the workspace working directory is provisioned.
@@ -868,6 +874,10 @@ impl BootConfig {
                         .filter(|s| !s.trim().is_empty())
                         .map(PathBuf::from),
                     recovery: false,
+                    launch_id: env
+                        .get("SEALANT_CAPTURE_LAUNCH_ID")
+                        .map(|s| s.trim().to_owned())
+                        .filter(|s| !s.is_empty()),
                 }))
             }
             Some(other) => Err(BootError::config(format!(
