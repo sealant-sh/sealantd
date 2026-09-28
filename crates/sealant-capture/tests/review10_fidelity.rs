@@ -428,6 +428,17 @@ fn out_of_range() -> [(SystemTime, (i64, i64)); 2] {
     ]
 }
 
+/// Whether the filesystem under `dir` stores `at` exactly. Some (ext4 with 128-byte inodes,
+/// as on CI runners) clamp times to 32-bit seconds, so a time before 1901 cannot be set at all.
+fn filesystem_holds(dir: &Path, at: SystemTime, expected: (i64, i64)) -> bool {
+    let probe = dir.join(".time-probe");
+    fs::write(&probe, b"").unwrap();
+    set_time(&probe, at);
+    let held = times_of(&probe) == expected;
+    fs::remove_file(&probe).unwrap();
+    held
+}
+
 fn set_time(path: &Path, at: SystemTime) {
     fs::File::options()
         .read(true)
@@ -463,6 +474,10 @@ fn out_of_range_paths(root: &Path) -> Vec<PathBuf> {
 fn an_automatic_capture_restores_a_time_outside_2262_exactly() {
     for (at, expected) in out_of_range() {
         let fx = Fixture::new();
+        if !filesystem_holds(&fx.root, at, expected) {
+            eprintln!("skipped {expected:?}: this filesystem cannot store that time");
+            continue;
+        }
         let paths = out_of_range_paths(&fx.root);
         for p in &paths {
             set_time(p, at);
