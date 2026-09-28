@@ -2177,9 +2177,11 @@ mod tests {
 
         for _ in 0..3 {
             let (stop, watcher) = watch_status(&capture);
+            let before = capture.runner().snapshot();
             let start = Instant::now();
             let again = runtime.final_flush(None, Some(3_000)).await.unwrap();
             let took = start.elapsed();
+            let after = capture.runner().snapshot();
             stop.store(true, Ordering::SeqCst);
             let seen = watcher.join().unwrap();
             assert!(again.complete, "{again:?}");
@@ -2191,7 +2193,14 @@ mod tests {
                 seen.len(),
                 not_complete.first()
             );
-            assert!(took < Duration::from_millis(100), "took {took:?}");
+            // It snaps nothing (and so answers in milliseconds, not the seconds a walk of the
+            // bulk class takes): read from the runner's counters, not from the wall clock a
+            // loaded runner stretches past any bound.
+            assert_eq!(
+                (after.small_snaps, after.bulk_snaps),
+                (before.small_snaps, before.bulk_snaps),
+                "a repeat final flush snaps nothing (it took {took:?})"
+            );
         }
         assert_eq!(
             registrar.chain().len(),
