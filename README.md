@@ -53,6 +53,50 @@ names the path it could not), the control socket's directory (`SEALANT_CONTROL_S
 `$HOME/.local/state/sealantd/session-journals` (root's default, `/var/lib/sealantd/…`, is not
 one it can create). The harness's `HOME` stays `/root`.
 
+## Capture store: what Core and Mend rely on
+
+A capture-source workspace (`SEALANT_WORKSPACE_SOURCE=capture`, ADR-0015) keeps its work product
+in the control plane's store. The contracts below are the ones the control plane builds against;
+the protocol details live in `crates/sealant-capture/src/registrar.rs` and `manifest.rs`.
+
+- **Capture starts before user code.** The engine starts right after the head is materialized,
+  before dotfiles, lifecycle setup/startup steps and the harness. Every exit after that runs the
+  final flush, and a daemon whose final flush is incomplete exits 75 (`EX_TEMPFAIL`), whatever
+  failed.
+- **Object keys** are `captures/<worktree>/<epoch>/g<generation>/{packs,trees,manifests}/<sha256>`.
+  The generation starts at 0 per worktree and epoch and moves on, durably, before every rebuild
+  of a capture the registrar refused. A key a register was refused for is never written again:
+  what the rebuild uploads, even the same bytes, goes up under the next generation. A key without
+  the `g<n>` segment was written before generations and is read as before.
+- **The git section** (`git_trees` manifest feature, written only when `plan.get` lists it)
+  names `worktree_tree` (the working tree as `git add -A` stages it: what a review diffs),
+  `index_tree` and `raw_tree` in their own fields. `raw_tree` holds every file's bytes as they are
+  on disk, before any clean filter, end-of-line or `working-tree-encoding` conversion; a restore
+  checks it out and writes those bytes back unsmudged. `refs` is then the repository's refs,
+  whatever their names. Without the feature the two trees ride `refs` as
+  `refs/sealant/capture/worktree` and `…/index`, as before. `HEAD` is its immediate target (a
+  symbolic ref chain is kept link by link), and every object `FETCH_HEAD`, `ORIG_HEAD`,
+  `MERGE_HEAD`, a rebase, a cherry-pick sequence or a bisect names is in the packs.
+- **The final seal** (`final_seal.executor`) is `plan.get`'s `executor`, the launch the session
+  token was issued for, and nothing else. A plan that names no executor gets no seal.
+- **`complete` means current.** `capture.status` and the final flush's answer say `complete`
+  only while the disk is as the last final flush captured it. After any later change the watcher
+  reports, or a watcher overflow, they answer `incomplete_reason: "changed"` until a final flush
+  is asked again.
+- **Remotes.** Plan remotes are added only where the repository has no remote of that name. An
+  existing URL is never changed, and a resumed or recovered disk is left as it is.
+- **Recovery reboot.** `sealantd boot --recovery` (or `SEALANT_RECOVERY=1`, or the marker
+  `/.sealantd-recovery`) restarts a daemon that exited on its own disk, with the same boot
+  environment and secret environment file. It never materializes over the disk and runs no
+  dotfiles, lifecycle step or harness, and it admits nothing. It ships the disk's own staging,
+  runs the final flush on its stop or when asked, and exits 0 only when that flush is complete,
+  else 75. It resumes a disk whose staging continues the chain head, or one whose recorded
+  materialize (capture id, executor, epoch) is exactly the head's; any other disk is refused,
+  untouched. One daemon runs per capture disk: every capture boot holds an exclusive lock on
+  `<worktree>/.sealantd/boot.lock`, and a second boot beside a live one exits 75 without touching
+  anything. On a still-running MicroVM, Core's agent stops every process the dead daemon left,
+  then spawns `sealantd boot --recovery` exactly as it spawned `sealantd boot`.
+
 ## Build & validate
 
 ```

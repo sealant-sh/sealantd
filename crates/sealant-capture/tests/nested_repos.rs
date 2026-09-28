@@ -9,7 +9,6 @@ use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
 
-use sealant_capture::manifest::WORKTREE_TREE_REF;
 use sealant_capture::{
     CaptureConfig, CaptureEngine, CaptureKind, Class, InMemoryRegistrar, LocalDir,
     MaterializeClass, MaterializeTargets, Materializer, SnapRequest,
@@ -80,7 +79,13 @@ fn nested_repositories_round_trip_through_the_chunked_class() {
             seq: 1,
         })
         .unwrap();
-    let wt_tree = &staged.manifest.manifest.sections.git.refs[WORKTREE_TREE_REF];
+    let wt_tree = staged
+        .manifest
+        .manifest
+        .sections
+        .git
+        .worktree_tree_id()
+        .unwrap();
     let entries = git(&root, &["ls-tree", "-r", wt_tree]);
     assert!(entries.contains("notes.md"), "{entries}");
     assert!(!entries.contains("vendor/x"), "{entries}");

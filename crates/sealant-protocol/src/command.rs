@@ -993,7 +993,10 @@ pub struct CaptureStatusReport {
     /// Why `complete` is false: `not-final`, `in-progress` (a final flush is running),
     /// `processes-remain`, `sweep-unavailable`, `snapshot-failed` (a final snap failed, or a
     /// class's last snap did: `snaps`), `unreadable`, `fenced`, `conflict`, `deadline`,
-    /// `ship-failed`, `pending` or `internal`. Absent when `complete`.
+    /// `ship-failed`, `pending`, `sealing`, `changed` (the disk changed after the final flush,
+    /// or its changes can no longer be observed — a watcher overflow, a class that polls: a
+    /// final flush asked again snaps again and can answer complete) or `internal`. Absent when
+    /// `complete`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub incomplete_reason: Option<String>,
     /// Paths the last snap of each class could not read, summed over both classes (a

@@ -7,7 +7,6 @@ use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
 
-use sealant_capture::manifest::{INDEX_TREE_REF, WORKTREE_TREE_REF};
 use sealant_capture::{
     CaptureConfig, CaptureEngine, CaptureKind, Class, InMemoryRegistrar, LocalDir,
     MaterializeClass, MaterializeTargets, Materializer, SnapRequest,
@@ -37,14 +36,13 @@ fn exclude_lines(root: &Path) -> Vec<String> {
         .collect()
 }
 
-fn assert_tree_clean(root: &Path, refs: &std::collections::BTreeMap<String, String>, name: &str) {
-    let tree = &refs[name];
+fn assert_tree_clean(root: &Path, tree: &str) {
     let listing = git(root, &["ls-tree", "-r", "--name-only", tree]);
     assert!(
         !listing.lines().any(|l| l.starts_with(".sealantd")),
-        "{name} carries daemon internals:\n{listing}"
+        "{tree} carries daemon internals:\n{listing}"
     );
-    assert!(listing.contains("src/a.txt"), "{name}:\n{listing}");
+    assert!(listing.contains("src/a.txt"), "{tree}:\n{listing}");
 }
 
 #[test]
@@ -101,9 +99,10 @@ fn staging_never_enters_the_git_section() {
             seq: 2,
         })
         .unwrap();
-    let refs = &staged.manifest.manifest.sections.git.refs;
-    assert_tree_clean(&root, refs, INDEX_TREE_REF);
-    assert_tree_clean(&root, refs, WORKTREE_TREE_REF);
+    let git = &staged.manifest.manifest.sections.git;
+    assert_tree_clean(&root, git.index_tree_id().unwrap());
+    assert_tree_clean(&root, git.worktree_tree_id().unwrap());
+    assert_tree_clean(&root, git.checkout_tree_id().unwrap());
 
     // Without the local exclude the worktree-tree helper still keeps it out on its own.
     fs::write(root.join(".git/info/exclude"), "").unwrap();
@@ -116,8 +115,13 @@ fn staging_never_enters_the_git_section() {
         .unwrap();
     assert_tree_clean(
         &root,
-        &staged.manifest.manifest.sections.git.refs,
-        WORKTREE_TREE_REF,
+        staged
+            .manifest
+            .manifest
+            .sections
+            .git
+            .worktree_tree_id()
+            .unwrap(),
     );
 
     // A materialized tree carries the exclude before anything runs in it.

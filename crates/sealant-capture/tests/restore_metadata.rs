@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use nix::sys::stat::{UtimensatFlags, utimensat};
 use nix::sys::time::TimeSpec;
-use sealant_capture::manifest::{WORKTREE_TREE_REF, WorktreeMeta};
+use sealant_capture::manifest::WorktreeMeta;
 use sealant_capture::materialize::MaterializeError;
 use sealant_capture::pack::PackReader;
 use sealant_capture::registrar::HeadInfo;
@@ -597,10 +597,8 @@ fn an_overlay_that_cannot_be_applied_fails_the_materialize() {
     // The tree of the commit (no untracked files) under the overlay of the working tree.
     let mut odd = head.manifest.clone();
     let commit_tree = git(&fx.root, &["rev-parse", "HEAD^{tree}"]);
-    odd.sections
-        .git
-        .refs
-        .insert(WORKTREE_TREE_REF.to_owned(), commit_tree);
+    odd.sections.git.worktree_tree = Some(commit_tree.clone());
+    odd.sections.git.raw_tree = Some(commit_tree);
     let err = Materializer::new(
         sink.as_ref(),
         MaterializeTargets::new(&fx.base.join("odd"), None),

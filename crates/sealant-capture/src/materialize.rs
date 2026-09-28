@@ -57,8 +57,8 @@ use crate::index::{self, DAEMON_DIR, FileStat, IndexedFile, Listing, TreeIndex};
 use crate::keys::key_digest;
 use crate::longpath;
 use crate::manifest::{
-    EncodedManifest, FORMAT_DIR_OBJECTS, FORMAT_DIR_PACKS, FsckStatus, INDEX_TREE_REF,
-    MAX_SECTION_FORMAT, Manifest, TreeRef, WORKTREE_META_FORMAT, WORKTREE_TREE_REF, WorktreeMeta,
+    EncodedManifest, FORMAT_DIR_OBJECTS, FORMAT_DIR_PACKS, FsckStatus, MAX_SECTION_FORMAT,
+    Manifest, TreeRef, WORKTREE_META_FORMAT, WorktreeMeta,
 };
 use crate::pack::{PackError, PackReader};
 use crate::roots::ClassRoots;
@@ -271,10 +271,32 @@ pub struct DiskState {
     pub workspace: TreeIndex,
     /// Bulk class index (paths relative to the root).
     pub bulk: TreeIndex,
-    /// The `WORKTREE_TREE_REF` tree the working tree was last brought to.
+    /// The tree the working tree was last brought to (the git section's raw tree when it has
+    /// one, else its worktree tree).
     pub worktree_tree: Option<String>,
-    /// The `INDEX_TREE_REF` tree the index was last read from.
+    /// The index tree the index was last read from.
     pub index_tree: Option<String>,
+    /// The capture the last completed materialize brought the disk to, and under which lease
+    /// epoch and executor ([`MaterializedCapture`]). The caller that knows them records it
+    /// once a materialize completed ([`DiskState::record_capture`]); a materialize clears it
+    /// before it writes anything, so an interrupted one leaves none.
+    pub capture: Option<MaterializedCapture>,
+}
+
+/// What a completed materialize brought the disk to: the capture id, and the lease epoch and
+/// executor (the launch `plan.get` named) it was materialized under. A recovery boot that finds
+/// no staging continuing the head resumes a disk only when this names the plan's head, under
+/// the plan's executor, at an epoch no later than the plan's (review 2026-09-28 #22): equal
+/// worktree trees said nothing of the refs, index, bulk or metadata beside them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MaterializedCapture {
+    /// The capture id.
+    pub capture_id: String,
+    /// The lease epoch.
+    pub epoch: u64,
+    /// The executor `plan.get` named, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executor: Option<String>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -282,6 +304,8 @@ struct MaterializedRecord {
     worktree_tree: Option<String>,
     #[serde(default)]
     index_tree: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    capture: Option<MaterializedCapture>,
 }
 
 impl DiskState {
@@ -297,7 +321,15 @@ impl DiskState {
             bulk: TreeIndex::load(&index_dir.join("bulk.json")),
             worktree_tree: record.worktree_tree,
             index_tree: record.index_tree,
+            capture: record.capture,
         }
+    }
+
+    /// Record in `index_dir` that the disk holds `capture` (a materialize of it completed).
+    pub fn record_capture(index_dir: &Path, capture: MaterializedCapture) -> io::Result<()> {
+        let mut state = Self::load(index_dir);
+        state.capture = Some(capture);
+        state.save(index_dir)
     }
 
     /// Save to `index_dir` (write-then-rename per file).
@@ -312,6 +344,7 @@ impl DiskState {
             serde_json::to_vec(&MaterializedRecord {
                 worktree_tree: self.worktree_tree.clone(),
                 index_tree: self.index_tree.clone(),
+                capture: self.capture.clone(),
             })?,
         )?;
         fs::rename(tmp, path)
@@ -319,7 +352,7 @@ impl DiskState {
 }
 
 /// Workspace-class virtual paths the git class owns and the workspace sweep never removes:
-/// the index is rebuilt from [`INDEX_TREE_REF`] (and overwritten by the captured bytes when
+/// the index is rebuilt from the index tree (and overwritten by the captured bytes when
 /// the workspace class carries them). A plan whose workspace class does not name it — a base
 /// capture the control plane authored from a bare repository has an empty workspace root —
 /// must not lose it: without an index git takes every tracked path that matches an ignore
@@ -455,6 +488,11 @@ impl<'a> Materializer<'a> {
         state: &mut DiskState,
     ) -> Result<MaterializeReport, MaterializeError> {
         let mut report = MaterializeReport::default();
+        // What the disk held is about to change: until the caller records the capture this
+        // materialize brings it to, it names none.
+        if state.capture.take().is_some() {
+            state.save(&self.targets.index_dir)?;
+        }
         fs::create_dir_all(&self.targets.root).at("mkdir -p", &self.targets.root)?;
         fs::create_dir_all(&self.targets.cache_dir).at("mkdir -p", &self.targets.cache_dir)?;
         let roots = self.targets.roots();
@@ -660,9 +698,10 @@ impl<'a> Materializer<'a> {
     /// Every path of the plan's worktree tree (files, symlinks, directories), relative to the
     /// root; empty when the root is not a repository or does not hold the tree.
     fn tracked_paths(&self, manifest: &Manifest) -> Result<BTreeSet<String>, MaterializeError> {
-        let Some(tree) = manifest.sections.git.refs.get(WORKTREE_TREE_REF) else {
+        let Some(tree) = manifest.sections.git.checkout_tree_id().map(str::to_owned) else {
             return Ok(BTreeSet::new());
         };
+        let tree = &tree;
         let Ok(repo) = GitRepo::open(&self.targets.root) else {
             return Ok(BTreeSet::new());
         };
@@ -740,28 +779,49 @@ impl<'a> Materializer<'a> {
                 report.git_packs += 1;
             }
         }
-        gitpack::write_packed_refs(&repo, &git.refs, &git.symrefs)?;
+        // Every ref the repository held, whatever its name; an older manifest's two pseudo-refs
+        // are its trees, not refs.
+        gitpack::write_packed_refs(&repo, &git.refs_to_restore(), &git.symrefs)?;
         gitpack::write_head(&repo, &git.head)?;
-        if let Some(tree) = git.refs.get(WORKTREE_TREE_REF) {
+        if let Some(tree) = git.checkout_tree_id() {
+            let tree = &tree.to_owned();
             let excludes = vec![DAEMON_DIR.to_owned()];
             // The tree last checked out is trusted only while its objects are still here.
             let from = state.worktree_tree.clone().filter(|t| {
                 repo.existing(std::slice::from_ref(t))
                     .is_ok_and(|e| !e.is_empty())
             });
-            match from {
+            let written = match from {
                 Some(from) => {
-                    let changed =
-                        gitpack::checkout_tree_from(&repo, &from, tree, &self.targets.scratch_dir)?;
-                    report.git_paths_changed = Some(changed);
+                    let changed = gitpack::checkout_tree_changing(
+                        &repo,
+                        &from,
+                        tree,
+                        &self.targets.scratch_dir,
+                    )?;
+                    report.git_paths_changed = Some(changed.len() as u64);
+                    Some(changed)
                 }
                 None => {
                     gitpack::checkout_tree(&repo, tree, &self.targets.scratch_dir)?;
+                    None
+                }
+            };
+            // A raw tree holds the captured bytes: whatever git's attributes smudged or
+            // converted on the way out is written back as it was captured.
+            if git.raw_tree.is_some() {
+                let rewritten = gitpack::restore_raw_bytes(&repo, tree, written.as_deref())?;
+                if rewritten > 0 {
+                    tracing::debug!(
+                        rewritten,
+                        "materialize: wrote captured bytes over git's conversion"
+                    );
                 }
             }
-            for rel in
+            for key in
                 gitpack::untracked_against(&repo, tree, &self.targets.scratch_dir, &excludes)?
             {
+                let rel = crate::tree::os_of_key(&key);
                 // A path git cannot reach is the chunked class's to keep or sweep.
                 if worktree_meta::beyond_git(rel.as_bytes(), false) {
                     continue;
@@ -775,12 +835,12 @@ impl<'a> Materializer<'a> {
             }
             state.worktree_tree = Some(tree.clone());
         }
-        if let Some(tree) = git.refs.get(INDEX_TREE_REF)
+        if let Some(tree) = git.index_tree_id()
             && state.index_tree.as_deref() != Some(tree)
         {
             // The workspace class overwrites this with the captured index bytes when it has them.
             gitpack::read_tree_into_index(&repo, tree)?;
-            state.index_tree = Some(tree.clone());
+            state.index_tree = Some(tree.to_owned());
         }
         if report.git_packs > 0 || report.git_paths_changed.is_none() {
             report.fsck = Some(repo.fsck()?);

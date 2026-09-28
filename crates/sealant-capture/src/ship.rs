@@ -11,7 +11,7 @@
 //! Smaller objects go up [`DEFAULT_UPLOADS_IN_FLIGHT`] at a time, a batch of URLs minted in one
 //! channel call ahead of their PUTs; their threads' CPU is charged to the cycle as well.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -149,12 +149,11 @@ pub struct HeldCapture {
     pub retry_at: Instant,
 }
 
-/// A capture the registrar refused to register (422 `missing-objects` / `unrestorable`) that
-/// uploading its own objects again did not fix: an object it names is one it did not stage (a
-/// pack an earlier capture uploaded, which retention removed while this executor's chunk index
-/// still pointed at it), or the same capture was refused twice. The engine rebuilds it from
-/// disk in its place — same `n`, same parent, the named packs forgotten so their chunks are read
-/// and packed again — and nothing is dropped: the captures staged after it are folded into the
+/// A capture the registrar refused to register (422 `missing-objects` / `unrestorable`): an
+/// object it names is not in the store, or was condemned by retention and is refused by name
+/// for good. The engine rebuilds it from disk in its place — same `n`, same parent, the named
+/// packs forgotten so their chunks are read and packed again, under a new key generation so no
+/// key the refusal named is ever put again ([`crate::keys`]) — and nothing is dropped: the captures staged after it are folded into the
 /// rebuilt one, which holds the disk as it is now ([`crate::engine::CaptureEngine::repair`]).
 /// Kept in staging (`repair.json`), so a restart finishes it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -279,6 +278,10 @@ pub enum ShipError {
 
 /// The file (beside `queue/`) that makes a restage one step: see [`Staging::restage`].
 const RESTAGE_JOURNAL: &str = "restage.json";
+
+/// The file (beside `queue/`) holding every identity's key generation (`<worktree>/<epoch>` →
+/// generation; [`Staging::key_generation`]).
+const KEY_GENERATIONS: &str = "key-generations.json";
 
 /// The file (beside `queue/`) holding a [`RepairRequest`].
 const REPAIR_REQUEST: &str = "repair.json";
@@ -569,37 +572,97 @@ impl Staging {
         self.dir.join("queue").join(format!("{n:020}.json"))
     }
 
-    fn marker_dir(&self) -> PathBuf {
+    /// Where the acks of objects uploaded under the current identity and key `generation` are
+    /// kept (`None`: keys written before generations, whose acks sit directly under the
+    /// identity, where an older build left them).
+    fn marker_dir_of(&self, generation: Option<u64>) -> PathBuf {
         let (worktree_id, epoch) = self.identity();
-        self.dir
+        let dir = self
+            .dir
             .join("uploaded")
             .join(worktree_id.replace('/', "_"))
-            .join(epoch.to_string())
+            .join(epoch.to_string());
+        match generation {
+            Some(generation) => dir.join(format!("g{generation}")),
+            None => dir,
+        }
     }
 
-    fn marker_path(&self, file: &str) -> PathBuf {
-        self.marker_dir().join(file)
+    fn marker_dir(&self) -> PathBuf {
+        self.marker_dir_of(Some(self.key_generation()))
     }
 
-    /// Whether an object file was acked as uploaded.
+    /// The ack of `file` uploaded to `key`: kept per key generation, since an object file (named
+    /// by its content) goes up under a new key in each generation it is staged in.
+    fn marker_path(&self, key: &str, file: &str) -> PathBuf {
+        self.marker_dir_of(crate::keys::key_generation(key))
+            .join(file)
+    }
+
+    /// Whether an object file was acked as uploaded to `key`.
     #[must_use]
-    pub fn is_uploaded(&self, file: &str) -> bool {
-        self.marker_path(file).exists()
+    pub fn is_uploaded(&self, key: &str, file: &str) -> bool {
+        self.marker_path(key, file).exists()
     }
 
-    /// Ack an object file.
-    pub fn mark_uploaded(&self, file: &str) -> io::Result<()> {
-        let path = self.marker_path(file);
+    /// Whether an object file was acked as uploaded under the current key generation.
+    #[must_use]
+    pub fn is_uploaded_now(&self, file: &str) -> bool {
+        self.marker_dir().join(file).exists()
+    }
+
+    /// Ack an object file uploaded to `key`.
+    pub fn mark_uploaded(&self, key: &str, file: &str) -> io::Result<()> {
+        let path = self.marker_path(key, file);
+        if let Some(dir) = path.parent() {
+            fs::create_dir_all(dir).at("mkdir -p", dir)?;
+        }
         fs::write(&path, b"").at("write", &path)
     }
 
-    /// Drop an object file's ack (the registrar said the store does not hold it): the next
-    /// upload of an entry listing it puts it again, and a build stages it again.
-    pub fn unmark_uploaded(&self, file: &str) -> io::Result<()> {
-        match fs::remove_file(self.marker_path(file)) {
+    /// Drop an object file's ack for `key` (the registrar said the store does not hold it): a
+    /// build stages it again.
+    pub fn unmark_uploaded(&self, key: &str, file: &str) -> io::Result<()> {
+        match fs::remove_file(self.marker_path(key, file)) {
             Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
             _ => Ok(()),
         }
+    }
+
+    /// The key generation objects are staged under now, for the current identity
+    /// ([`crate::keys`]): 0 until a refused capture is first rebuilt.
+    #[must_use]
+    pub fn key_generation(&self) -> u64 {
+        let (worktree_id, epoch) = self.identity();
+        self.key_generations()
+            .get(&format!("{worktree_id}/{epoch}"))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn key_generations(&self) -> BTreeMap<String, u64> {
+        fs::read(self.dir.join(KEY_GENERATIONS))
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default()
+    }
+
+    /// Move the current identity's key generation on, durably, before anything is staged under
+    /// it (a refused capture is about to be rebuilt): nothing staged from now on reuses a key
+    /// the registrar may have condemned. Returns the new generation.
+    pub fn next_key_generation(&self) -> io::Result<u64> {
+        let (worktree_id, epoch) = self.identity();
+        let mut all = self.key_generations();
+        let slot = all.entry(format!("{worktree_id}/{epoch}")).or_insert(0);
+        *slot += 1;
+        let next = *slot;
+        let path = self.dir.join(KEY_GENERATIONS);
+        let tmp = path.with_extension("tmp");
+        write_synced(&tmp, &serde_json::to_vec(&all)?)?;
+        fs::rename(&tmp, &path).at("rename into", &path)?;
+        sync_dir(&self.dir);
+        fs::create_dir_all(self.marker_dir())?;
+        Ok(next)
     }
 
     /// Ask the engine to rebuild a refused capture from disk ([`RepairRequest`]).
@@ -814,7 +877,7 @@ impl Staging {
         entries
             .iter()
             .flat_map(|e| &e.uploads)
-            .filter(|u| seen.insert(u.file.as_str()) && !self.is_uploaded(&u.file))
+            .filter(|u| seen.insert(u.key.as_str()) && !self.is_uploaded(&u.key, &u.file))
             .map(|u| u.bytes)
             .sum()
     }
@@ -846,7 +909,7 @@ impl Staging {
             let name = name.to_string_lossy();
             if d.file_type()?.is_file()
                 && !listed.contains(name.as_ref())
-                && !self.is_uploaded(&name)
+                && !self.is_uploaded_now(&name)
             {
                 total += d.metadata()?.len();
             }
@@ -1240,17 +1303,20 @@ impl Shipper {
             .is_some_and(|r| r.n == entry.n && r.capture_id == entry.capture_id)
     }
 
-    /// The registrar refused `entry`. First time, when every key it named is one of the
-    /// entry's own staged objects (every key, when it named none): drop those acks so the
-    /// objects are uploaded again, each checked against the store, and register again (`true`).
-    /// Otherwise — a key the entry did not stage, a staged file already swept, or the same
-    /// capture refused again — ask the engine to rebuild it from disk (`false`).
+    /// The registrar refused `entry`: ask the engine to rebuild it from disk (nothing registers
+    /// until it has). Never by putting the same keys again (cross-repo decision 6):
+    /// a key a register was refused for may be one retention condemned, which the registrar
+    /// refuses for good — and a delete retention paused would take it back out of the store
+    /// under any capture that named it again. The rebuild moves the key generation on first
+    /// ([`Staging::next_key_generation`]), so what it uploads, even the same bytes, goes up
+    /// under keys no refusal ever named. (Before, the first refusal of a capture whose named
+    /// keys it had staged itself put those same keys again.)
     fn after_refusal(
         &self,
         entry: &QueueEntry,
         reason: &str,
         missing: &[String],
-    ) -> io::Result<bool> {
+    ) -> io::Result<()> {
         self.status
             .register_refusals
             .fetch_add(1, Ordering::Relaxed);
@@ -1271,18 +1337,6 @@ impl Shipper {
             });
             refusals
         };
-        let objects = self.staging.objects_dir();
-        let own: Vec<&Upload> = entry
-            .uploads
-            .iter()
-            .filter(|u| missing.is_empty() || missing.contains(&u.key))
-            .collect();
-        let all_named_staged = missing
-            .iter()
-            .all(|k| entry.uploads.iter().any(|u| &u.key == k));
-        // A file swept after an earlier ack can be put again only if the store still has it,
-        // which is what a refusal says it does not.
-        let reuploadable = own.iter().all(|u| objects.join(&u.file).exists());
         tracing::warn!(
             n = entry.n,
             capture = %entry.capture_id,
@@ -1292,12 +1346,6 @@ impl Shipper {
             refusals,
             "capture register refused; the capture stays queued"
         );
-        if refusals == 1 && all_named_staged && reuploadable {
-            for u in own {
-                self.staging.unmark_uploaded(&u.file)?;
-            }
-            return Ok(true);
-        }
         self.staging.request_repair(&RepairRequest {
             n: entry.n,
             capture_id: entry.capture_id.clone(),
@@ -1312,7 +1360,7 @@ impl Shipper {
             "the refused capture is rebuilt from disk in its place"
         );
         self.call_repair_hook();
-        Ok(false)
+        Ok(())
     }
 
     fn held_back(&self, entry: &QueueEntry) -> bool {
@@ -1366,7 +1414,7 @@ impl Shipper {
 
     /// Upload one object with retry and ack it; nothing is paced here.
     fn put_object(&self, u: &Upload) -> Result<(), ShipError> {
-        if self.staging.is_uploaded(&u.file) {
+        if self.staging.is_uploaded(&u.key, &u.file) {
             return Ok(());
         }
         let path = self.staging.objects_dir().join(&u.file);
@@ -1376,7 +1424,7 @@ impl Shipper {
                 // The bytes were swept after an earlier ack of another entry; the store has them.
                 match self.sink.exists(&u.key) {
                     Ok(true) => {
-                        self.staging.mark_uploaded(&u.file)?;
+                        self.staging.mark_uploaded(&u.key, &u.file)?;
                         return Ok(());
                     }
                     Ok(false) => {
@@ -1413,7 +1461,7 @@ impl Shipper {
                                 self.status.already_present.fetch_add(1, Ordering::Relaxed);
                             }
                         }
-                        self.staging.mark_uploaded(&u.file)?;
+                        self.staging.mark_uploaded(&u.key, &u.file)?;
                         self.lease_ok();
                         return Ok(());
                     }
@@ -1477,7 +1525,7 @@ impl Shipper {
         let objects = self.staging.objects_dir();
         let single_put = |u: &Upload| {
             u.bytes < self.multipart.threshold
-                && !self.staging.is_uploaded(&u.file)
+                && !self.staging.is_uploaded(&u.key, &u.file)
                 && objects.join(&u.file).exists()
         };
         let mut start = 0;
@@ -1702,7 +1750,7 @@ impl Shipper {
             && entry
                 .uploads
                 .iter()
-                .any(|u| !self.staging.is_uploaded(&u.file))
+                .any(|u| !self.staging.is_uploaded(&u.key, &u.file))
     }
 
     /// One pass over the queue for `scope`, holding the pass lock. `flushing`: the caller is a
@@ -1873,14 +1921,12 @@ impl Shipper {
                     self.lease_lost();
                     return Ok(pass);
                 }
-                // Never dropped: uploaded again, or rebuilt from disk in its place.
+                // Never dropped: rebuilt from disk in its place, under fresh keys.
                 Err(ShipError::RegisterRefused {
                     reason, missing, ..
                 }) => {
                     self.staging.release();
-                    if self.after_refusal(entry, &reason, &missing)? {
-                        continue;
-                    }
+                    self.after_refusal(entry, &reason, &missing)?;
                     pass.repair = Some(entry.n);
                     return Ok(pass);
                 }
@@ -2195,6 +2241,9 @@ mod tests {
                             head: "HEAD".into(),
                             fsck: crate::manifest::FsckStatus::Unverified,
                             symrefs: std::collections::BTreeMap::new(),
+                            worktree_tree: None,
+                            index_tree: None,
+                            raw_tree: None,
                         },
                         workspace: crate::manifest::WorkspaceSection::objects(
                             String::new(),

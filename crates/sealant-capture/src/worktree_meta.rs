@@ -297,7 +297,8 @@ pub struct MetaScope {
     pub excludes: Vec<String>,
     /// Directory names the bulk class carries wherever they appear.
     pub bulk_dirs: Vec<String>,
-    /// Root-relative nested repositories (the workspace class carries them).
+    /// Root-relative nested repositories (the workspace class carries them), as
+    /// [`crate::tree::key_of`] keys.
     pub nested: Vec<String>,
     /// Absolute paths left out (the staging directory, the harness home).
     pub skip_abs: Vec<PathBuf>,
@@ -305,7 +306,9 @@ pub struct MetaScope {
 
 fn under(rel: &[u8], set: &[String]) -> bool {
     set.iter().any(|e| {
-        let e = e.trim_matches('/').as_bytes();
+        // Keys of the paths' bytes: a nested repository whose name is not UTF-8 is its bytes.
+        let e = crate::tree::bytes_of(e.trim_matches('/'));
+        let e = e.as_ref();
         !e.is_empty()
             && (rel == e
                 || rel

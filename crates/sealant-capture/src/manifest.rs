@@ -6,11 +6,17 @@
 //!
 //! Layout conventions this crate adds on top of the ADR fields:
 //!
-//! - `sections.git.refs` carries two pseudo-refs beside the repository's refs:
-//!   [`WORKTREE_TREE_REF`] (a tree object of the working tree at snap time: tracked files with
-//!   their uncommitted edits plus untracked, non-ignored files) and [`INDEX_TREE_REF`] (the tree
-//!   written from the index). Both are pack closure tips; the materializer never writes them to
-//!   `packed-refs`.
+//! - The git section names two trees beside the repository's refs: the worktree tree (a tree
+//!   object of the working tree at snap time: tracked files with their uncommitted edits plus
+//!   untracked, non-ignored files, as `git add -A` would stage them) and the index tree (the tree
+//!   written from the index). Both are pack closure tips. A capture of this build writes them in
+//!   their own fields, `worktree_tree` and `index_tree` (the `git_trees` manifest feature), beside
+//!   `raw_tree` — the worktree tree with every file's blob holding the bytes on disk, before any
+//!   clean filter, end-of-line or encoding conversion git's attributes would apply — and `refs`
+//!   holds the repository's refs only, whatever their names. Before, the two trees rode `refs` as
+//!   the pseudo-refs [`WORKTREE_TREE_REF`] and [`INDEX_TREE_REF`] (and still do for a registrar
+//!   that does not read `git_trees`): a reader of such a manifest takes those two exact names as
+//!   the trees and every other name as a ref ([`GitSection::refs_to_restore`]).
 //! - The workspace dir object's root has three children: `.git/` (the repository's bookkeeping
 //!   minus objects, refs, `HEAD` and `packed-refs`), `tree/` (git-ignored files and nested
 //!   repositories under the worktree that are not bulk) and `harness/` (the harness home).
@@ -45,12 +51,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::chunk::{ChunkId, sha256_hex};
 
-/// Pseudo-ref naming the working-tree tree object in `sections.git.refs`.
+/// The name the worktree tree rides `sections.git.refs` under in a manifest without
+/// `worktree_tree` (written before the `git_trees` feature, or for a registrar that does not
+/// read it). In a manifest with `worktree_tree` it is an ordinary ref name like any other.
 pub const WORKTREE_TREE_REF: &str = "refs/sealant/capture/worktree";
-/// Pseudo-ref naming the index tree object in `sections.git.refs`.
+/// The name the index tree rides `sections.git.refs` under in a manifest without
+/// `worktree_tree`; see [`WORKTREE_TREE_REF`].
 pub const INDEX_TREE_REF: &str = "refs/sealant/capture/index";
-/// Prefix of every pseudo-ref the materializer must not write to `packed-refs`.
-pub const PSEUDO_REF_PREFIX: &str = "refs/sealant/capture/";
 
 /// Why a capture was taken.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -128,6 +135,79 @@ pub struct GitSection {
     /// empty, so a manifest without one encodes exactly as before.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub symrefs: BTreeMap<String, String>,
+    /// The worktree tree (`git_trees`): the working tree as `git add -A` stages it, with the
+    /// repository's own attributes and filters — what a review diffs against a commit. When
+    /// present, `refs` holds the repository's refs only (a ref named
+    /// `refs/sealant/capture/worktree` is the user's); absent, the tree rides `refs` as
+    /// [`WORKTREE_TREE_REF`] and so does the index tree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_tree: Option<String>,
+    /// The index tree (`git_trees`), when the index could be written as one (not when it has
+    /// unmerged entries). Read only when `worktree_tree` is present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index_tree: Option<String>,
+    /// The raw tree (`git_trees`): the worktree tree with every regular file's blob holding
+    /// the file's bytes as they are on disk — no clean filter, no end-of-line or
+    /// `working-tree-encoding` conversion, no `ident` collapse. A restore checks this tree out
+    /// and writes each file's bytes as they are, never smudged. Absent in a manifest without
+    /// `worktree_tree`, whose restore checks the worktree tree out as git would.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_tree: Option<String>,
+}
+
+impl GitSection {
+    /// Whether this section names its trees in their own fields (`git_trees`) rather than as
+    /// pseudo-refs in `refs`.
+    #[must_use]
+    pub fn has_tree_fields(&self) -> bool {
+        self.worktree_tree.is_some()
+    }
+
+    /// The worktree tree: `worktree_tree`, else the [`WORKTREE_TREE_REF`] entry of `refs`.
+    #[must_use]
+    pub fn worktree_tree_id(&self) -> Option<&str> {
+        match &self.worktree_tree {
+            Some(tree) => Some(tree),
+            None => self.refs.get(WORKTREE_TREE_REF).map(String::as_str),
+        }
+    }
+
+    /// The index tree: `index_tree` when the section names its trees in fields, else the
+    /// [`INDEX_TREE_REF`] entry of `refs`.
+    #[must_use]
+    pub fn index_tree_id(&self) -> Option<&str> {
+        if self.has_tree_fields() {
+            self.index_tree.as_deref()
+        } else {
+            self.refs.get(INDEX_TREE_REF).map(String::as_str)
+        }
+    }
+
+    /// The tree a restore checks out: `raw_tree` when the section has one (its files' bytes are
+    /// written as they are), else the worktree tree (checked out as git would).
+    #[must_use]
+    pub fn checkout_tree_id(&self) -> Option<&str> {
+        self.raw_tree.as_deref().or_else(|| self.worktree_tree_id())
+    }
+
+    /// Whether `name` in `refs` is a pseudo-ref of a section written before `git_trees` (the
+    /// worktree or index tree), not one of the repository's refs.
+    #[must_use]
+    pub fn is_legacy_pseudo_ref(&self, name: &str) -> bool {
+        !self.has_tree_fields() && (name == WORKTREE_TREE_REF || name == INDEX_TREE_REF)
+    }
+
+    /// The repository's refs, as a restore writes them: every entry of `refs` except, in a
+    /// section written before `git_trees`, the two pseudo-refs. Before, a restore dropped every
+    /// name under `refs/sealant/capture/`, a user's own ref among them.
+    #[must_use]
+    pub fn refs_to_restore(&self) -> BTreeMap<String, String> {
+        self.refs
+            .iter()
+            .filter(|(name, _)| !self.is_legacy_pseudo_ref(name))
+            .map(|(name, sha)| (name.clone(), sha.clone()))
+            .collect()
+    }
 }
 
 /// Section format 1: every dir object is its own object at `…/trees/<sha256>`, and `root` and
@@ -197,7 +277,7 @@ pub struct TreeRef<'a> {
 pub const WORKTREE_META_FORMAT: u32 = 1;
 
 /// The worktree metadata overlay: what a git tree does not carry about the working tree the
-/// [`WORKTREE_TREE_REF`] tree describes — exact mode bits, nanosecond mtimes of files, symlinks
+/// worktree tree describes — exact mode bits, nanosecond mtimes of files, symlinks
 /// and directories (the root included), directories git does not track (empty ones among them)
 /// and hardlink groups. The document is JSON ([`crate::worktree_meta::MetaDocument`]), CDC
 /// chunked into the workspace section's packs: every key in `packs` is also in the section's
@@ -457,8 +537,8 @@ pub struct FinalSeal {
     pub complete: bool,
     /// The lease epoch the sealing capture registers under.
     pub epoch: u64,
-    /// The executor sealantd was planned as: `plan.get`'s `executor`, else
-    /// `SEALANT_WORKSPACE_ID`.
+    /// The executor sealantd was planned as: `plan.get`'s `executor` (the launch the session
+    /// token was issued for), and nothing else.
     pub executor: String,
 }
 
@@ -497,12 +577,20 @@ impl Manifest {
         })
     }
 
-    /// Every ref value plus `head` when it is a sha: the pack closure tips of this capture.
+    /// Every ref value, the trees the git section names, plus `head` when it is a sha: the pack
+    /// closure tips of this capture.
     #[must_use]
     pub fn git_tips(&self) -> Vec<String> {
-        let mut tips: Vec<String> = self.sections.git.refs.values().cloned().collect();
-        if !self.sections.git.head.starts_with("refs/") {
-            tips.push(self.sections.git.head.clone());
+        let git = &self.sections.git;
+        let mut tips: Vec<String> = git.refs.values().cloned().collect();
+        tips.extend(
+            [&git.worktree_tree, &git.index_tree, &git.raw_tree]
+                .into_iter()
+                .flatten()
+                .cloned(),
+        );
+        if !git.head.starts_with("refs/") {
+            tips.push(git.head.clone());
         }
         tips.sort();
         tips.dedup();
@@ -561,6 +649,9 @@ mod tests {
                     head: "refs/heads/main".into(),
                     fsck: FsckStatus::Verified,
                     symrefs: BTreeMap::new(),
+                    worktree_tree: None,
+                    index_tree: None,
+                    raw_tree: None,
                 },
                 workspace: WorkspaceSection::objects("captures/wt/1/trees/t", vec![]),
                 bulk: BulkState::pending(),
@@ -750,6 +841,57 @@ mod tests {
         let text = String::from_utf8(e.bytes.clone()).unwrap();
         assert!(
             text.contains(r#""fsck":"verified","symrefs":{"refs/remotes/origin/HEAD":"refs/remotes/origin/main"}}"#),
+            "{text}"
+        );
+        assert_eq!(Manifest::decode(&e.bytes).unwrap().manifest, m);
+    }
+
+    /// `git_trees`: the trees in their own fields, absent unless set (an older manifest's bytes
+    /// are unchanged). With them, `refs` is the repository's refs whatever their names; without
+    /// them, a reader takes the two pseudo-refs as the trees and every other name — one under
+    /// `refs/sealant/capture/` included — as a ref.
+    #[test]
+    fn tree_fields_replace_the_pseudo_refs_and_old_manifests_still_read() {
+        assert!(!String::from_utf8_lossy(&sample().encode().bytes).contains("worktree_tree"));
+        let mut legacy = sample();
+        legacy.sections.git.refs.extend([
+            (WORKTREE_TREE_REF.to_owned(), "wt".to_owned()),
+            (INDEX_TREE_REF.to_owned(), "ix".to_owned()),
+            ("refs/sealant/capture/mine".to_owned(), "c1".to_owned()),
+        ]);
+        let git = &legacy.sections.git;
+        assert!(!git.has_tree_fields());
+        assert_eq!(git.worktree_tree_id(), Some("wt"));
+        assert_eq!(git.index_tree_id(), Some("ix"));
+        assert_eq!(git.checkout_tree_id(), Some("wt"));
+        assert_eq!(
+            git.refs_to_restore().keys().collect::<Vec<_>>(),
+            ["refs/heads/main", "refs/sealant/capture/mine"]
+        );
+
+        let mut m = sample();
+        m.sections.git.refs.extend([
+            (WORKTREE_TREE_REF.to_owned(), "user-one".to_owned()),
+            (INDEX_TREE_REF.to_owned(), "user-two".to_owned()),
+        ]);
+        m.sections.git.worktree_tree = Some("wt".into());
+        m.sections.git.index_tree = Some("ix".into());
+        m.sections.git.raw_tree = Some("raw".into());
+        let git = &m.sections.git;
+        assert_eq!(git.worktree_tree_id(), Some("wt"));
+        assert_eq!(git.index_tree_id(), Some("ix"));
+        assert_eq!(git.checkout_tree_id(), Some("raw"));
+        assert_eq!(git.refs_to_restore().len(), 3, "every user ref is restored");
+        let tips = m.git_tips();
+        for t in ["wt", "ix", "raw", "user-one", "user-two", "abc"] {
+            assert!(tips.contains(&t.to_owned()), "{t} in {tips:?}");
+        }
+        let e = m.clone().encode();
+        let text = String::from_utf8(e.bytes.clone()).unwrap();
+        assert!(
+            text.contains(
+                r#""fsck":"verified","worktree_tree":"wt","index_tree":"ix","raw_tree":"raw"}"#
+            ),
             "{text}"
         );
         assert_eq!(Manifest::decode(&e.bytes).unwrap().manifest, m);

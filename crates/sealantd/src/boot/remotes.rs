@@ -3,8 +3,16 @@
 //! The executor builds that repository itself: `git init`, then the head's packs. Remotes are
 //! configuration of the control plane's own copy and never travel in a capture, so the
 //! repository a harness works in has none, and `git push origin` finds no `origin`. `plan.get`
-//! answers `remotes`, and this module sets each one after the head is materialized, at boot and
-//! again at a `capture.replan`, where a standby learns which worktree it serves.
+//! answers `remotes`, and this module adds each one the repository does not have after the head
+//! is materialized, at boot and again at a `capture.replan`, where a standby learns which
+//! worktree it serves.
+//!
+//! A remote the repository already has is never changed. The repository's `.git/config` is
+//! captured with the rest of `.git/` (workspace-class bookkeeping), so a remote there is either
+//! one a capture carried — the user's own, whatever URL they gave it — or one this module added;
+//! setting it back to the plan's URL overwrote a session's `git remote set-url origin <fork>`
+//! before any capture held it, and a later push went to the wrong remote (review 2026-09-28
+//! #13). A disk the boot resumes as it is (a restart, a recovery boot) gets nothing at all.
 //!
 //! Only a name and a URL travel. How the remote is authenticated stays the control plane's
 //! business: Mend points git's ssh at a transport that signs on its own machine.
@@ -20,7 +28,8 @@ use sealant_capture::registrar::PlanRemote;
 
 use crate::boot::error::BootError;
 
-/// Set `remotes` on the repository at `working_directory`.
+/// Add each of `remotes` the repository at `working_directory` does not have; one it has, under
+/// any URL, is left as it is.
 ///
 /// # Errors
 /// Returns [`BootError::Config`] when a remote's name or URL is not one this passes to git.
@@ -41,14 +50,31 @@ pub(crate) fn apply(working_directory: &Path, remotes: &[PlanRemote]) -> Result<
     };
     for remote in remotes {
         // The URL may carry a credential (`https://user:token@…`), so it is never logged.
-        match repo.set_remote(&remote.name, &remote.url) {
-            Ok(change) => tracing::info!(name = %remote.name, change = ?change, "plan remote set"),
+        match add_if_absent(&repo, remote) {
+            Ok(true) => tracing::info!(name = %remote.name, "plan remote added"),
+            Ok(false) => tracing::info!(
+                name = %remote.name,
+                "the repository has this remote already; kept as it is"
+            ),
             Err(error) => {
                 tracing::warn!(name = %remote.name, error = %error, "plan remote skipped")
             }
         }
     }
     Ok(())
+}
+
+/// Add `remote` unless the repository has a remote of that name (any URL): `true` when added.
+fn add_if_absent(
+    repo: &GitRepo,
+    remote: &PlanRemote,
+) -> Result<bool, sealant_capture::gitpack::GitError> {
+    let key = format!("remote.{}.url", remote.name);
+    if repo.run(&["config", "--local", "--get", &key]).is_ok() {
+        return Ok(false);
+    }
+    repo.run(&["remote", "add", &remote.name, &remote.url])?;
+    Ok(true)
 }
 
 fn validate(remote: &PlanRemote) -> Result<(), BootError> {
@@ -100,28 +126,24 @@ mod tests {
             .then(|| String::from_utf8_lossy(&out.stdout).trim().to_owned())
     }
 
+    /// A remote the repository lacks is added; one it has keeps its URL, whatever the plan says
+    /// (review 2026-09-28 #13: `set-url` overwrote the user's `origin`).
     #[test]
-    fn adds_updates_and_leaves_alone() {
+    fn adds_what_is_absent_and_never_changes_what_is_there() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let repo = GitRepo::init(dir.path()).expect("init");
+        GitRepo::init(dir.path()).expect("init");
         let first = "git@example.invalid:acme/api.git";
         let second = "ssh://git@example.invalid:2222/srv/git/api.git";
 
         apply(dir.path(), &[remote("origin", first)]).expect("add");
         assert_eq!(url_of(dir.path(), "origin").as_deref(), Some(first));
 
-        // A re-materialize names the same remote again: nothing changes, nothing fails.
-        assert_eq!(
-            repo.set_remote("origin", first).expect("same"),
-            sealant_capture::gitpack::RemoteChange::Unchanged
-        );
-
         apply(
             dir.path(),
             &[remote("origin", second), remote("upstream", first)],
         )
-        .expect("update");
-        assert_eq!(url_of(dir.path(), "origin").as_deref(), Some(second));
+        .expect("apply again");
+        assert_eq!(url_of(dir.path(), "origin").as_deref(), Some(first));
         assert_eq!(url_of(dir.path(), "upstream").as_deref(), Some(first));
     }
 

@@ -17,10 +17,11 @@ use crate::index::{
 };
 use crate::io_at::IoAt;
 use crate::keys::KeyPrefix;
+use crate::longpath;
 use crate::manifest::{
     BulkSection, BulkState, CaptureKind, DirFormat, EncodedManifest, FORMAT_DIR_PACKS, FinalSeal,
-    GitSection, Manifest, Sections, WORKTREE_META_FORMAT, WORKTREE_TREE_REF, WorkspaceSection,
-    WorktreeMeta, rfc3339_now,
+    GitSection, INDEX_TREE_REF, Manifest, Sections, WORKTREE_META_FORMAT, WORKTREE_TREE_REF,
+    WorkspaceSection, WorktreeMeta, rfc3339_now,
 };
 use crate::materialize::{
     DiskState, MaterializeClass, MaterializeError, MaterializeReport, MaterializeTargets,
@@ -161,9 +162,15 @@ pub struct CaptureConfig {
     /// trusted by its stat ([`index::RACY_WINDOW`]; see `index` "When a file is re-read").
     pub racy_window: Duration,
     /// The executor this engine captures for, as the session token names it: `plan.get`'s
-    /// `executor`, else `SEALANT_WORKSPACE_ID`. A complete final flush seals the chain under
+    /// `executor` (the launch), and nothing else. A complete final flush seals the chain under
     /// it ([`crate::manifest::FinalSeal`]); `None` seals nothing.
     pub executor: Option<String>,
+    /// Name the git section's trees in their own fields (`worktree_tree`, `index_tree`,
+    /// `raw_tree`; the `git_trees` manifest feature) rather than as pseudo-refs in `refs`: for a
+    /// registrar whose `plan.get` lists `git_trees`. Without it the worktree tree is the one
+    /// restored, as git checks it out, and a user ref named `refs/sealant/capture/worktree` or
+    /// `…/index` is shadowed by the tree.
+    pub git_trees: bool,
 }
 
 impl CaptureConfig {
@@ -191,6 +198,7 @@ impl CaptureConfig {
             uploads_in_flight: crate::ship::DEFAULT_UPLOADS_IN_FLIGHT,
             racy_window: index::RACY_WINDOW,
             executor: None,
+            git_trees: true,
         }
     }
 
@@ -202,12 +210,14 @@ impl CaptureConfig {
             .unwrap_or_else(|| self.root.join(DAEMON_DIR).join("capture"))
     }
 
-    /// The key prefix.
+    /// The key prefix, at key generation 0 (the engine takes the staging's own,
+    /// [`crate::ship::Staging::key_generation`]).
     #[must_use]
     pub fn prefix(&self) -> KeyPrefix {
         KeyPrefix {
             worktree_id: self.worktree_id.clone(),
             epoch: self.epoch,
+            generation: Some(0),
         }
     }
 }
@@ -426,6 +436,9 @@ pub struct SnapRequest {
 struct RepairTarget {
     entry: QueueEntry,
     followers: Vec<QueueEntry>,
+    /// The keys the registrar refused (or every key of the rebuilt sections, when it named
+    /// none): never staged again, never uploaded again (cross-repo decision 6).
+    forget: HashSet<String>,
 }
 
 /// The chunked-section keys a registered head names: its workspace and bulk packs and dir
@@ -720,7 +733,10 @@ impl CaptureEngine {
         {
             last_tips.clear();
         }
-        let prefix = config.prefix();
+        let prefix = KeyPrefix {
+            generation: Some(staging.key_generation()),
+            ..config.prefix()
+        };
         // Chunk locations from another epoch are reused only where the registered head this
         // engine continues names their packs (ADR-0015: a manifest may reference packs from
         // earlier epochs on its chain); anything else an earlier epoch staged may never have
@@ -957,8 +973,11 @@ impl CaptureEngine {
     ) -> Result<(), EngineError> {
         self.config.worktree_id = worktree_id.to_owned();
         self.config.epoch = epoch;
-        self.prefix = self.config.prefix();
         self.staging.set_identity(worktree_id, epoch)?;
+        self.prefix = KeyPrefix {
+            generation: Some(self.staging.key_generation()),
+            ..self.config.prefix()
+        };
         let dropped = self.staging.discard_foreign()?;
         let base = format!("{}/", self.prefix.base());
         let chain = previous.as_ref().map(chain_keys).unwrap_or_default();
@@ -1122,6 +1141,51 @@ impl CaptureEngine {
         gitlinks: &[String],
     ) -> Result<Listing, EngineError> {
         Ok(self.roots().workspace_listing(repo, gitlinks)?)
+    }
+
+    /// The paths of `gitlinks` (nested repositories and paths git could not index, keys) that
+    /// hold something on disk and that `listing` carries nowhere: neither at or under
+    /// `tree/<path>` nor reported unreadable there. A path under a bulk directory (the bulk
+    /// class carries it) or the daemon's own is not the workspace class's to carry; an empty
+    /// directory (a submodule never checked out) holds nothing to lose.
+    fn uncarried_gitlinks(&self, gitlinks: &[String], listing: &Listing) -> Vec<String> {
+        let roots = self.roots();
+        let covered = |map_keys: &mut dyn Iterator<Item = &String>, key: &str| {
+            let at = format!("tree/{key}");
+            let under = format!("{at}/");
+            let mut found = false;
+            for k in map_keys {
+                if *k == at || k.starts_with(&under) || at.starts_with(&format!("{k}/")) {
+                    found = true;
+                    break;
+                }
+            }
+            found
+        };
+        gitlinks
+            .iter()
+            .filter(|key| {
+                let rel = PathBuf::from(crate::tree::os_of_key(key));
+                let abs = self.config.root.join(&rel);
+                if index::has_component_in(&rel, &roots.bulk_dirs)
+                    || rel.as_os_str() == DAEMON_DIR
+                    || roots.is_daemon_path(&abs)
+                {
+                    return false;
+                }
+                let holds = match longpath::symlink_metadata(&abs) {
+                    Ok(meta) if meta.is_dir() => {
+                        longpath::read_dir(&abs).map_or(true, |names| !names.is_empty())
+                    }
+                    Ok(_) => true,
+                    Err(e) => !index::is_vanished(&e),
+                };
+                holds
+                    && !covered(&mut listing.entries.keys(), key)
+                    && !covered(&mut listing.unreadable.keys(), key)
+            })
+            .cloned()
+            .collect()
     }
 
     /// What the worktree metadata overlay covers: the working tree minus the daemon's paths,
@@ -1423,13 +1487,14 @@ impl CaptureEngine {
                 for (sha, dir) in &built.dirs {
                     let file = format!("tree-{sha}");
                     let path = objects.join(&file);
-                    if !path.exists() && !self.staging.is_uploaded(&file) {
+                    let key = self.prefix.tree(sha);
+                    if !path.exists() && !self.staging.is_uploaded(&key, &file) {
                         fs::write(&path, &dir.bytes).at("write", &path)?;
                         stats.dirs_new += 1;
                     }
-                    if !self.staging.is_uploaded(&file) {
+                    if !self.staging.is_uploaded(&key, &file) {
                         uploads.push(Upload {
-                            key: self.prefix.tree(sha),
+                            key,
                             file,
                             bytes: dir.bytes.len() as u64,
                         });
@@ -1667,9 +1732,20 @@ impl CaptureEngine {
         self.dirs.bulk.retain(|_, k| !forget.contains(k));
         for key in &forget {
             if let Some(file) = file_of_key(key) {
-                self.staging.unmark_uploaded(&file)?;
+                self.staging.unmark_uploaded(key, &file)?;
             }
         }
+        // Nothing the rebuild stages goes up under a key a refusal may have named (cross-repo
+        // decision 6): a new key generation first, durably, so a pack of the very same bytes
+        // is a new key, and a delete retention paused on a condemned key can only take bytes
+        // no live capture names.
+        let generation = self.staging.next_key_generation()?;
+        self.prefix.generation = Some(generation);
+        tracing::warn!(
+            generation,
+            prefix = %self.prefix,
+            "a refused capture is rebuilt under a new key generation"
+        );
         if !git_missing.is_empty() {
             self.last_tips.clear();
             self.repair_git = Some(
@@ -1701,7 +1777,11 @@ impl CaptureEngine {
             folded = followers.len(),
             "rebuilding a refused capture from disk"
         );
-        let mut target = RepairTarget { entry, followers };
+        let mut target = RepairTarget {
+            entry,
+            followers,
+            forget,
+        };
         for class in [Class::Small, Class::Bulk] {
             if (class == Class::Small && !small) || (class == Class::Bulk && !bulk) {
                 continue;
@@ -1726,6 +1806,7 @@ impl CaptureEngine {
             target = RepairTarget {
                 entry: rebuilt,
                 followers: Vec::new(),
+                forget: target.forget,
             };
         }
         self.staging.clear_repair()?;
@@ -1890,17 +1971,28 @@ impl CaptureEngine {
                 // An automatic snap gives what the worktree cannot read the previous capture's
                 // entry; a final one carries nothing and fails on it instead.
                 let strict = req.kind == CaptureKind::Final;
-                let carry_from = self
+                let previous_git = self
                     .previous
                     .as_ref()
-                    .and_then(|p| p.manifest.sections.git.refs.get(WORKTREE_TREE_REF).cloned())
+                    .map(|p| &p.manifest.sections.git)
                     .filter(|_| !strict);
-                let git = gitpack::build_git_pack_carrying(
+                let carry_from = previous_git
+                    .and_then(|g| g.worktree_tree_id())
+                    .map(str::to_owned);
+                let carry_raw_from = previous_git
+                    .and_then(|g| g.checkout_tree_id())
+                    .map(str::to_owned);
+                let raw_cache = self.staging.index_dir().join("raw-blobs.json");
+                let git = gitpack::build_git_pack_with(
                     &repo,
                     &objects,
                     &previous_tips,
                     &excludes,
-                    carry_from.as_deref(),
+                    gitpack::TreeOptions {
+                        carry_from: carry_from.as_deref(),
+                        carry_raw_from: carry_raw_from.as_deref(),
+                        raw_cache: Some(&raw_cache),
+                    },
                 )?;
                 let mut git_unreadable: Vec<UnreadablePath> = git
                     .closure
@@ -1939,10 +2031,39 @@ impl CaptureEngine {
                     });
                     git_packs.push(key);
                 }
-                let listing = self.workspace_listing(&repo, &git.closure.gitlinks)?;
+                let mut listing = self.workspace_listing(&repo, &git.closure.gitlinks)?;
+                // Every nested repository and path git could not index is the workspace
+                // class's to carry; one on disk that its listing does not hold would be
+                // acknowledged as saved and restore as nothing.
+                let uncarried = self.uncarried_gitlinks(&git.closure.gitlinks, &listing);
+                if !uncarried.is_empty() {
+                    if strict {
+                        return Err(io::Error::other(format!(
+                            "{} path(s) the worktree tree leaves to the workspace class are in \
+                             no class: {}",
+                            uncarried.len(),
+                            uncarried.join(", ")
+                        ))
+                        .into());
+                    }
+                    for key in &uncarried {
+                        let abs = self.config.root.join(crate::tree::os_of_key(key));
+                        listing.note_unreadable(
+                            format!("tree/{key}"),
+                            abs,
+                            &io::Error::other("a nested repository no class carries"),
+                        );
+                    }
+                }
+                // The tree a restore checks out: the raw tree when the manifest names one.
+                let checkout_tree = if self.config.git_trees {
+                    git.closure.raw_tree.clone()
+                } else {
+                    git.closure.worktree_tree.clone()
+                };
                 // What the worktree tree does not carry: modes, mtimes, untracked directories,
                 // hardlink groups.
-                let meta_doc = match git.closure.refs.get(WORKTREE_TREE_REF) {
+                let meta_doc = match Some(&checkout_tree) {
                     Some(tree) => {
                         let captured = worktree_meta::capture(
                             &repo,
@@ -2037,14 +2158,54 @@ impl CaptureEngine {
                 self.last_tips = git.closure.tips.clone();
                 self.last_meta.clone_from(&meta_doc);
                 self.repair_git = None;
-                Sections {
-                    git: GitSection {
+                let closure = git.closure;
+                let git_section = if self.config.git_trees {
+                    GitSection {
                         packs: git_packs,
-                        refs: git.closure.refs,
-                        head: git.closure.head,
+                        refs: closure.refs,
+                        head: closure.head,
                         fsck: git.fsck,
-                        symrefs: git.closure.symrefs,
-                    },
+                        symrefs: closure.symrefs,
+                        worktree_tree: Some(closure.worktree_tree),
+                        index_tree: closure.index_tree,
+                        raw_tree: Some(closure.raw_tree),
+                    }
+                } else {
+                    // A registrar that does not read `git_trees`: the trees ride `refs` as the
+                    // pseudo-refs, as before, over any user ref of the same name.
+                    let mut refs = closure.refs;
+                    for name in [WORKTREE_TREE_REF, INDEX_TREE_REF] {
+                        if refs.contains_key(name) {
+                            tracing::warn!(
+                                name,
+                                "a ref of the repository has the name the registrar reads a tree \
+                                 under; it is not captured (the registrar does not read \
+                                 git_trees)"
+                            );
+                        }
+                    }
+                    refs.insert(WORKTREE_TREE_REF.to_owned(), closure.worktree_tree);
+                    match closure.index_tree {
+                        Some(tree) => {
+                            refs.insert(INDEX_TREE_REF.to_owned(), tree);
+                        }
+                        None => {
+                            refs.remove(INDEX_TREE_REF);
+                        }
+                    }
+                    GitSection {
+                        packs: git_packs,
+                        refs,
+                        head: closure.head,
+                        fsck: git.fsck,
+                        symrefs: closure.symrefs,
+                        worktree_tree: None,
+                        index_tree: None,
+                        raw_tree: None,
+                    }
+                };
+                Sections {
+                    git: git_section,
                     workspace: WorkspaceSection {
                         root: built.root,
                         packs: built.packs,
@@ -2219,13 +2380,15 @@ impl CaptureEngine {
         let mut all_uploads: Vec<Upload> = Vec::new();
         if let Some(target) = &repairing {
             // Everything the replaced captures staged but their manifests: this manifest may
-            // name any of it (a follower's git pack, a bulk section it carries).
+            // name any of it (a follower's git pack, a bulk section it carries) — but never a
+            // key the refusal named: that one is not put again (decision 6); what it held was
+            // staged again above under the new key generation.
             for u in std::iter::once(&target.entry)
                 .chain(&target.followers)
                 .flat_map(|e| &e.uploads)
-                .filter(|u| !u.file.starts_with("manifest-"))
+                .filter(|u| !u.file.starts_with("manifest-") && !target.forget.contains(&u.key))
             {
-                if !all_uploads.iter().any(|e| e.file == u.file) {
+                if !all_uploads.iter().any(|e| e.key == u.key) {
                     all_uploads.push(u.clone());
                 }
             }
@@ -2246,7 +2409,7 @@ impl CaptureEngine {
             );
         }
         for u in uploads {
-            if !all_uploads.iter().any(|e| e.file == u.file) {
+            if !all_uploads.iter().any(|e| e.key == u.key) {
                 all_uploads.push(u);
             }
         }
@@ -2582,6 +2745,42 @@ mod tests {
             .output()
             .unwrap();
         assert!(out.status.success(), "git {args:?}");
+    }
+
+    /// A nested repository (or a path git could not index) that holds something on disk is
+    /// the workspace class's to carry: one its listing does not hold is reported, and a final
+    /// snap refuses to call it saved. Carried at or under its `tree/` path, under a bulk
+    /// directory (the bulk class's), an empty directory (a submodule never checked out) or a
+    /// path gone from disk are not.
+    #[test]
+    fn a_nested_repository_no_class_carries_is_reported() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("ws");
+        std::fs::create_dir_all(root.join("nested")).unwrap();
+        std::fs::write(root.join("nested/work.txt"), b"nested work").unwrap();
+        std::fs::create_dir_all(root.join("empty")).unwrap();
+        std::fs::create_dir_all(root.join("node_modules/dep")).unwrap();
+        std::fs::write(root.join("node_modules/dep/x.js"), b"x").unwrap();
+        git(&root, &["init", "-q", "-b", "main"]);
+        let engine = CaptureEngine::open(CaptureConfig::new("wt", 1, &root), None).unwrap();
+        let gitlinks: Vec<String> = ["empty", "gone", "nested", "node_modules/dep"]
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
+        let mut listing = Listing::default();
+        assert_eq!(
+            engine.uncarried_gitlinks(&gitlinks, &listing),
+            vec!["nested".to_owned()]
+        );
+        let meta = std::fs::symlink_metadata(root.join("nested/work.txt")).unwrap();
+        listing.entries.insert(
+            "tree/nested/work.txt".to_owned(),
+            index::Source {
+                abs: root.join("nested/work.txt"),
+                meta,
+            },
+        );
+        assert!(engine.uncarried_gitlinks(&gitlinks, &listing).is_empty());
     }
 
     /// Finding 1b of the third Docker end to end, through the engine: a path whose metadata

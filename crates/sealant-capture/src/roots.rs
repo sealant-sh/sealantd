@@ -37,8 +37,8 @@ impl ClassRoots {
     /// The workspace class listing: `.git/` bookkeeping (minus objects, refs, `HEAD`,
     /// `packed-refs`, other worktrees' admin directories, and git's transient files), local
     /// git-lfs objects (`.git/lfs/`, which may exist nowhere else), `tree/` (git-ignored files
-    /// and the nested repositories in `gitlinks`), `harness/` (the harness home minus credential
-    /// files).
+    /// and the nested repositories in `gitlinks`, [`crate::tree::key_of`] keys of their paths),
+    /// `harness/` (the harness home minus credential files).
     pub fn workspace_listing(
         &self,
         repo: &GitRepo,
@@ -93,9 +93,12 @@ impl ClassRoots {
         }
         // Nested repositories, and the paths git cannot reach: a directory, or a file (mounted
         // as one; a directory mount of a file would take nothing).
+        // Each is a key of the path's bytes: a name that is not UTF-8 is found under its own
+        // name (decoded lossily, it was looked for where nothing is, and carried as nothing).
         tree_roots.extend(gitlinks.iter().map(|g| {
-            let is_dir = longpath::symlink_metadata(&root.join(g)).is_ok_and(|m| m.is_dir());
-            (PathBuf::from(g), is_dir)
+            let rel = PathBuf::from(os_of_key(g));
+            let is_dir = longpath::symlink_metadata(&root.join(&rel)).is_ok_and(|m| m.is_dir());
+            (rel, is_dir)
         }));
         for (rel, is_dir) in tree_roots {
             let abs = root.join(&rel);
