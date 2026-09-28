@@ -221,7 +221,18 @@ pub struct CaptureConfig {
     /// Only a repository whose refs are not in the files backend needs it: a final snap of one
     /// fails without it, and a files repository's captures are what they always were.
     pub reads_ref_format: bool,
+    /// The store reads the `wide_times` manifest feature (`plan.get`'s `manifest_features`):
+    /// it keeps a modification time outside signed 64-bit nanoseconds exactly
+    /// ([`crate::index::NARROW_NS`]). Every capture records such a time exactly; a final snap
+    /// over one fails without this (`unreadable`), and a disk with none needs nothing.
+    pub reads_wide_times: bool,
 }
+
+/// The manifest features written only for what one repository or disk holds — a repository
+/// that is not SHA-1 (`object_format`), one whose refs are not in the files backend
+/// (`ref_format`), a time outside signed 64-bit nanoseconds (`wide_times`) — and decided there,
+/// not required of every store ([`CaptureConfig::unread_features`] leaves them out).
+pub const PER_REPOSITORY_FEATURES: [&str; 3] = ["object_format", "ref_format", "wide_times"];
 
 impl CaptureConfig {
     /// Defaults for `root`.
@@ -252,6 +263,7 @@ impl CaptureConfig {
             unread_features: Vec::new(),
             reads_object_format: true,
             reads_ref_format: true,
+            reads_wide_times: true,
         }
     }
 
@@ -262,16 +274,94 @@ impl CaptureConfig {
         self.git_trees = reads.iter().any(|f| f == "git_trees");
         self.reads_object_format = reads.iter().any(|f| f == "object_format");
         self.reads_ref_format = reads.iter().any(|f| f == "ref_format");
+        self.reads_wide_times = reads.iter().any(|f| f == "wide_times");
         // `object_format` is written only for a repository that is not SHA-1, `ref_format`
-        // only for one whose refs are not in the files backend, and each is decided there
-        // ([`Self::reads_object_format`], [`Self::reads_ref_format`]).
+        // only for one whose refs are not in the files backend, `wide_times` only for a time
+        // outside signed 64-bit nanoseconds, and each is decided there
+        // ([`Self::reads_object_format`], [`Self::reads_ref_format`],
+        // [`Self::reads_wide_times`]; the boot decides the first two for the repository it
+        // admits writers over, [`Self::repository_gap`]).
         self.unread_features = crate::registrar::MANIFEST_FEATURES
             .iter()
-            .filter(|f| {
-                **f != "object_format" && **f != "ref_format" && !reads.iter().any(|r| r == *f)
-            })
+            .filter(|f| !PER_REPOSITORY_FEATURES.contains(f) && !reads.iter().any(|r| r == *f))
             .map(|f| (*f).to_owned())
             .collect();
+    }
+
+    /// Why the store cannot hold the repository a boot admits writers over, when it cannot: one
+    /// of `object_format` that is not `sha1`, or whose refs are in the `ref_format` backend
+    /// that is not `files`, needs the store to read that manifest feature. A final flush over
+    /// it would say incomplete ([`CaptureEngine::snap`]); decided at the boot instead, from the
+    /// head's git section and the repository already on the disk, so that no user code is
+    /// admitted over a store that cannot keep what it writes (decision 16; review 2026-09-28,
+    /// tenth pass). A format this build does not restore is refused as well.
+    #[must_use]
+    pub fn repository_gap(&self, object_format: &str, ref_format: &str) -> Option<String> {
+        let mut gaps = Vec::new();
+        if object_format != "sha1" {
+            if !crate::manifest::OBJECT_FORMATS.contains(&object_format) {
+                gaps.push(format!(
+                    "the repository's object format {object_format} is not one this build restores"
+                ));
+            } else if !self.reads_object_format {
+                gaps.push(format!(
+                    "the repository's object format is {object_format}, and the store does not \
+                     read the manifest feature object_format"
+                ));
+            }
+        }
+        if ref_format != "files" {
+            if !crate::manifest::REF_FORMATS.contains(&ref_format) {
+                gaps.push(format!(
+                    "the repository keeps its refs in the {ref_format} backend, which this build \
+                     does not restore"
+                ));
+            } else if !self.reads_ref_format {
+                gaps.push(format!(
+                    "the repository keeps its refs in the {ref_format} backend, and the store \
+                     does not read the manifest feature ref_format"
+                ));
+            }
+        }
+        (!gaps.is_empty()).then(|| {
+            format!(
+                "{}: what it would restore is not the repository",
+                gaps.join("; ")
+            )
+        })
+    }
+
+    /// Why no user code may be admitted to write over this store, when none may: what the
+    /// store does not read of every capture ([`Self::fidelity_gap`]), and what it does not read
+    /// of the repository the writers get — the one the chain head's git section (`head`) names,
+    /// and the one already at `disk`, when there is one ([`Self::repository_gap`]). A
+    /// repository whose formats cannot be read is refused too: nothing says the store can
+    /// keep it.
+    #[must_use]
+    pub fn admission_gap(&self, head: Option<&GitSection>, disk: &Path) -> Option<String> {
+        let mut gaps: Vec<String> = self.fidelity_gap().into_iter().collect();
+        if let Some(git) = head
+            && let Some(gap) = self.repository_gap(git.object_format(), git.ref_format())
+        {
+            gaps.push(format!("the chain head: {gap}"));
+        }
+        if disk.join(".git").exists() {
+            let formats = GitRepo::open(disk)
+                .and_then(|repo| Ok((repo.object_format()?, repo.ref_format()?)));
+            match formats {
+                Ok((object_format, ref_format)) => {
+                    if let Some(gap) = self.repository_gap(&object_format, &ref_format) {
+                        gaps.push(format!("the repository at {}: {gap}", disk.display()));
+                    }
+                }
+                Err(error) => gaps.push(format!(
+                    "the object format and ref backend of the repository at {} cannot be read \
+                     ({error})",
+                    disk.display()
+                )),
+            }
+        }
+        (!gaps.is_empty()).then(|| gaps.join("; "))
     }
 
     /// Why the store cannot hold what a capture holds, when it cannot: the features it does not
@@ -804,6 +894,31 @@ fn daemon_excludes(config: &CaptureConfig) -> Vec<String> {
         }
     }
     excludes
+}
+
+/// The nested repositories `listing` carries (a `.git` entry under `prefix`, not inside
+/// another `.git`), keyed by the virtual path of their directory, with how each keeps its git
+/// storage ([`gitpack::nested_storage`]).
+fn nested_repositories(
+    repo: &GitRepo,
+    workspace: &Path,
+    listing: &Listing,
+    prefix: &str,
+) -> Vec<(String, PathBuf, gitpack::NestedStorage)> {
+    listing
+        .entries
+        .iter()
+        .filter_map(|(key, src)| {
+            let rel = key.strip_prefix(prefix)?;
+            let dir_key = rel.strip_suffix("/.git")?;
+            if dir_key.split('/').any(|c| c == ".git") {
+                return None;
+            }
+            let dir = src.abs.parent()?.to_path_buf();
+            let storage = gitpack::nested_storage(repo, workspace, &dir);
+            Some((format!("{prefix}{dir_key}"), dir, storage))
+        })
+        .collect()
 }
 
 impl CaptureEngine {
@@ -1660,6 +1775,7 @@ impl CaptureEngine {
         let built = match extra_put {
             Ok(()) => TreeBuilder::new(&mut work.index, &key_for_dir)
                 .strict(strict)
+                .narrow_times(strict && !self.config.reads_wide_times)
                 .racy_window(self.config.racy_window)
                 .suspects(&mut work.suspects)
                 .build(listing, &mut sink),
@@ -2378,6 +2494,75 @@ impl CaptureEngine {
                         );
                     }
                 }
+                // Nested repositories that share git storage (review 2026-09-28, tenth pass,
+                // #2; decision 29): one that borrows the top-level object store gets the
+                // objects its own state reaches there packed beside the closure; one that needs
+                // storage outside the workspace cannot come back from this capture.
+                let mut borrowed: Vec<String> = Vec::new();
+                let mut unrepresentable: Vec<String> = Vec::new();
+                for (key, dir, storage) in
+                    nested_repositories(&repo, &self.config.root, &listing, "tree/")
+                {
+                    match storage {
+                        gitpack::NestedStorage::BorrowsTop => {
+                            let nested = GitRepo::open(&dir)?;
+                            let (tips, unresolved) = gitpack::borrowed_objects(
+                                &repo,
+                                &nested,
+                                &objects,
+                                &git.closure.tips,
+                            )?;
+                            borrowed.extend(tips);
+                            unrepresentable.extend(unresolved.into_iter().map(|u| {
+                                format!("{key}: an operation in progress there names {u}")
+                            }));
+                        }
+                        gitpack::NestedStorage::Unrepresentable(why) => {
+                            unrepresentable.push(format!("{key}: {why}"));
+                        }
+                        gitpack::NestedStorage::Carried | gitpack::NestedStorage::TopWorktree => {}
+                    }
+                }
+                if !unrepresentable.is_empty() {
+                    let gap = format!(
+                        "{} nested repositor{} keep git state a capture of the workspace cannot                          bring back: {}",
+                        unrepresentable.len(),
+                        if unrepresentable.len() == 1 {
+                            "y"
+                        } else {
+                            "ies"
+                        },
+                        unrepresentable.join("; ")
+                    );
+                    if strict {
+                        return Err(io::Error::other(gap).into());
+                    }
+                    tracing::warn!(%gap, "a final flush over them is not complete");
+                }
+                borrowed.sort();
+                borrowed.dedup();
+                if !borrowed.is_empty() {
+                    let mut negatives = previous_tips.clone();
+                    negatives.extend(git.closure.tips.iter().cloned());
+                    if let Some(p) = gitpack::pack_tips(&repo, &objects, &borrowed, &negatives)? {
+                        stats.git_pack_bytes += p.bytes;
+                        stats.git_objects += p.objects;
+                        let key = self.prefix.pack(&p.sha256);
+                        uploads.push(Upload {
+                            key: key.clone(),
+                            file: p.sha256.clone(),
+                            bytes: p.bytes,
+                        });
+                        uploads.push(Upload {
+                            key: self.prefix.pack_idx(&p.sha256),
+                            file: format!("{}.idx", p.sha256),
+                            bytes: fs::metadata(&p.idx_path)?.len(),
+                        });
+                        if !git_packs.contains(&key) {
+                            git_packs.push(key);
+                        }
+                    }
+                }
                 // The tree a restore checks out: the raw tree when the manifest names one.
                 let checkout_tree = if self.config.git_trees {
                     git.closure.raw_tree.clone()
@@ -2433,9 +2618,12 @@ impl CaptureEngine {
                             })
                             .collect();
                         git_unreadable = merge_unreadable(git_unreadable, meta_unreadable);
-                        // A time the overlay cannot record exactly: a final snap does not hold
-                        // that path as it is (review 2026-09-28, ninth pass, #3).
-                        if !captured.unrecordable_times.is_empty() {
+                        // A wide time (outside signed 64-bit nanoseconds): the overlay records
+                        // it exactly, and a store that does not read `wide_times` does not keep
+                        // it — a final snap for one does not hold that path as it is (review
+                        // 2026-09-28, ninth pass, #3; tenth pass).
+                        if !captured.unrecordable_times.is_empty() && !self.config.reads_wide_times
+                        {
                             if strict {
                                 let times = captured
                                     .unrecordable_times
@@ -2455,8 +2643,9 @@ impl CaptureEngine {
                                         .map(|u| u.path.as_str())
                                         .collect::<Vec<_>>()
                                         .join(", "),
-                                    "modification times outside what a capture records are \
-                                     saturated; a final flush over them is not complete"
+                                    "modification times outside signed 64-bit nanoseconds are \
+                                     recorded exactly, and the store does not read wide_times: \
+                                     a final flush over them is not complete"
                                 );
                             }
                         }
@@ -2571,6 +2760,9 @@ impl CaptureEngine {
                 // pack's negatives: a snap that fails here (a final one that cannot read work)
                 // stages nothing, and its tips would leave objects out of every later pack.
                 self.last_tips = git.closure.tips.clone();
+                self.last_tips.extend(borrowed);
+                self.last_tips.sort();
+                self.last_tips.dedup();
                 self.last_meta.clone_from(&meta_doc);
                 self.repair_git = None;
                 let closure = git.closure;
@@ -2653,6 +2845,38 @@ impl CaptureEngine {
             }
             Class::Bulk => {
                 let listing = self.bulk_listing();
+                // A nested repository under a bulk directory whose git storage is not all
+                // carried as files: this class cannot join what it borrows from the top-level
+                // store to the git section, and nothing carries storage outside the workspace
+                // (review 2026-09-28, tenth pass, #2; decision 29).
+                if let Ok(repo) = GitRepo::open(&self.config.root) {
+                    let shared: Vec<String> =
+                        nested_repositories(&repo, &self.config.root, &listing, "")
+                            .into_iter()
+                            .filter_map(|(key, _, storage)| match storage {
+                                gitpack::NestedStorage::Carried
+                                | gitpack::NestedStorage::TopWorktree => None,
+                                gitpack::NestedStorage::BorrowsTop => Some(format!(
+                                    "{key}: it borrows objects from the top-level object store,                                      which a bulk capture does not join to the git section"
+                                )),
+                                gitpack::NestedStorage::Unrepresentable(why) => {
+                                    Some(format!("{key}: {why}"))
+                                }
+                            })
+                            .collect();
+                    if !shared.is_empty() {
+                        let gap = format!(
+                            "{} nested repositor{} under a bulk directory keep git state a                              capture of the workspace cannot bring back: {}",
+                            shared.len(),
+                            if shared.len() == 1 { "y" } else { "ies" },
+                            shared.join("; ")
+                        );
+                        if req.kind == CaptureKind::Final {
+                            return Err(io::Error::other(gap).into());
+                        }
+                        tracing::warn!(%gap, "a final flush over them is not complete");
+                    }
+                }
                 let multi = multi_named_symlinks(&listing);
                 if !multi.is_empty() {
                     if req.kind == CaptureKind::Final {

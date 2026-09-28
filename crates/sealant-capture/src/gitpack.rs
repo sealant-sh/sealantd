@@ -1039,17 +1039,49 @@ impl GitRepo {
         Ok(out.status.success().then(|| stdout_string(&out)))
     }
 
-    /// Every sha a reflog entry points at (its old and its new value), in whichever backend
-    /// the repository keeps its reflogs, every worktree's. Asked of git, never inferred from a
-    /// `logs/` directory: a reftable repository has none, and its reflog-only commits were left
-    /// out of a complete capture (review 2026-09-28, ninth pass, #1). The empty `--stdin` makes
-    /// a repository with no reflog at all answer nothing instead of the usage text.
+    /// Every object a reflog entry points at (its old and its new value), whatever its type,
+    /// in whichever backend the repository keeps its reflogs, every worktree's. Asked of git,
+    /// never inferred from a `logs/` directory: a reftable repository has none, and its
+    /// reflog-only commits were left out of a complete capture (review 2026-09-28, ninth pass,
+    /// #1). The empty `--stdin` makes a repository with no reflog at all answer nothing instead
+    /// of the usage text.
+    ///
+    /// `git rev-list --reflog` lists the commits only: a blob, a tree or an annotated tag a
+    /// reflog still names (a ref moved away from one: a notes or custom ref, a tag) was in no
+    /// pack, and a sealed capture restored a reflog naming objects the repository did not hold
+    /// (review 2026-09-28, tenth pass, #1). The other objects are listed with `--objects`, the
+    /// commits negated so that no commit's tree is walked: every tag, tree and blob a reflog
+    /// names, with what they reach (a tree's entries, a tag's target), and nothing else.
     pub fn reflog_tips(&self) -> Result<Vec<String>, GitError> {
         let out = self.run_with_stdin(
             &["rev-list", "--no-walk=unsorted", "--reflog", "--stdin"],
             b"",
         )?;
-        Ok(stdout_string(&out).lines().map(str::to_owned).collect())
+        let mut tips: Vec<String> = stdout_string(&out).lines().map(str::to_owned).collect();
+        let mut negated = String::new();
+        for commit in &tips {
+            negated.push('^');
+            negated.push_str(commit);
+            negated.push('\n');
+        }
+        let out = self.run_with_stdin(
+            &[
+                "rev-list",
+                "--objects",
+                "--no-object-names",
+                "--no-walk=unsorted",
+                "--reflog",
+                "--stdin",
+            ],
+            negated.as_bytes(),
+        )?;
+        tips.extend(
+            stdout_string(&out)
+                .lines()
+                .filter(|l| !l.is_empty())
+                .map(str::to_owned),
+        );
+        Ok(tips)
     }
 
     /// The objects the refs outside `refs/` name, as the repository's backend holds them:
@@ -1779,7 +1811,7 @@ impl GitRepo {
                 // Git trusts an entry's stat data only when the index was written after the file
                 // changed (an entry as new as the index is "racily clean" and re-read): the copy
                 // keeps the real index's mtime, so it is exactly as trusting as the user's own.
-                let mtime = real.mtime().saturating_mul(1_000_000_000) + real.mtime_nsec();
+                let mtime = crate::index::mtime_ns(&real);
                 longpath::set_mtime_nofollow(tmp_index, mtime)
                     .map_err(at("set the mtime of", tmp_index))?;
             } else if let Some(head_tree) = self.head_tree()? {
@@ -2471,6 +2503,349 @@ impl RawCache {
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// Nested repositories that share git storage (review 2026-09-28, tenth pass, #2; decision 29).
+// ---------------------------------------------------------------------------------------------
+
+/// A linked worktree of a repository (`git worktree add`): its administrative directory under
+/// `<common dir>/worktrees/` and the working tree its `gitdir` file names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkedWorktree {
+    /// Its directory's name under `<common dir>/worktrees/`, as bytes.
+    pub name: Vec<u8>,
+    /// `<common dir>/worktrees/<name>`.
+    pub admin: PathBuf,
+    /// The working tree (the directory holding the `.git` file the admin's `gitdir` names);
+    /// `None` when `gitdir` cannot be read.
+    pub worktree: Option<PathBuf>,
+}
+
+/// `path` as the filesystem resolves it when it exists (symlinks followed), else lexically.
+fn resolved(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| normalized(path))
+}
+
+/// Whether `path` is `root` or under it, both resolved ([`resolved`]).
+#[must_use]
+pub fn is_within(path: &Path, root: &Path) -> bool {
+    resolved(path).starts_with(resolved(root))
+}
+
+/// A git pointer file's target (`gitdir: <path>`, `commondir`'s `<path>`), resolved against
+/// `base` when relative. `None` when the file does not exist.
+fn pointer(file: &Path, prefix: &[u8], base: &Path) -> io::Result<Option<PathBuf>> {
+    let bytes = match fs::read(file) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let text = trim_newline(&bytes);
+    let text = text.strip_prefix(prefix).unwrap_or(text);
+    let target = PathBuf::from(OsStr::from_bytes(text));
+    Ok(Some(if target.is_absolute() {
+        normalized(&target)
+    } else {
+        normalized(&base.join(target))
+    }))
+}
+
+/// How a nested repository keeps its git storage, as a capture of the workspace sees it
+/// ([`nested_storage`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NestedStorage {
+    /// Everything it needs is under its own directory, or elsewhere inside the workspace: the
+    /// chunked classes carry it as files.
+    Carried,
+    /// A linked worktree of the top-level repository: the workspace class carries its
+    /// administrative directory, and the top-level closure reads its tips
+    /// ([`GitRepo::linked_worktrees_inside`]).
+    TopWorktree,
+    /// It borrows objects from the top-level object store (`objects/info/alternates`, or a
+    /// common directory that is the top-level one): the objects its tips reach there join the
+    /// top-level packs ([`borrowed_objects`]).
+    BorrowsTop,
+    /// It needs storage a capture of the workspace does not hold: why.
+    Unrepresentable(String),
+}
+
+/// Most alternates git follows from one object store (its own `MAX_ALTERNATES` depth).
+const ALTERNATE_DEPTH: usize = 5;
+
+/// How the nested repository at `dir` (a directory holding a `.git`) keeps its git storage,
+/// for a capture of `workspace` whose top-level repository is `top`. Its git directory (a
+/// `.git` directory, or the one a `.git` file names), that directory's common directory, and
+/// every object store its alternates name (followed as git follows them) must each be inside
+/// the workspace, where the chunked classes carry them as files; or be the top-level
+/// repository's own (a linked worktree's administrative directory, the top-level object
+/// store), which the git section carries. Anything else cannot come back from a capture of the
+/// workspace: [`NestedStorage::Unrepresentable`] (decision 29).
+#[must_use]
+pub fn nested_storage(top: &GitRepo, workspace: &Path, dir: &Path) -> NestedStorage {
+    let dotgit = dir.join(".git");
+    let unreadable = |what: &str, e: &dyn std::fmt::Display| {
+        NestedStorage::Unrepresentable(format!("its {what} cannot be read ({e})"))
+    };
+    let git_dir = match fs::symlink_metadata(&dotgit) {
+        Ok(meta) if meta.is_file() => match pointer(&dotgit, b"gitdir: ", dir) {
+            Ok(Some(target)) => target,
+            Ok(None) => return NestedStorage::Carried,
+            Err(e) => return unreadable(".git file", &e),
+        },
+        Ok(_) => dotgit.clone(),
+        Err(e) if index_vanished(&e) => return NestedStorage::Carried,
+        Err(e) => return unreadable(".git", &e),
+    };
+    let top_worktrees = resolved(&top.common_dir.join("worktrees"));
+    let top_objects = resolved(&top.common_dir.join("objects"));
+    let top_git_dirs = [resolved(&top.git_dir), resolved(&top.common_dir)];
+    // Carried as files: under the workspace (the chunked classes), or in the top-level git
+    // directories the workspace class mounts — never their object store (the git section's)
+    // or another worktree's administrative directory.
+    let carried = |path: &Path| {
+        let at = resolved(path);
+        if at.starts_with(&top_objects) {
+            return false;
+        }
+        if top_git_dirs.iter().any(|d| at.starts_with(d)) {
+            return !at.starts_with(&top_worktrees) || at.starts_with(&top_git_dirs[0]);
+        }
+        is_within(path, workspace)
+    };
+    let git_dir_at = resolved(&git_dir);
+    if git_dir_at.starts_with(&top_worktrees) && git_dir_at != top_git_dirs[0] {
+        // The top-level repository's own linked worktree: carried as such when its admin
+        // names this directory as its worktree.
+        let names_dir = pointer(&git_dir.join("gitdir"), b"", &git_dir)
+            .ok()
+            .flatten()
+            .and_then(|p| p.parent().map(resolved))
+            .is_some_and(|wt| wt == resolved(dir));
+        return if names_dir && is_within(dir, workspace) {
+            NestedStorage::TopWorktree
+        } else {
+            NestedStorage::Unrepresentable(format!(
+                "its git directory {} is an administrative directory of the top-level \
+                 repository that does not name it as its worktree",
+                git_dir.display()
+            ))
+        };
+    }
+    if !carried(&git_dir) {
+        return NestedStorage::Unrepresentable(format!(
+            "its git directory {} is outside the workspace",
+            git_dir.display()
+        ));
+    }
+    let common = match pointer(&git_dir.join("commondir"), b"", &git_dir) {
+        Ok(Some(common)) => common,
+        Ok(None) => git_dir.clone(),
+        Err(e) => return unreadable("commondir file", &e),
+    };
+    if resolved(&common) == top_git_dirs[1] {
+        // The top-level repository's common directory: its refs and objects are the git
+        // section's, and so are its own alternates.
+        return NestedStorage::BorrowsTop;
+    }
+    let mut borrows = false;
+    if !carried(&common) {
+        return NestedStorage::Unrepresentable(format!(
+            "its common directory {} is outside the workspace",
+            common.display()
+        ));
+    }
+    // Every object store its alternates reach, as git follows them.
+    let mut stores = vec![(common.join("objects"), 0usize)];
+    let mut seen = BTreeSet::new();
+    while let Some((store, depth)) = stores.pop() {
+        if !seen.insert(resolved(&store)) {
+            continue;
+        }
+        let file = store.join("info").join("alternates");
+        let bytes = match fs::read(&file) {
+            Ok(bytes) => bytes,
+            Err(e) if index_vanished(&e) => continue,
+            Err(e) => return unreadable("objects/info/alternates", &e),
+        };
+        for line in bytes.split(|b| *b == b'\n') {
+            let line = line.strip_suffix(b"\r").unwrap_or(line);
+            if line.is_empty() || line.starts_with(b"#") {
+                continue;
+            }
+            if line.starts_with(b"\"") {
+                return NestedStorage::Unrepresentable(format!(
+                    "its alternates name a quoted path ({}), which this build does not read",
+                    String::from_utf8_lossy(line)
+                ));
+            }
+            let named = PathBuf::from(OsStr::from_bytes(line));
+            let alternate = if named.is_absolute() {
+                normalized(&named)
+            } else {
+                normalized(&store.join(named))
+            };
+            if resolved(&alternate) == top_objects {
+                borrows = true;
+            } else if !carried(&alternate) {
+                return NestedStorage::Unrepresentable(format!(
+                    "it borrows objects from {}, outside the workspace",
+                    alternate.display()
+                ));
+            } else if depth + 1 < ALTERNATE_DEPTH {
+                stores.push((alternate, depth + 1));
+            }
+        }
+    }
+    if borrows {
+        NestedStorage::BorrowsTop
+    } else {
+        NestedStorage::Carried
+    }
+}
+
+fn index_vanished(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+    )
+}
+
+impl GitRepo {
+    /// Every linked worktree of the repository (`<common dir>/worktrees/*`), the one this
+    /// repository is (when it is one) included.
+    pub fn linked_worktrees(&self) -> Result<Vec<LinkedWorktree>, GitError> {
+        let dir = self.common_dir.join("worktrees");
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) if index_vanished(&e) => return Ok(Vec::new()),
+            Err(e) => return Err(at("read_dir", &dir)(e)),
+        };
+        let mut found = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(at("read_dir", &dir))?;
+            let admin = entry.path();
+            if !fs::symlink_metadata(&admin).is_ok_and(|m| m.is_dir()) {
+                continue;
+            }
+            let worktree = pointer(&admin.join("gitdir"), b"", &admin)
+                .ok()
+                .flatten()
+                .and_then(|dotgit| dotgit.parent().map(Path::to_path_buf));
+            found.push(LinkedWorktree {
+                name: entry.file_name().into_vec(),
+                admin,
+                worktree,
+            });
+        }
+        found.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(found)
+    }
+
+    /// The linked worktrees whose working tree is under `workspace` (not the repository's own
+    /// worktree): their administrative directories are the workspace class's to carry, and
+    /// their tips the top-level closure's (review 2026-09-28, tenth pass, #2).
+    pub fn linked_worktrees_inside(
+        &self,
+        workspace: &Path,
+    ) -> Result<Vec<LinkedWorktree>, GitError> {
+        let own = resolved(&self.git_dir);
+        let root = resolved(workspace);
+        Ok(self
+            .linked_worktrees()?
+            .into_iter()
+            .filter(|w| resolved(&w.admin) != own)
+            .filter(|w| {
+                w.worktree
+                    .as_deref()
+                    .is_some_and(|wt| resolved(wt) != root && is_within(wt, workspace))
+            })
+            .collect())
+    }
+
+    /// The objects a worktree's own state reaches, read in it: `HEAD`, the refs it sees (its
+    /// per-worktree refs among them), its root refs, every stage of its index (and the index
+    /// as a tree when it can be written as one), and its reflogs. Written trees go through a
+    /// scratch index in `scratch_dir`.
+    pub fn worktree_state_tips(
+        &self,
+        scratch_dir: &Path,
+        ref_format: &str,
+    ) -> Result<Vec<String>, GitError> {
+        let mut tips: Vec<String> = self.refs()?.into_values().collect();
+        tips.extend(self.root_ref_tips(ref_format)?);
+        let head = git_command(&self.root)?
+            .args(["rev-parse", "--verify", "-q", "HEAD"])
+            .output_gated()?;
+        if head.status.success() {
+            tips.push(stdout_string(&head));
+        }
+        if let Some(tree) = self.index_tree(scratch_dir)? {
+            tips.push(tree);
+        }
+        tips.extend(self.index_blobs()?);
+        tips.extend(self.reflog_tips()?);
+        tips.sort();
+        tips.dedup();
+        Ok(tips)
+    }
+}
+
+/// The objects of the top-level store that the nested repository `nested`, which borrows it
+/// ([`NestedStorage::BorrowsTop`]), reaches from its own state
+/// ([`GitRepo::worktree_state_tips`], its operation state's objects) and the top-level
+/// closure's `known` tips do not: the tips that join the top-level packs, and what its
+/// operation state names that git cannot resolve.
+pub fn borrowed_objects(
+    top: &GitRepo,
+    nested: &GitRepo,
+    scratch_dir: &Path,
+    known: &[String],
+) -> Result<(Vec<String>, Vec<String>), GitError> {
+    let ref_format = nested.ref_format()?;
+    let mut roots = nested.worktree_state_tips(scratch_dir, &ref_format)?;
+    let operations = nested.operation_objects()?;
+    roots.extend(operations.tips);
+    if roots.is_empty() {
+        return Ok((Vec::new(), operations.unresolved));
+    }
+    // What the top-level closure already reaches, the nested repository sees too (it borrows
+    // the store they are in): negated, so only the objects its own state adds are walked.
+    let visible = nested.existing(known)?;
+    let mut input = String::new();
+    for r in &roots {
+        input.push_str(r);
+        input.push('\n');
+    }
+    for k in &visible {
+        input.push('^');
+        input.push_str(k);
+        input.push('\n');
+    }
+    let out = nested.run_with_stdin(
+        &["rev-list", "--objects", "--no-object-names", "--stdin"],
+        input.as_bytes(),
+    )?;
+    let reached: Vec<String> = stdout_string(&out)
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(str::to_owned)
+        .collect();
+    Ok((top.existing(&reached)?, operations.unresolved))
+}
+
+/// Pack `tips` of `repo` against `negatives` (both present in its store) into `out_dir`, as
+/// the git class packs its closure: the objects nested repositories borrow from the top-level
+/// store (review 2026-09-28, tenth pass, #2). `None` when nothing is new.
+pub fn pack_tips(
+    repo: &GitRepo,
+    out_dir: &Path,
+    tips: &[String],
+    negatives: &[String],
+) -> Result<Option<FinishedGitPack>, GitError> {
+    fs::create_dir_all(out_dir).map_err(at("mkdir -p", out_dir))?;
+    let negatives = repo.existing(negatives)?;
+    pack_once(repo, out_dir, tips, &negatives, PACK_ATTEMPTS + 2)
+}
+
 /// The closure read before packing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Closure {
@@ -2566,6 +2941,30 @@ pub fn read_closure_with(
     tips.extend(repo.reflog_tips()?);
     let operations = repo.operation_objects()?;
     tips.extend(operations.tips);
+    let mut unresolved_operations = operations.unresolved;
+    // A linked worktree inside the workspace keeps its state in the top-level repository's
+    // `worktrees/<name>`, which the workspace class carries: its `HEAD`, refs, reflogs, every
+    // index stage and operation state reach objects of the shared store no ref of this
+    // worktree may reach (a file staged only there; review 2026-09-28, tenth pass, #2).
+    for linked in repo.linked_worktrees_inside(&repo.root)? {
+        let Some(dir) = linked.worktree.filter(|d| d.join(".git").exists()) else {
+            continue;
+        };
+        let worktree = GitRepo::open(&dir)?;
+        if resolved(&worktree.common_dir) != resolved(&repo.common_dir) {
+            continue;
+        }
+        tips.extend(worktree.worktree_state_tips(scratch_dir, &ref_format)?);
+        let operations = worktree.operation_objects()?;
+        tips.extend(operations.tips);
+        let name = key_of(&linked.name).into_owned();
+        unresolved_operations.extend(
+            operations
+                .unresolved
+                .into_iter()
+                .map(|u| format!("worktree {name}: {u}")),
+        );
+    }
     let WorktreeTree {
         tree: worktree_tree,
         raw_tree,
@@ -2588,7 +2987,7 @@ pub fn read_closure_with(
         gitlinks,
         unreadable,
         carried,
-        unresolved_operations: operations.unresolved,
+        unresolved_operations,
         ref_format,
         unrestorable_ref_links,
     })

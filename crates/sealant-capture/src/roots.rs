@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use crate::gitpack::{GitError, GitRepo};
 use crate::index::{self, DAEMON_DIR, Listing, has_component_in, rel_key};
 use crate::longpath;
-use crate::tree::os_of_key;
+use crate::tree::{key_of, os_of_key};
 
 /// Where the classes live on disk.
 #[derive(Debug, Clone)]
@@ -35,7 +35,8 @@ impl ClassRoots {
     }
 
     /// The workspace class listing: `.git/` bookkeeping (minus objects, refs, `HEAD`,
-    /// `packed-refs`, other worktrees' admin directories, and git's transient files — but every
+    /// `packed-refs`, the admin directories of worktrees outside the workspace, and git's
+    /// transient files — but every
     /// symlink standing for `HEAD` or a ref is carried as that symlink, beside the ref in the
     /// git section, so a restore stores it as it was), local
     /// git-lfs objects (`.git/lfs/`, which may exist nowhere else), `tree/` (git-ignored files
@@ -47,9 +48,22 @@ impl ClassRoots {
         gitlinks: &[String],
     ) -> Result<Listing, GitError> {
         let mut listing = Listing::default();
-        // Objects and refs travel in the git section; `worktrees/` holds other worktrees'
-        // bookkeeping, which is theirs to capture.
-        let git_prune = |_: &Path, v: &str, _: &str| v == ".git/objects" || v == ".git/worktrees";
+        // Objects and refs travel in the git section; `worktrees/<name>` holds another
+        // worktree's bookkeeping, which is its own capture's to carry — unless that worktree is
+        // inside this workspace: its `index`, `HEAD`, `ORIG_HEAD`, reflog and per-worktree refs
+        // exist nowhere else, and the git section packs what they reach (review 2026-09-28,
+        // tenth pass, #2).
+        let carried_admins: Vec<String> = repo
+            .linked_worktrees_inside(&self.root)?
+            .iter()
+            .map(|w| format!(".git/worktrees/{}", key_of(&w.name)))
+            .collect();
+        let git_prune = |_: &Path, v: &str, _: &str| {
+            v == ".git/objects"
+                || v.strip_prefix(".git/worktrees/").is_some_and(|name| {
+                    !name.contains('/') && !carried_admins.iter().any(|a| a == v)
+                })
+        };
         // A symlink under `refs/` or at `HEAD` stands for a ref, and the git section holds the
         // ref (`refs`, `symrefs`, `head`) — as the same ref to git, written back as text. How
         // the repository stored it is this class's: the symlink itself, its link text and
