@@ -309,6 +309,12 @@ pub struct CaptureEngine {
     /// for good is dropped with everything staged after it, and the chain continues from here.
     base: Option<EncodedManifest>,
     base_tips: Vec<String>,
+    /// The manifest the queued bulk capture was staged on (its parent), and the tips as of it.
+    /// A small snap while that bulk capture's objects upload is staged ahead of it: it takes
+    /// the bulk capture's place on the chain with this manifest's bulk section, and the bulk
+    /// capture moves on top of it. See [`CaptureEngine::snap_preemptible`].
+    below: Option<EncodedManifest>,
+    below_tips: Vec<String>,
 }
 
 impl std::fmt::Debug for CaptureEngine {
@@ -402,6 +408,8 @@ impl CaptureEngine {
             bulk_work: None,
             chunks,
             last_tips,
+            below: None,
+            below_tips: Vec::new(),
         })
     }
 
@@ -454,6 +462,8 @@ impl CaptureEngine {
         let _ = self.staging.take_refusals();
         self.base = self.previous.clone();
         self.base_tips = self.last_tips.clone();
+        self.below = None;
+        self.below_tips.clear();
         tracing::info!(
             worktree = worktree_id,
             epoch,
@@ -717,21 +727,35 @@ impl CaptureEngine {
             // this executor knows: `base`, kept from the snap that emptied the queue.
             let base_is_parent =
                 self.base.as_ref().map(|b| b.capture_id.as_str()) == refusal.parent.as_deref();
-            if !base_is_parent {
-                tracing::warn!(
+            // A refused bulk capture sits on top of the small captures staged ahead of it: its
+            // parent is the manifest it was staged on, not the oldest queued capture's.
+            let below_is_parent =
+                self.below.as_ref().map(|b| b.capture_id.as_str()) == refusal.parent.as_deref();
+            let continue_from = if base_is_parent {
+                Some((self.base.clone(), self.base_tips.clone()))
+            } else if below_is_parent {
+                Some((self.below.clone(), self.below_tips.clone()))
+            } else {
+                None
+            };
+            match continue_from {
+                None => tracing::warn!(
                     n = refusal.n,
                     parent = ?refusal.parent,
                     base = ?self.base.as_ref().map(|b| b.manifest.n),
                     "refused capture's parent is not the chain head this executor kept; the next \
                      capture may find a wrong parent until a re-plan"
-                );
-            } else if self
-                .previous
-                .as_ref()
-                .is_some_and(|p| p.manifest.n >= refusal.n)
-            {
-                self.previous = self.base.clone();
-                self.last_tips = self.base_tips.clone();
+                ),
+                Some((manifest, tips))
+                    if self
+                        .previous
+                        .as_ref()
+                        .is_some_and(|p| p.manifest.n >= refusal.n) =>
+                {
+                    self.previous = manifest;
+                    self.last_tips = tips;
+                }
+                Some(_) => {}
             }
             let gone: HashSet<&String> = refusal
                 .uploads
@@ -765,8 +789,91 @@ impl CaptureEngine {
             );
         }
         self.bulk_work = None;
+        self.below = None;
+        self.below_tips.clear();
         self.persist()?;
         Ok(())
+    }
+
+    /// The queued bulk capture a small snap is staged ahead of, with the manifest it was staged
+    /// on: the newest queued capture, when it is a bulk one the shipper is not registering, is
+    /// the capture this engine staged last, and names the manifest kept as `below` as its
+    /// parent. Call under the staging's coalesce guard.
+    fn hoist_target(&self) -> Result<Option<(QueueEntry, EncodedManifest)>, EngineError> {
+        let Some(below) = &self.below else {
+            return Ok(None);
+        };
+        let Some(bulk) = self.staging.hoistable()? else {
+            return Ok(None);
+        };
+        let staged_last =
+            self.previous.as_ref().map(|p| p.capture_id.as_str()) == Some(bulk.capture_id.as_str());
+        let on_below = bulk.register.parent.as_deref() == Some(below.capture_id.as_str());
+        Ok((staged_last && on_below).then(|| (bulk, below.clone())))
+    }
+
+    /// `bulk` staged again on top of `small` (a capture taking its place): the same objects, a
+    /// new manifest at `small.n + 1` whose parent is `small` and whose git and workspace sections
+    /// are `small`'s. Writes the manifest file and returns the queue entry and the manifest; the
+    /// caller queues the entry before `small`, so the bulk capture is never missing from the
+    /// queue, and sweeps the old manifest once `small` is queued.
+    fn restage_bulk(
+        &self,
+        bulk: &QueueEntry,
+        small: &EncodedManifest,
+    ) -> Result<(QueueEntry, EncodedManifest), EngineError> {
+        let old = &bulk.register.manifest;
+        let n = small.manifest.n + 1;
+        let manifest = Manifest {
+            worktree_id: old.worktree_id.clone(),
+            n,
+            parent: Some(small.capture_id.clone()),
+            epoch: old.epoch,
+            seq: old.seq,
+            kind: old.kind,
+            created_at: old.created_at.clone(),
+            sections: Sections {
+                git: small.manifest.sections.git.clone(),
+                workspace: small.manifest.sections.workspace.clone(),
+                bulk: old.sections.bulk.clone(),
+            },
+            checkpoint: None,
+        }
+        .encode();
+        let manifest_key = self.prefix.manifest(&manifest.capture_id);
+        let manifest_file = format!("manifest-{}", manifest.capture_id);
+        fs::write(
+            self.staging.objects_dir().join(&manifest_file),
+            &manifest.bytes,
+        )?;
+        let mut uploads: Vec<Upload> = bulk
+            .uploads
+            .iter()
+            .filter(|u| u.key != bulk.register.manifest_key)
+            .cloned()
+            .collect();
+        uploads.push(Upload {
+            key: manifest_key.clone(),
+            file: manifest_file,
+            bytes: manifest.bytes.len() as u64,
+        });
+        let entry = QueueEntry {
+            n,
+            capture_id: manifest.capture_id.clone(),
+            kind: bulk.kind,
+            class: Some(Class::Bulk),
+            uploads,
+            register: RegisterRequest {
+                worktree_id: bulk.register.worktree_id.clone(),
+                epoch: bulk.register.epoch,
+                n,
+                parent: manifest.manifest.parent.clone(),
+                capture_id: manifest.capture_id.clone(),
+                manifest_key,
+                manifest: manifest.manifest.clone(),
+            },
+        };
+        Ok((entry, manifest))
     }
 
     /// Take a snap and stage it; a bulk build stops at the next chunk boundary whenever
@@ -792,7 +899,7 @@ impl CaptureEngine {
         // The tips as of `previous`, before this snap's pack moves them on.
         let tips_before = self.last_tips.clone();
 
-        let sections = match req.class {
+        let mut sections = match req.class {
             Class::Small => {
                 let repo = GitRepo::open(&self.config.root)?;
                 let mut previous_tips = self
@@ -879,9 +986,32 @@ impl CaptureEngine {
             }
         };
 
+        // Chain position, decided under the coalesce guard: the shipper cannot claim a capture
+        // meanwhile, so what is queued stays what this snap sees.
+        let staging = Arc::clone(&self.staging);
+        let coalesce_guard = staging.coalesce_guard();
+        // A small capture never waits for a bulk capture's upload (hundreds of MB for a
+        // dependency tree). While the newest queued capture is a bulk one the shipper is not
+        // registering, this capture takes its place on the chain, with the bulk section of the
+        // manifest the bulk capture was staged on, and the bulk capture moves on top of it.
+        // Before this, every small capture staged after a bulk one named it as its parent and
+        // waited for its whole upload (observed: 800 MB of `node_modules` held the chain at
+        // the capture before the agent's edits for 20 minutes).
+        let hoist = match req.class {
+            Class::Small => self.hoist_target()?,
+            Class::Bulk => None,
+        };
+        if let Some((_, below)) = &hoist {
+            sections.bulk = below.manifest.sections.bulk.clone();
+        }
+        let follows = match &hoist {
+            Some((_, below)) => Some(below),
+            None => self.previous.as_ref(),
+        };
+
         // Nothing changed: an `auto` snap stages nothing rather than growing the chain.
         if req.kind == CaptureKind::Auto
-            && let Some(prev) = &self.previous
+            && let Some(prev) = follows
             && prev.manifest.sections == sections
         {
             // Only the objects no queued capture lists go: a dir object this build listed
@@ -910,24 +1040,31 @@ impl CaptureEngine {
             })));
         }
 
-        // Chain position: coalesce with a pending, not-yet-shipping auto capture. The guard keeps
-        // the shipper from claiming that capture until its replacement is in the queue.
-        let staging = Arc::clone(&self.staging);
-        let coalesce_guard = staging.coalesce_guard();
         // Nothing queued: this capture becomes the oldest queued one, so its parent is the
         // chain head a refusal would send the engine back to.
         if self.staging.pending()?.is_empty() {
             self.base = self.previous.clone();
             self.base_tips = tips_before;
         }
+        // Coalesce with a pending, not-yet-shipping `auto` capture of the same class: a small
+        // snap never folds into a bulk capture (it would wait for that upload), nor a bulk
+        // snap into a small one. The guard keeps the shipper from claiming that capture until
+        // its replacement is in the queue.
         let coalesce = if req.kind == CaptureKind::Auto {
-            self.staging.coalescible()?
+            match &hoist {
+                Some((bulk, _)) => self.staging.coalescible_below(bulk)?,
+                None => self
+                    .staging
+                    .coalescible()?
+                    .filter(|e| (e.class == Some(Class::Bulk)) == (req.class == Class::Bulk)),
+            }
         } else {
             None
         };
-        let (n, parent) = match &coalesce {
-            Some(old) => (old.n, old.register.parent.clone()),
-            None => (
+        let (n, parent) = match (&coalesce, &hoist) {
+            (Some(old), _) => (old.n, old.register.parent.clone()),
+            (None, Some((bulk, _))) => (bulk.n, bulk.register.parent.clone()),
+            (None, None) => (
                 self.previous.as_ref().map_or(0, |p| p.manifest.n + 1),
                 self.previous.as_ref().map(|p| p.capture_id.clone()),
             ),
@@ -990,12 +1127,54 @@ impl CaptureEngine {
                 manifest: manifest.manifest.clone(),
             },
         };
-        match &coalesce {
-            Some(old) => self.staging.replace(old, &entry)?,
-            None => self.staging.enqueue(&entry)?,
+        if req.class == Class::Bulk {
+            match &coalesce {
+                // Staged on the newest capture: that is the manifest a small snap takes this
+                // bulk capture's place with.
+                None => {
+                    self.below = self.previous.clone();
+                    self.below_tips = self.last_tips.clone();
+                }
+                // It replaces a queued bulk capture and keeps that one's parent.
+                Some(old) => {
+                    if self.below.as_ref().map(|b| &b.capture_id) != old.register.parent.as_ref() {
+                        self.below = None;
+                    }
+                }
+            }
         }
+        let newest = match &hoist {
+            Some((bulk, _)) => {
+                // The bulk capture first (at `n + 1`, over its own queue file when this capture
+                // coalesced the one below it), then this capture in its place, then the bulk
+                // capture's old manifest goes.
+                let (moved, moved_manifest) = self.restage_bulk(bulk, &manifest)?;
+                self.staging.enqueue(&moved)?;
+                match &coalesce {
+                    Some(old) => self.staging.replace(old, &entry)?,
+                    None => self.staging.enqueue(&entry)?,
+                }
+                self.staging.sweep(bulk)?;
+                self.below = Some(manifest.clone());
+                self.below_tips = self.last_tips.clone();
+                tracing::info!(
+                    n,
+                    bulk_n = moved.n,
+                    kind = ?req.kind,
+                    "capture staged ahead of the bulk capture still uploading"
+                );
+                moved_manifest
+            }
+            None => {
+                match &coalesce {
+                    Some(old) => self.staging.replace(old, &entry)?,
+                    None => self.staging.enqueue(&entry)?,
+                }
+                manifest.clone()
+            }
+        };
         drop(coalesce_guard);
-        self.previous = Some(manifest.clone());
+        self.previous = Some(newest);
         self.persist()?;
         stats.elapsed_ms = start.elapsed().as_millis() as u64;
         tracing::info!(

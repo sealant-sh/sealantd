@@ -10,7 +10,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use sealant_capture::manifest::BulkState;
 use sealant_capture::registrar::{HeartbeatRequest, PlanGetRequest, RegistrarError};
 use sealant_capture::{
-    BlobSink, CadenceRunner, CaptureKind as EngineKind, MaterializeClass, Materializer, Registrar,
+    BlobSink, CadenceRunner, CaptureKind as EngineKind, Class, MaterializeClass, Materializer,
+    Registrar,
 };
 use sealant_protocol::{
     CaptureClass, CaptureKind, CaptureReplanned, CaptureStaged, CaptureStatusReport, ControlError,
@@ -355,7 +356,12 @@ impl CaptureRuntime {
     pub fn status(&self) -> CaptureStatusReport {
         let ship = self.runner.shipper().status.snapshot();
         let staging = self.runner.staging();
-        let pending = staging.pending().map(|p| p.len() as u64).unwrap_or(0);
+        let queued = staging.pending().unwrap_or_default();
+        let pending = queued.len() as u64;
+        let pending_bulk = queued
+            .iter()
+            .filter(|e| e.class == Some(Class::Bulk))
+            .count() as u64;
         let staged_bytes = staging.staged_bytes().unwrap_or(0);
         let last = self.last_snap_unix_ms.load(Ordering::Relaxed);
         let (worktree_id, epoch) = self.identity();
@@ -378,6 +384,7 @@ impl CaptureRuntime {
             .into_iter()
             .flatten()
             .collect(),
+            pending_bulk,
         }
     }
 
@@ -528,6 +535,7 @@ mod tests {
             panic!("capture.flush: {:?}", resp.outcome);
         };
         assert_eq!(report.pending, 0);
+        assert_eq!(report.pending_bulk, 0);
         let chain = registrar.chain();
         assert_eq!(chain.len(), 2);
         assert_eq!(chain[1].manifest.kind, EngineKind::Suspend);

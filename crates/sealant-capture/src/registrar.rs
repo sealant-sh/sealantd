@@ -1213,9 +1213,16 @@ impl Registrar for HttpRegistrar {
 pub struct RegistrarMinter<R: Registrar + ?Sized> {
     registrar: std::sync::Arc<R>,
     identity: Mutex<(String, u64)>,
-    put_cache: Mutex<BTreeMap<String, String>>,
+    /// PUT URLs minted and not used yet, with when they were minted.
+    put_cache: Mutex<BTreeMap<String, (String, std::time::Instant)>>,
     get_urls: Mutex<BTreeMap<String, String>>,
 }
+
+/// How long a minted PUT URL is used before it is minted again. The registrar chooses the
+/// URL's lifetime (Mend presigns for 15 minutes); this stays well inside any sane one. A bulk
+/// upload that stops mid-batch for a capture staged ahead of it resumes on the URLs it holds
+/// instead of spending another `upload.urls` call on them.
+pub const PUT_URL_REUSE: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 
 impl<R: Registrar + ?Sized> RegistrarMinter<R> {
     /// Mint for `worktree_id` at `epoch`, seeded with the plan's GET URLs.
@@ -1261,21 +1268,52 @@ impl<R: Registrar + ?Sized> RegistrarMinter<R> {
     }
 
     /// Pre-mint PUT URLs for a batch of `(key, bytes)` (one channel call). Every key travels
-    /// with its size, so the registrar can price the whole batch before it mints anything.
+    /// with its size, so the registrar can price the whole batch before it mints anything. Keys
+    /// that already hold a URL minted within [`PUT_URL_REUSE`] are not asked for again; when
+    /// every key does, no call is made.
     pub fn prefetch_put(&self, keys: &[(String, u64)]) -> Result<(), RegistrarError> {
+        let wanted: Vec<(String, u64)> = {
+            let mut cache = self
+                .put_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            cache.retain(|_, (_, at)| at.elapsed() < PUT_URL_REUSE);
+            keys.iter()
+                .filter(|(k, _)| !cache.contains_key(k))
+                .cloned()
+                .collect()
+        };
+        if wanted.is_empty() {
+            return Ok(());
+        }
         let (worktree_id, epoch) = self.identity();
         let mut req = UploadUrlsRequest::new(
             &worktree_id,
             epoch,
-            keys.iter().map(|(k, _)| k.clone()).collect(),
+            wanted.iter().map(|(k, _)| k.clone()).collect(),
         );
-        req.sizes = keys.iter().cloned().collect();
+        req.sizes = wanted.into_iter().collect();
         let resp = self.registrar.upload_urls(&req)?;
+        self.cache_puts(resp.urls);
+        Ok(())
+    }
+
+    fn cache_puts(&self, urls: BTreeMap<String, String>) {
+        let now = std::time::Instant::now();
         self.put_cache
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .extend(resp.urls);
-        Ok(())
+            .extend(urls.into_iter().map(|(k, u)| (k, (u, now))));
+    }
+
+    /// The cached PUT URL for `key`, taken out of the cache, when it is fresh.
+    fn take_put(&self, key: &str) -> Option<String> {
+        self.put_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(key)
+            .filter(|(_, at)| at.elapsed() < PUT_URL_REUSE)
+            .map(|(u, _)| u)
     }
 }
 
@@ -1285,25 +1323,17 @@ impl<R: Registrar + ?Sized> crate::sink::UrlMinter for RegistrarMinter<R> {
     }
 
     fn put_url(&self, key: &str, size: u64) -> Result<String, crate::sink::SinkError> {
-        if let Some(u) = self
-            .put_cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(key)
-        {
+        if let Some(u) = self.take_put(key) {
             return Ok(u);
         }
         // The fallback for a key no batch minted, and it declares that key's real length: a
         // registrar may sign the URL for exactly those bytes (Mend's upload length binding), so
         // a stand-in size would mint a URL the PUT cannot use.
         Self::prefetch_put(self, &[(key.to_owned(), size)]).map_err(|e| mint_error(key, e))?;
-        self.put_cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(key)
+        self.take_put(key)
             .ok_or_else(|| crate::sink::SinkError::NoUrl {
                 key: key.to_owned(),
-                reason: "no PUT url minted".to_owned(),
+                reason: "the registrar answered upload.urls without this key".to_owned(),
             })
     }
 
@@ -1334,10 +1364,7 @@ impl<R: Registrar + ?Sized> crate::sink::UrlMinter for RegistrarMinter<R> {
         let multipart = resp.multipart.remove(key);
         // A registrar that answered with a plain PUT URL (below its threshold, or no multipart
         // support) has minted it now; keep it for the single-PUT fallback.
-        self.put_cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .extend(resp.urls);
+        self.cache_puts(resp.urls);
         Ok(multipart)
     }
 
@@ -1377,8 +1404,11 @@ impl<R: Registrar + ?Sized> crate::sink::UrlMinter for RegistrarMinter<R> {
     }
 }
 
-/// A quota refusal stays itself on the way to the sink (terminal, with its numbers); anything
-/// else is "no url for this key".
+/// A quota refusal stays itself on the way to the sink (terminal, with its numbers); a transient
+/// failure of the call (transport, 5xx, the registrar's 429 call quota) stays retryable; anything
+/// else is "no url for this key". A 429 used to become `NoUrl`, which the shipper does not retry,
+/// so one throttled mint failed the whole pass as `no url for <key>: transport: upload.urls: http
+/// 429`.
 fn mint_error(key: &str, error: RegistrarError) -> crate::sink::SinkError {
     match error {
         RegistrarError::QuotaRefused {
@@ -1391,6 +1421,11 @@ fn mint_error(key: &str, error: RegistrarError) -> crate::sink::SinkError {
             limit,
             used,
             requested,
+        },
+        RegistrarError::Transport(reason) => crate::sink::SinkError::Transport {
+            method: "upload.urls",
+            key: key.to_owned(),
+            reason,
         },
         other => crate::sink::SinkError::NoUrl {
             key: key.to_owned(),

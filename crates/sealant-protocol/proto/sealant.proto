@@ -593,6 +593,10 @@ message CaptureStatusReport {
   // Classes the registrar refused for the session's byte quota; nothing of such a class ships
   // again until the next epoch or capture.replan.
   repeated CaptureClass refused = 12;
+  // Of `pending`, the bulk captures (dependency trees, build outputs) whose objects are still
+  // uploading. capture.flush returns once every other capture is registered; these follow in
+  // the background and register after it.
+  uint64 pending_bulk = 13;
 }
 message LeaseEpochReport { uint64 epoch = 1; string worktree_id = 2; bool fenced = 3; }
 message CaptureReplanned {

@@ -166,10 +166,12 @@ fn an_unchanged_snap_keeps_the_objects_a_queued_capture_lists() {
     );
 }
 
-/// A small `auto` snap that coalesces with a queued bulk capture carries the bulk section as
-/// it is, dir objects included, so the combined capture materializes.
+/// A small `auto` snap while a bulk capture is queued is staged ahead of it, never folded into
+/// it: the small capture takes the bulk capture's place with the bulk section it was staged on,
+/// and the bulk capture — its dir objects and packs unchanged — moves on top, so the two
+/// register in that order and the head materializes both.
 #[test]
-fn a_small_snap_coalescing_a_queued_bulk_capture_keeps_its_dir_objects() {
+fn a_small_snap_is_staged_ahead_of_a_queued_bulk_capture() {
     let fx = fixture(4, 3);
     let sink = Arc::new(LocalDir::new(&fx.base.join("store")).unwrap());
     let registrar = Arc::new(InMemoryRegistrar::new("wt", 1, None));
@@ -184,38 +186,84 @@ fn a_small_snap_coalescing_a_queued_bulk_capture_keeps_its_dir_objects() {
     assert!(bulk.stats.dirs_new >= 4, "{:?}", bulk.stats);
     let queued = engine.staging().pending().unwrap();
     assert_eq!(queued.len(), 1);
-    let bulk_trees = queued[0]
+    let bulk_objects: Vec<String> = queued[0]
         .uploads
         .iter()
-        .filter(|u| u.file.starts_with("tree-"))
-        .count();
-    assert!(bulk_trees >= 4);
-
-    // Before the shipper claims it, the workspace class changes and a small snap coalesces.
-    fs::write(fx.root.join(".env"), "SECRET=2\n").unwrap();
-    let small = snap(&mut engine, Class::Small, 3);
-    assert_eq!(small.n, 1, "coalesced into the bulk capture's slot");
-    assert!(matches!(
-        small.manifest.manifest.sections.bulk,
-        BulkState::Ready(_)
-    ));
-    let queued = engine.staging().pending().unwrap();
-    assert_eq!(queued.len(), 1);
-    assert_eq!(queued[0].capture_id, small.manifest.capture_id);
-    let carried = queued[0]
-        .uploads
-        .iter()
-        .filter(|u| u.file.starts_with("tree-"))
-        .count();
+        .filter(|u| u.key != queued[0].register.manifest_key)
+        .map(|u| u.file.clone())
+        .collect();
     assert!(
-        carried >= bulk_trees,
-        "the bulk dir objects ride along: {carried} < {bulk_trees}"
+        bulk_objects
+            .iter()
+            .filter(|f| f.starts_with("tree-"))
+            .count()
+            >= 4,
+        "{bulk_objects:?}"
     );
 
-    assert_eq!(shipper.ship_pending().unwrap(), 1);
+    // Before the shipper reaches it, the workspace class changes and a small snap runs.
+    fs::write(fx.root.join(".env"), "SECRET=2\n").unwrap();
+    let small = snap(&mut engine, Class::Small, 3);
+    assert!(!small.unchanged);
+    assert_eq!(
+        small.n, 1,
+        "the small capture takes the bulk capture's slot"
+    );
+    assert_eq!(
+        small.manifest.manifest.sections.bulk,
+        BulkState::pending(),
+        "with the bulk section of the capture below"
+    );
+    let queued = engine.staging().pending().unwrap();
+    assert_eq!(queued.len(), 2);
+    assert_eq!(queued[0].capture_id, small.manifest.capture_id);
+    assert!(
+        queued[0]
+            .uploads
+            .iter()
+            .all(|u| !bulk_objects.contains(&u.file)),
+        "the small capture carries none of the bulk objects"
+    );
+    let moved = &queued[1];
+    assert_eq!(moved.n, 2);
+    assert_eq!(moved.class, Some(Class::Bulk));
+    assert_eq!(
+        moved.register.parent.as_deref(),
+        Some(small.manifest.capture_id.as_str())
+    );
+    assert_ne!(moved.capture_id, bulk.manifest.capture_id, "a new manifest");
+    assert_eq!(
+        moved.register.manifest.sections.bulk,
+        bulk.manifest.manifest.sections.bulk
+    );
+    assert_eq!(
+        moved.register.manifest.sections.workspace,
+        small.manifest.manifest.sections.workspace
+    );
+    for file in &bulk_objects {
+        assert!(moved.uploads.iter().any(|u| u.file == *file), "{file}");
+        assert!(engine.staging().objects_dir().join(file).exists(), "{file}");
+    }
+    assert!(
+        !engine
+            .staging()
+            .objects_dir()
+            .join(format!("manifest-{}", bulk.manifest.capture_id))
+            .exists(),
+        "the bulk capture's old manifest is swept"
+    );
+    assert_eq!(
+        engine.previous().map(|p| p.capture_id.clone()),
+        Some(moved.capture_id.clone()),
+        "the engine continues from the bulk capture"
+    );
+
+    assert_eq!(shipper.ship_pending().unwrap(), 2);
+    let chain = registrar.chain();
+    assert_eq!(chain.len(), 3);
+    assert_eq!(chain[1].capture_id, small.manifest.capture_id);
+    assert_eq!(chain[2].capture_id, moved.capture_id);
     let head = registrar.head().unwrap();
-    assert_eq!(head.n, 1);
-    assert_eq!(head.capture_id, small.manifest.capture_id);
     let restore = fx.base.join("restore");
     let report = Materializer::new(
         sink.as_ref(),
@@ -229,6 +277,15 @@ fn a_small_snap_coalescing_a_queued_bulk_capture_keeps_its_dir_objects() {
         "SECRET=2\n"
     );
     assert!(restore.join("node_modules/pkg3/lib/m2.js").exists());
+
+    // The next small snap chains after the registered bulk capture, bulk section and all.
+    fs::write(fx.root.join(".env"), "SECRET=3\n").unwrap();
+    let after = snap(&mut engine, Class::Small, 4);
+    assert_eq!(after.n, 3);
+    assert_eq!(
+        after.manifest.manifest.sections.bulk,
+        moved.register.manifest.sections.bulk
+    );
 }
 
 /// A minter that counts what the sink asked of it.

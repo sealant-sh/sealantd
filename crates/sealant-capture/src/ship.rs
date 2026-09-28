@@ -1,6 +1,9 @@
 //! Staging and shipping. Snaps are staged on local disk under `<workspace root>/.sealantd/capture/`
 //! (the same filesystem as the tree); a worker uploads oldest-first with retry and coalescing,
-//! then registers. The queue follows the `Spool` discipline of ADR-0007 (append → replay → ack,
+//! then registers. One pass runs at a time. A bulk capture's objects upload unclaimed and yield
+//! between objects: to a capture staged ahead of it (the engine stages small captures ahead of a
+//! bulk one still uploading) and to a waiting flush, which registers every capture ahead of the
+//! bulk one and returns. The queue follows the `Spool` discipline of ADR-0007 (append → replay → ack,
 //! a disk bound), not its record format: one JSON entry per capture, one ack marker per object.
 //! The shipper is throttled to ≤ 50% of one core as a CPU-time duty cycle from `getrusage`;
 //! objects at or above [`MultipartConfig::threshold`] go up as multipart uploads with several
@@ -10,7 +13,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -176,6 +179,10 @@ pub struct Staging {
     coalesce: Mutex<()>,
     /// Captures the registrar refused, for the engine to read at its next snap.
     refusals: Mutex<Vec<RefusedCapture>>,
+    /// Bumped on every queue change (an entry staged, replaced, acked or dropped). A shipper
+    /// uploading a bulk capture's objects checks it between objects, so a capture staged ahead
+    /// of that bulk capture ships first.
+    generation: AtomicU64,
 }
 
 impl Staging {
@@ -192,6 +199,7 @@ impl Staging {
             in_flight: Mutex::new(None),
             coalesce: Mutex::new(()),
             refusals: Mutex::new(Vec::new()),
+            generation: AtomicU64::new(0),
         };
         fs::create_dir_all(staging.marker_dir())?;
         Ok(staging)
@@ -238,10 +246,28 @@ impl Staging {
                 continue;
             }
             fs::remove_file(self.queue_path(entry.n)).ok();
+            self.bump();
             self.sweep(&entry)?;
             dropped += 1;
         }
         Ok(dropped)
+    }
+
+    /// Changes whenever the queue does.
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
+    }
+
+    fn bump(&self) {
+        self.generation.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn in_flight(&self) -> Option<u64> {
+        *self
+            .in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Root.
@@ -306,7 +332,9 @@ impl Staging {
         let path = self.queue_path(entry.n);
         let tmp = path.with_extension("tmp");
         fs::write(&tmp, serde_json::to_vec(entry)?)?;
-        fs::rename(tmp, path)
+        fs::rename(tmp, path)?;
+        self.bump();
+        Ok(())
     }
 
     /// Pending entries, oldest first. Unparseable entries are skipped with a warning.
@@ -383,15 +411,43 @@ impl Staging {
         let Some(last) = pending.last() else {
             return Ok(None);
         };
-        let in_flight = *self
-            .in_flight
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if last.kind == CaptureKind::Auto && in_flight != Some(last.n) {
+        if last.kind == CaptureKind::Auto && self.in_flight() != Some(last.n) {
             Ok(Some(last.clone()))
         } else {
             Ok(None)
         }
+    }
+
+    /// The entry right below `top` (the bulk capture a small snap is staged ahead of) if it is
+    /// an `auto` small-class capture not being shipped: the one that small snap may coalesce
+    /// with. Call under [`Staging::coalesce_guard`].
+    pub fn coalescible_below(&self, top: &QueueEntry) -> io::Result<Option<QueueEntry>> {
+        let pending = self.pending()?;
+        let Some(below) = pending.iter().rev().find(|e| e.n < top.n) else {
+            return Ok(None);
+        };
+        if below.kind == CaptureKind::Auto
+            && below.class != Some(Class::Bulk)
+            && self.in_flight() != Some(below.n)
+        {
+            Ok(Some(below.clone()))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// The bulk capture a small snap may be staged ahead of: the newest pending entry, when it
+    /// is a bulk capture under this identity that the shipper is not registering. Its objects
+    /// may be uploading; they are content-addressed and stay with it, only its manifest (its
+    /// `n` and parent) moves. Call under [`Staging::coalesce_guard`].
+    pub fn hoistable(&self) -> io::Result<Option<QueueEntry>> {
+        let pending = self.pending()?;
+        Ok(pending
+            .last()
+            .filter(|e| {
+                e.class == Some(Class::Bulk) && self.in_flight() != Some(e.n) && !self.is_foreign(e)
+            })
+            .cloned())
     }
 
     /// Drop `entry` because the registrar refused it for good, with every queued capture after
@@ -409,6 +465,7 @@ impl Staging {
             refusal.uploads.extend(queued.uploads.iter().cloned());
             dropped += 1;
         }
+        self.bump();
         let uploads = refusal.uploads.clone();
         self.refusals
             .lock()
@@ -438,6 +495,7 @@ impl Staging {
                 Err(e)
             }
         })?;
+        self.bump();
         self.sweep(entry)
     }
 
@@ -451,7 +509,9 @@ impl Staging {
         self.sweep(old)
     }
 
-    fn sweep(&self, removed: &QueueEntry) -> io::Result<()> {
+    /// Remove the object files of `removed` (an entry no longer queued at its `n`) that no queued
+    /// entry lists.
+    pub fn sweep(&self, removed: &QueueEntry) -> io::Result<()> {
         self.discard_unreferenced(&removed.uploads).map(|_| ())
     }
 
@@ -630,7 +690,38 @@ impl Default for RetryPolicy {
     }
 }
 
-/// Uploads staged captures oldest-first and registers each.
+/// Why a pass stopped uploading a bulk capture's objects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stop {
+    /// The queue changed: re-read it (a capture was staged ahead, or the bulk capture moved).
+    Changed,
+    /// A flush is waiting for the pass.
+    Waiting,
+    /// The caller's deadline passed.
+    Deadline,
+}
+
+/// Which captures a pass is after.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Scope {
+    /// Everything pending.
+    All,
+    /// Every capture ahead of a bulk capture whose objects are still uploading: what a change
+    /// or a diff needs. The bulk capture keeps uploading in the worker.
+    AheadOfBulk,
+}
+
+/// What one pass got through.
+#[derive(Debug, Clone, Copy, Default)]
+struct Pass {
+    shipped: usize,
+    /// The scope is shipped: the queue is empty, or only bulk captures still uploading are left.
+    done: bool,
+    /// The pass stopped uploading a bulk capture's objects for a waiting flush.
+    yielded: bool,
+}
+
+/// Uploads staged captures oldest-first and registers each, one pass at a time.
 pub struct Shipper {
     staging: Arc<Staging>,
     sink: Arc<dyn BlobSink>,
@@ -638,6 +729,13 @@ pub struct Shipper {
     cpu_fraction: f64,
     retry: RetryPolicy,
     multipart: MultipartConfig,
+    /// Held by a pass. Two passes over one queue raced for the same objects: each consumed PUT
+    /// URLs the other had minted, the loser minted one key per call, and the registrar's
+    /// `upload.urls` call quota ran out (observed: `no url for …/trees/<sha>` after a flush ran
+    /// beside the worker through an 800 MB bulk upload).
+    pass: Mutex<()>,
+    /// Flushes waiting for the pass; the worker's bulk upload yields to them.
+    waiting: AtomicUsize,
     /// Counters.
     pub status: Arc<ShipStatus>,
 }
@@ -667,6 +765,8 @@ impl Shipper {
             cpu_fraction: DEFAULT_CPU_FRACTION,
             retry: RetryPolicy::default(),
             multipart: MultipartConfig::DEFAULT,
+            pass: Mutex::new(()),
+            waiting: AtomicUsize::new(0),
             status,
         }
     }
@@ -819,6 +919,17 @@ impl Shipper {
     /// already, missing from staging, or multipart-sized: its parts mint their own URLs, and a
     /// URL minted ahead of a minutes-long upload could expire before its PUT.
     fn upload_all(&self, uploads: &[Upload], cycle: &mut DutyCycle) -> Result<(), ShipError> {
+        self.upload_until(uploads, cycle, &|| None).map(|_| ())
+    }
+
+    /// [`Self::upload_all`], asking `stop` before every object; the reason it gave, or `None`
+    /// once every object is up.
+    fn upload_until(
+        &self,
+        uploads: &[Upload],
+        cycle: &mut DutyCycle,
+        stop: &dyn Fn() -> Option<Stop>,
+    ) -> Result<Option<Stop>, ShipError> {
         let objects = self.staging.objects_dir();
         let single_put = |u: &Upload| {
             u.bytes < self.multipart.threshold
@@ -827,6 +938,9 @@ impl Shipper {
         };
         let mut start = 0;
         while start < uploads.len() {
+            if let Some(why) = stop() {
+                return Ok(Some(why));
+            }
             let mut end = start;
             while end < uploads.len() && end - start < PREFETCH_BATCH && single_put(&uploads[end]) {
                 end += 1;
@@ -840,8 +954,26 @@ impl Shipper {
                 .iter()
                 .map(|u| (u.key.clone(), u.bytes))
                 .collect();
-            match self.sink.prefetch_put(&keys) {
-                Ok(()) => {}
+            self.prefetch(&keys)?;
+            for u in &uploads[start..end] {
+                if let Some(why) = stop() {
+                    return Ok(Some(why));
+                }
+                self.upload_one(u, cycle)?;
+            }
+            start = end;
+        }
+        Ok(None)
+    }
+
+    /// Mint a batch's PUT URLs. A transient failure (transport, 5xx, 429) is retried with
+    /// backoff and then fails the pass: falling back to one mint per key would turn one refused
+    /// call into hundreds against the registrar's call quota.
+    fn prefetch(&self, keys: &[(String, u64)]) -> Result<(), ShipError> {
+        let mut attempt = 0;
+        loop {
+            match self.sink.prefetch_put(keys) {
+                Ok(()) => return Ok(()),
                 // The registrar priced the batch and refused it: nothing was minted, and no
                 // later attempt at these bytes can pass.
                 Err(SinkError::QuotaRefused {
@@ -857,15 +989,25 @@ impl Shipper {
                         requested,
                     });
                 }
+                Err(error) if error.is_retryable() => {
+                    self.status.failures.fetch_add(1, Ordering::Relaxed);
+                    attempt += 1;
+                    if attempt >= self.retry.attempts {
+                        return Err(ShipError::Upload {
+                            key: keys.first().map(|(k, _)| k.clone()).unwrap_or_default(),
+                            source: error,
+                        });
+                    }
+                    tracing::warn!(keys = keys.len(), attempt, %error, "batch URL mint failed; retrying");
+                    thread::sleep(self.backoff(attempt - 1));
+                }
                 // Each PUT mints its own then, and reports what stands in the way.
-                Err(error) => tracing::warn!(keys = keys.len(), %error, "batch URL mint failed"),
+                Err(error) => {
+                    tracing::warn!(keys = keys.len(), %error, "batch URL mint failed");
+                    return Ok(());
+                }
             }
-            for u in &uploads[start..end] {
-                self.upload_one(u, cycle)?;
-            }
-            start = end;
         }
-        Ok(())
     }
 
     fn register_one(&self, entry: &QueueEntry) -> Result<(), ShipError> {
@@ -920,40 +1062,124 @@ impl Shipper {
     }
 
     /// One pass: ship every pending entry in order. Stops at the first entry that cannot be
-    /// shipped (its error is returned; the queue keeps it and everything after it).
+    /// shipped (its error is returned; the queue keeps it and everything after it). A bulk
+    /// capture's objects go up unclaimed: when a capture is staged ahead of it meanwhile, the
+    /// pass ships that one first and then resumes the bulk upload where it stopped.
     pub fn ship_pending(&self) -> Result<usize, ShipError> {
+        Ok(self.pass(Scope::All, None, false)?.shipped)
+    }
+
+    /// Whether `entry` is a bulk capture with objects still to upload.
+    fn uploading_bulk(&self, entry: &QueueEntry) -> bool {
+        entry.class == Some(Class::Bulk)
+            && entry
+                .uploads
+                .iter()
+                .any(|u| !self.staging.is_uploaded(&u.file))
+    }
+
+    /// One pass over the queue for `scope`, holding the pass lock. `flushing`: the caller is a
+    /// flush (counted as waiting while it waits for the lock); otherwise the pass is the
+    /// worker's, and its bulk upload yields to a waiting flush.
+    fn pass(
+        &self,
+        scope: Scope,
+        deadline: Option<Instant>,
+        flushing: bool,
+    ) -> Result<Pass, ShipError> {
+        let guard = if flushing {
+            self.waiting.fetch_add(1, Ordering::SeqCst);
+            let guard = self.pass.lock();
+            self.waiting.fetch_sub(1, Ordering::SeqCst);
+            guard
+        } else {
+            self.pass.lock()
+        };
+        let _pass = guard.unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut pass = Pass::default();
         if self.is_fenced() {
-            return Ok(0);
+            pass.done = true;
+            return Ok(pass);
         }
-        let mut shipped = 0;
+        let past = |deadline: Option<Instant>| deadline.is_some_and(|d| Instant::now() >= d);
         let mut cycle = DutyCycle::new(self.cpu_fraction);
-        for entry in self.staging.pending()? {
-            if !self.staging.claim(&entry) {
+        loop {
+            let pending = self.staging.pending()?;
+            let Some(entry) = pending.first() else {
+                pass.done = true;
+                return Ok(pass);
+            };
+            if !self.staging.is_foreign(entry) && self.uploading_bulk(entry) {
+                if scope == Scope::AheadOfBulk
+                    && pending.iter().all(|e| e.class == Some(Class::Bulk))
+                {
+                    pass.done = true;
+                    return Ok(pass);
+                }
+                let generation = self.staging.generation();
+                let stop = || {
+                    if self.staging.generation() != generation {
+                        Some(Stop::Changed)
+                    } else if !flushing && self.waiting.load(Ordering::SeqCst) > 0 {
+                        Some(Stop::Waiting)
+                    } else if past(deadline) {
+                        Some(Stop::Deadline)
+                    } else {
+                        None
+                    }
+                };
+                match self.upload_until(&entry.uploads, &mut cycle, &stop) {
+                    // Every object is up (the next round registers it), or the queue changed.
+                    Ok(None | Some(Stop::Changed)) => continue,
+                    Ok(Some(Stop::Waiting)) => {
+                        pass.yielded = true;
+                        return Ok(pass);
+                    }
+                    Ok(Some(Stop::Deadline)) => return Ok(pass),
+                    Err(ShipError::QuotaRefused {
+                        reason,
+                        limit,
+                        used,
+                        requested,
+                    }) => {
+                        self.refuse(entry, &reason, limit, used, requested)?;
+                        return Ok(pass);
+                    }
+                    // The entry was coalesced or re-staged under the upload (a later bulk snap
+                    // swept an object it no longer lists): start again from the queue.
+                    Err(_) if self.staging.generation() != generation => continue,
+                    Err(e) => return Err(e),
+                }
+            }
+            if !self.staging.claim(entry) {
                 // Coalesced away since the queue was read: the replacement sits at the same
                 // `n`; the next pass ships it (never skip ahead — the chain is ordered).
-                break;
+                return Ok(pass);
             }
-            if self.staging.is_foreign(&entry) {
+            if self.staging.is_foreign(entry) {
                 // Staged under an identity a re-plan replaced: nothing of it can register.
                 self.staging.release();
-                self.staging.ack(&entry)?;
+                self.staging.ack(entry)?;
                 tracing::info!(n = entry.n, worktree = %entry.register.worktree_id, epoch = entry.register.epoch, "foreign capture dropped");
                 continue;
             }
             let result = self
                 .upload_all(&entry.uploads, &mut cycle)
-                .and_then(|()| self.register_one(&entry));
-            self.staging.release();
+                .and_then(|()| self.register_one(entry));
             match result {
                 Ok(()) => {
-                    self.staging.ack(&entry)?;
-                    shipped += 1;
+                    // Acked before it is released: a snap must never coalesce with, or be
+                    // staged ahead of, a capture the registrar already holds.
+                    let acked = self.staging.ack(entry);
+                    self.staging.release();
+                    acked?;
+                    pass.shipped += 1;
                     if let Some(class) = entry.class {
                         self.status
                             .refused_flag(class)
                             .store(false, Ordering::Relaxed);
                     }
-                    tracing::info!(n = entry.n, capture = %entry.capture_id, kind = ?entry.kind, "capture registered");
+                    tracing::info!(n = entry.n, capture = %entry.capture_id, kind = ?entry.kind, class = ?entry.class, "capture registered");
                 }
                 Err(ShipError::QuotaRefused {
                     reason,
@@ -961,13 +1187,19 @@ impl Shipper {
                     used,
                     requested,
                 }) => {
-                    self.refuse(&entry, &reason, limit, used, requested)?;
-                    return Ok(shipped);
+                    self.staging.release();
+                    self.refuse(entry, &reason, limit, used, requested)?;
+                    return Ok(pass);
                 }
-                Err(e) => return Err(e),
+                Err(e) => {
+                    self.staging.release();
+                    return Err(e);
+                }
+            }
+            if past(deadline) {
+                return Ok(pass);
             }
         }
-        Ok(shipped)
     }
 
     /// The registrar refused `entry` for the session's byte quota: drop it, its staged bytes and
@@ -1016,35 +1248,62 @@ impl Shipper {
         Ok(())
     }
 
-    /// Ship until the queue is empty or an error is not retryable, bounded by `deadline`.
+    /// Ship until the queue is empty or an error is not retryable, bounded by `deadline` (also
+    /// inside a pass: a bulk upload stops between objects when it passes).
     pub fn flush(&self, deadline: Duration) -> Result<usize, ShipError> {
-        let start = Instant::now();
+        self.flush_scope(Scope::All, deadline)
+    }
+
+    /// Register every capture staged ahead of a bulk capture whose objects are still uploading,
+    /// bounded by `deadline`, and return: that is the git pack, the worktree tree and the
+    /// workspace class — what a change or a diff needs. The bulk capture keeps uploading in the
+    /// worker and registers after them; until then the chain head's bulk section is the one
+    /// before it (or `"pending"`).
+    pub fn flush_small(&self, deadline: Duration) -> Result<usize, ShipError> {
+        self.flush_scope(Scope::AheadOfBulk, deadline)
+    }
+
+    fn flush_scope(&self, scope: Scope, deadline: Duration) -> Result<usize, ShipError> {
+        let until = Instant::now() + deadline;
         let mut total = 0;
         loop {
-            match self.ship_pending() {
-                Ok(n) => {
-                    total += n;
-                    if self.staging.pending()?.is_empty() {
+            match self.pass(scope, Some(until), true) {
+                Ok(pass) => {
+                    total += pass.shipped;
+                    if pass.done {
                         return Ok(total);
+                    }
+                    if pass.shipped == 0 && Instant::now() < until {
+                        // Nothing moved (a claim lost to a coalescing snap): not a hot loop.
+                        thread::sleep(
+                            self.retry
+                                .backoff
+                                .min(until.saturating_duration_since(Instant::now())),
+                        );
                     }
                 }
                 Err(ShipError::Fenced(e)) => return Err(ShipError::Fenced(e)),
                 Err(ShipError::Conflict(e)) => return Err(ShipError::Conflict(e)),
                 Err(e) => {
-                    if start.elapsed() >= deadline {
+                    if Instant::now() >= until {
                         return Err(e);
                     }
-                    thread::sleep(self.retry.backoff);
+                    thread::sleep(
+                        self.retry
+                            .backoff
+                            .min(until.saturating_duration_since(Instant::now())),
+                    );
                 }
             }
-            if start.elapsed() >= deadline {
+            if Instant::now() >= until {
                 return Ok(total);
             }
         }
     }
 }
 
-/// A background worker thread that runs [`Shipper::ship_pending`] on a wake-up or a tick.
+/// A background worker thread that runs [`Shipper::ship_pending`] on a wake-up or a tick, and
+/// straight away again after its bulk upload yielded to a flush.
 #[derive(Debug)]
 pub struct ShipWorker {
     stop: Arc<AtomicBool>,
@@ -1062,8 +1321,15 @@ impl ShipWorker {
             .name("capture-ship".into())
             .spawn(move || {
                 while !stop2.load(Ordering::Relaxed) {
-                    if let Err(e) = shipper.ship_pending() {
-                        tracing::warn!(error = %e, "ship pass failed");
+                    match shipper.pass(Scope::All, None, false) {
+                        // A flush took the pass; the bulk upload resumes once it is done (the
+                        // next pass waits for the lock).
+                        Ok(pass) if pass.yielded => {
+                            thread::yield_now();
+                            continue;
+                        }
+                        Ok(_) => {}
+                        Err(e) => tracing::warn!(error = %e, "ship pass failed"),
                     }
                     let (lock, cv) = &*wake2;
                     let mut woken = lock
