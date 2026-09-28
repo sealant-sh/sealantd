@@ -961,19 +961,7 @@ impl GitRepo {
         }
         bytes.extend_from_slice(pattern.as_bytes());
         bytes.push(b'\n');
-        let tmp = info.join("exclude.capture-tmp");
-        {
-            let mut file = File::create(&tmp).map_err(at("create", &tmp))?;
-            file.write_all(&bytes).map_err(at("write", &tmp))?;
-            if let Some(mode) = mode {
-                use std::os::unix::fs::PermissionsExt;
-                file.set_permissions(fs::Permissions::from_mode(mode))
-                    .map_err(at("chmod", &tmp))?;
-            }
-            file.sync_all().map_err(at("fsync", &tmp))?;
-        }
-        fs::rename(&tmp, &path).map_err(at("rename into", &path))?;
-        Ok(())
+        replace_through_own_temp(&path, &bytes, mode)
     }
 
     /// Whether `path` (worktree-relative) is ignored by the repository's ignore rules.
@@ -3489,21 +3477,84 @@ pub fn install_pack(
     if pack_path.exists() && idx_path.exists() {
         return Ok(false);
     }
-    let tmp = dir.join(format!("tmp-capture-{sha256}.pack"));
-    fs::write(&tmp, pack).map_err(at("write", &tmp))?;
-    let tmp_idx = tmp.with_extension("idx");
-    match idx {
-        Some(bytes) => fs::write(&tmp_idx, bytes).map_err(at("write", &tmp_idx))?,
-        None => {
-            let tmp_str = tmp.to_string_lossy().to_string();
-            let args = ["index-pack", &tmp_str];
-            check(&args, git_command(&repo.root)?.args(args).output_bounded()?)?;
-            fs::remove_file(tmp.with_extension("rev")).ok();
+    // Both staged in files of their own (`.pack-<sha>.pack.capture-tmp-<pid>-<n>`): a name
+    // already in `objects/pack` — a user's `tmp-capture-<sha>.pack` — is never truncated,
+    // renamed away or removed (review 2026-09-28, seventeenth pass, #2).
+    let (tmp, file) = own_temp_beside(&pack_path)?;
+    let (tmp_idx, idx_file) = match own_temp_beside(&idx_path) {
+        Ok(owned) => owned,
+        Err(e) => {
+            fs::remove_file(&tmp).ok();
+            return Err(e);
         }
+    };
+    let installed = (|| {
+        write_synced(file, &tmp, pack)?;
+        match idx {
+            Some(bytes) => write_synced(idx_file, &tmp_idx, bytes)?,
+            None => {
+                drop(idx_file);
+                // `-o` names the index this call owns; with no `.pack` suffix to derive one
+                // from, no reverse index is written either.
+                let args: [&OsStr; 5] = [
+                    "index-pack".as_ref(),
+                    "--no-rev-index".as_ref(),
+                    "-o".as_ref(),
+                    tmp_idx.as_os_str(),
+                    tmp.as_os_str(),
+                ];
+                let out = git_command(&repo.root)?.args(args).output_bounded()?;
+                check(&["index-pack", "--no-rev-index", "-o"], out)?;
+            }
+        }
+        fs::rename(&tmp_idx, &idx_path).map_err(at("rename into", &idx_path))?;
+        fs::rename(&tmp, &pack_path).map_err(at("rename into", &pack_path))
+    })();
+    if let Err(e) = installed {
+        fs::remove_file(&tmp).ok();
+        fs::remove_file(&tmp_idx).ok();
+        return Err(e);
     }
-    fs::rename(&tmp_idx, &idx_path).map_err(at("rename into", &idx_path))?;
-    fs::rename(&tmp, &pack_path).map_err(at("rename into", &pack_path))?;
     Ok(true)
+}
+
+/// A new file beside `path` to stage it in ([`longpath::create_temp`], `0o666` under the umask as
+/// a plain create would make it): never a name that was there before, so only this file is the
+/// caller's to write, rename or remove.
+fn own_temp_beside(path: &Path) -> Result<(PathBuf, File), GitError> {
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let name = path.file_name().unwrap_or_default().as_bytes();
+    longpath::create_temp(dir, name, ".capture-tmp", 0o666)
+        .map_err(at("create a staging file in", dir))
+}
+
+/// Write `bytes` through `file` (the staging file at `tmp`) and flush them to the disk.
+fn write_synced(mut file: File, tmp: &Path, bytes: &[u8]) -> Result<(), GitError> {
+    file.write_all(bytes).map_err(at("write", tmp))?;
+    file.sync_all().map_err(at("fsync", tmp))
+}
+
+/// Replace the file at `path` with `bytes` (given `mode` when set): written into a staging file
+/// this call creates beside it ([`own_temp_beside`]) and renamed over it. A name already beside
+/// it — a user's `exclude.capture-tmp` in `.git/info` — is never truncated, renamed away or
+/// removed, and on a failure only the staging file this call made goes (review 2026-09-28,
+/// seventeenth pass, #2: the fixed `info/exclude.capture-tmp` was truncated and renamed over
+/// `info/exclude` each time capture opened, consuming a saved user file of that name).
+fn replace_through_own_temp(path: &Path, bytes: &[u8], mode: Option<u32>) -> Result<(), GitError> {
+    use std::os::unix::fs::PermissionsExt;
+    let (tmp, file) = own_temp_beside(path)?;
+    let written = (|| {
+        if let Some(mode) = mode {
+            file.set_permissions(fs::Permissions::from_mode(mode))
+                .map_err(at("chmod", &tmp))?;
+        }
+        write_synced(file, &tmp, bytes)?;
+        fs::rename(&tmp, path).map_err(at("rename into", path))
+    })();
+    if written.is_err() {
+        fs::remove_file(&tmp).ok();
+    }
+    written
 }
 
 /// Make the repository's refs exactly `refs` (every name, as given: the caller leaves out an
@@ -3558,10 +3609,7 @@ pub fn write_packed_refs(
         text.extend_from_slice(&name);
         text.push(b'\n');
     }
-    let path = repo.common_dir.join("packed-refs");
-    let tmp = repo.common_dir.join("packed-refs.capture-tmp");
-    fs::write(&tmp, text).map_err(at("write", &tmp))?;
-    fs::rename(&tmp, &path).map_err(at("rename into", &path))?;
+    replace_through_own_temp(&repo.common_dir.join("packed-refs"), &text, None)?;
     // After `packed-refs` holds the manifest's refs: a loose ref shadows a packed one, so none
     // may remain.
     for dir in [&repo.common_dir, &repo.git_dir] {
@@ -3651,11 +3699,7 @@ pub fn write_head(repo: &GitRepo, head: &str) -> Result<(), GitError> {
     }
     text.extend_from_slice(&bytes_of(head));
     text.push(b'\n');
-    let path = repo.git_dir.join("HEAD");
-    let tmp = repo.git_dir.join("HEAD.capture-tmp");
-    fs::write(&tmp, text).map_err(at("write", &tmp))?;
-    fs::rename(&tmp, &path).map_err(at("rename into", &path))?;
-    Ok(())
+    replace_through_own_temp(&repo.git_dir.join("HEAD"), &text, None)
 }
 
 /// Make every symlink of [`GitRepo::ref_symlinks`] that git read as a ref (its name in `refs`,
@@ -4459,5 +4503,65 @@ mod tests {
         assert_eq!(peel(&fresh), peel(&repo));
         let describe = |dir: &GitRepo| stdout_string(&dir.run(&["describe", "HEAD"]).unwrap());
         assert_eq!(describe(&fresh).trim(), "v1");
+    }
+
+    /// A restore's git writers stage in files of their own: a user file at a name they used to
+    /// stage through (`HEAD.capture-tmp`, `packed-refs.capture-tmp`, the pack's
+    /// `tmp-capture-<sha>.{pack,idx,rev}`) is left byte for byte, and no staging file stays
+    /// behind (review 2026-09-28, seventeenth pass, #2 — the same fixed-name class as
+    /// `info/exclude.capture-tmp`).
+    #[test]
+    fn restore_writers_keep_user_files_at_their_old_staging_names() {
+        let (dir, repo) = fixture();
+        let scratch = dir.path().join("scratch");
+        let r = build_git_pack(&repo, &scratch, &[], &[]).unwrap();
+        let pack = r.pack.as_ref().unwrap();
+        let fresh = GitRepo::init(&dir.path().join("fresh")).unwrap();
+        let pack_dir = fresh.common_dir.join("objects/pack");
+        fs::create_dir_all(&pack_dir).unwrap();
+        let sha = &pack.sha256;
+        let user: Vec<(PathBuf, Vec<u8>)> = [
+            fresh.git_dir.join("HEAD.capture-tmp"),
+            fresh.common_dir.join("packed-refs.capture-tmp"),
+            pack_dir.join(format!("tmp-capture-{sha}.pack")),
+            pack_dir.join(format!("tmp-capture-{sha}.idx")),
+            pack_dir.join(format!("tmp-capture-{sha}.rev")),
+        ]
+        .into_iter()
+        .map(|p| {
+            let bytes = format!("user file {}\n", p.display()).into_bytes();
+            fs::write(&p, &bytes).unwrap();
+            (p, bytes)
+        })
+        .collect();
+
+        assert!(install_pack(&fresh, sha, &fs::read(&pack.path).unwrap(), None).unwrap());
+        write_packed_refs(&fresh, &r.closure.refs, &r.closure.symrefs).unwrap();
+        write_head(&fresh, &r.closure.head).unwrap();
+
+        for (path, bytes) in &user {
+            assert_eq!(
+                fs::read(path).ok().as_ref(),
+                Some(bytes),
+                "{} kept",
+                path.display()
+            );
+        }
+        for d in [&fresh.git_dir, &pack_dir] {
+            let left: Vec<String> = fs::read_dir(d)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .filter(|n| n.starts_with('.') && n.contains(".capture-tmp"))
+                .collect();
+            assert!(left.is_empty(), "staging left in {}: {left:?}", d.display());
+        }
+        assert!(pack_installed(&fresh, sha));
+        // (No fsck: the user's `tmp-capture-<sha>.idx` above is no index, and fsck says so.)
+        let tree = |r: &GitRepo| r.run(&["cat-file", "-p", "HEAD^{tree}"]).unwrap().stdout;
+        assert_eq!(tree(&fresh), tree(&repo));
+        assert_eq!(
+            fresh.run(&["rev-parse", "HEAD"]).unwrap().stdout,
+            repo.run(&["rev-parse", "HEAD"]).unwrap().stdout
+        );
     }
 }
