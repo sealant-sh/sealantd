@@ -461,11 +461,14 @@ fn a_throttled_url_mint_is_retried_not_reported_as_no_url() {
     let mut engine = CaptureEngine::open(CaptureConfig::new("wt", 1, &root), None).unwrap();
     let sink: Arc<dyn BlobSink> = slow.clone();
     let dyn_registrar: Arc<dyn Registrar> = registrar.clone();
-    let shipper = engine.shipper(sink, dyn_registrar).with_retry(RetryPolicy {
-        attempts: 5,
-        backoff: Duration::from_millis(1),
-        max_backoff: Duration::from_millis(5),
-    });
+    let shipper = engine
+        .shipper(sink, dyn_registrar)
+        .with_retry(RetryPolicy {
+            attempts: 5,
+            backoff: Duration::from_millis(1),
+            max_backoff: Duration::from_millis(5),
+        })
+        .with_outage_backoff(Duration::from_millis(200), Duration::from_millis(200));
     let small = snap(&mut engine, Class::Small, 1);
     assert_eq!(shipper.ship_pending().unwrap(), 1);
     assert_eq!(
@@ -492,5 +495,15 @@ fn a_throttled_url_mint_is_retried_not_reported_as_no_url() {
         other => panic!("expected a retryable upload error: {other:?}"),
     }
     registrar.throttle.store(0, Ordering::SeqCst);
+    // The next pass waits out the backoff after a failed one (it does not go straight back to
+    // the registrar), then ships.
+    let calls = registrar.calls.load(Ordering::SeqCst);
+    assert_eq!(shipper.ship_pending().unwrap(), 0, "within the backoff");
+    assert_eq!(
+        registrar.calls.load(Ordering::SeqCst),
+        calls,
+        "no call meanwhile"
+    );
+    std::thread::sleep(Duration::from_millis(250));
     assert_eq!(shipper.ship_pending().unwrap(), 1);
 }

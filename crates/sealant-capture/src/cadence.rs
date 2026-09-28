@@ -206,10 +206,18 @@ impl Clock {
         self.last_change = None;
     }
 
-    /// When the next snap is due and why, or `None` when nothing is pending.
+    /// When the next snap is due and why, or `None` when nothing is pending. A class that polls
+    /// is still watched outside the directories it could not watch: a change seen there is due
+    /// on the quiet clock as in a watched class, the poll covers the rest.
     fn due(&self, mode: Mode) -> Option<(Instant, Trigger)> {
         match mode {
-            Mode::Polled => Some((self.last_snap + self.max, Trigger::Poll)),
+            Mode::Polled => {
+                let poll = (self.last_snap + self.max, Trigger::Poll);
+                Some(match self.due(Mode::Watched) {
+                    Some(seen) if seen.0 < poll.0 => seen,
+                    _ => poll,
+                })
+            }
             Mode::Watched => {
                 let first = self.first_change?;
                 let last = self.last_change.unwrap_or(first);
@@ -395,12 +403,29 @@ impl Shared {
                     tracing::warn!(
                         ?class,
                         "a directory of the class could not be watched; it polls at its \
-                         maximum interval from now on"
+                         maximum interval until the watcher watches it (the rest of the class \
+                         stays watched)"
                     );
                 }
                 *mode = Mode::Polled;
                 // What changed there is unseen: the next poll is due now.
                 clock.last_snap = now.checked_sub(clock.max).unwrap_or(now);
+            }
+            ChangeSignal::Rewatched(class) => {
+                let st = &mut *st;
+                let (mode, clock) = match class {
+                    Class::Small => (&mut st.small_mode, &mut st.small),
+                    Class::Bulk => (&mut st.bulk_mode, &mut st.bulk),
+                };
+                // After an overflow every class polls for good: events were lost.
+                if !st.overflowed {
+                    if *mode == Mode::Polled {
+                        tracing::info!(?class, "the class is watched again");
+                    }
+                    *mode = Mode::Watched;
+                }
+                // What changed while it polled went unseen: a snap on the quiet clock reads it.
+                clock.dirty(now);
             }
         }
         drop(st);
@@ -897,6 +922,28 @@ impl CadenceRunner {
     /// the disk current and the chain unsealed ([`Self::chain_sealed`]).
     #[must_use]
     pub fn final_is_current(&self) -> bool {
+        self.every_class_watched() && self.final_is_current_as_snapped()
+    }
+
+    /// Whether the watcher sees every class now: watching both (the bulk class only when it is
+    /// captured), never overflowed. A class that polls delivers no change, so nothing it holds
+    /// can be known unchanged since a snap.
+    #[must_use]
+    pub fn every_class_watched(&self) -> bool {
+        let st = self.shared.state();
+        !st.overflowed
+            && st.small_mode == Mode::Watched
+            && (!self.shared.capture_bulk || st.bulk_mode == Mode::Watched)
+    }
+
+    /// [`Self::final_is_current`] as of the last final flush's own snaps: nothing the watcher
+    /// delivered since before its first snap, no repair asked for, no bulk build paused mid-way,
+    /// snaps no longer allowed — whether or not every class is watched. A final flush answers by
+    /// this: its snaps, taken after every writer stopped, read every class as it was, a polled
+    /// one included; only a later read ([`Self::final_is_current`]) cannot vouch for a class
+    /// that polls.
+    #[must_use]
+    pub fn final_is_current_as_snapped(&self) -> bool {
         let Some(sealed) = *self
             .shared
             .sealed
@@ -908,15 +955,8 @@ impl CadenceRunner {
         if self.shared.allowed() {
             return false;
         }
-        {
-            let st = self.shared.state();
-            if st.overflowed
-                || st.repair
-                || st.small_mode != Mode::Watched
-                || (self.shared.capture_bulk && st.bulk_mode != Mode::Watched)
-            {
-                return false;
-            }
+        if self.shared.state().repair {
+            return false;
         }
         if self.shared.changes.load(Ordering::SeqCst) != sealed.changes
             || self.shared.staging.repair_request().is_some()

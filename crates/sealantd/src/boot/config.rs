@@ -82,6 +82,7 @@ const CONSUMED_KEYS: &[&str] = &[
     "SEALANT_CONTROL_WSS_CLIENT_CA",
     "SEALANT_CONTROL_WSS_MAX_CONNECTIONS",
     "SEALANT_SHUTDOWN_GRACE_MS",
+    "SEALANT_SHUTDOWN_FINAL_DEADLINE_MS",
     "SEALANT_WATCH_FILESYSTEM",
     "SEALANT_NETWORK_PROXY",
     "SEALANT_SPOOL_DIR",
@@ -462,9 +463,20 @@ pub struct ControlConfig {
     /// `SEALANT_SHUTDOWN_GRACE_MS`: how long a graceful shutdown waits for processes after
     /// `SIGTERM` before it kills them, and how long a suspend `capture.flush` without a
     /// deadline may take. Absent: the runtime's default (10 s). It bounds nothing else: a final
-    /// capture flush (SIGTERM, SIGINT, `runtime.gracefulShutdown`, harness exit) runs until
-    /// everything is shipped, and a `capture.flush` with a deadline gets that deadline.
+    /// capture flush runs until everything is shipped (a shutdown's, only within
+    /// [`Self::shutdown_final_deadline_ms`]), and a `capture.flush` with a deadline gets that
+    /// deadline.
     pub shutdown_grace_ms: Option<u64>,
+    /// `SEALANT_SHUTDOWN_FINAL_DEADLINE_MS`: how long the final capture flush of a shutdown
+    /// (`SIGTERM`, `SIGINT`, `runtime.gracefulShutdown`) may take, counted from the moment the
+    /// shutdown began — process grace, snaps and shipping included — before the daemon stops
+    /// trying and exits 75 with its staging directory kept (the platform keeps the disk and
+    /// recovers it: nothing is lost). The platform sets it to its stop grace less a margin, so
+    /// the daemon says "not saved" itself instead of being killed mid-upload. Absent: until the
+    /// flush completes (a store that stays down then holds the stop until the platform's kill).
+    /// A final flush after the harness exits on its own is not bounded by it, unless a shutdown
+    /// begins meanwhile.
+    pub shutdown_final_deadline_ms: Option<u64>,
 }
 
 /// The fully-parsed, validated boot configuration.
@@ -542,6 +554,18 @@ fn default_session_journal_dir(env: &dyn EnvSource, root: bool) -> PathBuf {
 
 fn is_truthy(value: &str) -> bool {
     matches!(value.trim(), "1" | "true" | "TRUE" | "True")
+}
+
+/// A whole number of milliseconds in `key`, when set (blank is unset).
+fn millis(env: &dyn EnvSource, key: &str) -> Result<Option<u64>, BootError> {
+    match env.get(key).filter(|s| !s.trim().is_empty()) {
+        None => Ok(None),
+        Some(raw) => raw.trim().parse::<u64>().map(Some).map_err(|_| {
+            BootError::config(format!(
+                "{key} must be a whole number of milliseconds, got {raw:?}"
+            ))
+        }),
+    }
 }
 
 impl BootConfig {
@@ -684,17 +708,8 @@ impl BootConfig {
                 ),
             execution_id: env.get("SEALANT_EXECUTION_ID").filter(|s| !s.is_empty()),
             workspace_id: env.get("SEALANT_WORKSPACE_ID").filter(|s| !s.is_empty()),
-            shutdown_grace_ms: match env
-                .get("SEALANT_SHUTDOWN_GRACE_MS")
-                .filter(|s| !s.trim().is_empty())
-            {
-                None => None,
-                Some(raw) => Some(raw.trim().parse::<u64>().map_err(|_| {
-                    BootError::config(format!(
-                        "SEALANT_SHUTDOWN_GRACE_MS must be a whole number of milliseconds, got {raw:?}"
-                    ))
-                })?),
-            },
+            shutdown_grace_ms: millis(env, "SEALANT_SHUTDOWN_GRACE_MS")?,
+            shutdown_final_deadline_ms: millis(env, "SEALANT_SHUTDOWN_FINAL_DEADLINE_MS")?,
         };
 
         let passthrough_env = passthrough_env(env);
@@ -1421,6 +1436,34 @@ mod tests {
         let err = load_with(&[("SEALANT_SHUTDOWN_GRACE_MS", "10s")]).unwrap_err();
         assert!(
             err.to_string().contains("SEALANT_SHUTDOWN_GRACE_MS"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn shutdown_final_deadline_is_configurable_and_checked() {
+        assert_eq!(
+            load_with(&[]).unwrap().control.shutdown_final_deadline_ms,
+            None,
+            "absent: the shutdown's final flush runs until it completes"
+        );
+        let cfg = load_with(&[("SEALANT_SHUTDOWN_FINAL_DEADLINE_MS", "55000")]).expect("valid");
+        assert_eq!(cfg.control.shutdown_final_deadline_ms, Some(55_000));
+        assert_eq!(
+            crate::boot::into_runtime_config(&cfg, &[]).shutdown_final_deadline_ms,
+            Some(55_000),
+            "the runtime takes it"
+        );
+        assert!(
+            !cfg.passthrough_env
+                .iter()
+                .any(|(k, _)| k == "SEALANT_SHUTDOWN_FINAL_DEADLINE_MS"),
+            "consumed, not passed to the harness"
+        );
+        let err = load_with(&[("SEALANT_SHUTDOWN_FINAL_DEADLINE_MS", "55s")]).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("SEALANT_SHUTDOWN_FINAL_DEADLINE_MS"),
             "{err}"
         );
     }

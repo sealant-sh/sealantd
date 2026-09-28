@@ -341,6 +341,7 @@ fn into_runtime_config(config: &BootConfig, secret_env: &[(String, String)]) -> 
     if let Some(grace_ms) = config.control.shutdown_grace_ms {
         runtime_config.shutdown_grace_ms = grace_ms;
     }
+    runtime_config.shutdown_final_deadline_ms = config.control.shutdown_final_deadline_ms;
     // The harness child's base environment: the passthrough env, the launcher's secret env, and
     // the prep-set identity vars. Every secret value seeds the I/O redactor whatever its name.
     runtime_config.child_env = harness_child_env(config, secret_env);
@@ -422,7 +423,11 @@ pub fn run_supervised(
         }
     };
 
-    tokio_runtime.block_on(boot_serve(runtime, config, capture_boot))
+    let code = tokio_runtime.block_on(boot_serve(runtime, config, capture_boot));
+    // A final flush the shutdown's deadline gave up on may still be snapping on a blocking
+    // thread: the exit is decided (75), and it must not wait for it.
+    tokio_runtime.shutdown_timeout(std::time::Duration::from_secs(1));
+    code
 }
 
 /// The async supervisor body (steps 11–18).
@@ -612,9 +617,10 @@ async fn boot_serve(
     // Step 16b: the final capture — admission closed, every writer terminated and awaited (the
     // harness is gone; its lifecycle siblings, sessions, execs, escaped processes and the
     // workspace's containers may not be), then both classes snapped and everything registered,
-    // with no deadline. It waits for a final flush already running (the signal listener's, a
-    // control command's); after one that stopped every writer it neither stops them again nor
-    // re-snaps an unchanged disk, and ships what is left. Exit 75 applies to this path only.
+    // with no deadline unless a shutdown began (then within `SEALANT_SHUTDOWN_FINAL_DEADLINE_MS`
+    // of it). It waits for a final flush already running (the signal listener's, a control
+    // command's); after one that stopped every writer it neither stops them again nor re-snaps
+    // an unchanged disk, and ships what is left. Exit 75 applies to this path only.
     let exit_code = final_capture(&runtime, exit_code).await;
 
     // Steps 17–18.
@@ -703,14 +709,15 @@ fn start_capture(
 
 /// Every exit after the capture engine started runs its final flush: admission closed, every
 /// writer terminated and awaited, then both classes snapped and everything registered, with no
-/// deadline. It waits for a final flush already running (the signal listener's, a control
-/// command's); after one that stopped every writer it neither stops them again nor re-snaps an
+/// deadline — unless a shutdown began, before it or while it runs: then within the shutdown's
+/// deadline (`SEALANT_SHUTDOWN_FINAL_DEADLINE_MS`), past which it exits 75. It waits for a
+/// final flush already running (the signal listener's, a control command's); after one that stopped every writer it neither stops them again nor re-snaps an
 /// unchanged disk, and ships what is left. A daemon whose final capture is incomplete never
 /// exits with `code`: it exits 75 ([`crate::runtime::EXIT_CAPTURE_INCOMPLETE`]), because what
 /// is on this disk is not all in the store and whoever tears the workspace down must know. No
 /// capture engine: `code` as it is.
 async fn final_capture(runtime: &Arc<Runtime>, code: ExitCode) -> ExitCode {
-    if runtime.final_flush(None, None).await.is_none() {
+    if runtime.exit_final_flush(None).await.is_none() {
         return code;
     }
     if runtime.capture_incomplete() {

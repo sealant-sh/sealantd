@@ -89,6 +89,11 @@ struct ServeArgs {
     /// deadline. A final flush's snaps and shipping are not bounded by it.
     #[arg(long)]
     shutdown_grace_ms: Option<u64>,
+    /// How long a shutdown's final capture flush may take, from `SIGTERM` / `SIGINT` /
+    /// `runtime.gracefulShutdown`, before the daemon exits 75 with its staging kept (default:
+    /// until it completes). The boot's `SEALANT_SHUTDOWN_FINAL_DEADLINE_MS`.
+    #[arg(long)]
+    shutdown_final_deadline_ms: Option<u64>,
     /// Validate configuration, print a sanitized summary, and exit.
     #[arg(long)]
     check_config: bool,
@@ -153,6 +158,7 @@ fn build_config(cli: &ServeArgs) -> RuntimeConfig {
     if let Some(grace_ms) = cli.shutdown_grace_ms {
         config.shutdown_grace_ms = grace_ms;
     }
+    config.shutdown_final_deadline_ms = cli.shutdown_final_deadline_ms;
     if let Some(shell) = &cli.shell {
         config.default_shell = shell.clone();
     }
@@ -231,12 +237,17 @@ fn run_serve(cli: ServeArgs) -> ExitCode {
         }
     };
 
-    tokio_runtime.block_on(serve(cli, wss, runtime))
+    let code = tokio_runtime.block_on(serve(cli, wss, runtime));
+    // A final flush the shutdown's deadline gave up on may still be snapping on a blocking
+    // thread: the exit is decided, and it must not wait for it.
+    tokio_runtime.shutdown_timeout(std::time::Duration::from_secs(1));
+    code
 }
 
 /// On `SIGTERM` / `SIGINT`: the final capture flush (admission closed, every managed process
-/// terminated and awaited, then both classes snapped and everything registered, with no
-/// deadline; a no-op without a capture engine), then request graceful shutdown. The flush
+/// terminated and awaited, then both classes snapped and everything registered, within the
+/// shutdown's deadline when one is configured — `SEALANT_SHUTDOWN_FINAL_DEADLINE_MS`; a no-op
+/// without a capture engine), then request graceful shutdown. The flush
 /// comes first because it stops the writers itself: a snap taken before they stop misses what
 /// they write after it.
 pub(crate) fn spawn_signal_listener(runtime: Arc<Runtime>) {
@@ -260,7 +271,7 @@ pub(crate) fn spawn_signal_listener(runtime: Arc<Runtime>) {
             _ = terminate.recv() => tracing::info!("received SIGTERM"),
             _ = interrupt.recv() => tracing::info!("received SIGINT"),
         }
-        runtime.final_flush(None, None).await;
+        runtime.shutdown_final_flush(None).await;
         runtime.shutdown().request_graceful(None);
     });
 }

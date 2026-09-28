@@ -1578,8 +1578,12 @@ impl Registrar for HttpRegistrar {
 pub struct RegistrarMinter<R: Registrar + ?Sized> {
     registrar: std::sync::Arc<R>,
     identity: Mutex<(String, u64)>,
-    /// PUT URLs minted and not used yet, with when they were minted.
+    /// PUT URLs minted and not settled yet ([`crate::sink::UrlMinter::settled`]), with when
+    /// they were minted: a PUT that failed on the store's side retries on the same URL.
     put_cache: Mutex<BTreeMap<String, (String, std::time::Instant)>>,
+    /// Multipart uploads created and not settled yet, with when: a multipart upload that failed
+    /// on the store's side resumes under the same upload and part URLs.
+    multipart_cache: Mutex<BTreeMap<String, (MultipartUrls, std::time::Instant)>>,
     get_urls: Mutex<BTreeMap<String, String>>,
 }
 
@@ -1602,6 +1606,7 @@ impl<R: Registrar + ?Sized> RegistrarMinter<R> {
             registrar,
             identity: Mutex::new((worktree_id.to_owned(), epoch)),
             put_cache: Mutex::new(BTreeMap::new()),
+            multipart_cache: Mutex::new(BTreeMap::new()),
             get_urls: Mutex::new(get_urls),
         }
     }
@@ -1623,6 +1628,10 @@ impl<R: Registrar + ?Sized> RegistrarMinter<R> {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = (worktree_id.to_owned(), epoch);
         self.put_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        self.multipart_cache
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clear();
@@ -1671,14 +1680,23 @@ impl<R: Registrar + ?Sized> RegistrarMinter<R> {
             .extend(urls.into_iter().map(|(k, u)| (k, (u, now))));
     }
 
-    /// The cached PUT URL for `key`, taken out of the cache, when it is fresh.
+    /// The cached PUT URL for `key`, when it is fresh. It stays cached until the upload of
+    /// `key` settles ([`crate::sink::UrlMinter::settled`]): before, it was taken out on first
+    /// use, and every retry of a PUT the store refused for now minted another — a store that
+    /// stayed down spent the registrar's `upload.urls` call quota (Docker end to end, round 5).
     fn take_put(&self, key: &str) -> Option<String> {
-        self.put_cache
+        let mut cache = self
+            .put_cache
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(key)
-            .filter(|(_, at)| at.elapsed() < PUT_URL_REUSE)
-            .map(|(u, _)| u)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match cache.get(key) {
+            Some((url, at)) if at.elapsed() < PUT_URL_REUSE => Some(url.clone()),
+            Some(_) => {
+                cache.remove(key);
+                None
+            }
+            None => None,
+        }
     }
 }
 
@@ -1702,6 +1720,17 @@ impl<R: Registrar + ?Sized> crate::sink::UrlMinter for RegistrarMinter<R> {
             })
     }
 
+    fn settled(&self, key: &str) {
+        self.put_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(key);
+        self.multipart_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(key);
+    }
+
     fn get_url(&self, key: &str) -> Result<String, crate::sink::SinkError> {
         self.get_urls
             .lock()
@@ -1719,6 +1748,16 @@ impl<R: Registrar + ?Sized> crate::sink::UrlMinter for RegistrarMinter<R> {
         key: &str,
         size: u64,
     ) -> Result<Option<MultipartUrls>, crate::sink::SinkError> {
+        if let Some(plan) = self
+            .multipart_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(key)
+            .filter(|(_, at)| at.elapsed() < PUT_URL_REUSE)
+            .map(|(plan, _)| plan.clone())
+        {
+            return Ok(Some(plan));
+        }
         let (worktree_id, epoch) = self.identity();
         let mut req = UploadUrlsRequest::new(&worktree_id, epoch, vec![key.to_owned()]);
         req.sizes.insert(key.to_owned(), size);
@@ -1727,6 +1766,12 @@ impl<R: Registrar + ?Sized> crate::sink::UrlMinter for RegistrarMinter<R> {
             .upload_urls(&req)
             .map_err(|e| mint_error(key, e))?;
         let multipart = resp.multipart.remove(key);
+        if let Some(plan) = &multipart {
+            self.multipart_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(key.to_owned(), (plan.clone(), std::time::Instant::now()));
+        }
         // A registrar that answered with a plain PUT URL (below its threshold, or no multipart
         // support) has minted it now; keep it for the single-PUT fallback.
         self.cache_puts(resp.urls);

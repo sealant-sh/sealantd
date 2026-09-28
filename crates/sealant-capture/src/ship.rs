@@ -59,6 +59,13 @@ pub const HOLD_BACKOFF: (Duration, Duration) = (Duration::from_secs(30), Duratio
 pub const LEASE_LOST_BACKOFF: (Duration, Duration) =
     (Duration::from_secs(1), Duration::from_secs(30));
 
+/// After a pass fails on a transient refusal — the store or the registrar down, or answering
+/// 5xx / 429 once every retry of the pass is spent — the shipper waits 1 s before the next pass,
+/// doubling per failed pass in a row up to 30 s, instead of starting over at once. Before, the
+/// worker and a final flush went straight back to the registrar, and a store that stayed down
+/// spent its `upload.urls` call quota (Docker end to end, round 5: 560 calls in three minutes).
+pub const OUTAGE_BACKOFF: (Duration, Duration) = (Duration::from_secs(1), Duration::from_secs(30));
+
 /// Single-PUT uploads in flight at once. A presigned PUT from a MicroVM to S3 is a round trip of
 /// ≈ 70 ms whatever the object's size (measured on alpha, 2026-09-27: 20,878 objects in 24
 /// minutes one at a time), so the small objects of a capture are latency-bound, not
@@ -274,6 +281,19 @@ pub enum ShipError {
         /// Why.
         reason: String,
     },
+}
+
+impl ShipError {
+    /// Whether the store or the registrar refused for now (unreachable, 5xx, 429) with every
+    /// retry of the pass spent: asked again after a backoff ([`OUTAGE_BACKOFF`]).
+    #[must_use]
+    pub fn is_transient(&self) -> bool {
+        match self {
+            Self::Upload { source, .. } => source.is_retryable(),
+            Self::Register { source, .. } => source.is_retryable(),
+            _ => false,
+        }
+    }
 }
 
 /// The file (beside `queue/`) that makes a restage one step: see [`Staging::restage`].
@@ -1147,6 +1167,13 @@ pub struct Shipper {
     lease: Mutex<(u32, Option<Instant>)>,
     /// First wait after a lease-lost answer and its cap; doubles per answer in a row.
     lease_backoff: (Duration, Duration),
+    /// Passes failed on a transient refusal in a row, and when shipping asks again.
+    outage: Mutex<(u32, Option<Instant>)>,
+    /// First wait after such a pass and its cap ([`OUTAGE_BACKOFF`]).
+    outage_backoff: (Duration, Duration),
+    /// No flush ships past this, whatever deadline its caller gave: the daemon's shutdown
+    /// deadline ([`Self::set_cutoff`]).
+    cutoff: Mutex<Option<Instant>>,
     /// The register refusal being worked through (cleared when that capture registers or is
     /// no longer queued).
     refusal: Mutex<Option<RegisterRefusal>>,
@@ -1189,6 +1216,9 @@ impl Shipper {
             hold_backoff: HOLD_BACKOFF,
             lease: Mutex::new((0, None)),
             lease_backoff: LEASE_LOST_BACKOFF,
+            outage: Mutex::new((0, None)),
+            outage_backoff: OUTAGE_BACKOFF,
+            cutoff: Mutex::new(None),
             refusal: Mutex::new(None),
             repair_hook: Mutex::new(None),
             status,
@@ -1238,6 +1268,68 @@ impl Shipper {
         self
     }
 
+    /// The wait after a pass failed on a transient refusal (`first`, doubling up to `max`);
+    /// [`OUTAGE_BACKOFF`].
+    #[must_use]
+    pub fn with_outage_backoff(mut self, first: Duration, max: Duration) -> Self {
+        self.outage_backoff = (first, max);
+        self
+    }
+
+    /// No flush ships past `at` from now on, whatever deadline its caller gave, and one running
+    /// returns once it passes (between objects): the daemon's shutdown deadline, after which it
+    /// exits with what is left still staged. The earliest cutoff set holds.
+    pub fn set_cutoff(&self, at: Instant) {
+        let mut cutoff = lock(&self.cutoff);
+        *cutoff = Some(cutoff.map_or(at, |c| c.min(at)));
+    }
+
+    /// Whether the cutoff passed: retries stop, and what is left stays staged.
+    fn cut_off(&self) -> bool {
+        lock(&self.cutoff).is_some_and(|c| Instant::now() >= c)
+    }
+
+    /// Sleep `wait` between retries, or until the cutoff when that comes first.
+    fn retry_sleep(&self, wait: Duration) {
+        let wait = match *lock(&self.cutoff) {
+            Some(c) => wait.min(c.saturating_duration_since(Instant::now())),
+            None => wait,
+        };
+        thread::sleep(wait);
+    }
+
+    /// `until`, or the cutoff when that comes first.
+    fn bound(&self, until: Option<Instant>) -> Option<Instant> {
+        match (until, *lock(&self.cutoff)) {
+            (Some(u), Some(c)) => Some(u.min(c)),
+            (u, c) => u.or(c),
+        }
+    }
+
+    /// A pass failed on a transient refusal: the next pass waits out the backoff.
+    fn outage(&self, error: &ShipError) {
+        let mut outage = lock(&self.outage);
+        outage.0 += 1;
+        let (first, max) = self.outage_backoff;
+        let wait = first
+            .saturating_mul(1u32 << (outage.0 - 1).min(16))
+            .min(max);
+        outage.1 = Some(Instant::now() + wait);
+        let passes = outage.0;
+        drop(outage);
+        tracing::warn!(
+            passes,
+            retry_in_ms = wait.as_millis() as u64,
+            %error,
+            "shipping failed on a transient refusal; the next pass waits, everything stays staged"
+        );
+    }
+
+    /// When shipping asks again after a failed pass, while that is still ahead.
+    fn outage_retry_at(&self) -> Option<Instant> {
+        lock(&self.outage).1.filter(|at| Instant::now() < *at)
+    }
+
     /// The registrar answered that the lease is not live: pause shipping until the backoff
     /// runs out. Nothing is dropped and nothing is a conflict; the harness is paused by the
     /// heartbeat, not here.
@@ -1257,8 +1349,16 @@ impl Shipper {
         );
     }
 
-    /// An upload or a register went through: the lease is live again.
+    /// An upload or a register went through: the lease is live again, and the store and the
+    /// registrar are answering.
     fn lease_ok(&self) {
+        {
+            let mut outage = lock(&self.outage);
+            if outage.0 > 0 {
+                *outage = (0, None);
+                tracing::info!("shipping went through again");
+            }
+        }
         if self.status.lease_lost.swap(false, Ordering::Relaxed) {
             *lock(&self.lease) = (0, None);
             tracing::info!("the lease is live again; shipping resumed");
@@ -1493,7 +1593,10 @@ impl Shipper {
                     }
                 }
             }
-            thread::sleep(self.backoff(attempt));
+            if self.cut_off() {
+                break;
+            }
+            self.retry_sleep(self.backoff(attempt));
         }
         Err(ShipError::Upload {
             key: u.key.clone(),
@@ -1657,8 +1760,14 @@ impl Shipper {
                             source: error,
                         });
                     }
+                    if self.cut_off() {
+                        return Err(ShipError::Upload {
+                            key: keys.first().map(|(k, _)| k.clone()).unwrap_or_default(),
+                            source: error,
+                        });
+                    }
                     tracing::warn!(keys = keys.len(), attempt, %error, "batch URL mint failed; retrying");
-                    thread::sleep(self.backoff(attempt - 1));
+                    self.retry_sleep(self.backoff(attempt - 1));
                 }
                 // Each PUT mints its own then, and reports what stands in the way.
                 Err(error) => {
@@ -1720,7 +1829,10 @@ impl Shipper {
                     self.status.failures.fetch_add(1, Ordering::Relaxed);
                     tracing::warn!(n = entry.n, attempt, error = %e, "register failed; retrying");
                     last = Some(e);
-                    thread::sleep(self.backoff(attempt));
+                    if self.cut_off() {
+                        break;
+                    }
+                    self.retry_sleep(self.backoff(attempt));
                 }
                 Err(e) => {
                     return Err(ShipError::Register {
@@ -1762,6 +1874,22 @@ impl Shipper {
         deadline: Option<Instant>,
         flushing: bool,
     ) -> Result<Pass, ShipError> {
+        let result = self.pass_once(scope, deadline, flushing);
+        if let Err(error) = &result
+            && error.is_transient()
+        {
+            self.outage(error);
+        }
+        result
+    }
+
+    /// [`Self::pass`] itself.
+    fn pass_once(
+        &self,
+        scope: Scope,
+        deadline: Option<Instant>,
+        flushing: bool,
+    ) -> Result<Pass, ShipError> {
         let guard = if flushing {
             self.waiting.fetch_add(1, Ordering::SeqCst);
             let guard = self.pass.lock();
@@ -1780,12 +1908,18 @@ impl Shipper {
         if self.lease_retry_at().is_some() {
             return Ok(pass);
         }
+        // Waiting after a pass the store or the registrar refused: asking again at once only
+        // spends the registrar's call quota.
+        if self.outage_retry_at().is_some() {
+            return Ok(pass);
+        }
         // A restage is half-way (its journal is committed, the engine finishes it at its next
         // snap): the queue may name a parent no entry holds yet. Nothing ships meanwhile.
         if self.staging.restage_pending() {
             return Ok(pass);
         }
-        let past = |deadline: Option<Instant>| deadline.is_some_and(|d| Instant::now() >= d);
+        let past =
+            |deadline: Option<Instant>| self.bound(deadline).is_some_and(|d| Instant::now() >= d);
         let mut cycle = DutyCycle::new(self.cpu_fraction);
         loop {
             let pending = self.staging.pending()?;
@@ -2023,9 +2157,9 @@ impl Shipper {
     /// See above.
     pub fn flush_final(&self, deadline: Option<Duration>) -> Result<usize, ShipError> {
         let until = deadline.map(|d| Instant::now() + d);
-        let past = || until.is_some_and(|u| Instant::now() >= u);
+        let past = || self.bound(until).is_some_and(|u| Instant::now() >= u);
         let left = || {
-            until.map_or(Duration::MAX, |u| {
+            self.bound(until).map_or(Duration::MAX, |u| {
                 u.saturating_duration_since(Instant::now())
             })
         };
@@ -2089,6 +2223,7 @@ impl Shipper {
             .iter()
             .map(|h| h.retry_at)
             .chain(self.lease_retry_at())
+            .chain(self.outage_retry_at())
             .map(|at| at.saturating_duration_since(now))
             .min()
             .unwrap_or(self.retry.backoff)
@@ -2097,9 +2232,9 @@ impl Shipper {
 
     fn flush_scope(&self, scope: Scope, deadline: Option<Duration>) -> Result<usize, ShipError> {
         let until = deadline.map(|d| Instant::now() + d);
-        let past = || until.is_some_and(|u| Instant::now() >= u);
+        let past = || self.bound(until).is_some_and(|u| Instant::now() >= u);
         let left = || {
-            until.map_or(Duration::MAX, |u| {
+            self.bound(until).map_or(Duration::MAX, |u| {
                 u.saturating_duration_since(Instant::now())
             })
         };
