@@ -93,6 +93,17 @@ pub fn run_boot(log_level: &str, recovery: bool) -> ExitCode {
         Err(error) => {
             tracing::error!(%error, "boot preparation failed");
             eprintln!("sealantd boot: {error}");
+            // A recovery boot on a disk that was never materialized: verified empty, nothing
+            // to save (76), which the platform may release. Never a clean 0: nothing was saved
+            // either.
+            if let BootError::NeverMaterialized(_) = error {
+                tracing::warn!(
+                    outcome = "never-materialized",
+                    exit_code = crate::runtime::EXIT_NOTHING_TO_SAVE,
+                    "recovery: nothing to save: never materialized"
+                );
+                return ExitCode::from(crate::runtime::EXIT_NOTHING_TO_SAVE);
+            }
             // A recovery boot that could not start has not saved what the disk holds: it is
             // still unsaved work, never a clean exit. Nor has a capture boot refused beside a
             // daemon still running on its disk: that disk is the other daemon's to save.
@@ -131,6 +142,21 @@ fn prepare(
         )?),
         _ => None,
     };
+
+    // Step 1c: a recovery boot on a disk the daemon before it never materialized (it died at
+    // `plan.get`, say) has nothing to save — capture starts before any user code, so none ran
+    // there — and says so, touching nothing more: exit 76, never the 75 that keeps it forever.
+    // Checked under the lock (no daemon runs here) and before the channel is dialled (the
+    // failure that killed the first daemon may kill this one's `plan.get` too). Anything but a
+    // verified empty disk goes on to the recovery proper.
+    if config.recovery
+        && matches!(config.source, WorkspaceSource::Capture(_))
+        && capture::never_materialized(&config.workspace.working_directory).is_ok()
+    {
+        return Err(BootError::NeverMaterialized(
+            config.workspace.working_directory.display().to_string(),
+        ));
+    }
 
     // Step 2: become subreaper BEFORE any fork so double-forked orphans reparent here.
     if cfg!(target_os = "linux") {

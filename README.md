@@ -157,7 +157,13 @@ the protocol details live in `crates/sealant-capture/src/registrar.rs` and `mani
   runs the final flush on its stop or when asked, and exits 0 only when that flush is complete,
   else 75. It resumes a disk whose staging continues the chain head, or one whose recorded
   materialize (capture id, executor, epoch) is exactly the head's; any other disk is refused,
-  untouched. One daemon runs per capture disk: every capture boot holds an exclusive lock on
+  untouched — except a disk the daemon before it never materialized: the worktree absent, or
+  holding nothing but `.sealantd/boot.lock` (empty) — no materialize record, no staging, no
+  capture state, no repository, no file. Capture starts before any user code, so none ran there:
+  the recovery exits **76** (`EX_PROTOCOL`, `EXIT_NOTHING_TO_SAVE`) with `nothing to save: never
+  materialized` on stderr (log field `outcome="never-materialized"`), touching nothing and dialling
+  nothing, and the platform may release that executor. Checked under the disk lock, before
+  `plan.get`. Any other disk a recovery cannot save stays 75. One daemon runs per capture disk: every capture boot holds an exclusive lock on
   `<worktree>/.sealantd/boot.lock`, and a second boot beside a live one exits 75 without touching
   anything. On a still-running MicroVM, Core's agent stops every process the dead daemon left,
   then spawns `sealantd boot --recovery` exactly as it spawned `sealantd boot`.

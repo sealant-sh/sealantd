@@ -48,3 +48,9 @@ of cross-repo decisions 11 and 12.
   pauses the harness at once (it waited for the lease TTL). `upload.urls` and `capture.register`
   `lease-lost` pause shipping with everything staged under its epoch, as before, now tested per
   call.
+- **Nothing to save: never materialized (sixth end-to-end run).** A recovery boot on a disk the
+  daemon before it never materialized (it died at `plan.get`) exits **76** instead of 75, after
+  verifying under the disk lock and before dialling anything that the worktree is absent or holds
+  nothing but the empty `.sealantd/boot.lock`: no materialize record, no staging, no capture
+  state, no repository, no file. stderr says `nothing to save: never materialized`. Every other
+  disk a recovery cannot save is still 75, so a platform may release exactly the 76 executors.

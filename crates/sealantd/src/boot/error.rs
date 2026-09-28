@@ -56,6 +56,11 @@ pub enum BootError {
     /// Another sealantd holds this disk ([`crate::boot::lock::DiskLock`]): nothing was touched.
     #[error("{0}")]
     DiskInUse(String),
+
+    /// A recovery boot on a disk that was never materialized
+    /// ([`crate::boot::capture::never_materialized`]): nothing to save, and nothing was touched.
+    #[error("nothing to save: never materialized ({0})")]
+    NeverMaterialized(String),
 }
 
 impl BootError {

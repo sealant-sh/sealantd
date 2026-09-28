@@ -164,6 +164,63 @@ pub(crate) fn transport_of(source: &CaptureSourceConfig) -> Result<ChannelTransp
     Ok(transport)
 }
 
+/// Whether the disk at `working_directory` was never materialized, verified: `Ok` only when the
+/// worktree is absent, or a real directory (not a symlink) holding nothing but the daemon's own
+/// directory `.sealantd`, itself a real directory holding nothing but an empty regular
+/// `boot.lock` ([`crate::boot::lock`], taken before anything else). So: no materialize record
+/// (`.sealantd/capture/index/materialized.json`), no staging and no other capture state
+/// (`.sealantd/capture/`), no repository, no file of any kind. Capture starts right after a
+/// materialize and before any user code (cross-repo decision 8), so on such a disk no user code
+/// ran and nothing is work product. `Err` names the first thing found (a recovery then goes on,
+/// and exits 75 if it cannot save it). Read-only; the caller holds the disk lock.
+///
+/// # Errors
+/// What makes the disk anything but never materialized, or what could not be read.
+pub fn never_materialized(working_directory: &Path) -> Result<(), String> {
+    let only = |dir: &Path, allowed: &str| -> Result<Option<PathBuf>, String> {
+        let mut found = None;
+        let entries = std::fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        for entry in entries {
+            let entry = entry.map_err(|e| format!("{}: {e}", dir.display()))?;
+            if entry.file_name() != allowed {
+                return Err(format!("{} holds {:?}", dir.display(), entry.file_name()));
+            }
+            found = Some(entry.path());
+        }
+        Ok(found)
+    };
+    let meta = match std::fs::symlink_metadata(working_directory) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(format!("{}: {e}", working_directory.display())),
+    };
+    if !meta.file_type().is_dir() {
+        return Err(format!(
+            "{} is not a directory",
+            working_directory.display()
+        ));
+    }
+    let Some(daemon_dir) = only(working_directory, sealant_capture::index::DAEMON_DIR)? else {
+        return Ok(());
+    };
+    if !std::fs::symlink_metadata(&daemon_dir)
+        .map_err(|e| format!("{}: {e}", daemon_dir.display()))?
+        .file_type()
+        .is_dir()
+    {
+        return Err(format!("{} is not a directory", daemon_dir.display()));
+    }
+    let Some(lock) = only(&daemon_dir, "boot.lock")? else {
+        return Ok(());
+    };
+    let lock_meta =
+        std::fs::symlink_metadata(&lock).map_err(|e| format!("{}: {e}", lock.display()))?;
+    if !lock_meta.file_type().is_file() || lock_meta.len() != 0 {
+        return Err(format!("{} is not the empty lock file", lock.display()));
+    }
+    Ok(())
+}
+
 /// How long a boot first waits to ask `plan.get` again while another launch holds the lease;
 /// it doubles up to [`PLAN_LEASED_WAIT_MAX`].
 const PLAN_LEASED_WAIT: Duration = Duration::from_secs(1);
@@ -1439,6 +1496,64 @@ mod tests {
         assert_eq!(asked.len(), 3);
         assert!(asked.iter().all(|r| r.epoch == 0), "no epoch was adopted");
         assert_eq!(boot.epoch, 4, "the epoch it was given");
+    }
+
+    /// A disk the daemon before never materialized — absent, empty, or holding only the daemon's
+    /// empty lock file — is verified as such (a recovery boot on it exits 76, nothing to save);
+    /// anything else is not: a file, a repository, capture staging, a materialize record, a
+    /// second file beside the lock, a lock with bytes in it, a worktree that is a symlink.
+    #[test]
+    fn only_a_disk_with_nothing_on_it_was_never_materialized() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wt = tmp.path().join("repo");
+        assert_eq!(never_materialized(&wt), Ok(()), "absent");
+        std::fs::create_dir_all(&wt).unwrap();
+        assert_eq!(never_materialized(&wt), Ok(()), "empty");
+        let lock = crate::boot::lock::DiskLock::acquire(&wt).unwrap();
+        assert_eq!(never_materialized(&wt), Ok(()), "the lock alone");
+        drop(lock);
+        type Setup = fn(&Path);
+        let refused: [(&str, Setup); 8] = [
+            ("a file", |wt| {
+                std::fs::write(wt.join("draft.md"), "work").unwrap()
+            }),
+            ("a repository", |wt| {
+                std::fs::create_dir_all(wt.join(".git")).unwrap()
+            }),
+            ("an empty directory", |wt| {
+                std::fs::create_dir_all(wt.join("src")).unwrap()
+            }),
+            ("capture staging", |wt| {
+                std::fs::create_dir_all(wt.join(".sealantd/capture")).unwrap();
+            }),
+            ("a materialize record", |wt| {
+                let index = wt.join(".sealantd/capture/index");
+                std::fs::create_dir_all(&index).unwrap();
+                std::fs::write(index.join("materialized.json"), "{}").unwrap();
+            }),
+            ("a file beside the lock", |wt| {
+                std::fs::write(wt.join(".sealantd/other"), "").unwrap();
+            }),
+            ("a lock with bytes", |wt| {
+                std::fs::write(wt.join(".sealantd/boot.lock"), "x").unwrap();
+            }),
+            ("a daemon directory that is a file", |wt| {
+                std::fs::remove_dir_all(wt.join(".sealantd")).unwrap();
+                std::fs::write(wt.join(".sealantd"), "").unwrap();
+            }),
+        ];
+        for (what, setup) in refused {
+            let tmp = tempfile::tempdir().unwrap();
+            let wt = tmp.path().join("repo");
+            drop(crate::boot::lock::DiskLock::acquire(&wt).unwrap());
+            setup(&wt);
+            assert!(never_materialized(&wt).is_err(), "{what}");
+        }
+        let target = tmp.path().join("elsewhere");
+        std::fs::create_dir_all(&target).unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(never_materialized(&link).is_err(), "a symlink");
     }
 
     /// A registrar that ignores `launch` (an older Mend) but answers the executor its token was

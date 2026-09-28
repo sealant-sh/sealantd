@@ -43,6 +43,16 @@ fn new_unit_mark() -> u64 {
 /// is on this disk is not all registered, and the staging directory is left as it is.
 pub const EXIT_CAPTURE_INCOMPLETE: u8 = 75;
 
+/// The exit code of a recovery boot (`sealantd boot --recovery`) on a disk that was never
+/// materialized (`EX_PROTOCOL`, 76): the daemon before it died before its first materialize
+/// completed, and nothing there is work product. Only after [`crate::boot::capture::never_materialized`]
+/// verified it: the worktree absent or empty but for the daemon's own lock file — no materialize
+/// record, no staging, no capture state, no repository, no file. Capture starts right after the
+/// materialize and before any user code (cross-repo decision 8), so no user code ever ran on
+/// such a disk, and the platform may release it. Anything else a recovery cannot save stays
+/// [`EXIT_CAPTURE_INCOMPLETE`].
+pub const EXIT_NOTHING_TO_SAVE: u8 = 76;
+
 /// Collect the values captured I/O must redact (plan §18): the values of secret-looking env vars
 /// plus every launcher-provided secret literal, whatever its name.
 fn secret_env_values(config: &RuntimeConfig) -> Vec<String> {
