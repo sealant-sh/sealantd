@@ -1325,6 +1325,9 @@ impl CadenceRunner {
         // The executor is ending: everything it ships from now on preserves work it already
         // admitted, and its requests say so (`flush: final`; decision 35).
         self.shared.shipper.preserving().begin();
+        // A seal answer an earlier final flush heard decides nothing here unless it was
+        // `recorded`: this flush asks the registrar again (review 12 #4).
+        self.shared.shipper.seal_heard();
         let until = deadline.map(|d| Instant::now() + d);
         let mut shipped = 0;
         let mut round = 0;

@@ -40,7 +40,7 @@
 //! that cannot be restored — the overlay's, a chunked class's directory mode or mtime, a
 //! symlink's mtime, a hardlink — fails the materialize.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io::{self, Write};
@@ -556,6 +556,9 @@ impl<'a> Materializer<'a> {
         // class, `info/exclude`, a relinked name) moves them any more (review 2026-09-28,
         // seventh pass, #2). The worktree root (`tree`) is the overlay's.
         let mut class_roots: Vec<(PathBuf, u32, i128)> = Vec::new();
+        // Each class's own hardlink groups, as restored: the worktree metadata's links across
+        // classes move a whole group, never one name of it (review 12 #2).
+        let mut restored = worktree_meta::RestoredGroups::default();
         // Read before anything is written: a document that does not verify or decode fails
         // the materialize with the disk untouched.
         let meta = match meta {
@@ -611,6 +614,7 @@ impl<'a> Materializer<'a> {
             report.git_config = write.planned.contains(".git/config");
             let resolve = |v: &str| roots.workspace_path(&git_dir, v);
             Self::link_all(&write.links, &resolve, &mut report)?;
+            restored_groups(&mut restored, LinkClass::Workspace, &write.links, &resolve);
             // A symlink under `refs/` git read through to a loose ref's file came back
             // reaching nothing (the refs are packed): that file is written loose again, with
             // the value the git section holds (review 2026-09-28, ninth pass, #2).
@@ -687,6 +691,7 @@ impl<'a> Materializer<'a> {
             )?;
             let resolve = |v: &str| Some(root.join(crate::tree::os_of_key(v)));
             Self::link_all(&write.links, &resolve, &mut report)?;
+            restored_groups(&mut restored, LinkClass::Bulk, &write.links, &resolve);
             let listing = roots.bulk_listing();
             // Only bulk directories are swept; their ancestors are the worktree's.
             let bulk_only: BTreeSet<String> = listing
@@ -747,11 +752,8 @@ impl<'a> Materializer<'a> {
                 let strict = manifest.final_seal.is_some()
                     && class == MaterializeClass::All
                     && manifest.sections.bulk.section().is_some();
-                let applied = if strict {
-                    worktree_meta::apply_strict(&repo, doc, &scope, &resolve)?
-                } else {
-                    worktree_meta::apply(&repo, doc, &scope, &resolve)?
-                };
+                let applied =
+                    worktree_meta::apply_over(&repo, doc, &scope, &resolve, &restored, strict)?;
                 report.worktree_meta = applied.changed;
                 // A relinked name has a new inode: the class's index must say so, or the next
                 // delta would take it for changed and write it again.
@@ -1381,6 +1383,40 @@ pub fn system_time_from_ns(mtime_ns: i128) -> Option<SystemTime> {
         UNIX_EPOCH.checked_sub(whole)?
     };
     at.checked_add(Duration::from_nanos(u64::from(nanos)))
+}
+
+/// The hardlink groups one class's restore made ([`Materializer::link_all`]'s `links`), for
+/// [`worktree_meta::apply_over`]: each canonical name (its key: the class's index holds it) and
+/// its members.
+fn restored_groups(
+    restored: &mut worktree_meta::RestoredGroups,
+    class: LinkClass,
+    links: &[(String, PathBuf, u32)],
+    resolve: &dyn Fn(&str) -> Option<PathBuf>,
+) {
+    let mut groups: BTreeMap<&str, Vec<worktree_meta::RestoredName>> = BTreeMap::new();
+    for (canonical_v, member, _) in links {
+        let Some(canonical) = resolve(canonical_v) else {
+            continue;
+        };
+        groups
+            .entry(canonical_v.as_str())
+            .or_insert_with(|| {
+                vec![worktree_meta::RestoredName {
+                    class,
+                    key: Some(canonical_v.clone()),
+                    abs: canonical,
+                }]
+            })
+            .push(worktree_meta::RestoredName {
+                class,
+                key: None,
+                abs: member.clone(),
+            });
+    }
+    for (_, names) in groups {
+        restored.add(names);
+    }
 }
 
 /// Linking a member onto a canonical file, or sweeping one away, moves the canonical's ctime (its

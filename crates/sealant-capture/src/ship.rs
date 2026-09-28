@@ -1207,14 +1207,31 @@ pub struct Shipper {
     /// wakes its small-class loop, whose next snap rebuilds it.
     repair_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     /// The last capture carrying a final seal that registered, and what the registrar said of
-    /// its seal (`None`: it did not say) — [`Self::seal_standing`].
-    seal_answer: Mutex<Option<(String, Option<SealAnswer>)>>,
+    /// its seal (`None`: it did not say) — [`Self::seal_standing`]. Only `recorded` outlives
+    /// the final flush that heard it; any other answer is that flush's alone, and the next
+    /// final flush asks again ([`CachedSeal`]).
+    seal_answer: Mutex<Option<CachedSeal>>,
     /// Whether this executor began a final flush: every register from then on says so
     /// (`flush: final`; decision 35), and so does every `upload.urls` of a minter sharing it
     /// ([`Self::with_preserving`]).
     preserving: PreservingFlush,
     /// Counters.
     pub status: Arc<ShipStatus>,
+}
+
+/// What a sealing capture's register was answered about its seal, kept by the shipper
+/// ([`Shipper::seal_standing`]).
+#[derive(Debug, Clone)]
+struct CachedSeal {
+    /// The sealing capture.
+    capture_id: String,
+    /// What the registrar said (`None`: it did not say).
+    answer: Option<SealAnswer>,
+    /// Whether a [`Shipper::seal_standing`] has read it. A register's answer decides the final
+    /// flush that sent it; once read, only `recorded` still decides. A refusal or a withheld
+    /// seal is asked again by the next final flush, so a registrar that answered while it could
+    /// not read the objects (review 12 #4), or that has since recovered, is heard again.
+    read: bool,
 }
 
 /// Registers of a sealing capture a final flush sends again while the registrar withholds its
@@ -1280,14 +1297,25 @@ impl Shipper {
         &self.preserving
     }
 
+    /// A final flush begins: whatever its registers have not answered yet decides it, and a seal
+    /// answer heard before it only when `recorded` ([`Self::seal_standing`] asks again).
+    pub fn seal_heard(&self) {
+        if let Some(cached) = lock(&self.seal_answer).as_mut() {
+            cached.read = true;
+        }
+    }
+
     /// Whether the final seal the sealing capture `req` carries stands (cross-repo decision
     /// 22): the registrar recorded it, and says so. Its register's answer decides when it is
-    /// this capture's and `recorded` or `refused`; otherwise — withheld, or not asked in this
-    /// process (a daemon that restarted over a sealed chain) — the same register is sent
-    /// again, which the registrar answers as a lost ack saying where the seal stands now:
-    /// while `withheld`, at most [`SEAL_REASKS`] times, backing off, never past `until` or the
-    /// cutoff. An answer with no `seal` is a registrar that does not say, and a seal that does
-    /// not stand (decision 9).
+    /// this capture's and `recorded`, or `refused` and not yet read by an earlier call (the
+    /// final flush that registered it); otherwise — withheld, a refusal an earlier final flush
+    /// already heard, or not asked in this process (a daemon that restarted over a sealed
+    /// chain) — the same register is sent again, which the registrar answers as a lost ack
+    /// saying where the seal stands now: while `withheld`, at most [`SEAL_REASKS`] times,
+    /// backing off, never past `until` or the cutoff. So every final flush asks at least once
+    /// unless the seal was recorded, and a refusal costs one register per final flush. An
+    /// answer with no `seal` is a registrar that does not say, and a seal that does not stand
+    /// (decision 9).
     ///
     /// # Errors
     /// Why the seal does not stand: withheld (with the registrar's reason), refused, not said,
@@ -1305,10 +1333,20 @@ impl Shipper {
                 SealState::Refused => format!("the registrar refused the seal ({reason})"),
             }
         };
-        let mut answer: Option<Option<SealAnswer>> = lock(&self.seal_answer)
-            .as_ref()
-            .filter(|(id, _)| *id == req.capture_id)
-            .map(|(_, answer)| answer.clone());
+        // Heard by an earlier final flush, only `recorded` still decides (review 12 #4: a
+        // refusal kept here, repeated final flushes over an unchanged disk never asked a
+        // registrar that had recovered).
+        let mut answer: Option<Option<SealAnswer>> = {
+            let mut cached = lock(&self.seal_answer);
+            cached
+                .as_mut()
+                .filter(|c| c.capture_id == req.capture_id)
+                .and_then(|c| {
+                    let recorded = c.answer.as_ref().map(|a| a.state) == Some(SealState::Recorded);
+                    let first = !std::mem::replace(&mut c.read, true);
+                    (recorded || first).then(|| c.answer.clone())
+                })
+        };
         let mut why = "the registrar has not said whether it recorded the seal".to_owned();
         let mut asks = 0;
         loop {
@@ -1342,7 +1380,11 @@ impl Shipper {
                 .capture_register(&req.marked(&self.preserving))
             {
                 Ok(resp) if resp.head_capture_id == req.capture_id => {
-                    *lock(&self.seal_answer) = Some((req.capture_id.clone(), resp.seal.clone()));
+                    *lock(&self.seal_answer) = Some(CachedSeal {
+                        capture_id: req.capture_id.clone(),
+                        answer: resp.seal.clone(),
+                        read: true,
+                    });
                     answer = Some(resp.seal);
                 }
                 Ok(resp) => {
@@ -1930,7 +1972,11 @@ impl Shipper {
                         if resp.seal.as_ref().map(|a| a.state) != Some(SealState::Recorded) {
                             tracing::warn!(n = entry.n, seal = ?resp.seal, "the sealing capture registered; its seal does not stand");
                         }
-                        *lock(&self.seal_answer) = Some((entry.capture_id.clone(), resp.seal));
+                        *lock(&self.seal_answer) = Some(CachedSeal {
+                            capture_id: entry.capture_id.clone(),
+                            answer: resp.seal,
+                            read: false,
+                        });
                     }
                     self.lease_ok();
                     return Ok(());
