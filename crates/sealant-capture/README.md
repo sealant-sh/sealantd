@@ -101,6 +101,17 @@ it onto `b`, and writing `b` did the same to `.b.capture-tmp` (review 16 #2). A 
 capture restored whole also fails the materialize when any file a chunked class promised is not
 a regular file once the restore is done.
 
+The git side stages the same way. `GitRepo::exclude_locally` (every capture open and reopen),
+`write_head`, `write_packed_refs` and `install_pack` (a restore) write into a fresh
+`.<name>.capture-tmp-<pid>-<n>` beside the file they replace and rename it over, and a pack's
+index is written by `git index-pack -o` into a fresh name of its own (no reverse index). Before
+(review 17 #2), they went through the fixed names `.git/info/exclude.capture-tmp`,
+`.git/HEAD.capture-tmp`, `.git/packed-refs.capture-tmp` and
+`.git/objects/pack/tmp-capture-<sha>.{pack,idx,rev}`: opening capture truncated a user file at
+the first and renamed it over `info/exclude`, at the first open and again when a restarted
+executor reopened a disk whose sealed capture held the file, and the next final flush sealed the
+disk without it. `tests/review17_git_staging.rs` holds the open and the reopen.
+
 **The next capture is incremental too.** A restored executor learns where the head's chunks are:
 at open (and at a re-plan) the engine maps the chunks of every workspace and bulk pack the
 registered head names that the materializer left in the pack cache (and, writing dir packs, the
