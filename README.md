@@ -79,10 +79,37 @@ the protocol details live in `crates/sealant-capture/src/registrar.rs` and `mani
   `MERGE_HEAD`, a rebase, a cherry-pick sequence or a bisect names is in the packs.
 - **The final seal** (`final_seal.executor`) is `plan.get`'s `executor`, the launch the session
   token was issued for, and nothing else. A plan that names no executor gets no seal.
-- **`complete` means current.** `capture.status` and the final flush's answer say `complete`
-  only while the disk is as the last final flush captured it. After any later change the watcher
-  reports, or a watcher overflow, they answer `incomplete_reason: "changed"` until a final flush
-  is asked again.
+- **`complete` means current.** `capture.status` says `complete` only while the disk is as the
+  last final flush captured it. After any later change the watcher reports it answers
+  `incomplete_reason: "changed"` until a final flush is asked again. While a class polls (a
+  directory it could not watch, a watcher overflow) nothing can vouch for it after the flush:
+  the status reads `"unwatched"`, and a final flush asked again snaps that class and answers
+  complete. A final flush's own answer is complete when its snaps, taken after every writer
+  stopped, captured every class, a polled one included.
+- **The exit code follows the daemon's own last final flush.** A daemon exits 0 only when the
+  last final flush it ran to its end answered complete, else 75; a final flush another request
+  just began does not change that.
+- **The shutdown's deadline: `SEALANT_SHUTDOWN_FINAL_DEADLINE_MS`.** The final flush of a
+  shutdown (`SIGTERM`, `SIGINT`, `runtime.gracefulShutdown`) runs until it completes unless this
+  is set. When it is set, the flush gets that many milliseconds from the moment the shutdown
+  began: process grace, snaps and shipping included, and waiting for a final flush that is
+  already running (a control plane's without a deadline, or the one after the harness exited).
+  After that the daemon stops trying and exits 75 within about a second, its staging directory
+  as it was. Nothing is lost: what is not registered is still staged on the disk, which the
+  platform keeps and recovers (`--recovery`). **The platform sets it to its stop grace (the
+  time between `SIGTERM` and `SIGKILL`) less a margin of at least 5 s**, so the daemon reports
+  "not saved" itself instead of being killed mid-upload. A final flush after the harness exits
+  on its own is not bounded by it, unless a shutdown begins meanwhile.
+- **Uploads while the store or the registrar refuses.** A URL minted for a key is used again
+  until that key's upload settles (stored, already there, or the URL refused) or it is five
+  minutes old, and a multipart upload resumes under the same upload and part URLs. A pass that
+  fails on a transient refusal (unreachable, 5xx, 429) is followed by a backoff of 1 s, doubling
+  to 30 s, not by the next pass at once.
+- **Watching.** A directory removed or renamed away before its watch is added (a dependency
+  install's temporary directories) is not a failure. One that cannot be watched for a lasting
+  reason (the watch limit, the budget, a permission) has its class poll, the rest of the class
+  staying watched, and is tried again (2 s, doubling to 60 s): once it is watched, or gone, the
+  class is watched again.
 - **Remotes.** Plan remotes are added only where the repository has no remote of that name. An
   existing URL is never changed, and a resumed or recovered disk is left as it is.
 - **Recovery reboot.** `sealantd boot --recovery` (or `SEALANT_RECOVERY=1`, or the marker
