@@ -7,6 +7,7 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use sealant_capture::cadence::SHIP_TICK;
 use sealant_capture::manifest::CaptureKind;
 use sealant_capture::registrar::HeadInfo;
 use sealant_capture::{
@@ -126,18 +127,21 @@ fn fast_bulk(mut cadence: Cadence, quiet_ms: u64, max_ms: u64) -> Cadence {
 /// snap, the worker's wake-up, the ship and the registration — is held to the same work forced
 /// (an identical workspace's first capture, snapped and shipped right after on the same
 /// machine), not to a wall-clock constant: on a runner with a slow disk every fsync and git
-/// spawn is slower, for both alike. A missed wake-up (the capture waiting for the ship worker's
-/// 5 s tick, ≈ 1.5 s after the timer here) still fails it wherever a snap and ship take well
-/// under a second.
+/// spawn is slower, for both alike. The change is written as the runner starts, so a missed
+/// wake-up (the capture waiting for the ship worker's tick, [`SHIP_TICK`] after its first pass
+/// at the start) costs ≈ 3 s after the timer: held to at least 2 s, one forced capture measured
+/// once is not the only yardstick on a loaded runner (a scheduling stall of a second or so
+/// failed it), and a missed wake-up still fails it.
 #[test]
 fn a_change_registers_within_the_quiet_period() {
     let fx = Fixture::build();
     let cadence = Cadence::default();
     let quiet = cadence.quiet;
     let runner = fx.runner(fx.config(cadence));
+    // The ship worker made its first pass as the runner started; it ticks next about SHIP_TICK
+    // after this.
+    let started = Instant::now();
     assert_eq!(runner.snapshot().small_mode, WatchMode::Watched);
-    // Nothing changes: nothing is captured.
-    std::thread::sleep(Duration::from_millis(1500));
     assert!(fx.chain().is_empty(), "no snap without a change");
 
     let t0 = Instant::now();
@@ -185,11 +189,18 @@ fn a_change_registers_within_the_quiet_period() {
         fired <= quiet + Duration::from_secs(1),
         "the quiet timer fires at the quiet period: {fired:?}"
     );
+    // A missed wake-up registers at the worker's next tick, about this long after the timer.
+    let tick_after_timer = (started + SHIP_TICK).saturating_duration_since(t0 + fired);
     assert!(
-        after_quiet <= forced * 3 + Duration::from_millis(500),
+        after_quiet <= (forced * 3 + Duration::from_millis(500)).max(Duration::from_secs(2)),
         "snap + ship after the quiet timer took {after_quiet:?}; forced, the same work took \
-         {forced:?}"
+         {forced:?}; the worker's next tick was {tick_after_timer:?} after the timer"
     );
+
+    // Nothing changes after it: nothing more is captured.
+    std::thread::sleep(quiet + Duration::from_millis(500));
+    assert_eq!(fx.chain().len(), 1, "no snap without a change");
+    assert_eq!(runner.snapshot().quiet_fired, 1);
     runner.stop();
 }
 
