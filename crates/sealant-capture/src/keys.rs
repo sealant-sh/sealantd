@@ -81,6 +81,16 @@ pub fn key_digest(key: &str) -> Option<&str> {
     (digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit())).then_some(digest)
 }
 
+/// The SHA-256 of the bytes `key` names, when its name says it: a pack, tree or manifest key ends
+/// in it. A pack index (`packs/<sha>.idx`) names its pack's digest, not its own: `None`.
+#[must_use]
+pub fn content_digest(key: &str) -> Option<&str> {
+    if is_idx_key(key) {
+        return None;
+    }
+    key_digest(key)
+}
+
 /// The key generation an object key was written under: the `g<n>` segment just above its
 /// `packs`/`trees`/`manifests` directory; `None` for a key without one (written before
 /// generations, or by the control plane).
@@ -109,6 +119,24 @@ pub fn is_idx_key(key: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn content_digest_is_the_name_of_what_it_names_and_never_an_index() {
+        let d = "a".repeat(64);
+        assert_eq!(
+            content_digest(&format!("captures/wt/3/packs/{d}")),
+            Some(d.as_str())
+        );
+        assert_eq!(
+            content_digest(&format!("captures/wt/3/manifests/{d}")),
+            Some(d.as_str())
+        );
+        assert_eq!(
+            content_digest(&format!("captures/wt/3/packs/{d}.idx")),
+            None
+        );
+        assert_eq!(content_digest("captures/wt/3/packs/short"), None);
+    }
 
     #[test]
     fn keys_follow_the_adr_layout() {

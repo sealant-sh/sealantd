@@ -1827,6 +1827,16 @@ impl Shipper {
                 .iter()
                 .map(|u| (u.key.clone(), u.bytes))
                 .collect();
+            // A key whose name does not say its bytes' SHA-256 (a pack index) has it declared
+            // with the mint, so a registrar can bind its URL to those bytes. An index is small.
+            let digests: Vec<(String, String)> = uploads[start..end]
+                .iter()
+                .filter(|u| crate::keys::content_digest(&u.key).is_none())
+                .filter_map(|u| file_sha256(&objects.join(&u.file)).map(|d| (u.key.clone(), d)))
+                .collect();
+            if !digests.is_empty() {
+                self.sink.declare_sha256(&digests);
+            }
             self.prefetch(&keys)?;
             if let Some(why) = self.upload_batch(&uploads[start..end], cycle, stop)? {
                 return Ok(Some(why));
@@ -2534,6 +2544,21 @@ impl Drop for ShipWorker {
         self.stop.store(true, Ordering::Relaxed);
         self.wake();
     }
+}
+
+/// The SHA-256 of a staged file, hex; `None` when it cannot be read (its PUT reports why).
+fn file_sha256(path: &std::path::Path) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    let mut file = std::fs::File::open(path).ok()?;
+    std::io::copy(&mut file, &mut hasher).ok()?;
+    Some(
+        hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect(),
+    )
 }
 
 #[cfg(test)]
