@@ -70,8 +70,15 @@ pub const DEFAULT_BULK_DIRS: &[&str] = &[
     "coverage",
 ];
 
-/// Harness credential files excluded relative to the harness home (ADR-0015 open question 2).
-pub const CREDENTIAL_FILES: &[&str] = &[".claude/.credentials.json", ".codex/auth.json"];
+/// Harness credential files excluded relative to the harness home (ADR-0015 open question 2):
+/// Claude Code's, Codex's, pi's and opencode's own login files. A login made inside a session
+/// (`/login`) lands in one of these and is never captured.
+pub const CREDENTIAL_FILES: &[&str] = &[
+    ".claude/.credentials.json",
+    ".codex/auth.json",
+    ".pi/agent/auth.json",
+    ".local/share/opencode/auth.json",
+];
 
 /// The daemon's own directory under the workspace root (staging lives beneath it).
 pub const DAEMON_DIR: &str = ".sealantd";
