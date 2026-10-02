@@ -112,6 +112,9 @@ fn main() {
         serde_json::to_string(&second.stats).unwrap()
     );
     shipper.ship_pending().unwrap();
+    if std::env::var_os("BENCH_NO_RESTORE").is_some() {
+        return;
+    }
 
     let head = registrar.head().unwrap();
     let restore = out.join("restore");

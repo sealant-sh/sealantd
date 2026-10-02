@@ -1827,7 +1827,8 @@ impl CaptureEngine {
         };
         work.suspects.extend(self.invalidations.take(class));
         let mut sink = PackSink {
-            builder: PackBuilder::new(&objects, self.config.pack_cap),
+            builder: PackBuilder::new(&objects, self.config.pack_cap)
+                .hash_ahead(strict && self.config.final_readers > 1),
             known: &self.chunks.packs,
             carried: &work.chunks,
             // A final snap runs after every writer stopped, with a Stop waiting on it: nothing

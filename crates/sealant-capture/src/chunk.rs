@@ -5,8 +5,8 @@ use std::fmt;
 use std::io::{self, BufReader, Cursor, Read};
 
 use fastcdc::v2020::StreamCDC;
+use ring::digest::{SHA256, digest};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use sha2::{Digest, Sha256};
 
 /// Minimum chunk size (ADR-0015: 256 KiB). Files below this size are one chunk.
 pub const MIN_CHUNK_SIZE: usize = 256 * 1024;
@@ -23,7 +23,9 @@ impl ChunkId {
     /// Digest of `bytes`.
     #[must_use]
     pub fn of(bytes: &[u8]) -> Self {
-        Self(Sha256::digest(bytes).into())
+        let mut id = [0u8; 32];
+        id.copy_from_slice(digest(&SHA256, bytes).as_ref());
+        Self(id)
     }
 
     /// Wrap a raw digest.
@@ -75,7 +77,7 @@ impl<'de> Deserialize<'de> for ChunkId {
 /// Lowercase hex sha256 of `bytes` (packs, dir objects and manifests are keyed by this).
 #[must_use]
 pub fn sha256_hex(bytes: &[u8]) -> String {
-    hex::encode(Sha256::digest(bytes))
+    hex::encode(digest(&SHA256, bytes))
 }
 
 /// One chunk of a file: its id and uncompressed bytes.
@@ -120,28 +122,50 @@ pub fn chunk_reader<R: Read>(reader: R) -> ChunkStream<R> {
     }
 }
 
-/// The chunks of one file ([`chunk_file`]).
-pub enum FileChunks<R: Read> {
-    /// At most [`MIN_CHUNK_SIZE`] bytes: one chunk, or none when empty.
-    Whole(Option<Chunk>),
+/// A file's first bytes, read to see how long it is, then the rest of it.
+type HeadThenRest<R> = io::Chain<Cursor<Vec<u8>>, BufReader<R>>;
+
+/// One file cut where the chunker cuts it, each part's bytes not yet hashed ([`file_parts`]).
+pub enum FileParts<R: Read> {
+    /// At most [`MIN_CHUNK_SIZE`] bytes: one part, or none when empty.
+    Whole(Option<Vec<u8>>),
     /// Longer: the bytes already read, then the rest, through the chunker.
-    Stream(ChunkStream<io::Chain<Cursor<Vec<u8>>, BufReader<R>>>),
+    Stream(Box<StreamCDC<HeadThenRest<R>>>),
 }
 
-impl<R: Read> fmt::Debug for FileChunks<R> {
+impl<R: Read> fmt::Debug for FileParts<R> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("FileChunks")
+        f.write_str("FileParts")
     }
 }
+
+impl<R: Read> Iterator for FileParts<R> {
+    type Item = io::Result<Vec<u8>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Whole(part) => part.take().map(Ok),
+            Self::Stream(stream) => match stream.next()? {
+                Ok(cd) => Some(Ok(cd.data)),
+                Err(fastcdc::v2020::Error::Empty) => None,
+                Err(e) => Some(Err(io::Error::from(e))),
+            },
+        }
+    }
+}
+
+/// The chunks of one file ([`chunk_file`]): its parts, each hashed.
+#[derive(Debug)]
+pub struct FileChunks<R: Read>(FileParts<R>);
 
 impl<R: Read> Iterator for FileChunks<R> {
     type Item = io::Result<Chunk>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        match self {
-            Self::Whole(chunk) => chunk.take().map(Ok),
-            Self::Stream(stream) => stream.next(),
-        }
+        Some(self.0.next()?.map(|data| Chunk {
+            id: ChunkId::of(&data),
+            data,
+        }))
     }
 }
 
@@ -151,20 +175,26 @@ impl<R: Read> Iterator for FileChunks<R> {
 /// such files, and the zeroing was most of the time a snap of one took (2026-10-02). So the first
 /// `MIN_CHUNK_SIZE + 1` bytes are read first: a file that ends within them is its one chunk, and
 /// a longer one goes through the chunker from its first byte.
-pub fn chunk_file<R: Read>(mut reader: R) -> io::Result<FileChunks<R>> {
+pub fn chunk_file<R: Read>(reader: R) -> io::Result<FileChunks<R>> {
+    Ok(FileChunks(file_parts(reader)?))
+}
+
+/// [`chunk_file`] without the hashing: the same cuts, for a caller that hashes the parts itself
+/// (on other threads).
+pub fn file_parts<R: Read>(mut reader: R) -> io::Result<FileParts<R>> {
     let mut head = Vec::new();
     (&mut reader)
         .take(MIN_CHUNK_SIZE as u64 + 1)
         .read_to_end(&mut head)?;
     if head.len() <= MIN_CHUNK_SIZE {
-        return Ok(FileChunks::Whole((!head.is_empty()).then(|| Chunk {
-            id: ChunkId::of(&head),
-            data: head,
-        })));
+        return Ok(FileParts::Whole((!head.is_empty()).then_some(head)));
     }
-    Ok(FileChunks::Stream(chunk_reader(
+    Ok(FileParts::Stream(Box::new(StreamCDC::new(
         Cursor::new(head).chain(BufReader::with_capacity(1 << 20, reader)),
-    )))
+        MIN_CHUNK_SIZE,
+        AVG_CHUNK_SIZE,
+        MAX_CHUNK_SIZE,
+    ))))
 }
 
 /// Chunk an in-memory buffer.

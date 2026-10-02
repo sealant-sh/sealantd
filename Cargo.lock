@@ -1075,6 +1075,7 @@ dependencies = [
  "nix",
  "notify",
  "rcgen",
+ "ring",
  "rustls",
  "rustls-pemfile",
  "sealant-process",

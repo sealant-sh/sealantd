@@ -47,6 +47,9 @@ base64 = "0.22"
 crc32fast = "1"
 hex = "0.4"
 sha2 = "0.10"
+# The same SHA-256, from the assembly `ring` already ships for rustls: about twice the pure-Rust
+# one on a CPU without SHA extensions (measured 533 against 290 MB/s on an i9-9900K, 2026-10-02).
+ring = "0.17"
 getrandom = "0.2"
 tempfile = "3"
 # session capture store (ADR-0015): content-defined chunking, per-chunk zstd (the C library built by

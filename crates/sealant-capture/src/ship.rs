@@ -74,6 +74,12 @@ pub const OUTAGE_BACKOFF: (Duration, Duration) = (Duration::from_secs(1), Durati
 /// bandwidth-bound.
 pub const DEFAULT_UPLOADS_IN_FLIGHT: usize = 8;
 
+/// Objects at or over the multipart threshold in flight at once. Each mints its own URL when
+/// its turn comes and streams from its file, so four of them hold no more memory than one. They
+/// went up one at a time, and a dependency tree's thirteen 64 MiB packs were five seconds of a
+/// Stop on a bucket in the same machine (2026-10-02).
+pub const LARGE_UPLOADS_IN_FLIGHT: usize = 4;
+
 /// How large objects are uploaded. Measured (R1, 2026-09): one presigned PUT from a sandbox to
 /// R2 runs at 37–47 MB/s, four multipart parts in flight at 63.6 MB/s; AWS single-stream is
 /// ≈ 100 MB/s per flow.
@@ -1819,8 +1825,23 @@ impl Shipper {
                 end += 1;
             }
             if end == start {
-                self.upload_one(&uploads[start], cycle)?;
-                start += 1;
+                // A run of objects that are not one prefetched PUT each: multipart-sized,
+                // uploaded already, or gone from staging. `put_object` settles each.
+                while end < uploads.len()
+                    && end - start < PREFETCH_BATCH
+                    && !single_put(&uploads[end])
+                {
+                    end += 1;
+                }
+                if let Some(why) = self.upload_batch(
+                    &uploads[start..end],
+                    LARGE_UPLOADS_IN_FLIGHT.min(self.uploads_in_flight),
+                    cycle,
+                    stop,
+                )? {
+                    return Ok(Some(why));
+                }
+                start = end;
                 continue;
             }
             let keys: Vec<(String, u64)> = uploads[start..end]
@@ -1838,7 +1859,9 @@ impl Shipper {
                 self.sink.declare_sha256(&digests);
             }
             self.prefetch(&keys)?;
-            if let Some(why) = self.upload_batch(&uploads[start..end], cycle, stop)? {
+            if let Some(why) =
+                self.upload_batch(&uploads[start..end], self.uploads_in_flight, cycle, stop)?
+            {
                 return Ok(Some(why));
             }
             start = end;
@@ -1846,17 +1869,17 @@ impl Shipper {
         Ok(None)
     }
 
-    /// Upload a batch of single-PUT objects, `uploads_in_flight` at a time, asking `stop` before
-    /// each. The first failure stops the batch (objects already in flight finish); a byte-quota
+    /// Upload a batch of objects, `in_flight` at a time, asking `stop` before each. The first failure stops the batch (objects already in flight finish); a byte-quota
     /// refusal is reported over any other failure, since it decides what happens to the entry.
     /// Each worker charges its CPU to `cycle` and sleeps what the cycle owes outside the lock.
     fn upload_batch(
         &self,
         batch: &[Upload],
+        in_flight: usize,
         cycle: &mut DutyCycle,
         stop: &(dyn Fn() -> Option<Stop> + Sync),
     ) -> Result<Option<Stop>, ShipError> {
-        let workers = self.uploads_in_flight.min(batch.len());
+        let workers = in_flight.min(batch.len());
         if workers <= 1 {
             for u in batch {
                 if let Some(why) = stop() {

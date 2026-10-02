@@ -19,6 +19,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
 
@@ -187,6 +188,91 @@ fn work(shared: &Shared) {
     }
 }
 
+/// A part of a file, hashed and compressed.
+fn pack_part(data: &[u8]) -> io::Result<PackedChunk> {
+    Ok(PackedChunk {
+        id: ChunkId::of(data),
+        size: data.len() as u64,
+        packed: compress_chunk(data)?,
+    })
+}
+
+type PartJob = (Vec<u8>, SyncSender<io::Result<PackedChunk>>);
+
+fn packed(reply: &Receiver<io::Result<PackedChunk>>) -> io::Result<PackedChunk> {
+    reply
+        .recv()
+        .unwrap_or_else(|_| Err(io::Error::other("a packing thread stopped")))
+}
+
+/// Hash and compress the parts of one large file on `workers` threads, and hand each to `put`
+/// in the order the file has them.
+///
+/// A file over [`MAX_FILE_BYTES`] is never read ahead whole, so the build streamed it alone:
+/// read, cut, hashed and compressed on one thread. In a dependency tree those few files are a
+/// third of the bytes (2026-10-02: 24 files, 923 MB of 2.3 GB), and they were most of what a
+/// final flush waited for. The build still reads and cuts the file here, in order. Only the
+/// hashing and compressing move, at most `2 * workers` parts in flight.
+pub(crate) fn pack_parts(
+    parts: impl Iterator<Item = io::Result<Vec<u8>>>,
+    workers: usize,
+    mut put: impl FnMut(PackedChunk) -> io::Result<()>,
+) -> io::Result<()> {
+    let window = workers.max(1) * 2;
+    let (jobs, queue) = mpsc::sync_channel::<PartJob>(window);
+    let queue = Mutex::new(queue);
+    thread::scope(|scope| {
+        let mut spawned = 0;
+        for n in 0..workers {
+            let work = || {
+                loop {
+                    let job = queue.lock().unwrap_or_else(PoisonError::into_inner).recv();
+                    let Ok((data, reply)) = job else { return };
+                    // A panic must not leave the build waiting on a part that never comes.
+                    let part = catch_unwind(AssertUnwindSafe(|| pack_part(&data)))
+                        .unwrap_or_else(|_| Err(io::Error::other("a packing thread panicked")));
+                    reply.send(part).ok();
+                }
+            };
+            if thread::Builder::new()
+                .name(format!("capture-pack-{n}"))
+                .spawn_scoped(scope, work)
+                .is_ok()
+            {
+                spawned += 1;
+            }
+        }
+        let run = || -> io::Result<()> {
+            if spawned == 0 {
+                for part in parts {
+                    put(pack_part(&part?)?)?;
+                }
+                return Ok(());
+            }
+            let mut pending: VecDeque<Receiver<io::Result<PackedChunk>>> = VecDeque::new();
+            for part in parts {
+                let (reply, result) = mpsc::sync_channel(1);
+                jobs.send((part?, reply))
+                    .map_err(|_| io::Error::other("the packing threads stopped"))?;
+                pending.push_back(result);
+                if pending.len() >= window
+                    && let Some(first) = pending.pop_front()
+                {
+                    put(packed(&first)?)?;
+                }
+            }
+            for result in pending {
+                put(packed(&result)?)?;
+            }
+            Ok(())
+        };
+        let outcome = run();
+        // The threads end when nothing can send them a part.
+        drop(jobs);
+        outcome
+    })
+}
+
 /// One read of `abs`, as the build makes it: `None` when the file changed underneath.
 fn read_whole(abs: &Path) -> io::Result<Option<ReadAheadFile>> {
     let started = now_ns();
@@ -271,5 +357,76 @@ mod tests {
         for path in files.iter().rev() {
             let _ = ahead.take(path);
         }
+    }
+
+    fn patterned(len: usize) -> Vec<u8> {
+        let mut x = 0x9E37_79B9_7F4A_7C15_u64;
+        (0..len)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                (x >> 24 & 0xff) as u8
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_large_files_parts_come_back_in_order_as_the_build_would_read_them() {
+        let data = patterned(9 * 1024 * 1024);
+        let want = chunk_bytes(&data);
+        assert!(want.len() > 4, "several chunks: {}", want.len());
+        for workers in [0, 1, 4] {
+            let mut got = Vec::new();
+            pack_parts(
+                crate::chunk::file_parts(&data[..]).unwrap(),
+                workers,
+                |part| {
+                    got.push(part);
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                got.iter().map(|p| p.id).collect::<Vec<_>>(),
+                want.iter().map(|c| c.id).collect::<Vec<_>>(),
+                "{workers} workers"
+            );
+            for (part, chunk) in got.iter().zip(&want) {
+                assert_eq!(part.size, chunk.data.len() as u64);
+                let size = usize::try_from(part.size).unwrap();
+                assert_eq!(
+                    crate::pack::decompress_chunk(&part.packed, size).unwrap(),
+                    chunk.data
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_read_that_fails_or_a_part_refused_ends_the_file_and_the_threads() {
+        // The file's read fails part way.
+        let data = patterned(3 * 1024 * 1024);
+        let parts = crate::chunk::file_parts(&data[..])
+            .unwrap()
+            .take(2)
+            .chain(std::iter::once(Err(io::Error::other("the disk went"))));
+        let mut seen = 0;
+        let error = pack_parts(parts, 3, |_| {
+            seen += 1;
+            Ok(())
+        })
+        .unwrap_err();
+        assert_eq!(error.to_string(), "the disk went");
+        assert!(seen <= 2);
+        // The build refuses a part (its sink failed): nothing after it is handed over.
+        let mut handed = 0;
+        let error = pack_parts(crate::chunk::file_parts(&data[..]).unwrap(), 3, |_| {
+            handed += 1;
+            Err(io::Error::other("the sink is full"))
+        })
+        .unwrap_err();
+        assert_eq!(error.to_string(), "the sink is full");
+        assert_eq!(handed, 1);
     }
 }
