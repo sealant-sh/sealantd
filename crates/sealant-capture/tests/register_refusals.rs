@@ -171,11 +171,7 @@ impl Registrar for Mend {
                 message: "not acknowledged".to_owned(),
             })
         };
-        if self
-            .refuse
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-            .is_ok()
-        {
+        if take_one(&self.refuse) {
             return refuse("unrestorable", Vec::new());
         }
         let missing: Vec<String> = {
@@ -541,4 +537,17 @@ fn a_final_flush_rebuilds_a_refused_capture_and_completes() {
         "pub fn f() { last() }\n"
     );
     runner.stop();
+}
+
+/// Take one from `counter` if it holds any; whether one was taken. (`fetch_update` is deprecated
+/// on current stable; a compare-exchange loop builds everywhere.)
+fn take_one(counter: &AtomicU32) -> bool {
+    let mut n = counter.load(Ordering::SeqCst);
+    while n > 0 {
+        match counter.compare_exchange_weak(n, n - 1, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return true,
+            Err(actual) => n = actual,
+        }
+    }
+    false
 }

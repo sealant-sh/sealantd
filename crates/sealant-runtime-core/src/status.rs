@@ -83,11 +83,7 @@ impl RuntimeStatus {
 
     /// Decrement the active-process counter (saturating at zero).
     pub fn dec_processes(&self) {
-        let _ = self
-            .active_processes
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                Some(v.saturating_sub(1))
-            });
+        saturating_decrement(&self.active_processes);
     }
 
     /// Increment the active-session counter.
@@ -97,11 +93,7 @@ impl RuntimeStatus {
 
     /// Decrement the active-session counter (saturating at zero).
     pub fn dec_sessions(&self) {
-        let _ = self
-            .active_sessions
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                Some(v.saturating_sub(1))
-            });
+        saturating_decrement(&self.active_sessions);
     }
 
     /// Increment the active-execution counter.
@@ -111,11 +103,7 @@ impl RuntimeStatus {
 
     /// Decrement the active-execution counter (saturating at zero).
     pub fn dec_executions(&self) {
-        let _ = self
-            .active_executions
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                Some(v.saturating_sub(1))
-            });
+        saturating_decrement(&self.active_executions);
     }
 
     /// Current `(processes, sessions, executions)` counts.
@@ -158,6 +146,23 @@ impl RuntimeStatus {
 impl Default for RuntimeStatus {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Take one from `counter`, never below zero. A compare-exchange loop: `fetch_update` is
+/// deprecated on current stable (renamed `try_update`), which the crate's MSRV predates.
+fn saturating_decrement(counter: &AtomicU32) {
+    let mut current = counter.load(Ordering::Relaxed);
+    while current > 0 {
+        match counter.compare_exchange_weak(
+            current,
+            current - 1,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return,
+            Err(actual) => current = actual,
+        }
     }
 }
 

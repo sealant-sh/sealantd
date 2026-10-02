@@ -69,6 +69,23 @@
 //! object is retried under a fresh `upload_id`) is the registrar's to expire: a bucket lifecycle
 //! rule for incomplete multipart uploads, no `upload.abort` call in v1.
 //!
+//! # Bytes-bound PUT URLs: `sha256`
+//!
+//! A store that cannot refuse an overwrite (Garage ignores `If-None-Match`) can still refuse
+//! bytes other than the ones a URL was minted for: a registrar signs `x-amz-checksum-sha256`
+//! into the URL, and the store checks the body against it. Such a URL can only ever write the
+//! bytes its key names, so it holds no authority to replace anything, and a seal need not wait
+//! for it to expire. The executor lists `sha256` in `upload_answers`: it sends that header, the
+//! SHA-256 of the bytes in base64, on every PUT whose URL signs it, and declares in
+//! `upload.urls` the SHA-256 of each key whose name does not say it (a pack index; every other
+//! key ends in it).
+//!
+//! ```json
+//! → {"worktree_id":"wt","epoch":3,"keys":["captures/wt/3/packs/<sha>.idx"],
+//!    "sizes":{"captures/wt/3/packs/<sha>.idx":1208},
+//!    "sha256":{"captures/wt/3/packs/<sha>.idx":"<the index's own sha256>"}}
+//! ```
+//!
 //! # Byte-quota refusals
 //!
 //! A session has a byte budget. The registrar prices a key once and refuses a call that would
@@ -340,8 +357,9 @@ pub struct PlanGetRequest {
 }
 
 /// Every `upload.urls` answer shape beyond a URL this build reads (`plan.get`
-/// `upload_answers`): see the module docs.
-pub const UPLOAD_ANSWERS: [&str; 1] = ["present"];
+/// `upload_answers`): see the module docs. `sha256`: a PUT URL that signs
+/// `x-amz-checksum-sha256` is sent that header, the SHA-256 of the bytes (# Bytes-bound PUT URLs).
+pub const UPLOAD_ANSWERS: [&str; 2] = ["present", "sha256"];
 
 impl PlanGetRequest {
     /// The request a booting executor sends: `epoch` 0, this build's platform and the highest
@@ -573,6 +591,10 @@ pub struct UploadUrlsRequest {
     /// preserves work already admitted. Absent before, and from an older executor.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub flush: Option<FlushMarker>,
+    /// The SHA-256 (hex) of keys whose name does not say it (a pack index), so a registrar can
+    /// bind their URLs to their bytes (# Bytes-bound PUT URLs). Absent when there are none.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub sha256: BTreeMap<String, String>,
 }
 
 impl UploadUrlsRequest {
@@ -585,6 +607,7 @@ impl UploadUrlsRequest {
             keys,
             sizes: BTreeMap::new(),
             flush: None,
+            sha256: BTreeMap::new(),
         }
     }
 }
@@ -928,6 +951,7 @@ struct InMemoryState {
     priced: BTreeMap<String, u64>,
     /// Every size the caller declared on `upload.urls`, for tests of what the wire carried.
     sizes_seen: BTreeMap<String, u64>,
+    sha256_seen: BTreeMap<String, String>,
     chain: Vec<HeadInfo>,
     lease_alive: bool,
     summaries: Vec<ChangeSummaryRequest>,
@@ -1009,6 +1033,7 @@ impl InMemoryRegistrar {
                 live_epoch: epoch,
                 priced: BTreeMap::new(),
                 sizes_seen: BTreeMap::new(),
+                sha256_seen: BTreeMap::new(),
                 chain: Vec::new(),
                 lease_alive: true,
                 summaries: Vec::new(),
@@ -1170,6 +1195,12 @@ impl InMemoryRegistrar {
     #[must_use]
     pub fn sizes_seen(&self) -> BTreeMap<String, u64> {
         self.lock().sizes_seen.clone()
+    }
+
+    /// Every SHA-256 `upload.urls` was told about, by key (# Bytes-bound PUT URLs).
+    #[must_use]
+    pub fn sha256_seen(&self) -> BTreeMap<String, String> {
+        self.lock().sha256_seen.clone()
     }
 
     /// The `flush` every `upload.urls` and `capture.register` carried, oldest first, with the
@@ -1485,6 +1516,7 @@ impl Registrar for InMemoryRegistrar {
         }
         state.url_requests += 1;
         state.sizes_seen.extend(req.sizes.clone());
+        state.sha256_seen.extend(req.sha256.clone());
         state.flush_seen.push(("upload.urls", req.flush));
         let prefix = format!("captures/{}/{}/", req.worktree_id, req.epoch);
         // Priced before anything is minted: a refused batch leaves no URL behind.
@@ -1934,6 +1966,9 @@ pub struct RegistrarMinter<R: Registrar + ?Sized> {
     /// has not settled yet: nothing is PUT for them ([`crate::sink::PutTarget::Present`]).
     present: Mutex<BTreeSet<String>>,
     get_urls: Mutex<BTreeMap<String, String>>,
+    /// The SHA-256 of keys whose name does not say it ([`crate::sink::UrlMinter::declare_sha256`]),
+    /// declared in the `upload.urls` call that mints them; forgotten once their upload settles.
+    declared: Mutex<BTreeMap<String, String>>,
     /// Whether this executor began a final flush: every `upload.urls` from then on says so
     /// (`flush`; decision 35). Shared with the shipper ([`Self::preserving`]).
     preserving: PreservingFlush,
@@ -1961,6 +1996,7 @@ impl<R: Registrar + ?Sized> RegistrarMinter<R> {
             multipart_cache: Mutex::new(BTreeMap::new()),
             present: Mutex::new(BTreeSet::new()),
             get_urls: Mutex::new(get_urls),
+            declared: Mutex::new(BTreeMap::new()),
             preserving: PreservingFlush::default(),
         }
     }
@@ -2001,6 +2037,10 @@ impl<R: Registrar + ?Sized> RegistrarMinter<R> {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clear();
+        self.declared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
         *self
             .get_urls
             .lock()
@@ -2038,10 +2078,30 @@ impl<R: Registrar + ?Sized> RegistrarMinter<R> {
         );
         req.sizes = wanted.into_iter().collect();
         req.flush = self.preserving.marker();
+        req.sha256 = self.declared_for(&req.keys);
         let resp = self.registrar.upload_urls(&req)?;
         self.note_present(&req.keys, resp.present);
         self.cache_puts(resp.urls);
         Ok(())
+    }
+
+    /// What was declared about `keys` ([`Self::declare_sha256`]).
+    fn declared_for(&self, keys: &[String]) -> BTreeMap<String, String> {
+        let declared = self
+            .declared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        keys.iter()
+            .filter_map(|k| declared.get(k).map(|d| (k.clone(), d.clone())))
+            .collect()
+    }
+
+    /// Remember the SHA-256 of keys whose name does not say it, for the call that mints them.
+    pub fn declare_sha256(&self, digests: &[(String, String)]) {
+        self.declared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend(digests.iter().cloned());
     }
 
     /// Record the keys of `asked` the registrar answered `present`. A key it names that was not
@@ -2148,7 +2208,15 @@ impl<R: Registrar + ?Sized> crate::sink::UrlMinter for RegistrarMinter<R> {
             })
     }
 
+    fn declare_sha256(&self, digests: &[(String, String)]) {
+        Self::declare_sha256(self, digests);
+    }
+
     fn settled(&self, key: &str) {
+        self.declared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(key);
         self.present
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -2764,6 +2832,48 @@ mod tests {
     /// Every key of a prefetch batch travels with its size (not only multipart candidates), so
     /// the registrar can price the batch before it mints; a batch past the budget is refused
     /// whole, with the numbers, and nothing is minted.
+    /// # Bytes-bound PUT URLs: what was declared about a key travels with the call that mints
+    /// it, a key the call does not ask about is not mentioned, and a settled key is forgotten.
+    #[test]
+    fn a_declared_sha256_travels_with_the_mint_of_its_key() {
+        use crate::sink::UrlMinter;
+
+        let r = Arc::new(InMemoryRegistrar::new("wt", 1, Some("http://x".into())));
+        let minter = RegistrarMinter::new(
+            Arc::clone(&r) as Arc<dyn Registrar>,
+            "wt",
+            1,
+            BTreeMap::new(),
+        );
+        let index = "captures/wt/1/packs/p.idx".to_owned();
+        let other = "captures/wt/1/packs/q.idx".to_owned();
+        UrlMinter::declare_sha256(
+            &minter,
+            &[
+                (index.clone(), "a".repeat(64)),
+                (other.clone(), "b".repeat(64)),
+            ],
+        );
+        UrlMinter::prefetch_put(&minter, &[(index.clone(), 10)]).unwrap();
+        assert_eq!(
+            r.sha256_seen(),
+            BTreeMap::from([(index.clone(), "a".repeat(64))])
+        );
+        UrlMinter::settled(&minter, &other);
+        let unseen = "captures/wt/1/packs/q.idx".to_owned();
+        UrlMinter::prefetch_put(&minter, &[(unseen.clone(), 10)]).unwrap();
+        assert!(
+            !r.sha256_seen().contains_key(&unseen),
+            "a settled key's declaration is gone"
+        );
+        assert!(
+            PlanGetRequest::booting(None)
+                .upload_answers
+                .unwrap()
+                .contains(&"sha256".to_owned())
+        );
+    }
+
     #[test]
     fn prefetch_sizes_every_key_and_a_batch_past_the_budget_is_refused() {
         use crate::sink::UrlMinter;

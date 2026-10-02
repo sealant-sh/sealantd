@@ -338,11 +338,7 @@ impl Registrar for Throttled {
 
     fn upload_urls(&self, req: &UploadUrlsRequest) -> Result<UploadUrlsResponse, RegistrarError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        if self
-            .throttle
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-            .is_ok()
-        {
+        if take_one(&self.throttle) {
             // What `HttpRegistrar` makes of Mend's 429 `quota-exceeded`.
             return Err(RegistrarError::Transport("upload.urls: http 429".into()));
         }
@@ -506,4 +502,17 @@ fn a_throttled_url_mint_is_retried_not_reported_as_no_url() {
     );
     std::thread::sleep(Duration::from_millis(250));
     assert_eq!(shipper.ship_pending().unwrap(), 1);
+}
+
+/// Take one from `counter` if it holds any; whether one was taken. (`fetch_update` is deprecated
+/// on current stable; a compare-exchange loop builds everywhere.)
+fn take_one(counter: &AtomicU32) -> bool {
+    let mut n = counter.load(Ordering::SeqCst);
+    while n > 0 {
+        match counter.compare_exchange_weak(n, n - 1, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return true,
+            Err(actual) => n = actual,
+        }
+    }
+    false
 }

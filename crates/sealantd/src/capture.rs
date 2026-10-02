@@ -53,7 +53,7 @@ fn overdue() -> Option<CaptureOverdue> {
     let ms = |d: Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
     sealant_process::activity::overdue().map(|o| CaptureOverdue {
         step: o.step,
-        started_unix_ms: o.started.duration_since(UNIX_EPOCH).map_or(0, &ms),
+        started_unix_ms: o.started.duration_since(UNIX_EPOCH).map_or(0, ms),
         running_ms: ms(o.running),
         bound_ms: ms(o.bound),
     })

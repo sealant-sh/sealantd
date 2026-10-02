@@ -210,6 +210,13 @@ pub trait BlobSink: Send + Sync {
         let _ = keys;
         Ok(())
     }
+    /// The SHA-256 (hex) of objects about to be stored whose key does not name it (a pack
+    /// index): a presigned sink declares them when it asks for their URLs, so a registrar can
+    /// bind each URL to exactly those bytes ([`UrlMinter::declare_sha256`]). The default keeps
+    /// nothing.
+    fn declare_sha256(&self, digests: &[(String, String)]) {
+        let _ = digests;
+    }
     /// Read the bytes at `key`.
     fn get(&self, key: &str) -> Result<Vec<u8>, SinkError>;
     /// Whether `key` holds bytes.
@@ -364,6 +371,12 @@ pub trait UrlMinter: Send + Sync {
         let _ = keys;
         Ok(())
     }
+    /// Remember the SHA-256 (hex) of objects whose key does not name it (a pack index), to
+    /// declare in the `upload.urls` call that mints their URLs: a registrar that binds URLs to
+    /// their bytes needs it for such a key. The default keeps nothing.
+    fn declare_sha256(&self, digests: &[(String, String)]) {
+        let _ = digests;
+    }
     /// A GET URL for `key`.
     fn get_url(&self, key: &str) -> Result<String, SinkError>;
     /// The upload of `key` is done with the URLs minted for it: the object is stored (or was
@@ -409,6 +422,10 @@ impl<M: UrlMinter + ?Sized> UrlMinter for Arc<M> {
 
     fn prefetch_put(&self, keys: &[(String, u64)]) -> Result<(), SinkError> {
         (**self).prefetch_put(keys)
+    }
+
+    fn declare_sha256(&self, digests: &[(String, String)]) {
+        (**self).declare_sha256(digests);
     }
 
     fn get_url(&self, key: &str) -> Result<String, SinkError> {
@@ -468,6 +485,10 @@ impl UrlMinter for CheckedMinter {
 
     fn prefetch_put(&self, keys: &[(String, u64)]) -> Result<(), SinkError> {
         self.inner.prefetch_put(keys)
+    }
+
+    fn declare_sha256(&self, digests: &[(String, String)]) {
+        self.inner.declare_sha256(digests);
     }
 
     fn get_url(&self, key: &str) -> Result<String, SinkError> {
@@ -717,9 +738,25 @@ impl BlobSink for PresignedHttp {
         self.minter.prefetch_put(keys)
     }
 
+    fn declare_sha256(&self, digests: &[(String, String)]) {
+        self.minter.declare_sha256(digests);
+    }
+
     fn put_if_absent(&self, key: &str, source: BlobSource<'_>) -> Result<PutOutcome, SinkError> {
         // The length before the URL: it is what the mint declares and what the PUT sends.
         let len = source.len()?;
+        // The bytes' SHA-256, which a registrar may bind the URL to: the name says it for a
+        // content-addressed key; a pack index is hashed here, small as it is, and declared so
+        // a mint of its own carries it.
+        let digest = match crate::keys::content_digest(key) {
+            Some(named) => named.to_owned(),
+            None => {
+                let hashed = sha256_hex(&source)?;
+                self.minter
+                    .declare_sha256(&[(key.to_owned(), hashed.clone())]);
+                hashed
+            }
+        };
         let url = match self.minter.put_target(key, len)? {
             PutTarget::Url(url) => url,
             // The bucket holds the key, verified by the registrar: nothing to send.
@@ -736,6 +773,14 @@ impl BlobSink for PresignedHttp {
             // Write-once: a store that honours it (S3, R2, MinIO) refuses an overwrite with 412,
             // which is the object already there — keys are content-addressed.
             .header("If-None-Match", "*");
+        // A URL bound to its bytes (the registrar signed `x-amz-checksum-sha256` into it, on a
+        // store that cannot refuse an overwrite) is good for exactly those bytes, and the
+        // store checks them: the PUT names their SHA-256.
+        let req = if signs_checksum_sha256(&url) {
+            req.header("x-amz-checksum-sha256", base64_of_hex(&digest)?)
+        } else {
+            req
+        };
         let resp = match source {
             BlobSource::Bytes(b) => req.send(b),
             BlobSource::File(p) => req.send(fs::File::open(p)?),
@@ -925,6 +970,72 @@ impl BlobSink for PresignedHttp {
     fn helper_cpu(&self) -> Duration {
         Duration::from_micros(self.helper_cpu_micros.load(Ordering::Relaxed))
     }
+}
+
+/// Whether a presigned URL signs `x-amz-checksum-sha256` (`X-Amz-SignedHeaders`).
+fn signs_checksum_sha256(url: &str) -> bool {
+    url.split_once('?').is_some_and(|(_, query)| {
+        query.split('&').any(|pair| {
+            pair.split_once('=').is_some_and(|(name, value)| {
+                name.eq_ignore_ascii_case("X-Amz-SignedHeaders")
+                    && value
+                        .replace("%3B", ";")
+                        .replace("%3b", ";")
+                        .split(';')
+                        .any(|h| h.eq_ignore_ascii_case("x-amz-checksum-sha256"))
+            })
+        })
+    })
+}
+
+/// The SHA-256 of `source`, hex.
+fn sha256_hex(source: &BlobSource<'_>) -> Result<String, SinkError> {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    match source {
+        BlobSource::Bytes(b) => hasher.update(b),
+        BlobSource::File(p) => {
+            let mut file = fs::File::open(p)?;
+            io::copy(&mut file, &mut hasher)?;
+        }
+    }
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect())
+}
+
+/// A 64-character hex SHA-256 as the base64 an `x-amz-checksum-sha256` header carries.
+fn base64_of_hex(hex: &str) -> Result<String, SinkError> {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let invalid = || {
+        SinkError::Io(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not a sha256 hex digest",
+        ))
+    };
+    if hex.len() != 64 {
+        return Err(invalid());
+    }
+    let bytes = (0..32)
+        .map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).map_err(|_| invalid()))
+        .collect::<Result<Vec<u8>, _>>()?;
+    let mut out = String::with_capacity(44);
+    for chunk in bytes.chunks(3) {
+        let n = chunk
+            .iter()
+            .enumerate()
+            .fold(0u32, |acc, (i, b)| acc | (u32::from(*b) << (16 - 8 * i)));
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(char::from(ALPHABET[((n >> (18 - 6 * i)) & 63) as usize]));
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
