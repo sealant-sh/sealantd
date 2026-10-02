@@ -3,8 +3,9 @@
 "@sealant/runtime-client": patch
 ---
 
-A final capture flush uses every core. Measured on a 140,548-file, 2.3 GB dependency tree: 28.9 s
-before, 2.9 s now on a Ryzen 9950X3D, and 69 s before, 6.3 s now on an i9-9900K.
+A final capture flush uses every core. On a 140,548-file, 2.3 GB dependency tree the snapshot
+took 28.9 s and now takes 2.9 s on a Ryzen 9950X3D. In a session on an i9-9900K, which has no SHA
+extensions, it took 69 s and now takes 9 to 10 s.
 
 - Small files are read, hashed and compressed on reader threads, in the order the build takes them.
 - A file too large to read ahead whole is still read in order, and its parts are hashed and
