@@ -811,6 +811,12 @@ impl BlobSink for PresignedHttp {
         parts_in_flight: usize,
     ) -> Result<PutOutcome, SinkError> {
         let size = fs::metadata(file)?.len();
+        // A pack index's own SHA-256 goes with this mint too: a registrar may answer it as a
+        // single PUT bound to those bytes (its multipart threshold is its own).
+        if crate::keys::content_digest(key).is_none() && size > 0 {
+            let digest = sha256_hex(&BlobSource::File(file))?;
+            self.minter.declare_sha256(&[(key.to_owned(), digest)]);
+        }
         let plan = if size == 0 {
             None
         } else {

@@ -2266,6 +2266,7 @@ impl<R: Registrar + ?Sized> crate::sink::UrlMinter for RegistrarMinter<R> {
         let mut req = UploadUrlsRequest::new(&worktree_id, epoch, vec![key.to_owned()]);
         req.sizes.insert(key.to_owned(), size);
         req.flush = self.preserving.marker();
+        req.sha256 = self.declared_for(&req.keys);
         let mut resp = self
             .registrar
             .upload_urls(&req)
@@ -2872,6 +2873,12 @@ mod tests {
                 .unwrap()
                 .contains(&"sha256".to_owned())
         );
+        // A mint that asks for multipart carries what was declared too: the registrar may answer
+        // it as a single PUT, bound to those bytes.
+        let big = "captures/wt/1/packs/r.idx".to_owned();
+        UrlMinter::declare_sha256(&minter, &[(big.clone(), "c".repeat(64))]);
+        let _ = UrlMinter::multipart_urls(&minter, &big, 64 << 20).unwrap();
+        assert_eq!(r.sha256_seen().get(&big), Some(&"c".repeat(64)));
     }
 
     #[test]
