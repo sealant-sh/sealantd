@@ -1339,7 +1339,7 @@ impl<'a> TreeBuilder<'a> {
             };
             let mut plan: Vec<PathBuf> = group_list
                 .iter()
-                .filter_map(|members| members.first().and_then(&ahead))
+                .filter_map(|members| members.first().and_then(ahead))
                 .collect();
             for dir in &dirs_by_depth {
                 let kids = children.get(dir).map_or(&[][..], Vec::as_slice);
