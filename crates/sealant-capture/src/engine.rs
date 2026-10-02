@@ -180,6 +180,8 @@ pub struct CaptureConfig {
     pub watch: WatchPolicy,
     /// CPU budget for snapping and shipping, as a fraction of one core.
     pub cpu_fraction: f64,
+    /// Threads a final snap reads files on (`crate::readahead`); 1 reads on the build's own.
+    pub final_readers: usize,
     /// How the shipper uploads large objects.
     pub multipart: MultipartConfig,
     /// `<os>-<arch>-<libc>` stamped on bulk captures.
@@ -252,6 +254,9 @@ impl CaptureConfig {
             cadence: Cadence::default(),
             watch: WatchPolicy::default(),
             cpu_fraction: crate::ship::DEFAULT_CPU_FRACTION,
+            final_readers: std::thread::available_parallelism()
+                .map_or(1, std::num::NonZero::get)
+                .min(8),
             multipart: MultipartConfig::DEFAULT,
             platform: default_platform(),
             pack_cap: MAX_PACK_BYTES,
@@ -774,6 +779,14 @@ impl ChunkSink for PackSink<'_> {
 
     fn put(&mut self, id: ChunkId, data: &[u8]) -> io::Result<()> {
         self.builder.add(id, data).map_err(io::Error::other)?;
+        self.cycle.pace();
+        Ok(())
+    }
+
+    fn put_packed(&mut self, id: ChunkId, size: u64, packed: &[u8]) -> io::Result<()> {
+        self.builder
+            .add_packed(id, size, packed)
+            .map_err(io::Error::other)?;
         self.cycle.pace();
         Ok(())
     }
@@ -1817,7 +1830,13 @@ impl CaptureEngine {
             builder: PackBuilder::new(&objects, self.config.pack_cap),
             known: &self.chunks.packs,
             carried: &work.chunks,
-            cycle: DutyCycle::new(self.config.cpu_fraction),
+            // A final snap runs after every writer stopped, with a Stop waiting on it: nothing
+            // is left to yield the CPU to, so it is not paced and reads on every core it may.
+            cycle: DutyCycle::new(if strict {
+                1.0
+            } else {
+                self.config.cpu_fraction
+            }),
             preempt: (class == Class::Bulk).then_some(preempt),
         };
         // Chunks the section names beside its tree (the worktree metadata overlay) go into the
@@ -1837,6 +1856,7 @@ impl CaptureEngine {
                 .narrow_times(strict && !self.config.reads_wide_times)
                 .racy_window(self.config.racy_window)
                 .suspects(&mut work.suspects)
+                .readers(if strict { self.config.final_readers } else { 1 })
                 .build(listing, &mut sink),
             Err(e) => Err(e),
         };

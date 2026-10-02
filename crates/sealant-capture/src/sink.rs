@@ -521,9 +521,20 @@ impl UrlMinter for CheckedMinter {
     }
 }
 
+/// The upload rate one PUT's time limit assumes: slow, so a large object on a poor link is not
+/// cut off part way and sent again from its first byte.
+const SINGLE_PUT_ASSUMED_BYTES_PER_SECOND: u64 = 512 * 1024;
+
+/// How long one PUT of `len` bytes may take at [`SINGLE_PUT_ASSUMED_BYTES_PER_SECOND`].
+fn single_put_time(len: u64) -> Duration {
+    Duration::from_secs(len / SINGLE_PUT_ASSUMED_BYTES_PER_SECOND + 60)
+}
+
 /// Presigned-URL HTTP sink (S3, R2, Garage, or a test server).
 pub struct PresignedHttp {
     agent: ureq::Agent,
+    /// The per-request timeout the agent was built with.
+    timeout: Duration,
     minter: Box<dyn UrlMinter>,
     part_retry: PartRetry,
     /// CPU time (µs) burnt by finished part-upload threads.
@@ -555,6 +566,7 @@ impl PresignedHttp {
     ) -> Self {
         Self {
             agent: transport.object_agent(timeout),
+            timeout,
             minter: Box::new(CheckedMinter {
                 inner: minter,
                 transport: transport.clone(),
@@ -768,6 +780,11 @@ impl BlobSink for PresignedHttp {
         let req = self
             .agent
             .put(&url)
+            // A registrar may answer a key of any size with one URL bound to its bytes; one PUT
+            // of it gets the time its length needs, never less than the usual limit.
+            .config()
+            .timeout_global(Some(self.timeout.max(single_put_time(len))))
+            .build()
             .header("Content-Type", "application/octet-stream")
             .header("Content-Length", len.to_string())
             // Write-once: a store that honours it (S3, R2, MinIO) refuses an overwrite with 412,

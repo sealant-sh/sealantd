@@ -43,6 +43,12 @@ fn main() {
     let mut config = CaptureConfig::new("bench", 1, &root);
     config.staging_dir = Some(out.join("staging"));
     config.harness_home = home;
+    if let Ok(fraction) = std::env::var("BENCH_CPU_FRACTION") {
+        config.cpu_fraction = fraction.parse().expect("BENCH_CPU_FRACTION");
+    }
+    if let Ok(readers) = std::env::var("BENCH_FINAL_READERS") {
+        config.final_readers = readers.parse().expect("BENCH_FINAL_READERS");
+    }
     let sink = Arc::new(LocalDir::new(&out.join("store")).unwrap());
     let registrar = Arc::new(InMemoryRegistrar::new("bench", 1, None));
     let mut engine = CaptureEngine::open(config, None).unwrap();
@@ -64,7 +70,11 @@ fn main() {
         let t = Instant::now();
         let b = engine
             .snap(SnapRequest {
-                kind: CaptureKind::Auto,
+                kind: if std::env::var_os("BENCH_FINAL").is_some() {
+                    CaptureKind::Final
+                } else {
+                    CaptureKind::Auto
+                },
                 class: Class::Bulk,
                 seq: 2,
             })
@@ -74,6 +84,9 @@ fn main() {
             t.elapsed(),
             serde_json::to_string(&b.stats).unwrap()
         );
+    }
+    if std::env::var_os("BENCH_SNAP_ONLY").is_some() {
+        return;
     }
     let t = Instant::now();
     let shipper = engine

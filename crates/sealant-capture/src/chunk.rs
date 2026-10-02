@@ -2,7 +2,7 @@
 //! sha256 of a chunk's uncompressed bytes.
 
 use std::fmt;
-use std::io::Read;
+use std::io::{self, BufReader, Cursor, Read};
 
 use fastcdc::v2020::StreamCDC;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -120,10 +120,60 @@ pub fn chunk_reader<R: Read>(reader: R) -> ChunkStream<R> {
     }
 }
 
+/// The chunks of one file ([`chunk_file`]).
+pub enum FileChunks<R: Read> {
+    /// At most [`MIN_CHUNK_SIZE`] bytes: one chunk, or none when empty.
+    Whole(Option<Chunk>),
+    /// Longer: the bytes already read, then the rest, through the chunker.
+    Stream(ChunkStream<io::Chain<Cursor<Vec<u8>>, BufReader<R>>>),
+}
+
+impl<R: Read> fmt::Debug for FileChunks<R> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("FileChunks")
+    }
+}
+
+impl<R: Read> Iterator for FileChunks<R> {
+    type Item = io::Result<Chunk>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Whole(chunk) => chunk.take().map(Ok),
+            Self::Stream(stream) => stream.next(),
+        }
+    }
+}
+
+/// Chunk a file exactly as [`chunk_reader`] does, without its cost for a small one. The chunker
+/// zeroes a [`MAX_CHUNK_SIZE`] buffer for every reader it is given, and FastCDC returns an input
+/// of at most [`MIN_CHUNK_SIZE`] bytes as one chunk: a dependency tree is a hundred thousand
+/// such files, and the zeroing was most of the time a snap of one took (2026-10-02). So the first
+/// `MIN_CHUNK_SIZE + 1` bytes are read first: a file that ends within them is its one chunk, and
+/// a longer one goes through the chunker from its first byte.
+pub fn chunk_file<R: Read>(mut reader: R) -> io::Result<FileChunks<R>> {
+    let mut head = Vec::new();
+    (&mut reader)
+        .take(MIN_CHUNK_SIZE as u64 + 1)
+        .read_to_end(&mut head)?;
+    if head.len() <= MIN_CHUNK_SIZE {
+        return Ok(FileChunks::Whole((!head.is_empty()).then(|| Chunk {
+            id: ChunkId::of(&head),
+            data: head,
+        })));
+    }
+    Ok(FileChunks::Stream(chunk_reader(
+        Cursor::new(head).chain(BufReader::with_capacity(1 << 20, reader)),
+    )))
+}
+
 /// Chunk an in-memory buffer.
 #[must_use]
 pub fn chunk_bytes(bytes: &[u8]) -> Vec<Chunk> {
-    chunk_reader(bytes).filter_map(Result::ok).collect()
+    match chunk_file(bytes) {
+        Ok(chunks) => chunks.filter_map(Result::ok).collect(),
+        Err(_) => Vec::new(),
+    }
 }
 
 #[cfg(test)]
@@ -140,6 +190,26 @@ mod tests {
                 (x & 0xff) as u8
             })
             .collect()
+    }
+
+    #[test]
+    fn chunk_file_cuts_exactly_where_the_chunker_does() {
+        // Around the one-chunk boundary and well past it: the same chunks, byte for byte, as
+        // the chunker over the whole input.
+        for len in [
+            0,
+            1,
+            MIN_CHUNK_SIZE - 1,
+            MIN_CHUNK_SIZE,
+            MIN_CHUNK_SIZE + 1,
+            MIN_CHUNK_SIZE * 2,
+            9 * 1024 * 1024 + 13,
+        ] {
+            let data = pseudo_random(len, 11 + len as u64);
+            let streamed: Vec<Chunk> = chunk_reader(&data[..]).map(Result::unwrap).collect();
+            let filed: Vec<Chunk> = chunk_file(&data[..]).unwrap().map(Result::unwrap).collect();
+            assert_eq!(filed, streamed, "length {len}");
+        }
     }
 
     #[test]

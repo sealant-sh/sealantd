@@ -24,6 +24,7 @@ pub mod manifest;
 pub mod materialize;
 pub mod pack;
 pub mod position;
+mod readahead;
 pub mod registrar;
 pub mod roots;
 pub mod ship;

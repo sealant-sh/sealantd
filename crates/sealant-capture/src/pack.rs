@@ -217,6 +217,20 @@ impl PackBuilder {
             return Ok(());
         }
         let compressed = compress_chunk(data)?;
+        self.add_packed(id, data.len() as u64, &compressed)
+    }
+
+    /// Add a chunk already compressed with [`compress_chunk`], `size` bytes uncompressed (no-op
+    /// if already added).
+    pub fn add_packed(
+        &mut self,
+        id: ChunkId,
+        size: u64,
+        compressed: &[u8],
+    ) -> Result<(), PackError> {
+        if self.seen.contains_key(&id) {
+            return Ok(());
+        }
         let clen = compressed.len() as u64;
         let rotate = self
             .current
@@ -236,7 +250,7 @@ impl PackBuilder {
             self.current = Some(writer);
         }
         if let Some(w) = self.current.as_mut() {
-            w.append(id, &compressed, data.len() as u64)?;
+            w.append(id, compressed, size)?;
         }
         self.seen.insert(id, ());
         Ok(())
