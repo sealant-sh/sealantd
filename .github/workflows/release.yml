@@ -50,6 +50,7 @@ jobs:
           provenance: false
 
   npm:
+    # npm trusted publishing (OIDC) needs a GitHub-hosted runner: this job stays off Blacksmith.
     runs-on: ubuntu-latest
     # Gate every publish behind a protected environment: add required reviewers + restrict deployment
     # to protected tags in repo Settings -> Environments -> release. This means a compromised PR,
