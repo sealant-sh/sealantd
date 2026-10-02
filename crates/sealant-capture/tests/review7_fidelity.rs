@@ -392,13 +392,14 @@ fn a_strict_restore_refuses_one_inode_with_two_metadata_promises() {
 
 /// A booting executor tells the registrar it reads `present` in an `upload.urls` answer, so
 /// the registrar answers `present` only to an executor that can read it (cross-repo decision
-/// 20); an older executor's request says nothing and keeps getting a URL.
+/// 20); an older executor's request says nothing and keeps getting a URL. It also says it sends
+/// `x-amz-checksum-sha256` on a PUT whose URL signs it (`sha256`, bytes-bound PUT URLs).
 #[test]
 fn plan_get_says_this_executor_reads_present() {
     let booting = serde_json::to_value(PlanGetRequest::booting(None)).unwrap();
     assert_eq!(
         booting["upload_answers"],
-        serde_json::json!(["present"]),
+        serde_json::json!(["present", "sha256"]),
         "{booting}"
     );
 }
