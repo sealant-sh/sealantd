@@ -44,12 +44,18 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::chunk::{ChunkId, chunk_reader};
+use crate::chunk::{ChunkId, MAX_CHUNK_SIZE, chunk_file, file_parts};
 use crate::longpath;
+use crate::pack::decompress_chunk;
+use crate::readahead::{self, ReadAhead};
 use crate::tree::{DirEntry, DirObject, EncodedDir, key_of_os};
 
 /// Bounded attempts for a file (or file group) that changes underneath the reader.
 pub const READ_ATTEMPTS: u32 = 3;
+
+/// A file longer than this is hashed and compressed on the build's readers, when it has any: a
+/// shorter one is at most one chunk, and gains nothing.
+const PARALLEL_FILE_BYTES: u64 = MAX_CHUNK_SIZE as u64;
 
 /// A read whose file's ctime is this close to the start of the read is racy: the next build
 /// re-reads the file instead of trusting its stat. Two seconds covers the coarsest common
@@ -306,7 +312,7 @@ pub fn ctime_ns(meta: &Metadata) -> i128 {
     i128::from(meta.ctime()) * 1_000_000_000 + i128::from(meta.ctime_nsec())
 }
 
-fn now_ns() -> i128 {
+pub(crate) fn now_ns() -> i128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| i128::try_from(d.as_nanos()).unwrap_or(i128::MAX))
@@ -559,6 +565,10 @@ impl Listing {
         };
         // Per-directory name sets, for the `.pack` without `.idx` rule.
         let mut dir_names: HashMap<PathBuf, HashSet<String>> = HashMap::new();
+        // Directories of this walk whose ancestors are in the listing already: an entry's
+        // ancestors are its siblings', and looking each up again for every file was half the
+        // walk of a dependency tree (2026-10-02).
+        let mut ensured: HashSet<String> = HashSet::new();
         // A path of any length: a tree deeper than `PATH_MAX` is walked like any other.
         longpath::walk(&abs_dir, &mut |visit| {
             let (path, kind) = match visit {
@@ -611,7 +621,11 @@ impl Listing {
                 // A directory is walked all the same: an included descendant brings it in.
                 return true;
             }
-            self.ensure_ancestors(&v, &virtual_root, &abs_dir);
+            let parent = parent_of(&v);
+            if !ensured.contains(parent) {
+                self.ensure_ancestors(&v, &virtual_root, &abs_dir);
+                ensured.insert(parent.to_owned());
+            }
             self.add(v, path.to_path_buf(), meta);
             true
         });
@@ -744,6 +758,12 @@ pub trait ChunkSink {
     fn contains(&self, id: &ChunkId) -> bool;
     /// Store a new chunk.
     fn put(&mut self, id: ChunkId, data: &[u8]) -> io::Result<()>;
+    /// Store a new chunk already compressed as a pack holds it (`size` bytes uncompressed): what
+    /// a read-ahead worker hands over. A sink that keeps packs appends it as it is.
+    fn put_packed(&mut self, id: ChunkId, size: u64, packed: &[u8]) -> io::Result<()> {
+        let size = usize::try_from(size).map_err(io::Error::other)?;
+        self.put(id, &decompress_chunk(packed, size)?)
+    }
     /// Whether the builder should stop at the next chunk boundary and hand back what it has
     /// (a due small-class snap is waiting on a bulk build). Never asked by a small-class build.
     fn should_yield(&self) -> bool {
@@ -909,6 +929,9 @@ pub struct TreeBuilder<'a> {
     suspects: Option<&'a mut Suspects>,
     /// Paths read fresh this build whose read was racy.
     racy: HashSet<String>,
+    /// Threads reading files ahead of the build ([`Self::readers`]); one reads nothing ahead.
+    readers: usize,
+    read_ahead: Option<ReadAhead>,
 }
 
 impl std::fmt::Debug for TreeBuilder<'_> {
@@ -952,7 +975,18 @@ impl<'a> TreeBuilder<'a> {
             racy_window_ns: i128::try_from(RACY_WINDOW.as_nanos()).unwrap_or(i128::MAX),
             suspects: None,
             racy: HashSet::new(),
+            readers: 1,
+            read_ahead: None,
         }
+    }
+
+    /// Read files ahead of the build on `readers` threads (`crate::readahead`): for a build
+    /// nothing competes with, a final flush after every writer stopped. One, the default, reads
+    /// each file as the build reaches it.
+    #[must_use]
+    pub fn readers(mut self, readers: usize) -> Self {
+        self.readers = readers.max(1);
+        self
     }
 
     /// A strict build (a `final` snap) fails with [`UnreadableWork`] when anything it should
@@ -1021,6 +1055,27 @@ impl<'a> TreeBuilder<'a> {
         sink: &mut dyn ChunkSink,
         stats: &mut BuildStats,
     ) -> Result<Read, Yielded> {
+        // A worker read it ahead, whole and unchanged: the same read, already hashed and
+        // compressed. Anything else (it failed, the file changed underneath) is read here.
+        if let Some(ahead) = self.read_ahead.as_ref().and_then(|r| r.take(abs)) {
+            for chunk in &ahead.chunks {
+                if !sink.contains(&chunk.id) {
+                    if let Err(e) = sink.put_packed(chunk.id, chunk.size, &chunk.packed) {
+                        return Ok(Read::from_error(e));
+                    }
+                    stats.chunks_new += 1;
+                }
+            }
+            stats.files_read += 1;
+            stats.bytes_read += ahead.bytes;
+            self.read_done(abs);
+            return Ok(Read::Data {
+                chunks: ahead.chunks.iter().map(|c| c.id).collect(),
+                stat: ahead.stat,
+                torn: false,
+                racy: ahead.started.saturating_sub(ahead.stat.ctime) < self.racy_window_ns,
+            });
+        }
         let started = now_ns();
         let mut last: Option<(Vec<ChunkId>, FileStat)> = None;
         for attempt in 0..=READ_ATTEMPTS {
@@ -1084,7 +1139,23 @@ impl<'a> TreeBuilder<'a> {
         let file = longpath::open(abs)?;
         let mut chunks = Vec::new();
         let mut bytes = 0u64;
-        for chunk in chunk_reader(io::BufReader::with_capacity(1 << 20, file)) {
+        // A build with readers hashes and compresses a large file's parts on them, in order.
+        if self.readers > 1 && file.metadata().is_ok_and(|m| m.len() > PARALLEL_FILE_BYTES) {
+            readahead::pack_parts(file_parts(file)?, self.readers, |part| {
+                bytes += part.size;
+                if !sink.contains(&part.id) {
+                    sink.put_packed(part.id, part.size, &part.packed)?;
+                    stats.chunks_new += 1;
+                    if sink.should_yield() {
+                        return Err(io::Error::new(io::ErrorKind::Interrupted, "build yielded"));
+                    }
+                }
+                chunks.push(part.id);
+                Ok(())
+            })?;
+            return Ok((chunks, bytes));
+        }
+        for chunk in chunk_file(file)? {
             let chunk = chunk?;
             bytes += chunk.data.len() as u64;
             if !sink.contains(&chunk.id) {
@@ -1233,6 +1304,61 @@ impl<'a> TreeBuilder<'a> {
         let mut group_list: Vec<Vec<String>> =
             groups.into_values().filter(|g| g.len() > 1).collect();
         group_list.sort();
+        // Children per directory, deepest directories first.
+        let mut children: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        children.entry(String::new()).or_default();
+        for (v, node) in &nodes {
+            children
+                .entry(parent_of(v).to_owned())
+                .or_default()
+                .push(v.clone());
+            if node.is_dir() {
+                children.entry(v.clone()).or_default();
+            }
+        }
+        let mut dirs_by_depth: Vec<String> = children.keys().cloned().collect();
+        dirs_by_depth.sort_by_key(|d| {
+            std::cmp::Reverse(d.matches('/').count() + usize::from(!d.is_empty()))
+        });
+
+        // Read ahead what the build is about to read, in the order it will ask: each hardlink
+        // group's first member, then every other file, directory by directory.
+        if self.readers > 1 {
+            let grouped: HashSet<&String> = group_list.iter().flatten().collect();
+            let ahead = |v: &String| match nodes.get(v) {
+                Some(Node::Listed(src))
+                    if src.meta.is_file()
+                        && src.meta.len() <= readahead::MAX_FILE_BYTES
+                        && self
+                            .reusable(v, &src.abs, &FileStat::of(&src.meta), sink)
+                            .is_none() =>
+                {
+                    Some(src.abs.clone())
+                }
+                _ => None,
+            };
+            let mut plan: Vec<PathBuf> = group_list
+                .iter()
+                .filter_map(|members| members.first().and_then(ahead))
+                .collect();
+            for dir in &dirs_by_depth {
+                let kids = children.get(dir).map_or(&[][..], Vec::as_slice);
+                let names: HashSet<&str> = kids.iter().map(|k| name_of(k)).collect();
+                for v in kids {
+                    let name = name_of(v);
+                    // A file group (`X` with `X-wal`) is read together, by the build.
+                    let in_file_group =
+                        name.strip_suffix("-wal").is_some_and(|b| names.contains(b))
+                            || names.contains(format!("{name}-wal").as_str());
+                    if !grouped.contains(v) && !in_file_group {
+                        plan.extend(ahead(v));
+                    }
+                }
+            }
+            if !plan.is_empty() {
+                self.read_ahead = Some(ReadAhead::start(plan, self.readers));
+            }
+        }
         for members in group_list {
             let mut canonical: Option<String> = None;
             for m in &members {
@@ -1306,23 +1432,6 @@ impl<'a> TreeBuilder<'a> {
                 }
             }
         }
-
-        // Children per directory, deepest directories first.
-        let mut children: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        children.entry(String::new()).or_default();
-        for (v, node) in &nodes {
-            children
-                .entry(parent_of(v).to_owned())
-                .or_default()
-                .push(v.clone());
-            if node.is_dir() {
-                children.entry(v.clone()).or_default();
-            }
-        }
-        let mut dirs_by_depth: Vec<String> = children.keys().cloned().collect();
-        dirs_by_depth.sort_by_key(|d| {
-            std::cmp::Reverse(d.matches('/').count() + usize::from(!d.is_empty()))
-        });
 
         let mut dir_keys: HashMap<String, String> = HashMap::new();
         let mut dirs: HashMap<String, EncodedDir> = HashMap::new();
@@ -1813,6 +1922,80 @@ mod tests {
         assert_eq!(root.entries.len(), 1);
         assert_eq!(root.entries[0].name, "tree");
         assert_eq!(built.stats.files, 2);
+    }
+
+    /// A build that reads ahead on worker threads (a final flush) builds what a build on its own
+    /// thread does: the same tree, the same chunks stored, the same index.
+    #[test]
+    fn a_build_reading_ahead_builds_the_same_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = dir.path();
+        for d in 0..6 {
+            fs::create_dir_all(r.join(format!("pkg{d}/lib/deep"))).unwrap();
+            for f in 0..25 {
+                let body = format!("module {d} file {f}\n").repeat(f * 7 + 1);
+                fs::write(r.join(format!("pkg{d}/lib/f{f}.js")), &body).unwrap();
+                fs::write(r.join(format!("pkg{d}/lib/deep/g{f}.js")), body.as_bytes()).unwrap();
+            }
+        }
+        // What the build reads itself: a file group, a hardlink group, an empty file, a symlink,
+        // and a file past the one-chunk size.
+        fs::write(r.join("pkg0/state.db"), b"db bytes").unwrap();
+        fs::write(r.join("pkg0/state.db-wal"), b"wal bytes").unwrap();
+        fs::hard_link(r.join("pkg1/lib/f3.js"), r.join("pkg2/f3-link.js")).unwrap();
+        fs::write(r.join("pkg3/empty"), b"").unwrap();
+        std::os::unix::fs::symlink("lib/f1.js", r.join("pkg4/l")).unwrap();
+        let big: Vec<u8> = (0..crate::chunk::MIN_CHUNK_SIZE * 3)
+            .map(|i| u8::try_from((i * 31 + i / 7) % 251).unwrap())
+            .collect();
+        fs::write(r.join("pkg5/big.bin"), &big).unwrap();
+        // And a file too large to read ahead whole, which the build streams: its parts are
+        // hashed and compressed on the readers. Its second half repeats its first.
+        let half: Vec<u8> = (0..usize::try_from(readahead::MAX_FILE_BYTES).unwrap() / 2 + 4096)
+            .map(|i| u8::try_from((i * 131 + i / 13 + (i >> 11) * 7) % 251).unwrap())
+            .collect();
+        fs::write(
+            r.join("pkg5/huge.bin"),
+            [half.as_slice(), half.as_slice()].concat(),
+        )
+        .unwrap();
+        let mut l = Listing::default();
+        l.mount("", r, "", |_, _, _| false, |_, _, _| true);
+
+        let build = |readers: usize| {
+            let mut index = TreeIndex::default();
+            let mut sink = MemSink::default();
+            let built = TreeBuilder::new(&mut index, &key)
+                .racy_window(Duration::ZERO)
+                .strict(true)
+                .readers(readers)
+                .build(&l, &mut sink)
+                .unwrap()
+                .unwrap();
+            (built, index, sink.0)
+        };
+        let (alone, alone_index, alone_chunks) = build(1);
+        let (ahead, ahead_index, ahead_chunks) = build(4);
+        assert_eq!(ahead.root.sha256, alone.root.sha256);
+        assert_eq!(ahead.chunks, alone.chunks);
+        assert_eq!(ahead.stats.files, alone.stats.files);
+        assert_eq!(ahead.stats.files_read, alone.stats.files_read);
+        assert_eq!(ahead.stats.bytes_read, alone.stats.bytes_read);
+        assert_eq!(ahead.stats.chunks_new, alone.stats.chunks_new);
+        assert_eq!(ahead_index.files, alone_index.files);
+        assert_eq!(ahead_chunks, alone_chunks);
+        // And the next build reuses that index whole: nothing is read again.
+        let mut index = ahead_index;
+        let mut sink = MemSink(ahead_chunks);
+        let again = TreeBuilder::new(&mut index, &key)
+            .racy_window(Duration::ZERO)
+            .strict(true)
+            .readers(4)
+            .build(&l, &mut sink)
+            .unwrap()
+            .unwrap();
+        assert_eq!(again.stats.files_read, 0);
+        assert_eq!(again.root.sha256, alone.root.sha256);
     }
 
     #[test]

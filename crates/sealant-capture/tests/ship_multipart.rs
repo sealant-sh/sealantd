@@ -182,6 +182,39 @@ fn large_objects_ship_as_multipart_with_parts_in_flight() {
     assert!(fx.staging.pending().unwrap().is_empty());
 }
 
+/// Several large objects go up together, each still whole and its own (2026-10-02: a dependency
+/// tree's 64 MiB packs went up one at a time).
+#[test]
+fn several_large_objects_are_in_flight_together() {
+    let fx = fixture(false);
+    let bodies: Vec<Vec<u8>> = (0..6u32)
+        .map(|n| bytes(THRESHOLD as usize + 4096 * n as usize, 40 + n))
+        .collect();
+    let uploads: Vec<Upload> = bodies
+        .iter()
+        .enumerate()
+        .map(|(n, body)| fx.stage(&format!("pack{n}"), body))
+        .collect();
+    fx.staging.enqueue(&entry(0, uploads)).unwrap();
+
+    assert_eq!(fx.shipper.ship_pending().unwrap(), 1);
+
+    let c = &fx.server.counters;
+    assert_eq!(c.single_puts.load(Ordering::SeqCst), 6);
+    assert!(
+        c.max_large_in_flight.load(Ordering::SeqCst) >= 2,
+        "large objects in flight at once: {}",
+        c.max_large_in_flight.load(Ordering::SeqCst)
+    );
+    let objects = fx.server.objects.lock().unwrap();
+    for (n, body) in bodies.iter().enumerate() {
+        assert_eq!(&objects[&format!("captures/wt/1/packs/pack{n}")], body);
+    }
+    drop(objects);
+    assert_eq!(fx.shipper.status.snapshot().uploaded_objects, 6);
+    assert!(fx.staging.pending().unwrap().is_empty());
+}
+
 /// A key the store already holds: the registrar's write-once complete answers `exists`, which
 /// counts as already present (content-addressed keys hold identical bytes).
 #[test]

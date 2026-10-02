@@ -16,6 +16,9 @@ use sha2::{Digest, Sha256};
 /// Parts of open multipart uploads: upload id → part number → (etag, bytes).
 pub type Parts = HashMap<String, HashMap<u32, (String, Vec<u8>)>>;
 
+/// A single PUT of at least this many bytes is counted as a large one.
+pub const LARGE_BODY: usize = 256 * 1024;
+
 #[derive(Default)]
 pub struct Counters {
     /// Part PUTs that reached the server.
@@ -26,6 +29,9 @@ pub struct Counters {
     pub in_flight: AtomicUsize,
     /// The most part PUTs ever served at once.
     pub max_in_flight: AtomicUsize,
+    /// Single PUTs of a large body being served right now, and the most ever at once.
+    pub large_in_flight: AtomicUsize,
+    pub max_large_in_flight: AtomicUsize,
     /// Fail the next part PUT of this part number with 503, once.
     pub fail_part_once: AtomicU64,
     /// Whether that failure was served.
@@ -135,6 +141,16 @@ pub fn serve_with(part_delay: Duration) -> Server {
                         }
                         ("PUT", None) => {
                             counters.single_puts.fetch_add(1, Ordering::SeqCst);
+                            // A large body takes a moment, so overlapping ones are seen.
+                            if body.len() >= LARGE_BODY {
+                                let now =
+                                    counters.large_in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                                counters
+                                    .max_large_in_flight
+                                    .fetch_max(now, Ordering::SeqCst);
+                                std::thread::sleep(part_delay);
+                                counters.large_in_flight.fetch_sub(1, Ordering::SeqCst);
+                            }
                             let mut s = store.lock().unwrap();
                             if if_none_match && s.contains_key(&path) {
                                 ("412 Precondition Failed", Vec::new())
