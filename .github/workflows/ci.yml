@@ -44,7 +44,7 @@ jobs:
   # The released daemon runs on arm64 too (Graviton MicroVMs), so the same tests run natively
   # there. fmt is architecture-independent and stays on the job above.
   rust-arm64:
-    runs-on: ubuntu-24.04-arm
+    runs-on: blacksmith-4vcpu-ubuntu-2404-arm
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
