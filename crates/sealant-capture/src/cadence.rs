@@ -293,6 +293,8 @@ struct Counters {
     small_snaps: AtomicU64,
     small_staged: AtomicU64,
     bulk_snaps: AtomicU64,
+    /// Final flushes that walked no bulk tree: the last bulk snap stood for it (decision 51).
+    bulk_walks_skipped: AtomicU64,
     bulk_staged: AtomicU64,
     quiet_fired: AtomicU64,
     max_fired: AtomicU64,
@@ -320,6 +322,8 @@ pub struct CadenceSnapshot {
     pub small_staged: u64,
     /// Bulk-class snaps completed.
     pub bulk_snaps: u64,
+    /// Final flushes that walked no bulk tree because the last bulk snap stood for it.
+    pub bulk_walks_skipped: u64,
     /// Bulk-class snaps that staged something.
     pub bulk_staged: u64,
     /// Scheduled snaps fired by the quiet timer.
@@ -383,6 +387,13 @@ struct Shared {
     health: Mutex<[SnapHealth; 2]>,
     /// Change signals the watcher delivered (either class), for [`CadenceRunner::final_is_current`].
     changes: AtomicU64,
+    /// Change signals that could concern the bulk class (a bulk change, an overflow, an
+    /// unwatched directory of either class), for [`Shared::bulk_unchanged_since_clean_snap`].
+    bulk_changes: AtomicU64,
+    /// The `bulk_changes` count before the last bulk snap that read every file of the class
+    /// (nothing torn, unreadable or carried) and staged what it read. `None` until one does, and
+    /// after one that did not.
+    bulk_clean: Mutex<Option<u64>>,
     /// Captures staged by snaps (either class, any kind) and by sealing, for
     /// [`CadenceRunner::chain_sealed`].
     staged: AtomicU64,
@@ -433,6 +444,10 @@ impl Shared {
         // Every signal counts (a change, an overflow, an unwatched directory): a final flush
         // after it snaps again.
         self.changes.fetch_add(1, Ordering::SeqCst);
+        // Every signal but a small-class change may concern the bulk class.
+        if !matches!(signal, ChangeSignal::Changed(Class::Small)) {
+            self.bulk_changes.fetch_add(1, Ordering::SeqCst);
+        }
         let mut st = self.state();
         match signal {
             ChangeSignal::Changed(Class::Small) => st.small.dirty(now),
@@ -549,9 +564,38 @@ impl Shared {
         result
     }
 
+    /**
+     * Whether the dependency tree is as the last bulk snap captured it: that snap read every
+     * file (nothing torn, unreadable or carried), the watcher watches the whole class and saw
+     * no change that could concern it since before that snap began, no bulk build is paused
+     * mid-way, and the store reads `wide_times`, so a final build would check nothing more. A
+     * final flush then walks nothing (decision 51: 4.8 s of a 25 s Stop on the box, for a tree
+     * that had not changed).
+     */
+    fn bulk_unchanged_since_clean_snap(&self) -> bool {
+        let clean = *self
+            .bulk_clean
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let Some(before) = clean else { return false };
+        if self.bulk_changes.load(Ordering::SeqCst) != before {
+            return false;
+        }
+        {
+            let st = self.state();
+            if st.overflowed || st.bulk_mode != Mode::Watched {
+                return false;
+            }
+        }
+        let engine = self.engine();
+        !engine.bulk_in_progress() && engine.reads_wide_times()
+    }
+
     fn bulk_snap_inner(&self, forced: bool) -> Result<StagedCapture, EngineError> {
         self.state().bulk.clear();
         self.counters.bulk_running.store(true, Ordering::SeqCst);
+        // Read before the build: a change delivered while it reads is a change since.
+        let bulk_changes_before = self.bulk_changes.load(Ordering::SeqCst);
         let seq = self.seq.fetch_add(1, Ordering::Relaxed);
         let preempt = || {
             self.small_waiting.load(Ordering::SeqCst) > 0
@@ -611,6 +655,21 @@ impl Shared {
             Class::Bulk,
             result.as_ref().map(|_| ()).map_err(ToString::to_string),
         );
+        // A snap that read every file of the class stands for a final one until something in
+        // the class changes (`bulk_unchanged_since_clean_snap`).
+        *self
+            .bulk_clean
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = match &result {
+            Ok(staged)
+                if staged.stats.torn == 0
+                    && staged.stats.unreadable == 0
+                    && staged.stats.carried == 0 =>
+            {
+                Some(bulk_changes_before)
+            }
+            _ => None,
+        };
         if let Ok(staged) = &result
             && !staged.unchanged
         {
@@ -895,6 +954,8 @@ impl CadenceRunner {
                 counters: Counters::default(),
                 health: Mutex::new([SnapHealth::default(), SnapHealth::default()]),
                 changes: AtomicU64::new(0),
+                bulk_changes: AtomicU64::new(0),
+                bulk_clean: Mutex::new(None),
                 staged: AtomicU64::new(0),
                 sealed: Mutex::new(None),
             }),
@@ -1244,13 +1305,21 @@ impl CadenceRunner {
             // The small snap failed: this flush is incomplete whatever the bulk snap does, and
             // nothing it stages would be read as saved. The bulk class is snapped by the flush
             // that can complete (a dependency tree is 2.5 s or more to walk; a kept executor
-            // asked again and again spent it every time).
-            if self.shared.capture_bulk
-                && incomplete.is_none()
-                && let Err(error) = self.shared.bulk_snap(true)
-            {
-                tracing::error!(%error, "final bulk-class snap failed");
-                incomplete.get_or_insert(Incomplete::from_snap(Class::Bulk, &error));
+            // asked again and again spent it every time). A tree the last bulk snap read whole
+            // and that the watcher saw nothing change in since is not walked again (decision 51).
+            if self.shared.capture_bulk && incomplete.is_none() {
+                if self.shared.bulk_unchanged_since_clean_snap() {
+                    self.shared
+                        .counters
+                        .bulk_walks_skipped
+                        .fetch_add(1, Ordering::Relaxed);
+                    tracing::info!(
+                        "final flush: the dependency tree is as the last bulk snap captured it                          (that snap read every file, and the watcher saw no change in the class                          since); nothing to walk"
+                    );
+                } else if let Err(error) = self.shared.bulk_snap(true) {
+                    tracing::error!(%error, "final bulk-class snap failed");
+                    incomplete.get_or_insert(Incomplete::from_snap(Class::Bulk, &error));
+                }
             }
             // The small snap's overlay names the bulk class's names of tracked files (and of
             // workspace files the workspace class does not name) as the bulk index had them:
@@ -1606,6 +1675,7 @@ impl CadenceRunner {
             small_snaps: c.small_snaps.load(Ordering::Relaxed),
             small_staged: c.small_staged.load(Ordering::Relaxed),
             bulk_snaps: c.bulk_snaps.load(Ordering::Relaxed),
+            bulk_walks_skipped: c.bulk_walks_skipped.load(Ordering::Relaxed),
             bulk_staged: c.bulk_staged.load(Ordering::Relaxed),
             quiet_fired: c.quiet_fired.load(Ordering::Relaxed),
             max_fired: c.max_fired.load(Ordering::Relaxed),

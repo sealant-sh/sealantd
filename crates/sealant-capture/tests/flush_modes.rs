@@ -198,6 +198,54 @@ fn a_final_flush_snaps_a_freshly_changed_bulk_dir_and_waits_for_it() {
     runner.stop();
 }
 
+/// The dependency tree has not changed since the last bulk snap read every file of it, and the
+/// watcher saw nothing in the class since: a final flush walks it no more (decision 51; 4.8 s of
+/// a 25 s Stop on the box). A change in the class, and the next final flush walks it again.
+#[test]
+fn a_final_flush_walks_no_unchanged_bulk_tree() {
+    let fx = fixture(40);
+    let mut config = slow_config(&fx.root);
+    config.reads_wide_times = true;
+    let runner = runner(config, fx.store.clone(), &fx);
+    runner.start(None);
+    runner.flush(CaptureKind::Final, None).unwrap();
+    let first = fx.registrar.head().unwrap();
+    let walked = runner.snapshot().bulk_snaps;
+    // A change in the small class only.
+    fs::write(fx.root.join("src/lib.rs"), "pub fn f() {}\npub fn g() {}\n").unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    runner.flush(CaptureKind::Final, None).unwrap();
+    let second = fx.registrar.head().unwrap();
+    let snap = runner.snapshot();
+    assert_eq!(
+        snap.bulk_snaps, walked,
+        "the bulk tree was not walked again: {snap:?}"
+    );
+    assert_eq!(snap.bulk_walks_skipped, 1, "{snap:?}");
+    assert!(second.n > first.n, "the small change was captured");
+    assert_eq!(
+        second.manifest.sections.bulk, first.manifest.sections.bulk,
+        "the bulk section stands"
+    );
+    // A change in the dependency tree: the next final flush walks it.
+    fs::write(fx.root.join("node_modules/pkg3/lib/m1.js"), "rebuilt\n").unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    runner.flush(CaptureKind::Final, None).unwrap();
+    let third = fx.registrar.head().unwrap();
+    let snap = runner.snapshot();
+    assert_eq!(snap.bulk_snaps, walked + 1, "{snap:?}");
+    assert_eq!(snap.bulk_walks_skipped, 1, "{snap:?}");
+    assert_ne!(third.manifest.sections.bulk, second.manifest.sections.bulk);
+    let fresh = fx.base.join("fresh");
+    restore_head(&fx, &fresh);
+    assert_eq!(
+        files(&fresh.join("node_modules")),
+        files(&fx.root.join("node_modules"))
+    );
+    assert_eq!(files(&fresh.join("src")), files(&fx.root.join("src")));
+    runner.stop();
+}
+
 /// A scheduled bulk build is running when the final flush arrives (bulk clocks of a few
 /// milliseconds, a tree that changes under it): the forced bulk snap preempts it, resumes its
 /// progress, and captures the tree as it is when the flush was asked for.

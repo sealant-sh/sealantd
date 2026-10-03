@@ -2095,6 +2095,14 @@ impl CaptureEngine {
         self.bulk_work.is_some()
     }
 
+    /// Whether the store reads `wide_times`: when it does, a final (strict) build checks nothing
+    /// of a file an automatic build did not, so an automatic bulk snap that read every file
+    /// stands for the final one ([`crate::cadence::CadenceRunner`], decision 51).
+    #[must_use]
+    pub fn reads_wide_times(&self) -> bool {
+        self.config.reads_wide_times
+    }
+
     /// Rebuild the capture the registrar refused ([`crate::ship::RepairRequest`], asked for by the shipper)
     /// from disk, in its place: the packs it named are forgotten (their chunks are read and
     /// packed again, a dir object is staged again, a missing git pack makes the next git pack a
