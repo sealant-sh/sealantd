@@ -1,5 +1,44 @@
 # @sealant/runtime-client
 
+## 0.20.0
+
+### Minor Changes
+
+- c52f585: Upload URLs bound to their bytes. The executor lists `sha256` in `plan.get`'s `upload_answers`: it
+  sends `x-amz-checksum-sha256` (the SHA-256 of the bytes, base64) on every PUT whose URL signs it,
+  and declares in `upload.urls` the SHA-256 of each pack index, the one key whose name does not say
+  it. A registrar on a store that cannot refuse an overwrite but checks a signed checksum (Garage) can
+  then mint URLs that write those bytes or nothing: no write authority, and no seal waits for them to
+  expire. An older registrar ignores both, and nothing changes for a URL that does not sign it.
+
+### Patch Changes
+
+- 9a7fa5b: A pack index's SHA-256 is declared on a multipart mint too, so a registrar that answers it as a
+  single PUT can bind that URL to its bytes (before, it went unbound and the seal waited for it).
+- 26ce30d: A final capture flush uses every core. On a 140,548-file, 2.3 GB dependency tree the snapshot
+  took 28.9 s and now takes 2.9 s on a Ryzen 9950X3D. In a session on an i9-9900K, which has no SHA
+  extensions, it took 69 s and now takes 9 to 10 s.
+
+  - Small files are read, hashed and compressed on reader threads, in the order the build takes them.
+  - A file too large to read ahead whole is still read in order, and its parts are hashed and
+    compressed on those threads. 24 such files were 923 MB of that tree.
+  - A pack's digest is computed on a thread of its own, and the pack is synced and named while the
+    next one is written.
+  - SHA-256 comes from `ring`, about twice as fast as before on a CPU without SHA extensions.
+  - Objects of 16 MiB and more upload four at a time. They went up one at a time.
+  - A single PUT may run for as long as its size needs at 512 KiB/s. It was cut at 10 minutes.
+
+  The output is the same bytes: the same chunks, packs and tree as a build on one thread.
+
+- 15c33aa: Capture leaves pi's and opencode's own login files out of the harness home, as it does Claude
+  Code's and Codex's: `.pi/agent/auth.json` and `.local/share/opencode/auth.json`. A login made inside
+  a session with either harness is never captured; their settings and sessions still are.
+- Updated dependencies [9a7fa5b]
+- Updated dependencies [c52f585]
+- Updated dependencies [26ce30d]
+- Updated dependencies [15c33aa]
+  - @sealant/runtime-protocol@0.20.0
+
 ## 0.19.0
 
 ### Minor Changes
@@ -95,11 +134,11 @@ rev-list --stdin` got their whole input before their answer was read: once the a
 standby no session claimed (…)` on stderr, which Core's recovery sweep already releases on
     (`nothing-to-save`). Once any claim or writer was admitted none of this applies again.
 
-    Before, a claimed standby whose re-plan failed kept its placeholder captures queued forever
-    (`lease-lost`). Its final flush never completed, and the launch waited 12 minutes, failed and
-    needed a discard. Mend binds a `complete` answer to the lease epoch its claim took, so to act
-    on the answer itself it must read a claimed standby's answer under the placeholder's epoch and
-    its `standby:<id>` launch as nothing to save. Until then it sees the executor end.
+        Before, a claimed standby whose re-plan failed kept its placeholder captures queued forever
+        (`lease-lost`). Its final flush never completed, and the launch waited 12 minutes, failed and
+        needed a discard. Mend binds a `complete` answer to the lease epoch its claim took, so to act
+        on the answer itself it must read a claimed standby's answer under the placeholder's epoch and
+        its `standby:<id>` launch as nothing to save. Until then it sees the executor end.
 
   - **A base restores in its own formats (F4b).** When the plan's workspace class carries no
     `.git/config` or reftable tables (Mend's capture 0), the workspace sweep now leaves the ones
