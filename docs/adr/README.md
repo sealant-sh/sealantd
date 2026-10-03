@@ -17,5 +17,6 @@
 | [0013](0013-websocket-control-transport.md) | Secure WebSocket control transport (opt-in, mTLS; Kubernetes) |
 | [0014](0014-bindable-mounts.md) | Bindable mounts: bind a mounted root's subdirectory on demand |
 | [0015](0015-session-capture-and-sync.md) | Session capture store: executors are caches of the store (proposed; amended 2026-09-12, mechanism = capture store) |
+| [0016](0016-repository-roots.md) | Repository roots: one capture engine per repository a session holds (proposed 2026-10-03; Mend ADR 0010) |
 
 ADR template: Status, Context, Decision, Consequences, Alternatives considered.
