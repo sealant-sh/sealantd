@@ -227,8 +227,7 @@ harness.
 | `.pi/agent/mcp-oauth/` | pi | MCP OAuth tokens of the pi-mcp-adapter extension |
 | `.pi/agent/mcp-oauth-encrypted/` | pi | the same, encrypted with a person's key |
 | `.pi/agent/mcp.json` | pi | MCP servers, with the headers, env and client secrets typed into them |
-| `.pi/agent/git/` | pi | packages installed from git, a source URL's credentials in their git config |
-| `.pi/agent/tmp/` | pi | the same for packages a launch loads for itself |
+| `.pi/agent/tmp/` | pi | packages a launch loads for itself from git, a source URL's credentials in their git config |
 | `.pi/agent/crashes.json` | pi | error messages and stacks as they were, a secret in one included |
 | `.pi/agent/mend/profile/root/mcp.json` | pi | the same, as Mend delivered it from a person's pi profile |
 | `.mend/pi-profile-kept/` | pi | pi profiles Mend set aside, their `mcp.json` included |
@@ -242,7 +241,9 @@ are captured, and anything a person typed into them travels with the worktree:
 - `.claude/settings.json`: `env`.
 - `.pi/agent/models.json` and `.pi/agent/settings.json`: a custom provider's `apiKey` and
   `headers`, a legacy `apiKeys`, and a package source URL with credentials in it. pi reads a
-  `$VAR` or a `!command` in place of a key.
+  `$VAR` or a `!command` in place of a key. The clones of git packages (`.pi/agent/git/`) hold the
+  same URL and nothing more, and a restore without them would have pi clone and install each one
+  again before it starts, or fail to start when the clone fails.
 - opencode's database (`.local/share/opencode/opencode.db`): the `account`, `control_account`,
   `credential` and `session_share` tables hold an opencode console login, integration logins and
   share secrets beside the conversations. No path can split them out.

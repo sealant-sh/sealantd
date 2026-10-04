@@ -17,8 +17,8 @@ keyring, after a clean exit and killed in the middle of a turn. Newly left out, 
 - opencode: `.local/share/opencode/repos/` and `.local/share/opencode/log/`, where a clone URL's
   credentials land.
 - pi: `.pi/agent/mcp-auth.json` (pi's own MCP server OAuth tokens), `.pi/agent/oauth.json`, `.pi/agent/mcp-oauth/` and `.pi/agent/mcp-oauth-encrypted/`,
-  `.pi/agent/mcp.json`, `.pi/agent/git/` and `.pi/agent/tmp/` (package clones, a source URL's
-  credentials in their git config), `.pi/agent/crashes.json`, and the copy Mend delivers from a person's pi profile
+  `.pi/agent/mcp.json`, `.pi/agent/tmp/` (clones a launch loads, a source URL's credentials in
+  their git config), `.pi/agent/crashes.json`, and the copy Mend delivers from a person's pi profile
   (`.pi/agent/mend/profile/root/mcp.json`, `.mend/pi-profile-kept/`).
 
 A login or token one person made in a session no longer reaches the next session in the worktree.

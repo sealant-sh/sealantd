@@ -249,15 +249,9 @@ pub const HARNESS_CREDENTIALS: &[HarnessCredential] = &[
     },
     HarnessCredential {
         harness: "pi",
-        path: ".pi/agent/git",
-        kind: CredentialKind::Dir,
-        holds: "packages installed from git, a source URL's credentials in their git config",
-    },
-    HarnessCredential {
-        harness: "pi",
         path: ".pi/agent/tmp",
         kind: CredentialKind::Dir,
-        holds: "the same for packages a launch loads for itself",
+        holds: "packages a launch loads for itself from git, a source URL's credentials in their git config",
     },
     HarnessCredential {
         harness: "pi",
