@@ -11,7 +11,21 @@ permissions:
   packages: write
 
 jobs:
+  # A prerelease tag (vX.Y.Z-anything) would publish to npm `latest` and tag the image `latest`.
+  # Prereleases publish from main in next.yml (ADR 0015 in sealant-sh/mend), never from a tag.
+  stable-tag:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 5
+    steps:
+      - name: Refuse a prerelease tag
+        run: |
+          [[ $GITHUB_REF_NAME =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+            echo "::error::$GITHUB_REF_NAME is not a stable vX.Y.Z tag. Prereleases publish from main."
+            exit 1
+          }
+
   image:
+    needs: stable-tag
     # Blacksmith runner: faster builds + Docker layer caching for the heavy multi-arch image build.
     # (The npm job stays on ubuntu-latest — github-hosted — to keep OIDC trusted publishing safe.)
     runs-on: blacksmith-4vcpu-ubuntu-2404
@@ -50,6 +64,7 @@ jobs:
           provenance: false
 
   npm:
+    needs: stable-tag
     # npm trusted publishing (OIDC) needs a GitHub-hosted runner: this job stays off Blacksmith.
     runs-on: ubuntu-latest
     # Gate every publish behind a protected environment: add required reviewers + restrict deployment
