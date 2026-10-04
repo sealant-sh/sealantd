@@ -1,7 +1,6 @@
 # Prereleases from main (ADR 0015 in sealant-sh/mend, docs/adr/0015-next-channel.md). Every main
-# commit whose `ci` run passed publishes, under one version B-next.N (scripts/next-version.mjs: B is
-# what the next Version Packages pull request would release, N the commits since the last stable
-# tag):
+# commit whose `ci` run passed publishes, under one version B-next.N (scripts/next-version.mjs: N is
+# the commit's whole history, B never below a base already published since the last stable tag):
 #
 # - ghcr.io/sealant-sh/sealantd:<version>, amd64 and arm64, each built natively;
 # - @sealant/runtime-protocol and @sealant/runtime-client <version> on npm's `next` dist-tag, after
@@ -13,8 +12,9 @@
 # SECURITY: `workflow_run` runs this file as it is on main, never a pull request's copy, and the
 # guard below accepts only a push to this repository's main, not a fork's branch that happens to be
 # called main. The npm credential (OIDC, `id-token: write`) is held only by `publish`, which checks
-# out nothing and runs no repository code: it downloads the tarballs `pack` built, checks each one's
-# name, version and commit, and runs `npm publish --tag next`. A build dependency never sees it.
+# out nothing and runs no repository code: it downloads the tarballs `pack` built and checked,
+# refuses one with an entry outside package/, reads each one's name and version the way npm will
+# publish it, and runs `npm publish --tag next`. A build dependency never sees it.
 # Someone who can merge an edit to this file still could; that needs code-owner review on main
 # (CODEOWNERS covers .github/ and scripts/) and the `next` environment limited to main, both
 # repository settings (ADR 0015, decision 3). Register the publisher on both packages as a second
@@ -62,7 +62,7 @@ jobs:
           SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
           set -euo pipefail
-          version=$(node scripts/next-version.mjs --package packages/runtime-client HEAD)
+          version=$(node scripts/next-version.mjs --package packages/runtime-client --npm @sealant/runtime-client HEAD)
           [[ $version =~ ^[0-9]+\.[0-9]+\.[0-9]+-next\.[0-9]+$ ]] || {
             echo "::error::\"$version\" is not a next version."
             exit 1
@@ -79,6 +79,14 @@ jobs:
             fi
             publish=false
             echo "sealantd $version is already published from this commit; nothing to do."
+          fi
+          # `next` only moves forward. Every newer commit computes a higher version, so this fails
+          # only for an older commit re-run after a newer one published: loudly, before any build.
+          current=$(npm view @sealant/runtime-client dist-tags.next 2>/dev/null || true)
+          if [[ $publish == true && -n $current ]] &&
+            ! node scripts/next-version.mjs --newer "$version" "$current"; then
+            echo "::error::npm's next is already $current; $version from this commit is not newer. A newer commit published first."
+            exit 1
           fi
           {
             echo "version=$version"
@@ -206,14 +214,15 @@ jobs:
               && npm pkg set "gitHead=$SHA")
           done
       - run: pnpm -r build
-      - name: Pack
+      - name: Pack and check the tarballs
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/tarballs"
           for package in packages/runtime-protocol packages/runtime-client; do
             (cd "$package" && pnpm pack --pack-destination "$RUNNER_TEMP/tarballs")
           done
-          ls -l "$RUNNER_TEMP/tarballs"
+          # Every file each manifest exports is in its tarball, and nothing sits outside package/.
+          node scripts/check-tarball.mjs "$RUNNER_TEMP"/tarballs/*.tgz
       - uses: actions/upload-artifact@v4
         with:
           name: next-tarballs
@@ -248,42 +257,64 @@ jobs:
           DIGEST: ${{ needs.image-tag.outputs.digest }}
         run: |
           set -euo pipefail
-          [[ $VERSION =~ ^[0-9]+\.[0-9]+\.[0-9]+-next\.[0-9]+$ ]] || {
-            echo "::error::$VERSION is not a next version."
-            exit 1
+          # --- tarball check ---
+          # scripts/check-tarball.test.mjs runs this block as written. npm extracts a tarball with
+          # strip: 1, so an entry outside package/ (or a second package/package.json) could carry the
+          # manifest npm really publishes: refuse both, then take the name and version from npm's own
+          # dry run, and require both readings to be this run's next version.
+          check_tarball() {
+            local tarball=$1 name=$2 version=$3 commit=$4 entries manifest dry
+            [[ $version =~ ^[0-9]+\.[0-9]+\.[0-9]+-next\.[0-9]+$ ]] || {
+              echo "::error::$version is not a next version."
+              return 1
+            }
+            entries=$(tar -tzf "$tarball")
+            if grep -v '^package/' <<<"$entries" | grep -q .; then
+              echo "::error::$tarball has entries outside package/."
+              return 1
+            fi
+            if [[ $(grep -cx 'package/package.json' <<<"$entries" || true) != 1 ]]; then
+              echo "::error::$tarball does not have exactly one package/package.json."
+              return 1
+            fi
+            manifest=$(tar -xzOf "$tarball" package/package.json)
+            dry=$(npm publish "./$tarball" --dry-run --json --tag next 2>/dev/null)
+            # shellcheck disable=SC2016 # JavaScript template literals, not shell expansions
+            node -e '
+              const [name, version, commit, manifestText, dryText] = process.argv.slice(1);
+              const manifest = JSON.parse(manifestText);
+              const dry = JSON.parse(dryText);
+              const problems = [
+                manifest.name !== name && `name ${manifest.name}`,
+                manifest.version !== version && `version ${manifest.version}`,
+                manifest.gitHead !== commit && `gitHead ${manifest.gitHead}`,
+                dry.name !== name && `npm would publish ${dry.name}`,
+                dry.version !== version && `npm would publish version ${dry.version}`,
+                !/-next\.\d+$/.test(String(dry.version)) && `${dry.version} is not a next version`,
+              ].filter(Boolean);
+              if (problems.length > 0) {
+                console.error(`::error::${name}: ${problems.join(", ")}`);
+                process.exit(1);
+              }
+            ' "$name" "$version" "$commit" "$manifest" "$dry"
           }
-          # `next` only moves forward: an older commit re-run after a newer one published skips.
-          current=$(npm view @sealant/runtime-client dist-tags.next 2>/dev/null || true)
-          if [[ -n $current ]] && ! node -e '
-            const order = (v) => { const [core, n] = v.split("-next."); return [...core.split(".").map(Number), Number(n ?? Infinity)]; };
-            const [a, b] = [order(process.argv[1]), order(process.argv[2])];
-            const i = a.findIndex((x, k) => x !== b[k]);
-            process.exit(i >= 0 && a[i] > b[i] ? 0 : 1);
-          ' "$VERSION" "$current"; then
-            echo "::notice::npm's next is $current, not older than $VERSION; nothing published."
-            exit 0
-          fi
-          # The protocol first: the client depends on its exact version.
+          # --- end tarball check ---
+          # The protocol first: the client depends on its exact version. `plan` decided this commit
+          # publishes; a package already there is a re-run resuming after a partial publish, and
+          # must be from this commit.
           for name in runtime-protocol runtime-client; do
             tarball="sealant-$name-$VERSION.tgz"
             [[ -f $tarball ]] || { echo "::error::$tarball is missing."; exit 1; }
-            # A re-run after a partial publish: the protocol may already be there.
             if [[ -n $(npm view "@sealant/$name@$VERSION" version 2>/dev/null) ]]; then
-              echo "@sealant/$name@$VERSION is already published."
+              from=$(npm view "@sealant/$name@$VERSION" gitHead 2>/dev/null || true)
+              [[ $from == "$SHA" ]] || {
+                echo "::error::@sealant/$name@$VERSION was published from ${from:-an unknown commit}."
+                exit 1
+              }
+              echo "@sealant/$name@$VERSION is already published from this commit."
               continue
             fi
-            # shellcheck disable=SC2016 # JavaScript template literals, not shell expansions
-            tar -xzOf "$tarball" package/package.json | node -e '
-              const manifest = JSON.parse(require("node:fs").readFileSync(0, "utf8"));
-              const [name, version, commit] = process.argv.slice(1);
-              const problems = [
-                manifest.name !== `@sealant/${name}` && `name ${manifest.name}`,
-                manifest.version !== version && `version ${manifest.version}`,
-                !/-next\.\d+$/.test(manifest.version) && `${manifest.version} is not a next version`,
-                manifest.gitHead !== commit && `gitHead ${manifest.gitHead}`,
-              ].filter(Boolean);
-              if (problems.length > 0) { console.error(`::error::${name}: ${problems.join(", ")}`); process.exit(1); }
-            ' "$name" "$VERSION" "$SHA"
+            check_tarball "$tarball" "@sealant/$name" "$VERSION" "$SHA"
             npm publish "./$tarball" --tag next --access public --provenance --ignore-scripts
           done
           {

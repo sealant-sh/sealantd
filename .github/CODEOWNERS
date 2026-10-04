@@ -4,3 +4,6 @@
 /scripts/ @ypanagidis
 /docker/ @ypanagidis
 /.changeset/config.json @ypanagidis
+# Every workspace manifest: a lifecycle script there runs while the tarballs are built and packed.
+/package.json @ypanagidis
+/packages/*/package.json @ypanagidis

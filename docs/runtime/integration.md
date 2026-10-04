@@ -98,19 +98,23 @@ consistent `(binary, SDK)` pair.
 ## Prereleases from main
 
 Every main commit whose `ci` run passed also publishes both artifacts under one prerelease version,
-`B-next.N` (`.github/workflows/next.yml`, ADR 0015 in sealant-sh/mend). B is what the next Version
-Packages pull request would release (patch changesets only: `X.Y.(Z+1)`; any minor: `X.(Y+1).0`); N
-counts the commits since the last stable tag
-(`node scripts/next-version.mjs --package packages/runtime-client`). Only the `publish` job holds the
-npm credential, and it runs no repository code. Tag a release right after its Version Packages
-merge: the release refuses while an npm prerelease of that version came from a commit the tag
-leaves out.
+`B-next.N` (`.github/workflows/next.yml`, ADR 0015 in sealant-sh/mend). N is the commit's whole
+history (`git rev-list --count`); B is the larger of what the pending changesets would release and
+the base of the highest next build already published above the last stable tag, so each build is
+higher than the one before (`node scripts/next-version.mjs --package packages/runtime-client --npm
+@sealant/runtime-client`). `pack` builds, packs and checks every exported file is in the tarball;
+only `publish` holds the npm credential, and it runs no repository code.
 
 - `ghcr.io/sealant-sh/sealantd:0.20.0-next.N`, amd64 and arm64.
 - `@sealant/runtime-protocol` and `@sealant/runtime-client` `0.20.0-next.N` on npm's `next` dist-tag.
   `latest` moves only from a `vX.Y.Z` tag.
 
 Core pins a prerelease the way it pins a release, by exact version, when it needs a daemon change
-before sealantd releases. Core's recovery check treats a prerelease image of a version after 0.19.0
-like a release. Core refuses to cut a stable release while it pins a prerelease, so sealantd tags
-`vX.Y.Z` on the commit Core pinned first.
+before sealantd releases. Core's recovery check treats a `-next.N` image of a version after 0.19.0
+like a release.
+
+To release: merge the Version Packages pull request and **freeze main until the tag**; Core pins
+that commit's next build; then tag that same commit. Core refuses to cut a stable release while it
+pins a prerelease, so this tag comes first. The whole order is in sealant-sh/mend
+`docs/operations/next-channel.md`. The release refuses while an npm prerelease of the version came
+from a commit the tag leaves out, which is what a merge during the freeze produces.
