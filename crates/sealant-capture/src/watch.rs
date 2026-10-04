@@ -25,7 +25,7 @@ use crate::aliases::Aliases;
 use crate::engine::Class;
 use crate::gitpack::GitRepo;
 use crate::index::{
-    DAEMON_DIR, Suspects, has_component_in, is_git_transient, is_harness_credential_path, rel_key,
+    DAEMON_DIR, Suspects, has_component_in, is_git_transient, is_harness_excluded_path, rel_key,
 };
 use crate::longpath;
 
@@ -348,7 +348,7 @@ impl Policy {
         {
             if abs
                 .strip_prefix(home)
-                .is_ok_and(|rel| is_harness_credential_path(&rel_key(rel)))
+                .is_ok_and(|rel| is_harness_excluded_path(&rel_key(rel)))
             {
                 return None;
             }

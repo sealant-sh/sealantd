@@ -176,7 +176,7 @@ impl Fixture {
         fs::write(home.join(".local/share/opencode/opencode.db"), b"SQLite").unwrap();
         // Every other harness credential, beside its harness's settings: a file at a file's
         // path, a directory holding one at a directory's. All stay out.
-        for credential in index::HARNESS_CREDENTIALS {
+        for credential in index::harness_exclusions() {
             let at = home.join(credential.path);
             match credential.kind {
                 CredentialKind::File => {
@@ -328,8 +328,7 @@ fn round_trip_materializes_an_identical_workspace() {
 
     let tree_diff = diff_r(&fx.root, &restore, &[".git", ".sealantd"]);
     assert!(tree_diff.is_empty(), "tree differs:\n{tree_diff}");
-    let credential_names: Vec<String> = index::HARNESS_CREDENTIALS
-        .iter()
+    let credential_names: Vec<String> = index::harness_exclusions()
         .flat_map(|c| {
             let name = c.path.rsplit('/').next().unwrap();
             [name.to_owned(), format!("{name}.*")]
@@ -354,7 +353,7 @@ fn round_trip_materializes_an_identical_workspace() {
     assert!(!home2.join(".pi/agent/auth.json").exists());
     assert!(!home2.join(".local/share/opencode/auth.json").exists());
     assert!(!home2.join(".local/share/opencode/mcp-auth.json").exists());
-    for credential in index::HARNESS_CREDENTIALS {
+    for credential in index::harness_exclusions() {
         assert!(
             fs::symlink_metadata(home2.join(credential.path)).is_err(),
             "{} came back",
@@ -840,42 +839,53 @@ fn a_legacy_capture_s_codex_mcp_login_and_claude_backups_are_never_restored() {
     );
 }
 
-/// The credential table in ADR-0015 ("Harness credentials") and [`index::HARNESS_CREDENTIALS`]
-/// name the same paths, so a credential added to one and not the other fails the build.
+/// The tables in ADR-0015 ("Harness credentials", "Harness machine state") and
+/// [`index::HARNESS_CREDENTIALS`] / [`index::HARNESS_MACHINE_STATE`] name the same paths, so an
+/// entry added to one and not the other fails the build.
 #[test]
-fn the_adr_lists_every_harness_credential() {
+fn the_adr_lists_every_harness_exclusion() {
     let adr = fs::read_to_string(
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../docs/adr/0015-session-capture-and-sync.md"),
     )
     .unwrap();
-    let section = adr
-        .split("### Harness credentials")
-        .nth(1)
-        .expect("ADR-0015 has a Harness credentials section");
-    let documented: HashSet<String> = section
-        .lines()
-        .take_while(|line| !line.starts_with("#"))
-        .filter(|line| line.starts_with("| `"))
-        .filter_map(|line| line.split('`').nth(1).map(str::to_owned))
-        .collect();
-    let listed: HashSet<String> = index::HARNESS_CREDENTIALS
-        .iter()
-        .map(|c| match c.kind {
-            CredentialKind::File => c.path.to_owned(),
-            CredentialKind::Dir => format!("{}/", c.path),
-        })
-        .collect();
-    assert_eq!(documented, listed);
+    let documented = |heading: &str| -> HashSet<String> {
+        adr.split(heading)
+            .nth(1)
+            .unwrap_or_else(|| panic!("ADR-0015 has a {heading} section"))
+            .lines()
+            .skip(1)
+            .take_while(|line| !line.starts_with('#'))
+            .filter(|line| line.starts_with("| `"))
+            .filter_map(|line| line.split('`').nth(1).map(str::to_owned))
+            .collect()
+    };
+    let listed = |table: &[index::HarnessExclusion]| -> HashSet<String> {
+        table
+            .iter()
+            .map(|c| match c.kind {
+                CredentialKind::File => c.path.to_owned(),
+                CredentialKind::Dir => format!("{}/", c.path),
+            })
+            .collect()
+    };
+    assert_eq!(
+        documented("### Harness credentials"),
+        listed(index::HARNESS_CREDENTIALS)
+    );
+    assert_eq!(
+        documented("### Harness machine state"),
+        listed(index::HARNESS_MACHINE_STATE)
+    );
 }
 
-/// Capture itself leaves every harness credential out, not only the restore: neither the listing
+/// Capture itself leaves every harness credential and machine state out, not only the restore: neither the listing
 /// a snap walks nor the index of what it read holds a credential, or anything under or beside one.
 /// (A restore skips them as well, so a round trip alone would pass with a listing that captured
 /// them all, and the bucket would hold every person's login.)
 #[test]
 fn capture_leaves_every_harness_credential_out() {
-    use sealant_capture::index::{TreeIndex, is_harness_credential_path};
+    use sealant_capture::index::{TreeIndex, is_harness_excluded_path};
     use sealant_capture::roots::ClassRoots;
 
     let fx = Fixture::build(10, 1000);
@@ -894,7 +904,7 @@ fn capture_leaves_every_harness_credential_out() {
 
     let credential_of = |v: &String| {
         v.strip_prefix("harness/")
-            .is_some_and(is_harness_credential_path)
+            .is_some_and(is_harness_excluded_path)
     };
     let roots = ClassRoots {
         root: fx.root.clone(),

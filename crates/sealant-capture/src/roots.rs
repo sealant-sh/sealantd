@@ -149,12 +149,12 @@ impl ClassRoots {
         // the link, and one that is not a directory is unreadable, never nothing (review
         // 2026-09-28, eighth pass, #1). One that does not exist holds nothing.
         if let Some(home) = &self.harness_home {
-            // A harness credential (`index::HARNESS_CREDENTIALS`) is never listed: a credential
-            // directory is not walked, and a credential file, or whatever stands at its path, is
-            // left out.
+            // A harness credential or machine state (`index::harness_exclusions`) is never
+            // listed: such a directory is not walked, and such a file, or whatever stands at its
+            // path, is left out.
             let credential = |abs: &Path| {
                 abs.strip_prefix(home)
-                    .is_ok_and(|rel| index::is_harness_credential_path(&rel_key(rel)))
+                    .is_ok_and(|rel| index::is_harness_excluded_path(&rel_key(rel)))
             };
             listing.mount(
                 "harness",

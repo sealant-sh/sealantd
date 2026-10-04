@@ -251,6 +251,21 @@ are captured, and anything a person typed into them travels with the worktree:
 `~/.claude.json`, which holds a Console API key and MCP server headers, is not under the harness
 home and is not captured; its copies in `.claude/backups/` are on the list.
 
+### Harness machine state
+
+Kept out the same way, and in a table of their own because none is a credential: a harness's state
+that belongs to the machine it ran on, not to the work (`HARNESS_MACHINE_STATE`, held equal to this
+table by the same test). A `codex` typed by hand in a shell unpacks its runtime into
+`.codex/packages/` (about 427 MB) and starts an app-server daemon that keeps its state and its
+control socket beside it. Captured, every later executor of the worktree would restore the runtime,
+and the state of a daemon that no longer runs. Codex rebuilds each when it next needs it.
+
+| Path | Harness | Holds |
+| ---- | ------- | ----- |
+| `.codex/packages/` | codex | the Codex runtime a hand-run `codex` unpacks (about 427 MB) |
+| `.codex/app-server-daemon/` | codex | the state of an app-server daemon running on that machine |
+| `.codex/app-server-control/` | codex | that daemon's control socket |
+
 ### Cadence and budgets
 
 Small class: 2 s of quiet after any change, at most every 10 s while the tree stays dirty, at every

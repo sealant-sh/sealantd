@@ -21,6 +21,10 @@ keyring, after a clean exit and killed in the middle of a turn. Newly left out, 
   their git config), `.pi/agent/crashes.json`, and the copy Mend delivers from a person's pi profile
   (`.pi/agent/mend/profile/root/mcp.json`, `.mend/pi-profile-kept/`).
 
+Codex's machine state is left out too, in a list of its own since none of it is a credential:
+`.codex/packages/` (the runtime a `codex` typed by hand unpacks, about 427 MB),
+`.codex/app-server-daemon/` and `.codex/app-server-control/` (a daemon's state and control socket).
+
 A login or token one person made in a session no longer reaches the next session in the worktree.
 The list can now name a directory as well as a file, and a file covers its suffixed siblings (a
 lock, a write's temporary, a backup copy). ADR-0015 lists every entry.
