@@ -146,6 +146,24 @@ pub const HARNESS_CREDENTIALS: &[HarnessCredential] = &[
         holds: "IDE connection tokens",
     },
     HarnessCredential {
+        harness: "claude",
+        path: ".claude/sessions",
+        kind: CredentialKind::Dir,
+        holds: "each running process's local messaging token",
+    },
+    HarnessCredential {
+        harness: "claude",
+        path: ".claude/file-history",
+        kind: CredentialKind::Dir,
+        holds: "a copy of every file Claude Code edits, a secret file included",
+    },
+    HarnessCredential {
+        harness: "claude",
+        path: ".claude/remote-settings.json",
+        kind: CredentialKind::File,
+        holds: "an organization's managed settings, `env` included",
+    },
+    HarnessCredential {
         harness: "codex",
         path: ".codex/auth.json",
         kind: CredentialKind::File,
@@ -182,6 +200,18 @@ pub const HARNESS_CREDENTIALS: &[HarnessCredential] = &[
         holds: "MCP server OAuth tokens and client secrets",
     },
     HarnessCredential {
+        harness: "opencode",
+        path: ".local/share/opencode/repos",
+        kind: CredentialKind::Dir,
+        holds: "reference repositories, a clone URL's credentials in their git config",
+    },
+    HarnessCredential {
+        harness: "opencode",
+        path: ".local/share/opencode/log",
+        kind: CredentialKind::Dir,
+        holds: "logs, a failed clone's URL with its credentials included",
+    },
+    HarnessCredential {
         harness: "pi",
         path: ".pi/agent/auth.json",
         kind: CredentialKind::File,
@@ -216,6 +246,24 @@ pub const HARNESS_CREDENTIALS: &[HarnessCredential] = &[
         path: ".pi/agent/mcp.json",
         kind: CredentialKind::File,
         holds: "MCP servers, with the headers, env and client secrets typed into them",
+    },
+    HarnessCredential {
+        harness: "pi",
+        path: ".pi/agent/git",
+        kind: CredentialKind::Dir,
+        holds: "packages installed from git, a source URL's credentials in their git config",
+    },
+    HarnessCredential {
+        harness: "pi",
+        path: ".pi/agent/tmp",
+        kind: CredentialKind::Dir,
+        holds: "the same for packages a launch loads for itself",
+    },
+    HarnessCredential {
+        harness: "pi",
+        path: ".pi/agent/crashes.json",
+        kind: CredentialKind::File,
+        holds: "error messages and stacks as they were, a secret in one included",
     },
     HarnessCredential {
         harness: "pi",

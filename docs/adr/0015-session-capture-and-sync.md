@@ -192,13 +192,15 @@ writes one back. One person's login is never spent by, or shown to, another.
 to this table. A path ending in `/` is a directory and everything under it; a file covers its
 siblings named after it with a suffix too (`auth.json.lock`, a write's temporary
 `mcp.json.mend-seed-12`, a `.migrated` copy). The `.pi/agent/mend/` and `.mend/` entries are where
-Mend delivers a person's pi profile. The list fails open: a
-credential missing from it is captured. It was made on 2026-10-04 from each harness's source at the
-version workspace images install (Claude Code 2.1.289, Codex 0.160.0, opencode 1.18.34, pi 1.0.2),
-and from what each wrote in an unprivileged container with no OS keyring, where Codex and Claude Code
-keep their tokens in plaintext files, both after a clean exit and while a turn runs, killed with
-SIGKILL: a file a harness removes when it exits (Codex's and Claude Code's shell snapshots) is
-captured while it exists, and stays when the process is killed.
+Mend delivers a person's pi profile. The list fails open: a credential missing from it is captured.
+It was made on 2026-10-04 from each harness's source at the version workspace images install (Claude
+Code 2.1.289, Codex 0.160.0, opencode 1.18.34, pi 1.0.2), and from what each wrote in an
+unprivileged container with no OS keyring, where Codex and Claude Code keep their tokens in
+plaintext files, both after a clean exit and while a turn runs, killed with SIGKILL: a file a
+harness removes when it exits (Codex's and Claude Code's shell snapshots) is captured while it
+exists, and stays when the process is killed. Diagnostics and caches that copy a credential as it is
+(a failed clone's URL in a log, a crash message) are on the list too; each is rebuilt by the
+harness.
 
 | Path | Harness | Holds |
 | ---- | ------- | ----- |
@@ -208,18 +210,26 @@ captured while it exists, and stays when the process is killed.
 | `.claude/shell-snapshots/` | claude | the shell's functions and aliases, any secret written in them included |
 | `.claude/session-env/` | claude | what hooks export for the session |
 | `.claude/ide/` | claude | IDE connection tokens |
+| `.claude/sessions/` | claude | each running process's local messaging token |
+| `.claude/file-history/` | claude | a copy of every file Claude Code edits, a secret file included |
+| `.claude/remote-settings.json` | claude | an organization's managed settings, `env` included |
 | `.codex/auth.json` | codex | the ChatGPT login or API key |
 | `.codex/.credentials.json` | codex | MCP server OAuth tokens, where no OS keyring is available |
 | `.codex/secrets/` | codex | encrypted logins and MCP tokens (the key is in the OS keyring) |
 | `.codex/shell_snapshots/` | codex | every exported environment variable with its value (a token, a dotfile's export) |
 | `.local/share/opencode/auth.json` | opencode | provider logins and API keys |
 | `.local/share/opencode/mcp-auth.json` | opencode | MCP server OAuth tokens and client secrets |
+| `.local/share/opencode/repos/` | opencode | reference repositories, a clone URL's credentials in their git config |
+| `.local/share/opencode/log/` | opencode | logs, a failed clone's URL with its credentials included |
 | `.pi/agent/auth.json` | pi | provider logins and API keys |
 | `.pi/agent/mcp-auth.json` | pi | MCP server OAuth tokens and client secrets |
 | `.pi/agent/oauth.json` | pi | provider OAuth tokens from before pi moved them to `auth.json`, and its `.migrated` copy |
 | `.pi/agent/mcp-oauth/` | pi | MCP OAuth tokens of the pi-mcp-adapter extension |
 | `.pi/agent/mcp-oauth-encrypted/` | pi | the same, encrypted with a person's key |
 | `.pi/agent/mcp.json` | pi | MCP servers, with the headers, env and client secrets typed into them |
+| `.pi/agent/git/` | pi | packages installed from git, a source URL's credentials in their git config |
+| `.pi/agent/tmp/` | pi | the same for packages a launch loads for itself |
+| `.pi/agent/crashes.json` | pi | error messages and stacks as they were, a secret in one included |
 | `.pi/agent/mend/profile/root/mcp.json` | pi | the same, as Mend delivered it from a person's pi profile |
 | `.mend/pi-profile-kept/` | pi | pi profiles Mend set aside, their `mcp.json` included |
 
@@ -231,7 +241,8 @@ are captured, and anything a person typed into them travels with the worktree:
   instead (`bearer_token_env_var`, `env_http_headers`, `env_vars`, `env_key`).
 - `.claude/settings.json`: `env`.
 - `.pi/agent/models.json` and `.pi/agent/settings.json`: a custom provider's `apiKey` and
-  `headers`, and a legacy `apiKeys`. pi reads a `$VAR` or a `!command` in their place.
+  `headers`, a legacy `apiKeys`, and a package source URL with credentials in it. pi reads a
+  `$VAR` or a `!command` in place of a key.
 - opencode's database (`.local/share/opencode/opencode.db`): the `account`, `control_account`,
   `credential` and `session_share` tables hold an opencode console login, integration logins and
   share secrets beside the conversations. No path can split them out.
