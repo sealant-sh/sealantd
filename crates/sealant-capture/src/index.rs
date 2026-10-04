@@ -9,7 +9,7 @@
 //! # What is never captured
 //!
 //! Outside the daemon's own paths (its staging and `<root>/.sealantd`, [`DAEMON_DIR`]) and the
-//! harness credential files ([`CREDENTIAL_FILES`], re-injected at launch), a chunked class
+//! harness credentials ([`HARNESS_CREDENTIALS`]; a login is injected at launch), a chunked class
 //! carries every regular file, directory and symlink under its roots whatever it is called — a
 //! user's `Cargo.lock`, `*.pid`, SQLite `-shm`, a `.pack` without an `.idx`. The only other
 //! exclusions are git's own transient bookkeeping *inside a git directory*
@@ -76,17 +76,172 @@ pub const DEFAULT_BULK_DIRS: &[&str] = &[
     "coverage",
 ];
 
-/// Harness credential files excluded relative to the harness home (ADR-0015 open question 2):
-/// Claude Code's, Codex's, pi's and opencode's own login files, and the logins of the MCP servers
-/// opencode connects to (`mcp-auth.json`: OAuth tokens and client secrets). A login made inside a
-/// session (`/login`, an MCP server's sign-in) lands in one of these and is never captured.
-pub const CREDENTIAL_FILES: &[&str] = &[
-    ".claude/.credentials.json",
-    ".codex/auth.json",
-    ".pi/agent/auth.json",
-    ".local/share/opencode/auth.json",
-    ".local/share/opencode/mcp-auth.json",
+/// What a harness credential entry names: one file, or a directory and everything under it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CredentialKind {
+    /// Exactly this path.
+    File,
+    /// This path and every path under it.
+    Dir,
+}
+
+/// One path under the harness home where a harness keeps a credential: a login, an OAuth or
+/// MCP token, a key, or a copy of a file that holds one.
+#[derive(Clone, Copy, Debug)]
+pub struct HarnessCredential {
+    /// The harness that writes it.
+    pub harness: &'static str,
+    /// Relative to the harness home, `/`-separated.
+    pub path: &'static str,
+    pub kind: CredentialKind,
+    /// What it holds, as `docs/adr/0015-session-capture-and-sync.md` lists it.
+    pub holds: &'static str,
+}
+
+/// Every credential a harness can write into its home (ADR-0015 open question 2, "Harness
+/// credentials"). None is captured, and none a capture holds is restored: the harness home
+/// belongs to the worktree, and what one capture holds reaches the next session in it,
+/// whoever's that is. One person's login is never spent by, or shown to, another.
+///
+/// The list fails open: a credential missing from it is captured. It was made from each
+/// harness's source at the version workspace images install, and from what each one wrote in an
+/// unprivileged container with no OS keyring (Codex and Claude Code fall back to plaintext files
+/// there). The ADR's table and this one are held equal by a test.
+pub const HARNESS_CREDENTIALS: &[HarnessCredential] = &[
+    HarnessCredential {
+        harness: "claude",
+        path: ".claude/.credentials.json",
+        kind: CredentialKind::File,
+        holds: "the Claude login, MCP server OAuth tokens and client secrets, plugin secrets",
+    },
+    HarnessCredential {
+        harness: "claude",
+        path: ".claude/.device-keys.json",
+        kind: CredentialKind::File,
+        holds: "device private keys (Remote Control, trusted devices)",
+    },
+    HarnessCredential {
+        harness: "claude",
+        path: ".claude/backups",
+        kind: CredentialKind::Dir,
+        holds: "copies of `~/.claude.json`: a Console API key, MCP server headers and env",
+    },
+    HarnessCredential {
+        harness: "claude",
+        path: ".claude/shell-snapshots",
+        kind: CredentialKind::Dir,
+        holds: "the shell's functions and aliases, any secret written in them included",
+    },
+    HarnessCredential {
+        harness: "claude",
+        path: ".claude/session-env",
+        kind: CredentialKind::Dir,
+        holds: "what hooks export for the session",
+    },
+    HarnessCredential {
+        harness: "claude",
+        path: ".claude/ide",
+        kind: CredentialKind::Dir,
+        holds: "IDE connection tokens",
+    },
+    HarnessCredential {
+        harness: "codex",
+        path: ".codex/auth.json",
+        kind: CredentialKind::File,
+        holds: "the ChatGPT login or API key",
+    },
+    HarnessCredential {
+        harness: "codex",
+        path: ".codex/.credentials.json",
+        kind: CredentialKind::File,
+        holds: "MCP server OAuth tokens, where no OS keyring is available",
+    },
+    HarnessCredential {
+        harness: "codex",
+        path: ".codex/secrets",
+        kind: CredentialKind::Dir,
+        holds: "encrypted logins and MCP tokens (the key is in the OS keyring)",
+    },
+    HarnessCredential {
+        harness: "opencode",
+        path: ".local/share/opencode/auth.json",
+        kind: CredentialKind::File,
+        holds: "provider logins and API keys",
+    },
+    HarnessCredential {
+        harness: "opencode",
+        path: ".local/share/opencode/mcp-auth.json",
+        kind: CredentialKind::File,
+        holds: "MCP server OAuth tokens and client secrets",
+    },
+    HarnessCredential {
+        harness: "pi",
+        path: ".pi/agent/auth.json",
+        kind: CredentialKind::File,
+        holds: "provider logins and API keys",
+    },
+    HarnessCredential {
+        harness: "pi",
+        path: ".pi/agent/mcp-auth.json",
+        kind: CredentialKind::File,
+        holds: "MCP server OAuth tokens and client secrets",
+    },
+    HarnessCredential {
+        harness: "pi",
+        path: ".pi/agent/oauth.json",
+        kind: CredentialKind::File,
+        holds: "provider OAuth tokens (before pi moved them to `auth.json`)",
+    },
+    HarnessCredential {
+        harness: "pi",
+        path: ".pi/agent/oauth.json.migrated",
+        kind: CredentialKind::File,
+        holds: "the same, kept when pi migrated them",
+    },
+    HarnessCredential {
+        harness: "pi",
+        path: ".pi/agent/mcp-oauth",
+        kind: CredentialKind::Dir,
+        holds: "MCP OAuth tokens of the pi-mcp-adapter extension",
+    },
+    HarnessCredential {
+        harness: "pi",
+        path: ".pi/agent/mcp-oauth-encrypted",
+        kind: CredentialKind::Dir,
+        holds: "the same, encrypted with a person's key",
+    },
+    HarnessCredential {
+        harness: "pi",
+        path: ".pi/agent/mcp.json",
+        kind: CredentialKind::File,
+        holds: "MCP servers, with the headers, env and client secrets typed into them",
+    },
+    HarnessCredential {
+        harness: "pi",
+        path: ".pi/agent/mend/profile/root/mcp.json",
+        kind: CredentialKind::File,
+        holds: "the same, as Mend delivered it from a person's pi profile",
+    },
+    HarnessCredential {
+        harness: "pi",
+        path: ".mend/pi-profile-kept",
+        kind: CredentialKind::Dir,
+        holds: "pi profiles Mend set aside, their `mcp.json` included",
+    },
 ];
+
+/// Whether a path relative to the harness home (`/`-separated) is a harness credential
+/// ([`HARNESS_CREDENTIALS`]): a listed file, a listed directory, or anything under one.
+#[must_use]
+pub fn is_harness_credential_path(rel: &str) -> bool {
+    let rel = rel.trim_matches('/');
+    HARNESS_CREDENTIALS.iter().any(|c| match c.kind {
+        CredentialKind::File => rel == c.path,
+        CredentialKind::Dir => rel
+            .strip_prefix(c.path)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('/')),
+    })
+}
 
 /// The daemon's own directory under the workspace root (staging lives beneath it).
 pub const DAEMON_DIR: &str = ".sealantd";

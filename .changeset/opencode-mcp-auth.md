@@ -10,4 +10,4 @@ session is no longer saved, and no longer reaches the next session in the worktr
 
 A restore never writes a harness credential file back either: a capture made before a file joined
 the list (opencode's `mcp-auth.json` until now) still holds it, and materialize now skips every
-`CREDENTIAL_FILES` path under the harness home instead of restoring it.
+harness credential under the harness home instead of restoring it.

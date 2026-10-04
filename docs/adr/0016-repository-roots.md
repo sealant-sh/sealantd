@@ -103,8 +103,8 @@ names which root is fenced.
 - The main root's `nested_repositories` exclusion stays: a repository under `/workspace/repos/` is
   not under the main root, so the main engine never sees it. A sibling that is still nested inside
   the main root (the interim) is carried as it is today until Mend moves it.
-- The workspace class carries no `harness/` for a repository root; `CREDENTIAL_FILES` therefore
-  never apply there.
+- The workspace class carries no `harness/` for a repository root; `HARNESS_CREDENTIALS` therefore
+  never applies there.
 - `sources` and binds (ADR-0014) are untouched. A repository is neither.
 - The capture format is unchanged per manifest; only `manifest_features` grows.
 

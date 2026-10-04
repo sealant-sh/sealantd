@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use sealant_capture::gitpack::GitRepo;
+use sealant_capture::index::{self, CredentialKind};
 use sealant_capture::manifest::FsckStatus;
 use sealant_capture::registrar::Registrar;
 use sealant_capture::{
@@ -173,6 +174,25 @@ impl Fixture {
         )
         .unwrap();
         fs::write(home.join(".local/share/opencode/opencode.db"), b"SQLite").unwrap();
+        // Every other harness credential, beside its harness's settings: a file at a file's
+        // path, a directory holding one at a directory's. All stay out.
+        for credential in index::HARNESS_CREDENTIALS {
+            let at = home.join(credential.path);
+            match credential.kind {
+                CredentialKind::File => {
+                    fs::create_dir_all(at.parent().unwrap()).unwrap();
+                    if !at.exists() {
+                        fs::write(&at, "{\"token\":\"x\"}").unwrap();
+                    }
+                }
+                CredentialKind::Dir => {
+                    fs::create_dir_all(at.join("nested")).unwrap();
+                    fs::write(at.join("nested/token"), "x").unwrap();
+                }
+            }
+        }
+        fs::create_dir_all(home.join(".codex/sessions")).unwrap();
+        fs::write(home.join(".codex/config.toml"), "model = \"x\"\n").unwrap();
         // A stale lock, always excluded.
         fs::write(root.join(".git/index.lock"), b"").unwrap();
         Self {
@@ -301,11 +321,11 @@ fn round_trip_materializes_an_identical_workspace() {
 
     let tree_diff = diff_r(&fx.root, &restore, &[".git", ".sealantd"]);
     assert!(tree_diff.is_empty(), "tree differs:\n{tree_diff}");
-    let home_diff = diff_r(
-        &fx.home,
-        &home2,
-        &[".credentials.json", "auth.json", "mcp-auth.json"],
-    );
+    let credential_names: Vec<&str> = index::HARNESS_CREDENTIALS
+        .iter()
+        .map(|c| c.path.rsplit('/').next().unwrap())
+        .collect();
+    let home_diff = diff_r(&fx.home, &home2, &credential_names);
     assert!(home_diff.is_empty(), "harness home differs:\n{home_diff}");
 
     // (d) the `.pack` without `.idx` was skipped; the nested repo otherwise came back.
@@ -323,6 +343,14 @@ fn round_trip_materializes_an_identical_workspace() {
     assert!(!home2.join(".pi/agent/auth.json").exists());
     assert!(!home2.join(".local/share/opencode/auth.json").exists());
     assert!(!home2.join(".local/share/opencode/mcp-auth.json").exists());
+    for credential in index::HARNESS_CREDENTIALS {
+        assert!(
+            fs::symlink_metadata(home2.join(credential.path)).is_err(),
+            "{} came back",
+            credential.path
+        );
+    }
+    assert!(home2.join(".codex/config.toml").exists());
     assert!(home2.join(".pi/agent/settings.json").exists());
     assert!(home2.join(".local/share/opencode/opencode.db").exists());
     assert!(home2.join("state.db-shm").exists());
@@ -624,7 +652,7 @@ fn fence_stops_shipping_and_a_new_epoch_continues_the_chain() {
     assert_eq!(fs::read_to_string(restore.join("more.txt")).unwrap(), "x");
 }
 
-/// A capture made before a harness credential joined `CREDENTIAL_FILES` still holds it: opencode's
+/// A capture made before a harness credential joined `HARNESS_CREDENTIALS` still holds it: opencode's
 /// `mcp-auth.json` before #136, as a plain file or as a symlink someone planted at that path. A
 /// restore writes neither back, and restores everything beside it.
 #[test]
@@ -715,4 +743,111 @@ fn a_legacy_capture_s_harness_credential_is_never_restored() {
             "{planted}: the credential came back"
         );
     }
+}
+
+/// The same for the credentials the 2026-10-04 audit added: a capture made before holds Codex's
+/// MCP logins (`.codex/.credentials.json`) and Claude Code's copies of `~/.claude.json`
+/// (`.claude/backups/`, a directory). A restore writes back neither, nor anything under the
+/// directory, and restores Codex's config and Claude's settings beside them.
+#[test]
+fn a_legacy_capture_s_codex_mcp_login_and_claude_backups_are_never_restored() {
+    use sealant_capture::manifest::WorkspaceSection;
+    use sealant_capture::sink::{BlobSink, BlobSource};
+    use sealant_capture::tree::{DirEntry, DirObject};
+
+    const T: i128 = 1_700_000_000_000_000_000;
+    let fx = Fixture::build(10, 1000);
+    let sink = fx.sink();
+    let registrar = Arc::new(InMemoryRegistrar::new("wt-fixture", 1, None));
+    let mut engine = CaptureEngine::open(fx.config(1), None).unwrap();
+    engine
+        .snap(SnapRequest {
+            kind: CaptureKind::Auto,
+            class: Class::Small,
+            seq: 1,
+        })
+        .unwrap();
+    engine
+        .shipper(sink.clone(), registrar.clone())
+        .ship_pending()
+        .unwrap();
+    let mut manifest = registrar.head().unwrap().manifest;
+
+    let put = |dir: DirObject| -> String {
+        let encoded = dir.encode();
+        let key = format!("captures/wt-fixture/1/trees/{}", encoded.sha256);
+        sink.put_if_absent(&key, BlobSource::Bytes(&encoded.bytes))
+            .unwrap();
+        key
+    };
+    let codex = put(DirObject::new(vec![
+        DirEntry::file(".credentials.json", 0o600, 0, T, vec![]),
+        DirEntry::file("config.toml", 0o644, 0, T, vec![]),
+    ]));
+    let backups = put(DirObject::new(vec![DirEntry::file(
+        ".claude.json.backup.1791136741061",
+        0o600,
+        0,
+        T,
+        vec![],
+    )]));
+    let claude = put(DirObject::new(vec![
+        DirEntry::dir("backups", 0o755, T, backups),
+        DirEntry::file("settings.json", 0o644, 0, T, vec![]),
+    ]));
+    let harness = put(DirObject::new(vec![
+        DirEntry::dir(".claude", 0o755, T, claude),
+        DirEntry::dir(".codex", 0o755, T, codex),
+    ]));
+    let root = put(DirObject::new(vec![DirEntry::dir(
+        "harness", 0o755, T, harness,
+    )]));
+    manifest.sections.workspace = WorkspaceSection::objects(root, Vec::new());
+
+    let home2 = fx.base.join("home-legacy");
+    Materializer::new(
+        sink.as_ref(),
+        MaterializeTargets::new(&fx.base.join("restore-legacy"), Some(home2.clone())),
+    )
+    .materialize(&manifest, MaterializeClass::Workspace)
+    .unwrap();
+    assert!(home2.join(".codex/config.toml").exists());
+    assert!(home2.join(".claude/settings.json").exists());
+    assert!(
+        fs::symlink_metadata(home2.join(".codex/.credentials.json")).is_err(),
+        "Codex's MCP logins came back"
+    );
+    assert!(
+        fs::symlink_metadata(home2.join(".claude/backups")).is_err(),
+        "Claude Code's backups came back"
+    );
+}
+
+/// The credential table in ADR-0015 ("Harness credentials") and [`index::HARNESS_CREDENTIALS`]
+/// name the same paths, so a credential added to one and not the other fails the build.
+#[test]
+fn the_adr_lists_every_harness_credential() {
+    let adr = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/adr/0015-session-capture-and-sync.md"),
+    )
+    .unwrap();
+    let section = adr
+        .split("### Harness credentials")
+        .nth(1)
+        .expect("ADR-0015 has a Harness credentials section");
+    let documented: HashSet<String> = section
+        .lines()
+        .take_while(|line| !line.starts_with("#"))
+        .filter(|line| line.starts_with("| `"))
+        .filter_map(|line| line.split('`').nth(1).map(str::to_owned))
+        .collect();
+    let listed: HashSet<String> = index::HARNESS_CREDENTIALS
+        .iter()
+        .map(|c| match c.kind {
+            CredentialKind::File => c.path.to_owned(),
+            CredentialKind::Dir => format!("{}/", c.path),
+        })
+        .collect();
+    assert_eq!(documented, listed);
 }
