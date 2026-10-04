@@ -109,13 +109,16 @@ would release and the base of the highest next build already published above the
   `"@sealant/runtime-protocol": "npm:@sealant/runtime-protocol-next@<version>"`.
 
 The `next` trusted publisher is registered only on the two `-next` packages, so nothing in that
-workflow can publish `@sealant/runtime-*` or write `ghcr.io/sealant-sh/sealantd` tags. Only
-`publish` holds the credential; it installs nothing, runs no repository code, refuses an artifact
-holding anything but the expected tarballs, runs npm from an empty directory, and publishes a
-tarball it rebuilt from npm's own reading with an allowlisted manifest.
+workflow can publish `@sealant/runtime-*`. Images are weaker: the image jobs' `packages: write` can
+push `ghcr.io/sealant-sh/sealantd` too (GHCR cannot scope it); their actions are pinned to commits,
+and Core pins sealantd by `tag@sha256:…`, so a moved tag does not reach Core. Only `publish` holds
+the npm credential; it installs nothing, runs no repository code, refuses an artifact holding
+anything but the expected tarballs, runs npm from an empty directory, and publishes a tarball it
+rebuilt from npm's own reading with an allowlisted manifest.
 
 Core pins a prerelease by exact version when it needs a daemon change before sealantd releases:
-`ghcr.io/sealant-sh/sealantd-next:<version>` and the runtime packages as exact aliases
+`ghcr.io/sealant-sh/sealantd-next:<version>@sha256:<digest>` (Core's `tooling/scripts/pin-sealantd.mjs`
+writes it) and the runtime packages as exact aliases
 (`"@sealant/runtime-client": "npm:@sealant/runtime-client-next@<version>"`). Core's recovery check
 treats a `sealantd-next:X.Y.Z-next.N` image of a version after 0.19.0 like a release.
 
