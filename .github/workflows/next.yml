@@ -2,24 +2,25 @@
 # commit whose `ci` run passed publishes, under one version B-next.N (scripts/next-version.mjs: N is
 # the commit's whole history, B never below a base already published since the last stable tag):
 #
-# - ghcr.io/sealant-sh/sealantd:<version>, amd64 and arm64, each built natively;
-# - @sealant/runtime-protocol and @sealant/runtime-client <version> on npm's `next` dist-tag, after
-#   the image exists, so every SDK prerelease has its daemon.
+# - ghcr.io/sealant-sh/sealantd-next:<version>, amd64 and arm64, each built natively;
+# - @sealant/runtime-protocol-next and @sealant/runtime-client-next <version> on npm's `next`
+#   dist-tag, after the image exists, so every SDK prerelease has its daemon.
 #
-# `latest` (npm and GHCR) moves only from a vX.Y.Z tag, in release.yml. No floating tags: Core pins
-# the exact version.
+# Prereleases live under separate names, package and image alike. The `next` trusted publisher is
+# registered only on the two -next packages, and this workflow pushes only sealantd-next, so even a
+# fully compromised run cannot publish @sealant/runtime-*, move their `latest`, or write a stable
+# image tag. Core consumes a prerelease through exact aliases
+# (`"@sealant/runtime-client": "npm:@sealant/runtime-client-next@<version>"`) and the exact image.
 #
 # SECURITY: `workflow_run` runs this file as it is on main, never a pull request's copy, and the
 # guard below accepts only a push to this repository's main, not a fork's branch that happens to be
 # called main. The npm credential (OIDC, `id-token: write`) is held only by `publish`, which checks
-# out nothing and runs no repository code. It never publishes the tarballs `pack` made: it extracts
-# each with pacote (npm's own reader, pinned and installed in the job), rewrites package.json from an
-# allowlist (no `tag`, no scripts, no publishConfig but `access`), checks the name, the -next
-# version and the commit on that, repacks it, and publishes that under `next`. A build dependency never sees it.
-# Someone who can merge an edit to this file still could; that needs code-owner review on main
-# (CODEOWNERS covers .github/ and scripts/) and the `next` environment limited to main, both
-# repository settings (ADR 0015, decision 3). Register the publisher on both packages as a second
-# trusted publisher: repository sealant-sh/sealantd, workflow next.yml, environment next.
+# out nothing, installs nothing and runs no repository code. It refuses an artifact holding anything
+# but the expected tarballs, runs npm from an empty directory, and never publishes the tarballs
+# `pack` made: it extracts each with npm's own pacote, rewrites package.json from an allowlist,
+# checks the -next name, version and commit on that, repacks it, and publishes that under `next`.
+# Register the publisher on the two -next packages only (never on @sealant/runtime-*): repository
+# sealant-sh/sealantd, workflow next.yml, environment next.
 name: next
 
 on:
@@ -63,7 +64,7 @@ jobs:
           SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
           set -euo pipefail
-          version=$(node scripts/next-version.mjs --package packages/runtime-client --npm @sealant/runtime-client HEAD)
+          version=$(node scripts/next-version.mjs --package packages/runtime-client --npm @sealant/runtime-client-next HEAD)
           [[ $version =~ ^[0-9]+\.[0-9]+\.[0-9]+-next\.[0-9]+$ ]] || {
             echo "::error::\"$version\" is not a next version."
             exit 1
@@ -72,10 +73,10 @@ jobs:
           # this commit publishes nothing again. The same version from another commit is refused.
           # Every lookup fails the run on a registry error; nothing reads as "not published".
           publish=true
-          from=$(node scripts/next-version.mjs --published @sealant/runtime-client "$version")
+          from=$(node scripts/next-version.mjs --published @sealant/runtime-client-next "$version")
           if [[ -n $from ]]; then
             if [[ $from != "$SHA" ]]; then
-              echo "::error::@sealant/runtime-client@$version was published from $from, not $SHA."
+              echo "::error::@sealant/runtime-client-next@$version was published from $from, not $SHA."
               exit 1
             fi
             publish=false
@@ -85,7 +86,7 @@ jobs:
           # only for an older commit re-run after a newer one published: loudly, before any build.
           # `publish` checks again right before publishing.
           if [[ $publish == true ]]; then
-            current=$(node scripts/next-version.mjs --dist-tag @sealant/runtime-client next)
+            current=$(node scripts/next-version.mjs --dist-tag @sealant/runtime-client-next next)
             if [[ -n $current ]] && ! node scripts/next-version.mjs --newer "$version" "$current"; then
               echo "::error::npm's next is already $current; $version from this commit is not newer. A newer commit published first."
               exit 1
@@ -133,7 +134,7 @@ jobs:
             org.opencontainers.image.revision=${{ needs.plan.outputs.sha }}
             org.opencontainers.image.version=${{ needs.plan.outputs.version }}
           outputs:
-            type=image,name=ghcr.io/${{ github.repository }},push-by-digest=true,name-canonical=true,push=true
+            type=image,name=ghcr.io/${{ github.repository }}-next,push-by-digest=true,name-canonical=true,push=true
       - name: Export digest
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
@@ -172,7 +173,7 @@ jobs:
         id: tag
         working-directory: /tmp/digests
         env:
-          REPOSITORY: ghcr.io/${{ github.repository }}
+          REPOSITORY: ghcr.io/${{ github.repository }}-next
           VERSION: ${{ needs.plan.outputs.version }}
         run: |
           set -euo pipefail
@@ -217,9 +218,17 @@ jobs:
               && npm pkg set "gitHead=$SHA")
           done
       - run: pnpm -r build
-      - name: Pack and check the tarballs
+      # Prereleases publish under their own names: @sealant/runtime-protocol-next, and
+      # @sealant/runtime-client-next depending on it exactly through an alias, so code still imports
+      # @sealant/runtime-protocol.
+      - name: Pack under the -next names and check the tarballs
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
         run: |
           set -euo pipefail
+          (cd packages/runtime-protocol && npm pkg set name=@sealant/runtime-protocol-next)
+          (cd packages/runtime-client && npm pkg set name=@sealant/runtime-client-next \
+            "dependencies.@sealant/runtime-protocol=npm:@sealant/runtime-protocol-next@$VERSION")
           mkdir -p "$RUNNER_TEMP/tarballs"
           for package in packages/runtime-protocol packages/runtime-client; do
             (cd "$package" && pnpm pack --pack-destination "$RUNNER_TEMP/tarballs")
@@ -244,21 +253,16 @@ jobs:
     permissions:
       id-token: write
     steps:
+      # Node 24: trusted publishing needs the bundled npm >= 11.5, whose pacote the block uses.
       - uses: actions/setup-node@v6
         with:
           node-version: 24
           registry-url: "https://registry.npmjs.org"
-      # npm's own tarball reader, at a fixed version, installed here and not from the repository.
-      - name: Install pacote
-        run:
-          npm install --prefix "$RUNNER_TEMP/tools" --no-save --no-package-lock --ignore-scripts
-          --no-audit --no-fund pacote@21.5.0
       - uses: actions/download-artifact@v4
         with:
           name: next-tarballs
           path: tarballs
       - name: Rebuild and publish under next
-        working-directory: tarballs
         env:
           VERSION: ${{ needs.plan.outputs.version }}
           SHA: ${{ needs.plan.outputs.sha }}
@@ -266,28 +270,46 @@ jobs:
         run: |
           set -euo pipefail
           # --- republish ---
-          # republish.test.mjs runs this block as written, against a stub registry. The tarball pack built is
-          # never published as it is: npm's own reader (pacote, pinned in this job) extracts it, package.json
-          # is rewritten from an allowlist (no `tag`, no scripts, no publishConfig but `access`), the rewritten
-          # manifest is checked, and `npm pack` builds the tarball that is published. What is checked is what
-          # is published. Three earlier checks of the tarball as built each missed a way npm reads it
-          # differently (a second manifest outside package/, a `tag` field, package/./package.json).
+          # republish.test.mjs runs this block as written, against a stub registry. The callers check the
+          # downloaded artifact directory first (check_artifacts), then run every npm command from a fresh
+          # empty directory, so no .npmrc in or near the artifact can configure npm. The tarball pack built is
+          # never published as it is: npm's own copy of pacote (no install, nothing unpinned loads) extracts
+          # it, package.json is rewritten from an allowlist (no `tag`, no scripts, no publishConfig but
+          # `access`), a root binding.gyp is refused (npm would add an install script for it), the rewritten
+          # manifest is checked, and `npm pack` builds the tarball that is published.
           # Failures inside $(...) stop the job too.
           shopt -s inherit_errexit
           KEEP_FIELDS='["name","version","description","license","repository","homepage","bugs","keywords","type","main","module","types","typings","exports","files","bin","man","directories","engines","dependencies","peerDependencies","peerDependenciesMeta","optionalDependencies","gitHead"]'
 
-          # The registry's record of a package, retried; a failure or a 404 stops the job: never guessed.
-          packument() {
+          # The artifact directory <dir> holds exactly the expected tarballs (regular files), nothing else.
+          check_artifacts() {
+            local dir=$1 extra expected
+            shift
+            extra=$(cd "$dir" && find . -mindepth 1 | sed 's|^\./||' | grep -vxF -f <(printf '%s\n' "$@") || true)
+            if [[ -n $extra ]]; then
+              echo "::error::The artifact holds more than the expected tarballs: $(tr '\n' ' ' <<<"$extra")"
+              return 1
+            fi
+            for expected in "$@"; do
+              if [[ ! -f $dir/$expected || -L $dir/$expected ]]; then
+                echo "::error::$expected is missing from the artifact, or is not a regular file."
+                return 1
+              fi
+            done
+          }
+
+          # GET <path> from the registry, retried; a failure or a 404 stops the job: never guessed.
+          registry_get() {
             # shellcheck disable=SC2016 # JavaScript template literals, not shell expansions
             node -e '
-              const [name, registry] = process.argv.slice(1);
-              const url = new URL(name.replace("/", "%2f"), registry.endsWith("/") ? registry : `${registry}/`);
+              const [where, registry] = process.argv.slice(1);
+              const url = new URL(where, registry.endsWith("/") ? registry : `${registry}/`);
               const run = async () => {
                 for (let attempt = 1; attempt <= 4; attempt += 1) {
                   try {
                     const response = await fetch(url, { headers: { accept: "application/json" } });
                     if (response.ok) return process.stdout.write(JSON.stringify(await response.json()));
-                    if (attempt === 4) throw new Error(`the registry answered ${response.status} for ${name}`);
+                    if (attempt === 4) throw new Error(`the registry answered ${response.status} for ${where}`);
                   } catch (error) {
                     if (attempt === 4) {
                       console.error(`::error::${error.message}`);
@@ -298,20 +320,20 @@ jobs:
                 }
               };
               run();
-            ' "$1" "$(npm config get registry)"
+            ' -- "$1" "$(npm config get registry)"
           }
 
-          # A dist-tag's version, or nothing.
+          # A dist-tag's version, or nothing, from the uncached dist-tags endpoint.
           dist_tag() {
-            local record
-            record=$(packument "$1")
-            node -e 'process.stdout.write(String(JSON.parse(process.argv[1])["dist-tags"]?.[process.argv[2]] ?? ""))' "$record" "$2"
+            local tags
+            tags=$(registry_get "-/package/${1/\//%2f}/dist-tags")
+            node -e 'process.stdout.write(String(JSON.parse(process.argv[1])[process.argv[2]] ?? ""))' "$tags" "$2"
           }
 
           # The commit a published version came from ("unknown" without gitHead), or nothing if unpublished.
           published_from() {
             local record
-            record=$(packument "$1")
+            record=$(registry_get "${1/\//%2f}")
             node -e '
               const found = JSON.parse(process.argv[1]).versions?.[process.argv[2]];
               process.stdout.write(found === undefined ? "" : String(found.gitHead ?? "unknown"));
@@ -334,14 +356,15 @@ jobs:
 
           # Extracts <tarball> with pacote, rewrites and checks its manifest, repacks it; prints the new path.
           rebuild_tarball() {
-            local tarball=$1 name=$2 version=$3 commit=$4 channel=$5 work packed
+            local tarball=$1 name=$2 version=$3 commit=$4 channel=$5 work packed pacote
+            pacote=${REPUBLISH_TEST_PACOTE:-$(npm root -g)/npm/node_modules/pacote}
             work=$(mktemp -d)
             # shellcheck disable=SC2016 # JavaScript template literals, not shell expansions
             node -e '
               const fs = require("node:fs");
               const path = require("node:path");
-              const pacote = require(process.env.PACOTE);
-              const [tarball, dir, name, version, commit, channel, keepText] = process.argv.slice(1);
+              const [pacotePath, tarball, dir, name, version, commit, channel, keepText] = process.argv.slice(1);
+              const pacote = require(pacotePath);
               const run = async () => {
                 await pacote.extract(`file:${path.resolve(tarball)}`, dir);
                 const read = JSON.parse(fs.readFileSync(path.join(dir, "package.json"), "utf8"));
@@ -354,6 +377,7 @@ jobs:
                   manifest.version !== version && `version ${manifest.version}, not ${version}`,
                   !shape.test(String(manifest.version)) && `${manifest.version} is not a ${channel} version`,
                   manifest.gitHead !== commit && `gitHead ${manifest.gitHead}, not ${commit}`,
+                  fs.existsSync(path.join(dir, "binding.gyp")) && "a binding.gyp, which npm turns into an install script",
                 ].filter(Boolean);
                 if (problems.length > 0) {
                   console.error(`::error::${name}: ${problems.join("; ")}`);
@@ -365,7 +389,7 @@ jobs:
                 console.error(`::error::${name}: ${error.message}`);
                 process.exit(1);
               });
-            ' "$tarball" "$work/package" "$name" "$version" "$commit" "$channel" "$KEEP_FIELDS" >&2
+            ' "$pacote" "$tarball" "$work/package" "$name" "$version" "$commit" "$channel" "$KEEP_FIELDS" >&2
             # A packed .npmrc would configure the pack below; nothing else in the tree runs.
             find "$work/package" -name .npmrc -delete
             packed=$(cd "$work/package" && npm pack --ignore-scripts --json --pack-destination "$work")
@@ -373,11 +397,11 @@ jobs:
           }
 
           # Publishes <tarball> as <name>@<version> from <commit> under <channel>; extra npm flags follow.
-          # A version already published from this commit is done; from another commit, refused. Under next:
-          # refused unless newer than the current next, checked here, right before publishing, so a re-run of
-          # an old job cannot move next back; and afterwards `latest` must not be this version.
+          # A version already published from this commit is done; from another commit, refused. Under next,
+          # refused unless newer than the current next, read right before publishing, so a re-run of an old
+          # job cannot move next back.
           publish_rebuilt() {
-            local tarball=$1 name=$2 version=$3 commit=$4 channel=$5 from current latest_before latest rebuilt
+            local tarball=$1 name=$2 version=$3 commit=$4 channel=$5 from current rebuilt
             shift 5
             from=$(published_from "$name" "$version")
             if [[ -n $from ]]; then
@@ -388,7 +412,6 @@ jobs:
               echo "$name@$version is already published from this commit."
               return 0
             fi
-            latest_before=$(dist_tag "$name" latest)
             if [[ $channel == next ]]; then
               current=$(dist_tag "$name" next)
               if [[ -n $current ]] && ! newer "$version" "$current"; then
@@ -398,31 +421,23 @@ jobs:
             fi
             rebuilt=$(rebuild_tarball "$tarball" "$name" "$version" "$commit" "$channel")
             npm publish "$rebuilt" --tag "$channel" --access public --ignore-scripts "$@"
-            if [[ $channel == next ]]; then
-              latest=$(dist_tag "$name" latest)
-              if [[ $latest == "$version" ]]; then
-                echo "::error::$name@$version became latest. Moving latest back to ${latest_before:-nothing}."
-                if [[ -z $latest_before ]] || ! npm dist-tag add "$name@$latest_before" latest; then
-                  echo "::error::Could not move latest back. Run: npm dist-tag add $name@$latest_before latest"
-                fi
-                return 1
-              fi
-            fi
           }
           # --- end republish ---
 
-          export PACOTE="$RUNNER_TEMP/tools/node_modules/pacote"
+          artifacts="$GITHUB_WORKSPACE/tarballs"
+          check_artifacts "$artifacts" "sealant-runtime-protocol-next-$VERSION.tgz" "sealant-runtime-client-next-$VERSION.tgz"
+          # Every npm command runs from an empty directory: no project .npmrc can reach it.
+          cd "$(mktemp -d)"
           # The protocol first: the client depends on its exact version.
-          for name in runtime-protocol runtime-client; do
-            tarball="sealant-$name-$VERSION.tgz"
-            [[ -f $tarball ]] || { echo "::error::$tarball is missing."; exit 1; }
-            publish_rebuilt "$tarball" "@sealant/$name" "$VERSION" "$SHA" next --provenance
+          for name in runtime-protocol-next runtime-client-next; do
+            [[ $name == *-next ]] || { echo "::error::$name is not a -next package."; exit 1; }
+            publish_rebuilt "$artifacts/sealant-$name-$VERSION.tgz" "@sealant/$name" "$VERSION" "$SHA" next --provenance
           done
           {
             echo "## sealantd $VERSION"
             echo
             echo "From \`$SHA\`."
             echo
-            echo "- \`ghcr.io/$GITHUB_REPOSITORY:$VERSION\` (\`$DIGEST\`)"
-            echo "- \`@sealant/runtime-protocol@$VERSION\`, \`@sealant/runtime-client@$VERSION\` on npm \`next\`"
+            echo "- \`ghcr.io/$GITHUB_REPOSITORY-next:$VERSION\` (\`$DIGEST\`)"
+            echo "- \`@sealant/runtime-protocol-next@$VERSION\`, \`@sealant/runtime-client-next@$VERSION\` on npm \`next\`"
           } >> "$GITHUB_STEP_SUMMARY"
