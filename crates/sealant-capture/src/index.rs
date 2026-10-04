@@ -79,7 +79,8 @@ pub const DEFAULT_BULK_DIRS: &[&str] = &[
 /// What a harness credential entry names: one file, or a directory and everything under it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CredentialKind {
-    /// Exactly this path.
+    /// This path, and every sibling named after it with a suffix (`<path>.<suffix>`, and what is
+    /// under one): the temporary a write renames over it, its lock, a backup copy.
     File,
     /// This path and every path under it.
     Dir,
@@ -163,6 +164,12 @@ pub const HARNESS_CREDENTIALS: &[HarnessCredential] = &[
         holds: "encrypted logins and MCP tokens (the key is in the OS keyring)",
     },
     HarnessCredential {
+        harness: "codex",
+        path: ".codex/shell_snapshots",
+        kind: CredentialKind::Dir,
+        holds: "every exported environment variable with its value (a token, a dotfile's export)",
+    },
+    HarnessCredential {
         harness: "opencode",
         path: ".local/share/opencode/auth.json",
         kind: CredentialKind::File,
@@ -190,13 +197,7 @@ pub const HARNESS_CREDENTIALS: &[HarnessCredential] = &[
         harness: "pi",
         path: ".pi/agent/oauth.json",
         kind: CredentialKind::File,
-        holds: "provider OAuth tokens (before pi moved them to `auth.json`)",
-    },
-    HarnessCredential {
-        harness: "pi",
-        path: ".pi/agent/oauth.json.migrated",
-        kind: CredentialKind::File,
-        holds: "the same, kept when pi migrated them",
+        holds: "provider OAuth tokens from before pi moved them to `auth.json`, and its `.migrated` copy",
     },
     HarnessCredential {
         harness: "pi",
@@ -231,12 +232,15 @@ pub const HARNESS_CREDENTIALS: &[HarnessCredential] = &[
 ];
 
 /// Whether a path relative to the harness home (`/`-separated) is a harness credential
-/// ([`HARNESS_CREDENTIALS`]): a listed file, a listed directory, or anything under one.
+/// ([`HARNESS_CREDENTIALS`]): a listed file or a sibling named after it with a suffix, a listed
+/// directory, or anything under one.
 #[must_use]
 pub fn is_harness_credential_path(rel: &str) -> bool {
     let rel = rel.trim_matches('/');
     HARNESS_CREDENTIALS.iter().any(|c| match c.kind {
-        CredentialKind::File => rel == c.path,
+        CredentialKind::File => rel
+            .strip_prefix(c.path)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('.')),
         CredentialKind::Dir => rel
             .strip_prefix(c.path)
             .is_some_and(|rest| rest.is_empty() || rest.starts_with('/')),

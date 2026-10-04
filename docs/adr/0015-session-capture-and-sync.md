@@ -189,11 +189,16 @@ in it, whoever's that is. So no credential a harness writes there is captured, a
 writes one back. One person's login is never spent by, or shown to, another.
 
 `HARNESS_CREDENTIALS` (`crates/sealant-capture/src/index.rs`) is the list, and a test holds it equal
-to this table. A path ending in `/` is a directory and everything under it. The list fails open: a
+to this table. A path ending in `/` is a directory and everything under it; a file covers its
+siblings named after it with a suffix too (`auth.json.lock`, a write's temporary
+`mcp.json.mend-seed-12`, a `.migrated` copy). The `.pi/agent/mend/` and `.mend/` entries are where
+Mend delivers a person's pi profile. The list fails open: a
 credential missing from it is captured. It was made on 2026-10-04 from each harness's source at the
 version workspace images install (Claude Code 2.1.289, Codex 0.160.0, opencode 1.18.34, pi 1.0.2),
 and from what each wrote in an unprivileged container with no OS keyring, where Codex and Claude Code
-keep their tokens in plaintext files.
+keep their tokens in plaintext files, both after a clean exit and while a turn runs, killed with
+SIGKILL: a file a harness removes when it exits (Codex's and Claude Code's shell snapshots) is
+captured while it exists, and stays when the process is killed.
 
 | Path | Harness | Holds |
 | ---- | ------- | ----- |
@@ -206,12 +211,12 @@ keep their tokens in plaintext files.
 | `.codex/auth.json` | codex | the ChatGPT login or API key |
 | `.codex/.credentials.json` | codex | MCP server OAuth tokens, where no OS keyring is available |
 | `.codex/secrets/` | codex | encrypted logins and MCP tokens (the key is in the OS keyring) |
+| `.codex/shell_snapshots/` | codex | every exported environment variable with its value (a token, a dotfile's export) |
 | `.local/share/opencode/auth.json` | opencode | provider logins and API keys |
 | `.local/share/opencode/mcp-auth.json` | opencode | MCP server OAuth tokens and client secrets |
 | `.pi/agent/auth.json` | pi | provider logins and API keys |
 | `.pi/agent/mcp-auth.json` | pi | MCP server OAuth tokens and client secrets |
-| `.pi/agent/oauth.json` | pi | provider OAuth tokens (before pi moved them to `auth.json`) |
-| `.pi/agent/oauth.json.migrated` | pi | the same, kept when pi migrated them |
+| `.pi/agent/oauth.json` | pi | provider OAuth tokens from before pi moved them to `auth.json`, and its `.migrated` copy |
 | `.pi/agent/mcp-oauth/` | pi | MCP OAuth tokens of the pi-mcp-adapter extension |
 | `.pi/agent/mcp-oauth-encrypted/` | pi | the same, encrypted with a person's key |
 | `.pi/agent/mcp.json` | pi | MCP servers, with the headers, env and client secrets typed into them |

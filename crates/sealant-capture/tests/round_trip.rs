@@ -184,6 +184,13 @@ impl Fixture {
                     if !at.exists() {
                         fs::write(&at, "{\"token\":\"x\"}").unwrap();
                     }
+                    // A write's temporary beside it, and a lock directory.
+                    let mut sibling = at.clone().into_os_string();
+                    sibling.push(".mend-seed-12");
+                    fs::write(&sibling, "{\"token\":\"x\"}").unwrap();
+                    let mut lock = at.clone().into_os_string();
+                    lock.push(".lock");
+                    fs::create_dir_all(PathBuf::from(lock).join("held")).unwrap();
                 }
                 CredentialKind::Dir => {
                     fs::create_dir_all(at.join("nested")).unwrap();
@@ -321,10 +328,14 @@ fn round_trip_materializes_an_identical_workspace() {
 
     let tree_diff = diff_r(&fx.root, &restore, &[".git", ".sealantd"]);
     assert!(tree_diff.is_empty(), "tree differs:\n{tree_diff}");
-    let credential_names: Vec<&str> = index::HARNESS_CREDENTIALS
+    let credential_names: Vec<String> = index::HARNESS_CREDENTIALS
         .iter()
-        .map(|c| c.path.rsplit('/').next().unwrap())
+        .flat_map(|c| {
+            let name = c.path.rsplit('/').next().unwrap();
+            [name.to_owned(), format!("{name}.*")]
+        })
         .collect();
+    let credential_names: Vec<&str> = credential_names.iter().map(String::as_str).collect();
     let home_diff = diff_r(&fx.home, &home2, &credential_names);
     assert!(home_diff.is_empty(), "harness home differs:\n{home_diff}");
 
@@ -349,6 +360,12 @@ fn round_trip_materializes_an_identical_workspace() {
             "{} came back",
             credential.path
         );
+        if credential.kind == CredentialKind::File {
+            for sibling in [".mend-seed-12", ".lock"] {
+                let back = home2.join(format!("{}{sibling}", credential.path));
+                assert!(fs::symlink_metadata(&back).is_err(), "{back:?} came back");
+            }
+        }
     }
     assert!(home2.join(".codex/config.toml").exists());
     assert!(home2.join(".pi/agent/settings.json").exists());
@@ -850,4 +867,63 @@ fn the_adr_lists_every_harness_credential() {
         })
         .collect();
     assert_eq!(documented, listed);
+}
+
+/// Capture itself leaves every harness credential out, not only the restore: neither the listing
+/// a snap walks nor the index of what it read holds a credential, or anything under or beside one.
+/// (A restore skips them as well, so a round trip alone would pass with a listing that captured
+/// them all, and the bucket would hold every person's login.)
+#[test]
+fn capture_leaves_every_harness_credential_out() {
+    use sealant_capture::index::{TreeIndex, is_harness_credential_path};
+    use sealant_capture::roots::ClassRoots;
+
+    let fx = Fixture::build(10, 1000);
+    let sink = fx.sink();
+    let registrar = Arc::new(InMemoryRegistrar::new("wt-fixture", 1, None));
+    let config = fx.config(1);
+    let mut engine = CaptureEngine::open(config.clone(), None).unwrap();
+    engine
+        .snap(SnapRequest {
+            kind: CaptureKind::Auto,
+            class: Class::Small,
+            seq: 1,
+        })
+        .unwrap();
+    engine.shipper(sink, registrar).ship_pending().unwrap();
+
+    let credential_of = |v: &String| {
+        v.strip_prefix("harness/")
+            .is_some_and(is_harness_credential_path)
+    };
+    let roots = ClassRoots {
+        root: fx.root.clone(),
+        harness_home: Some(fx.home.clone()),
+        bulk_dirs: config.bulk_dirs.clone(),
+        staging_dir: config.staging_dir(),
+    };
+    let listing = roots
+        .workspace_listing(&GitRepo::open(&fx.root).unwrap(), &[])
+        .unwrap();
+    assert!(
+        listing
+            .entries
+            .keys()
+            .any(|v| v == "harness/.pi/agent/settings.json"),
+        "the harness home is listed"
+    );
+    let listed: Vec<&String> = listing
+        .entries
+        .keys()
+        .filter(|v| credential_of(v))
+        .collect();
+    assert!(listed.is_empty(), "listed: {listed:?}");
+
+    let index = TreeIndex::load(&config.staging_dir().join("index/workspace.json"));
+    assert!(
+        index.files.contains_key("harness/.pi/agent/settings.json"),
+        "the index is the one the snap wrote"
+    );
+    let read: Vec<&String> = index.files.keys().filter(|v| credential_of(v)).collect();
+    assert!(read.is_empty(), "captured: {read:?}");
 }

@@ -8,14 +8,15 @@ Capture leaves every harness credential out of the harness home, after an audit 
 keyring. Newly left out, and never restored from an earlier capture:
 
 - Codex: `.codex/.credentials.json`, where Codex keeps MCP server OAuth tokens when no keyring is
-  available (every workspace), and `.codex/secrets/`.
+  available (every workspace), `.codex/shell_snapshots/` (every exported environment variable with
+  its value, present while a session runs and left behind when it is killed), and `.codex/secrets/`.
 - Claude Code: `.claude/.device-keys.json`, and the directories `.claude/backups/` (copies of
   `~/.claude.json`, with a Console API key and MCP server headers), `.claude/shell-snapshots/`,
   `.claude/session-env/` and `.claude/ide/`.
-- pi: `.pi/agent/mcp-auth.json` (pi's own MCP server OAuth tokens), `.pi/agent/oauth.json` and
-  `oauth.json.migrated`, `.pi/agent/mcp-oauth/` and `.pi/agent/mcp-oauth-encrypted/`,
+- pi: `.pi/agent/mcp-auth.json` (pi's own MCP server OAuth tokens), `.pi/agent/oauth.json`, `.pi/agent/mcp-oauth/` and `.pi/agent/mcp-oauth-encrypted/`,
   `.pi/agent/mcp.json`, and the copy Mend delivers from a person's pi profile
   (`.pi/agent/mend/profile/root/mcp.json`, `.mend/pi-profile-kept/`).
 
 A login or token one person made in a session no longer reaches the next session in the worktree.
-The list can now name a directory as well as a file; ADR-0015 lists every entry.
+The list can now name a directory as well as a file, and a file covers its suffixed siblings (a
+lock, a write's temporary, a backup copy). ADR-0015 lists every entry.

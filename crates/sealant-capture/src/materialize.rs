@@ -1703,8 +1703,13 @@ mod tests {
             assert!(is_harness_credential(&format!("harness/{path}")), "{path}");
             assert!(!is_harness_credential(&format!("tree/{path}")), "{path}");
             assert!(!is_harness_credential(path), "{path}");
+            assert_eq!(
+                is_harness_credential(&format!("harness/{path}.mend-seed-12")),
+                credential.kind == index::CredentialKind::File,
+                "{path}: a file's suffixed sibling is a credential, a directory's is not"
+            );
             assert!(
-                !is_harness_credential(&format!("harness/{path}.bak")),
+                !is_harness_credential(&format!("harness/{path}x")),
                 "{path}"
             );
             assert_eq!(
@@ -1721,6 +1726,11 @@ mod tests {
             "harness/.local/share/opencode/opencode.db"
         ));
         assert!(!is_harness_credential("harness/.claude/backupsx/a"));
+        assert!(is_harness_credential("harness/.pi/agent/auth.json.lock/x"));
+        assert!(is_harness_credential(
+            "harness/.codex/shell_snapshots/019a.1.sh"
+        ));
+        assert!(!is_harness_credential("harness/.pi/agent/auth.jsonl"));
         assert!(!is_harness_credential("harness/.codex/config.toml"));
     }
 
