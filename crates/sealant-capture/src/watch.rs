@@ -24,7 +24,9 @@ use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use crate::aliases::Aliases;
 use crate::engine::Class;
 use crate::gitpack::GitRepo;
-use crate::index::{CREDENTIAL_FILES, DAEMON_DIR, Suspects, has_component_in, is_git_transient};
+use crate::index::{
+    DAEMON_DIR, Suspects, has_component_in, is_git_transient, is_harness_excluded_path, rel_key,
+};
 use crate::longpath;
 
 /// The `fs.inotify.max_user_watches` sysctl.
@@ -285,7 +287,6 @@ struct Policy {
     root: PathBuf,
     git_dirs: Vec<PathBuf>,
     harness_home: Option<PathBuf>,
-    credentials: Vec<PathBuf>,
     staging_dir: PathBuf,
     daemon_dir: PathBuf,
     bulk_dirs: Vec<String>,
@@ -305,16 +306,10 @@ impl Policy {
                 v
             })
             .unwrap_or_default();
-        let credentials = spec
-            .harness_home
-            .as_ref()
-            .map(|h| CREDENTIAL_FILES.iter().map(|c| h.join(c)).collect())
-            .unwrap_or_default();
         Self {
             root: spec.root.clone(),
             git_dirs,
             harness_home: spec.harness_home.clone(),
-            credentials,
             staging_dir: spec.staging_dir.clone(),
             daemon_dir: spec.root.join(DAEMON_DIR),
             bulk_dirs: spec.bulk_dirs.clone(),
@@ -351,7 +346,10 @@ impl Policy {
         if let Some(home) = &self.harness_home
             && abs.starts_with(home)
         {
-            if self.credentials.iter().any(|c| c == abs) {
+            if abs
+                .strip_prefix(home)
+                .is_ok_and(|rel| is_harness_excluded_path(&rel_key(rel)))
+            {
                 return None;
             }
             return Some(Class::Small);
@@ -1164,6 +1162,18 @@ mod tests {
         assert_eq!(
             policy.classify(&home.join(".claude/.credentials.json")),
             None
+        );
+        assert_eq!(
+            policy.classify(&home.join(".codex/.credentials.json")),
+            None
+        );
+        assert_eq!(
+            policy.classify(&home.join(".claude/backups/.claude.json.backup.1")),
+            None
+        );
+        assert_eq!(
+            policy.classify(&home.join(".codex/config.toml")),
+            Some(Class::Small)
         );
         assert_eq!(policy.classify(Path::new("/elsewhere/x")), None);
         assert_eq!(

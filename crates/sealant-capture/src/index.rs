@@ -9,7 +9,7 @@
 //! # What is never captured
 //!
 //! Outside the daemon's own paths (its staging and `<root>/.sealantd`, [`DAEMON_DIR`]) and the
-//! harness credential files ([`CREDENTIAL_FILES`], re-injected at launch), a chunked class
+//! harness credentials ([`HARNESS_CREDENTIALS`]; a login is injected at launch), a chunked class
 //! carries every regular file, directory and symlink under its roots whatever it is called — a
 //! user's `Cargo.lock`, `*.pid`, SQLite `-shm`, a `.pack` without an `.idx`. The only other
 //! exclusions are git's own transient bookkeeping *inside a git directory*
@@ -76,15 +76,250 @@ pub const DEFAULT_BULK_DIRS: &[&str] = &[
     "coverage",
 ];
 
-/// Harness credential files excluded relative to the harness home (ADR-0015 open question 2):
-/// Claude Code's, Codex's, pi's and opencode's own login files. A login made inside a session
-/// (`/login`) lands in one of these and is never captured.
-pub const CREDENTIAL_FILES: &[&str] = &[
-    ".claude/.credentials.json",
-    ".codex/auth.json",
-    ".pi/agent/auth.json",
-    ".local/share/opencode/auth.json",
+/// What a harness credential entry names: one file, or a directory and everything under it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CredentialKind {
+    /// This path, and every sibling named after it with a suffix (`<path>.<suffix>`, and what is
+    /// under one): the temporary a write renames over it, its lock, a backup copy.
+    File,
+    /// This path and every path under it.
+    Dir,
+}
+
+/// One path under the harness home that is never captured, and never restored from a capture:
+/// a credential ([`HARNESS_CREDENTIALS`]) or a harness's machine state ([`HARNESS_MACHINE_STATE`]).
+#[derive(Clone, Copy, Debug)]
+pub struct HarnessExclusion {
+    /// The harness that writes it.
+    pub harness: &'static str,
+    /// Relative to the harness home, `/`-separated.
+    pub path: &'static str,
+    pub kind: CredentialKind,
+    /// What it holds, as `docs/adr/0015-session-capture-and-sync.md` lists it.
+    pub holds: &'static str,
+}
+
+/// Every credential a harness can write into its home (ADR-0015 open question 2, "Harness
+/// credentials"). None is captured, and none a capture holds is restored: the harness home
+/// belongs to the worktree, and what one capture holds reaches the next session in it,
+/// whoever's that is. One person's login is never spent by, or shown to, another.
+///
+/// The list fails open: a credential missing from it is captured. It was made from each
+/// harness's source at the version workspace images install, and from what each one wrote in an
+/// unprivileged container with no OS keyring (Codex and Claude Code fall back to plaintext files
+/// there). The ADR's table and this one are held equal by a test.
+pub const HARNESS_CREDENTIALS: &[HarnessExclusion] = &[
+    HarnessExclusion {
+        harness: "claude",
+        path: ".claude/.credentials.json",
+        kind: CredentialKind::File,
+        holds: "the Claude login, MCP server OAuth tokens and client secrets, plugin secrets",
+    },
+    HarnessExclusion {
+        harness: "claude",
+        path: ".claude/.device-keys.json",
+        kind: CredentialKind::File,
+        holds: "device private keys (Remote Control, trusted devices)",
+    },
+    HarnessExclusion {
+        harness: "claude",
+        path: ".claude/backups",
+        kind: CredentialKind::Dir,
+        holds: "copies of `~/.claude.json`: a Console API key, MCP server headers and env",
+    },
+    HarnessExclusion {
+        harness: "claude",
+        path: ".claude/shell-snapshots",
+        kind: CredentialKind::Dir,
+        holds: "the shell's functions and aliases, any secret written in them included",
+    },
+    HarnessExclusion {
+        harness: "claude",
+        path: ".claude/session-env",
+        kind: CredentialKind::Dir,
+        holds: "what hooks export for the session",
+    },
+    HarnessExclusion {
+        harness: "claude",
+        path: ".claude/ide",
+        kind: CredentialKind::Dir,
+        holds: "IDE connection tokens",
+    },
+    HarnessExclusion {
+        harness: "claude",
+        path: ".claude/sessions",
+        kind: CredentialKind::Dir,
+        holds: "each running process's local messaging token",
+    },
+    HarnessExclusion {
+        harness: "claude",
+        path: ".claude/file-history",
+        kind: CredentialKind::Dir,
+        holds: "a copy of every file Claude Code edits, a secret file included",
+    },
+    HarnessExclusion {
+        harness: "claude",
+        path: ".claude/remote-settings.json",
+        kind: CredentialKind::File,
+        holds: "an organization's managed settings, `env` included",
+    },
+    HarnessExclusion {
+        harness: "codex",
+        path: ".codex/auth.json",
+        kind: CredentialKind::File,
+        holds: "the ChatGPT login or API key",
+    },
+    HarnessExclusion {
+        harness: "codex",
+        path: ".codex/.credentials.json",
+        kind: CredentialKind::File,
+        holds: "MCP server OAuth tokens, where no OS keyring is available",
+    },
+    HarnessExclusion {
+        harness: "codex",
+        path: ".codex/secrets",
+        kind: CredentialKind::Dir,
+        holds: "encrypted logins and MCP tokens (the key is in the OS keyring)",
+    },
+    HarnessExclusion {
+        harness: "codex",
+        path: ".codex/shell_snapshots",
+        kind: CredentialKind::Dir,
+        holds: "every exported environment variable with its value (a token, a dotfile's export)",
+    },
+    HarnessExclusion {
+        harness: "opencode",
+        path: ".local/share/opencode/auth.json",
+        kind: CredentialKind::File,
+        holds: "provider logins and API keys",
+    },
+    HarnessExclusion {
+        harness: "opencode",
+        path: ".local/share/opencode/mcp-auth.json",
+        kind: CredentialKind::File,
+        holds: "MCP server OAuth tokens and client secrets",
+    },
+    HarnessExclusion {
+        harness: "opencode",
+        path: ".local/share/opencode/repos",
+        kind: CredentialKind::Dir,
+        holds: "reference repositories, a clone URL's credentials in their git config",
+    },
+    HarnessExclusion {
+        harness: "opencode",
+        path: ".local/share/opencode/log",
+        kind: CredentialKind::Dir,
+        holds: "logs, a failed clone's URL with its credentials included",
+    },
+    HarnessExclusion {
+        harness: "pi",
+        path: ".pi/agent/auth.json",
+        kind: CredentialKind::File,
+        holds: "provider logins and API keys",
+    },
+    HarnessExclusion {
+        harness: "pi",
+        path: ".pi/agent/mcp-auth.json",
+        kind: CredentialKind::File,
+        holds: "MCP server OAuth tokens and client secrets",
+    },
+    HarnessExclusion {
+        harness: "pi",
+        path: ".pi/agent/oauth.json",
+        kind: CredentialKind::File,
+        holds: "provider OAuth tokens from before pi moved them to `auth.json`, and its `.migrated` copy",
+    },
+    HarnessExclusion {
+        harness: "pi",
+        path: ".pi/agent/mcp-oauth",
+        kind: CredentialKind::Dir,
+        holds: "MCP OAuth tokens of the pi-mcp-adapter extension",
+    },
+    HarnessExclusion {
+        harness: "pi",
+        path: ".pi/agent/mcp-oauth-encrypted",
+        kind: CredentialKind::Dir,
+        holds: "the same, encrypted with a person's key",
+    },
+    HarnessExclusion {
+        harness: "pi",
+        path: ".pi/agent/mcp.json",
+        kind: CredentialKind::File,
+        holds: "MCP servers, with the headers, env and client secrets typed into them",
+    },
+    HarnessExclusion {
+        harness: "pi",
+        path: ".pi/agent/tmp",
+        kind: CredentialKind::Dir,
+        holds: "packages a launch loads for itself from git, a source URL's credentials in their git config",
+    },
+    HarnessExclusion {
+        harness: "pi",
+        path: ".pi/agent/crashes.json",
+        kind: CredentialKind::File,
+        holds: "error messages and stacks as they were, a secret in one included",
+    },
+    HarnessExclusion {
+        harness: "pi",
+        path: ".pi/agent/mend/profile/root/mcp.json",
+        kind: CredentialKind::File,
+        holds: "the same, as Mend delivered it from a person's pi profile",
+    },
+    HarnessExclusion {
+        harness: "pi",
+        path: ".mend/pi-profile-kept",
+        kind: CredentialKind::Dir,
+        holds: "pi profiles Mend set aside, their `mcp.json` included",
+    },
 ];
+
+/// A harness's own state that belongs to the machine it ran on, not to the work: never captured,
+/// and never restored, though it holds no credential. Codex 0.160, typed by hand in a shell,
+/// unpacks its runtime into `.codex/packages/` (about 427 MB) and starts an app-server daemon that
+/// keeps its state and its control socket beside it; captured, every later executor of the
+/// worktree would restore the runtime, and a daemon's state from a machine where it no longer runs.
+/// Each is rebuilt when Codex next needs it. ADR-0015 lists these apart from the credentials.
+pub const HARNESS_MACHINE_STATE: &[HarnessExclusion] = &[
+    HarnessExclusion {
+        harness: "codex",
+        path: ".codex/packages",
+        kind: CredentialKind::Dir,
+        holds: "the Codex runtime a hand-run `codex` unpacks (about 427 MB)",
+    },
+    HarnessExclusion {
+        harness: "codex",
+        path: ".codex/app-server-daemon",
+        kind: CredentialKind::Dir,
+        holds: "the state of an app-server daemon running on that machine",
+    },
+    HarnessExclusion {
+        harness: "codex",
+        path: ".codex/app-server-control",
+        kind: CredentialKind::Dir,
+        holds: "that daemon's control socket",
+    },
+];
+
+/// Every path the harness home never captures or restores: the credentials, then the machine state.
+pub fn harness_exclusions() -> impl Iterator<Item = &'static HarnessExclusion> {
+    HARNESS_CREDENTIALS.iter().chain(HARNESS_MACHINE_STATE)
+}
+
+/// Whether a path relative to the harness home (`/`-separated) is never captured
+/// ([`harness_exclusions`]): a listed file or a sibling named after it with a suffix, a listed
+/// directory, or anything under one.
+#[must_use]
+pub fn is_harness_excluded_path(rel: &str) -> bool {
+    let rel = rel.trim_matches('/');
+    harness_exclusions().any(|c| match c.kind {
+        CredentialKind::File => rel
+            .strip_prefix(c.path)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('.')),
+        CredentialKind::Dir => rel
+            .strip_prefix(c.path)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('/')),
+    })
+}
 
 /// The daemon's own directory under the workspace root (staging lives beneath it).
 pub const DAEMON_DIR: &str = ".sealantd";

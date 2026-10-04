@@ -172,15 +172,99 @@ conflict.
   capture; pickup prefers the newest capture whose git section verifies.
 - Excluded always: `*.lock` (including `index.lock`), `objects/tmp_*`, `objects/incoming-*`,
   `gc.pid`, SQLite `-shm`, sockets, pid files, the OS `/tmp`, the daemon runtime directory and its
-  staging under `<workspace root>/.sealantd/`. Known harness credential files are on the exclusion
-  list pending open question 2 (today: `.claude/.credentials.json`, `.codex/auth.json`; Core
-  re-injects them at launch).
+  staging under `<workspace root>/.sealantd/`. Every harness credential under the harness home is
+  excluded, and never restored from a capture made before it was listed ("Harness credentials"
+  below; Core injects the session's own login at launch).
 - SQLite `db` + `-wal` are one file group: read consecutively (`-wal` first), re-read as a group if
   either changed underneath, bounded to three attempts, then shipped marked torn in the entry.
 - A `.pack` without its `.idx` in the workspace class is a mid-`index-pack` rename: skipped, never
   corruption.
 - Append-only files (JSONL transcripts) may ship as the tail since the previous capture; the dir
   entry still lists the whole chunk list, so materialize does not know or care.
+
+### Harness credentials
+
+The harness home belongs to the worktree: what one capture holds is restored into the next session
+in it, whoever's that is. So no credential a harness writes there is captured, and a restore never
+writes one back. One person's login is never spent by, or shown to, another.
+
+`HARNESS_CREDENTIALS` (`crates/sealant-capture/src/index.rs`) is the list, and a test holds it equal
+to this table. A path ending in `/` is a directory and everything under it; a file covers its
+siblings named after it with a suffix too (`auth.json.lock`, a write's temporary
+`mcp.json.mend-seed-12`, a `.migrated` copy). The `.pi/agent/mend/` and `.mend/` entries are where
+Mend delivers a person's pi profile. The list fails open: a credential missing from it is captured.
+It was made on 2026-10-04 from each harness's source at the version workspace images install (Claude
+Code 2.1.289, Codex 0.160.0, opencode 1.18.34, pi 1.0.2), and from what each wrote in an
+unprivileged container with no OS keyring, where Codex and Claude Code keep their tokens in
+plaintext files, both after a clean exit and while a turn runs, killed with SIGKILL: a file a
+harness removes when it exits (Codex's and Claude Code's shell snapshots) is captured while it
+exists, and stays when the process is killed. Diagnostics and caches that copy a credential as it is
+(a failed clone's URL in a log, a crash message) are on the list too; each is rebuilt by the
+harness.
+
+| Path | Harness | Holds |
+| ---- | ------- | ----- |
+| `.claude/.credentials.json` | claude | the Claude login, MCP server OAuth tokens and client secrets, plugin secrets |
+| `.claude/.device-keys.json` | claude | device private keys (Remote Control, trusted devices) |
+| `.claude/backups/` | claude | copies of `~/.claude.json`: a Console API key, MCP server headers and env |
+| `.claude/shell-snapshots/` | claude | the shell's functions and aliases, any secret written in them included |
+| `.claude/session-env/` | claude | what hooks export for the session |
+| `.claude/ide/` | claude | IDE connection tokens |
+| `.claude/sessions/` | claude | each running process's local messaging token |
+| `.claude/file-history/` | claude | a copy of every file Claude Code edits, a secret file included |
+| `.claude/remote-settings.json` | claude | an organization's managed settings, `env` included |
+| `.codex/auth.json` | codex | the ChatGPT login or API key |
+| `.codex/.credentials.json` | codex | MCP server OAuth tokens, where no OS keyring is available |
+| `.codex/secrets/` | codex | encrypted logins and MCP tokens (the key is in the OS keyring) |
+| `.codex/shell_snapshots/` | codex | every exported environment variable with its value (a token, a dotfile's export) |
+| `.local/share/opencode/auth.json` | opencode | provider logins and API keys |
+| `.local/share/opencode/mcp-auth.json` | opencode | MCP server OAuth tokens and client secrets |
+| `.local/share/opencode/repos/` | opencode | reference repositories, a clone URL's credentials in their git config |
+| `.local/share/opencode/log/` | opencode | logs, a failed clone's URL with its credentials included |
+| `.pi/agent/auth.json` | pi | provider logins and API keys |
+| `.pi/agent/mcp-auth.json` | pi | MCP server OAuth tokens and client secrets |
+| `.pi/agent/oauth.json` | pi | provider OAuth tokens from before pi moved them to `auth.json`, and its `.migrated` copy |
+| `.pi/agent/mcp-oauth/` | pi | MCP OAuth tokens of the pi-mcp-adapter extension |
+| `.pi/agent/mcp-oauth-encrypted/` | pi | the same, encrypted with a person's key |
+| `.pi/agent/mcp.json` | pi | MCP servers, with the headers, env and client secrets typed into them |
+| `.pi/agent/tmp/` | pi | packages a launch loads for itself from git, a source URL's credentials in their git config |
+| `.pi/agent/crashes.json` | pi | error messages and stacks as they were, a secret in one included |
+| `.pi/agent/mend/profile/root/mcp.json` | pi | the same, as Mend delivered it from a person's pi profile |
+| `.mend/pi-profile-kept/` | pi | pi profiles Mend set aside, their `mcp.json` included |
+
+Not on the list, because each is the harness's settings or conversation as much as a secret. They
+are captured, and anything a person typed into them travels with the worktree:
+
+- `.codex/config.toml`: MCP server `env`, `http_headers` and `oauth.client_secret`, a model
+  provider's `experimental_bearer_token`. Codex reads each of these from an environment variable
+  instead (`bearer_token_env_var`, `env_http_headers`, `env_vars`, `env_key`).
+- `.claude/settings.json`: `env`.
+- `.pi/agent/models.json` and `.pi/agent/settings.json`: a custom provider's `apiKey` and
+  `headers`, a legacy `apiKeys`, and a package source URL with credentials in it. pi reads a
+  `$VAR` or a `!command` in place of a key. The clones of git packages (`.pi/agent/git/`) hold the
+  same URL and nothing more, and a restore without them would have pi clone and install each one
+  again before it starts, or fail to start when the clone fails.
+- opencode's database (`.local/share/opencode/opencode.db`): the `account`, `control_account`,
+  `credential` and `session_share` tables hold an opencode console login, integration logins and
+  share secrets beside the conversations. No path can split them out.
+
+`~/.claude.json`, which holds a Console API key and MCP server headers, is not under the harness
+home and is not captured; its copies in `.claude/backups/` are on the list.
+
+### Harness machine state
+
+Kept out the same way, and in a table of their own because none is a credential: a harness's state
+that belongs to the machine it ran on, not to the work (`HARNESS_MACHINE_STATE`, held equal to this
+table by the same test). A `codex` typed by hand in a shell unpacks its runtime into
+`.codex/packages/` (about 427 MB) and starts an app-server daemon that keeps its state and its
+control socket beside it. Captured, every later executor of the worktree would restore the runtime,
+and the state of a daemon that no longer runs. Codex rebuilds each when it next needs it.
+
+| Path | Harness | Holds |
+| ---- | ------- | ----- |
+| `.codex/packages/` | codex | the Codex runtime a hand-run `codex` unpacks (about 427 MB) |
+| `.codex/app-server-daemon/` | codex | the state of an app-server daemon running on that machine |
+| `.codex/app-server-control/` | codex | that daemon's control socket |
 
 ### Cadence and budgets
 
@@ -430,6 +514,8 @@ figure is a multiple of it.
    the exclusion list and rely on Core's re-injection at launch (a pickup may prompt re-auth on
    some CLI versions), or capture them and accept a durable copy of every OAuth refresh token in
    the bucket.
+   **Answered 2026-10-04:** excluded, and the list covers every harness's credentials ("Harness
+   credentials"); the harness home is the worktree's, so a captured login reaches the next person.
 3. **Transcript privacy and retention.** Provider encryption at rest or a Mend-held key; the
    retention window for `auto` captures that contain transcripts; whether hosted tenants share a
    bucket with prefix isolation or get one each.

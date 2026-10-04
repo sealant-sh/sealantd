@@ -464,6 +464,9 @@ struct ClassWrite<'i> {
     /// Files the walk found to write, written together by [`Materializer::write_files`] once
     /// every directory they go into exists.
     pending: Vec<FileWrite>,
+    /// The workspace class: a harness credential file it names ([`is_harness_credential`]) is
+    /// never restored.
+    skip_credentials: bool,
 }
 
 /// One file a class writes: its virtual path, where it goes, and what goes in it.
@@ -491,6 +494,18 @@ fn restore_writers() -> usize {
 
 /// A file a chunked class restored: see [`ClassWrite::files`].
 type ClassFile = (String, PathBuf, Option<(u32, i128)>);
+
+/// Whether a workspace-class virtual path is a harness credential or machine state
+/// ([`index::harness_exclusions`], under the class's `harness/` root): a listed file, a listed
+/// directory, or anything under one. Capture leaves these out, but a capture made before an entry
+/// joined the list still holds it (opencode's `mcp-auth.json` before #136, Codex's
+/// `.credentials.json`): a restore never writes one back, so one person's login does not reach
+/// the next session's harness home. What the platform injected at launch is not the plan's, and
+/// the sweep never sees it (the listing leaves the same paths out), so it stays as it is.
+fn is_harness_credential(v: &str) -> bool {
+    v.strip_prefix("harness/")
+        .is_some_and(index::is_harness_excluded_path)
+}
 
 fn join_virtual(prefix: &str, name: &str) -> String {
     if prefix.is_empty() {
@@ -627,6 +642,7 @@ impl<'a> Materializer<'a> {
                 dirs: Vec::new(),
                 files: Vec::new(),
                 pending: Vec::new(),
+                skip_credentials: true,
             };
             for entry in &root.entries {
                 let Some(target) = roots.workspace_path(&git_dir, &entry.name) else {
@@ -730,6 +746,7 @@ impl<'a> Materializer<'a> {
                 dirs: Vec::new(),
                 files: Vec::new(),
                 pending: Vec::new(),
+                skip_credentials: false,
             };
             self.write_dir(&dirs, &bulk.root, &root, "", &mut write, &mut report)?;
             Self::write_files(&store, &mut write, &mut report)?;
@@ -1265,6 +1282,12 @@ impl<'a> Materializer<'a> {
         for entry in &obj.entries {
             let path = dir.join(entry.os_name());
             let v = join_virtual(vdir, &entry.name);
+            // Whatever stands at a credential's path, a directory included, is skipped whole:
+            // the listing prunes the same paths, so capture and restore agree.
+            if write.skip_credentials && is_harness_credential(&v) {
+                tracing::warn!(path = %v, "materialize: a captured harness credential is not restored");
+                continue;
+            }
             write.planned.insert(v.clone());
             if entry.kind != EntryKind::Dir && write.tracked.contains(&v) {
                 continue;
@@ -1670,6 +1693,52 @@ fn set_symlink_mtime(path: &Path, mtime_ns: i128) -> Result<(), MaterializeError
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every harness credential, under the workspace class's harness root, is never restored,
+    /// nor anything under a credential directory; a path of the same name anywhere else is.
+    #[test]
+    fn a_captured_harness_credential_is_never_restored() {
+        for credential in index::harness_exclusions() {
+            let path = credential.path;
+            assert!(is_harness_credential(&format!("harness/{path}")), "{path}");
+            assert!(!is_harness_credential(&format!("tree/{path}")), "{path}");
+            assert!(!is_harness_credential(path), "{path}");
+            assert_eq!(
+                is_harness_credential(&format!("harness/{path}.mend-seed-12")),
+                credential.kind == index::CredentialKind::File,
+                "{path}: a file's suffixed sibling is a credential, a directory's is not"
+            );
+            assert!(
+                !is_harness_credential(&format!("harness/{path}x")),
+                "{path}"
+            );
+            assert_eq!(
+                is_harness_credential(&format!("harness/{path}/inside")),
+                credential.kind == index::CredentialKind::Dir,
+                "{path}"
+            );
+        }
+        assert!(is_harness_credential("harness/.codex/.credentials.json"));
+        assert!(is_harness_credential(
+            "harness/.claude/backups/.claude.json.backup.1791136741061"
+        ));
+        assert!(!is_harness_credential(
+            "harness/.local/share/opencode/opencode.db"
+        ));
+        assert!(!is_harness_credential("harness/.claude/backupsx/a"));
+        assert!(is_harness_credential(
+            "harness/.codex/packages/standalone/codex"
+        ));
+        assert!(is_harness_credential(
+            "harness/.codex/app-server-control/control.sock"
+        ));
+        assert!(is_harness_credential("harness/.pi/agent/auth.json.lock/x"));
+        assert!(is_harness_credential(
+            "harness/.codex/shell_snapshots/019a.1.sh"
+        ));
+        assert!(!is_harness_credential("harness/.pi/agent/auth.jsonl"));
+        assert!(!is_harness_credential("harness/.codex/config.toml"));
+    }
 
     /// A directory whose metadata cannot be restored fails the materialize (it used to be
     /// ignored, leaving the directory with whatever mode and mtime the writes gave it).
