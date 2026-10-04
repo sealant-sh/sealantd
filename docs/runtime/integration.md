@@ -109,12 +109,14 @@ would release and the base of the highest next build already published above the
   `"@sealant/runtime-protocol": "npm:@sealant/runtime-protocol-next@<version>"`.
 
 The `next` trusted publisher is registered only on the two `-next` packages, so nothing in that
-workflow can publish `@sealant/runtime-*`. Images are weaker: the image jobs' `packages: write` can
-push `ghcr.io/sealant-sh/sealantd` too (GHCR cannot scope it); their actions are pinned to commits,
-and Core pins sealantd by `tag@sha256:…`, so a moved tag does not reach Core. Only `publish` holds
-the npm credential; it installs nothing, runs no repository code, refuses an artifact holding
-anything but the expected tarballs, runs npm from an empty directory, and publishes a tarball it
-rebuilt from npm's own reading with an allowlisted manifest.
+workflow can publish `@sealant/runtime-*`. Images have no such boundary: a job with
+`packages: write` can push `ghcr.io/sealant-sh/sealantd` too (GHCR cannot scope it), and any of the
+repository's writers can run a branch workflow that requests it, code-owner review or not. The image
+jobs' actions and BuildKit are pinned, and Core pins sealantd by `tag@sha256:…`, which keeps out a
+tag moved after the pin. Only `publish` holds the npm credential; it installs nothing, runs no
+repository code, refuses an artifact holding anything but the expected tarballs, runs npm from an
+empty directory, and publishes a tarball it rebuilt from npm's own reading with an allowlisted
+manifest.
 
 Core pins a prerelease by exact version when it needs a daemon change before sealantd releases:
 `ghcr.io/sealant-sh/sealantd-next:<version>@sha256:<digest>` (Core's `tooling/scripts/pin-sealantd.mjs`

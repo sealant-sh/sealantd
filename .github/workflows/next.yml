@@ -8,10 +8,11 @@
 #
 # Prereleases live under separate names, package and image alike. The `next` trusted publisher is
 # registered only on the two -next packages, so even a fully compromised run cannot publish
-# @sealant/runtime-* or move their `latest`. Images are weaker: the token the image jobs hold
-# (`packages: write`) can push ghcr.io/sealant-sh/sealantd too, and GHCR cannot scope it per image.
-# Every action in those jobs is pinned to a commit and restores no cache other jobs write; Core pins
-# sealantd as `tag@sha256:…`, so a moved tag does not reach Core (ADR 0015, Known gaps).
+# @sealant/runtime-* or move their `latest`. Images have no such boundary: the token the image jobs
+# hold (`packages: write`) can push ghcr.io/sealant-sh/sealantd too, GHCR cannot scope it per image,
+# and any writer can run a branch workflow that requests it, code-owner review or not. Every action
+# and BuildKit image in those jobs is pinned and no cache other jobs write is restored; Core pins
+# sealantd as `tag@sha256:…`, which keeps out a tag moved after the pin (ADR 0015, Known gaps).
 #
 # SECURITY: `workflow_run` runs this file as it is on main, never a pull request's copy, and the
 # guard below accepts only a push to this repository's main, not a fork's branch that happens to be
@@ -58,6 +59,8 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
+          # setup-node v6 restores a package-manager cache by itself when packageManager names npm.
+          package-manager-cache: false
           node-version: 24
       - name: Resolve the version
         id: plan
@@ -117,7 +120,10 @@ jobs:
         with:
           ref: ${{ needs.plan.outputs.sha }}
           persist-credentials: false
+      # BuildKit at a fixed digest: it runs privileged and performs the push.
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+        with:
+          driver-opts: image=moby/buildkit:v0.33.1@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea
       - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
@@ -164,7 +170,6 @@ jobs:
           path: /tmp/digests
           pattern: next-digests--*
           merge-multiple: true
-      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
       - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
@@ -203,6 +208,8 @@ jobs:
       - run: corepack enable
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
+          # setup-node v6 restores a package-manager cache by itself when packageManager names npm.
+          package-manager-cache: false
           node-version: 24
       # --ignore-scripts: never run dependency lifecycle scripts.
       - run: pnpm install --frozen-lockfile --ignore-scripts
@@ -257,6 +264,8 @@ jobs:
       # Node 24: trusted publishing needs the bundled npm >= 11.5, whose pacote the block uses.
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
+          # setup-node v6 restores a package-manager cache by itself when packageManager names npm.
+          package-manager-cache: false
           node-version: 24
           registry-url: "https://registry.npmjs.org"
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0

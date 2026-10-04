@@ -30,6 +30,8 @@ jobs:
       - run: corepack enable
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
+          # setup-node v6 restores a package-manager cache by itself when packageManager names npm.
+          package-manager-cache: false
           node-version: 24
       - run: pnpm install --frozen-lockfile --ignore-scripts
       - uses: changesets/action@a45c4d594aa4e2c509dc14a9f2b3b67ba3780d0d # v1.9.0
