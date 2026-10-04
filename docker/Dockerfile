@@ -22,7 +22,7 @@ RUN set -eux; \
       *) echo "unsupported arch $(uname -m)" >&2; exit 1 ;; \
     esac; \
     rustup target add "$target"; \
-    cargo build --release --bin sealantd --bin sealantctl --target "$target"; \
+    cargo build --locked --release --bin sealantd --bin sealantctl --target "$target"; \
     cp "target/$target/release/sealantd" /sealantd; \
     cp "target/$target/release/sealantctl" /sealantctl
 
@@ -33,10 +33,28 @@ RUN set -eux; \
 # socat package. OpenSSL/readline/libwrap are disabled — the relay only needs UNIX/STDIO/TCP.
 FROM alpine:3.22 AS socat-builder
 RUN apk add --no-cache build-base linux-headers wget
+# The tarball is fetched over HTTPS and checked against a pinned sha256 before anything unpacks it.
+# Upstream's own HTTPS (www.dest-unreach.org) presents a self-signed certificate for another host,
+# so it comes from two distribution mirrors instead: Fedora's lookaside cache, which is addressed by
+# the tarball's sha512, then Alpine's distfiles. Both serve upstream's release byte for byte; the
+# sha512 is the one Alpine's aports recorded when it packaged 1.8.0.3. A new version changes all
+# three ARGs together.
 ARG SOCAT_VERSION=1.8.0.3
+ARG SOCAT_SHA256=a9f9eb6cfb9aa6b1b4b8fe260edbac3f2c743f294db1e362b932eb3feca37ba4
+ARG SOCAT_SHA512=600a3387e9756e0937d2db49de9066df03d9818e4042da6b72109d1b5688dd72352754773a19bd2558fe93ec6a8a73e80e7cf2602fd915960f66c403fd89beef
 RUN set -eux; \
-    wget -q "http://www.dest-unreach.org/socat/download/socat-${SOCAT_VERSION}.tar.gz"; \
-    tar xzf "socat-${SOCAT_VERSION}.tar.gz"; \
+    tarball="socat-${SOCAT_VERSION}.tar.gz"; \
+    for url in \
+        "https://src.fedoraproject.org/repo/pkgs/socat/${tarball}/sha512/${SOCAT_SHA512}/${tarball}" \
+        "https://distfiles.alpinelinux.org/distfiles/v3.22/${tarball}"; do \
+        if wget -q -O "$tarball" "$url" && echo "${SOCAT_SHA256}  ${tarball}" | sha256sum -c -; then \
+            break; \
+        fi; \
+        rm -f "$tarball"; \
+    done; \
+    echo "${SOCAT_SHA256}  ${tarball}" | sha256sum -c -; \
+    echo "${SOCAT_SHA512}  ${tarball}" | sha512sum -c -; \
+    tar xzf "$tarball"; \
     cd "socat-${SOCAT_VERSION}"; \
     CFLAGS="-static -Os" LDFLAGS="-static" ./configure --disable-openssl --disable-readline --disable-libwrap; \
     make -j"$(nproc)"; \

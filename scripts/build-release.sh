@@ -15,7 +15,7 @@ for arch in ${ARCHES[*]}; do
     rust:slim sh -euc "
       apt-get update >/dev/null && apt-get install -y --no-install-recommends musl-tools >/dev/null
       rustup target add $target >/dev/null
-      cargo build --release --bin sealantd --target $target
+      cargo build --locked --release --bin sealantd --target $target
       cp target/$target/release/sealantd /src/dist/sealantd-$arch
       echo '--- file type ---'; file /src/dist/sealantd-$arch || true
     "

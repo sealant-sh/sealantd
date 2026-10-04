@@ -94,3 +94,38 @@ via `client.request({ case, value })` for commands without a sugar method.
 
 One git tag drives both artifacts (image tag + npm version) so a deployment pins a single,
 consistent `(binary, SDK)` pair.
+
+## Prereleases from main
+
+Every main commit whose `ci` run passed also publishes both artifacts, under **separate names**, as
+one prerelease version, `B-next.N` (`.github/workflows/next.yml`, ADR 0015 in sealant-sh/mend). N is
+the commit's whole history (`git rev-list --count`); B is the larger of what the pending changesets
+would release and the base of the highest next build already published above the last stable tag
+(`node scripts/next-version.mjs --package packages/runtime-client --npm @sealant/runtime-client-next`).
+
+- `ghcr.io/sealant-sh/sealantd-next:0.20.0-next.N`, amd64 and arm64.
+- `@sealant/runtime-protocol-next` and `@sealant/runtime-client-next` `0.20.0-next.N` on npm's
+  `next` dist-tag; the client depends on the protocol through an exact alias,
+  `"@sealant/runtime-protocol": "npm:@sealant/runtime-protocol-next@<version>"`.
+
+The `next` trusted publisher is registered only on the two `-next` packages, so nothing in that
+workflow can publish `@sealant/runtime-*`. Images have no such boundary: a job with
+`packages: write` can push `ghcr.io/sealant-sh/sealantd` too (GHCR cannot scope it), and any of the
+repository's writers can run a branch workflow that requests it, code-owner review or not. The image
+jobs' actions and BuildKit are pinned, and Core pins sealantd by `tag@sha256:…`, which keeps out a
+tag moved after the pin. Only `publish` holds the npm credential; it installs nothing, runs no
+repository code, refuses an artifact holding anything but the expected tarballs, runs npm from an
+empty directory, and publishes a tarball it rebuilt from npm's own reading with an allowlisted
+manifest.
+
+Core pins a prerelease by exact version when it needs a daemon change before sealantd releases:
+`ghcr.io/sealant-sh/sealantd-next:<version>@sha256:<digest>` (Core's `tooling/scripts/pin-sealantd.mjs`
+writes it) and the runtime packages as exact aliases
+(`"@sealant/runtime-client": "npm:@sealant/runtime-client-next@<version>"`). Core's recovery check
+treats a `sealantd-next:X.Y.Z-next.N` image of a version after 0.19.0 like a release.
+
+To release: merge the Version Packages pull request and **freeze main until the tag**; Core pins
+that commit's next build; then tag that same commit. Core refuses to cut a stable release while it
+pins a prerelease, so this tag comes first. The whole order is in sealant-sh/mend
+`docs/operations/next-channel.md`. The release refuses while an npm prerelease of the version came
+from a commit the tag leaves out, which is what a merge during the freeze produces.

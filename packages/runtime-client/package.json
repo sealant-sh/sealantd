@@ -32,7 +32,7 @@
     "prepublishOnly": "pnpm run build"
   },
   "dependencies": {
-    "@sealant/runtime-protocol": "workspace:^",
+    "@sealant/runtime-protocol": "workspace:*",
     "@bufbuild/protobuf": "^2.12.0"
   }
 }
