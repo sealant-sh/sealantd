@@ -623,3 +623,96 @@ fn fence_stops_shipping_and_a_new_epoch_continues_the_chain() {
     assert_eq!(report.fsck, Some(FsckStatus::Verified));
     assert_eq!(fs::read_to_string(restore.join("more.txt")).unwrap(), "x");
 }
+
+/// A capture made before a harness credential joined `CREDENTIAL_FILES` still holds it: opencode's
+/// `mcp-auth.json` before #136, as a plain file or as a symlink someone planted at that path. A
+/// restore writes neither back, and restores everything beside it.
+#[test]
+fn a_legacy_capture_s_harness_credential_is_never_restored() {
+    use sealant_capture::manifest::WorkspaceSection;
+    use sealant_capture::sink::{BlobSink, BlobSource};
+    use sealant_capture::tree::{DirEntry, DirObject};
+
+    for planted in ["file", "symlink"] {
+        let fx = Fixture::build(10, 1000);
+        let sink = fx.sink();
+        let registrar = Arc::new(InMemoryRegistrar::new("wt-fixture", 1, None));
+        let mut engine = CaptureEngine::open(fx.config(1), None).unwrap();
+        engine
+            .snap(SnapRequest {
+                kind: CaptureKind::Auto,
+                class: Class::Small,
+                seq: 1,
+            })
+            .unwrap();
+        engine
+            .shipper(sink.clone(), registrar.clone())
+            .ship_pending()
+            .unwrap();
+        let mut manifest = registrar.head().unwrap().manifest;
+
+        // The workspace class as such a capture holds it, written as format-1 dir objects:
+        // harness/.local/share/opencode/{mcp-auth.json, opencode.db} and harness/settings.json.
+        let put = |dir: DirObject| -> String {
+            let encoded = dir.encode();
+            let key = format!("captures/wt-fixture/1/trees/{}", encoded.sha256);
+            sink.put_if_absent(&key, BlobSource::Bytes(&encoded.bytes))
+                .unwrap();
+            key
+        };
+        let credential = match planted {
+            "file" => DirEntry::file("mcp-auth.json", 0o600, 0, 1_700_000_000_000_000_000, vec![]),
+            _ => DirEntry::symlink(
+                "mcp-auth.json",
+                0o777,
+                1_700_000_000_000_000_000,
+                "/workspace/repo/.planted",
+            ),
+        };
+        let opencode = put(DirObject::new(vec![
+            credential,
+            DirEntry::file("opencode.db", 0o644, 0, 1_700_000_000_000_000_000, vec![]),
+        ]));
+        let share = put(DirObject::new(vec![DirEntry::dir(
+            "opencode",
+            0o755,
+            1_700_000_000_000_000_000,
+            opencode,
+        )]));
+        let local = put(DirObject::new(vec![DirEntry::dir(
+            "share",
+            0o755,
+            1_700_000_000_000_000_000,
+            share,
+        )]));
+        let harness = put(DirObject::new(vec![
+            DirEntry::dir(".local", 0o755, 1_700_000_000_000_000_000, local),
+            DirEntry::file("settings.json", 0o644, 0, 1_700_000_000_000_000_000, vec![]),
+        ]));
+        let root = put(DirObject::new(vec![DirEntry::dir(
+            "harness",
+            0o755,
+            1_700_000_000_000_000_000,
+            harness,
+        )]));
+        manifest.sections.workspace = WorkspaceSection::objects(root, Vec::new());
+
+        let home2 = fx.base.join(format!("home-{planted}"));
+        Materializer::new(
+            sink.as_ref(),
+            MaterializeTargets::new(
+                &fx.base.join(format!("restore-{planted}")),
+                Some(home2.clone()),
+            ),
+        )
+        .materialize(&manifest, MaterializeClass::Workspace)
+        .unwrap();
+        let opencode_dir = home2.join(".local/share/opencode");
+        assert!(opencode_dir.join("opencode.db").exists(), "{planted}");
+        assert!(home2.join("settings.json").exists(), "{planted}");
+        assert!(
+            fs::symlink_metadata(opencode_dir.join("mcp-auth.json")).is_err(),
+            "{planted}: the credential came back"
+        );
+    }
+}
