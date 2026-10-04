@@ -1,0 +1,18 @@
+# What decides what gets published, and under which version or dist-tag, needs the owner's review
+# (ADR 0015 in sealant-sh/mend). Effective once main requires review from code owners.
+/.github/ @ypanagidis
+/scripts/ @ypanagidis
+/docker/ @ypanagidis
+/.changeset/config.json @ypanagidis
+# Every workspace manifest: a lifecycle script there runs while the tarballs are built and packed.
+/package.json @ypanagidis
+/packages/*/package.json @ypanagidis
+# What configures every install and build, the credential-free pack job's included.
+/pnpm-lock.yaml @ypanagidis
+/pnpm-workspace.yaml @ypanagidis
+.pnpmfile.cjs @ypanagidis
+# pnpm 11 loads .pnpmfile.mjs before .pnpmfile.cjs.
+.pnpmfile.mjs @ypanagidis
+.npmrc @ypanagidis
+Cargo.toml @ypanagidis
+Cargo.lock @ypanagidis
