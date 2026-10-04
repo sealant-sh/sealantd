@@ -13,9 +13,9 @@ permissions:
 jobs:
   # A prerelease tag (vX.Y.Z-anything) would publish to npm `latest` and tag the image `latest`.
   # Prereleases publish from main in next.yml (ADR 0015 in sealant-sh/mend), never from a tag.
-  # And every merge after the Version Packages pull request published another X.Y.Z-next.N: one
-  # built from a commit this tag leaves out sorts below X.Y.Z but holds more. Tag right after the
-  # Version Packages merge, or from a commit that contains it.
+  # And no next build of X.Y.Z may come from a commit this tag leaves out: it would sort below X.Y.Z
+  # but hold more. Main is frozen from the Version Packages merge to this tag (sealant-sh/mend
+  # docs/operations/next-channel.md); a merge during the freeze is what produces one.
   stable-tag:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 5

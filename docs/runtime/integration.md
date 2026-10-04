@@ -102,8 +102,10 @@ Every main commit whose `ci` run passed also publishes both artifacts under one 
 history (`git rev-list --count`); B is the larger of what the pending changesets would release and
 the base of the highest next build already published above the last stable tag, so each build is
 higher than the one before (`node scripts/next-version.mjs --package packages/runtime-client --npm
-@sealant/runtime-client`). `pack` builds, packs and checks every exported file is in the tarball;
-only `publish` holds the npm credential, and it runs no repository code.
+@sealant/runtime-client`). `pack` builds, packs and checks every exported file is in the tarball.
+Only `publish` holds the npm credential; it runs no repository code and never publishes the tarball
+it was given: it extracts it with npm's own reader (pacote), rewrites `package.json` from an
+allowlist, checks name, version and commit on that, repacks it and publishes that under `next`.
 
 - `ghcr.io/sealant-sh/sealantd:0.20.0-next.N`, amd64 and arm64.
 - `@sealant/runtime-protocol` and `@sealant/runtime-client` `0.20.0-next.N` on npm's `next` dist-tag.
