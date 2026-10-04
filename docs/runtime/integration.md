@@ -94,3 +94,18 @@ via `client.request({ case, value })` for commands without a sugar method.
 
 One git tag drives both artifacts (image tag + npm version) so a deployment pins a single,
 consistent `(binary, SDK)` pair.
+
+## Prereleases from main
+
+Every main commit whose `ci` run passed also publishes both artifacts under one prerelease version,
+`X.(Y+1).0-next.N` (`.github/workflows/next.yml`, ADR 0015 in sealant-sh/mend). `vX.Y.Z` is the
+highest stable tag; N counts the commits since that minor's first release (`scripts/next-version.mjs`).
+
+- `ghcr.io/sealant-sh/sealantd:0.20.0-next.N`, amd64 and arm64.
+- `@sealant/runtime-protocol` and `@sealant/runtime-client` `0.20.0-next.N` on npm's `next` dist-tag.
+  `latest` moves only from a `vX.Y.Z` tag.
+
+Core pins a prerelease the way it pins a release, by exact version, when it needs a daemon change
+before sealantd releases. Core's recovery check treats a prerelease image of a version after 0.19.0
+like a release. Core refuses to cut a stable release while it pins a prerelease, so sealantd tags
+`vX.Y.Z` on the commit Core pinned first.

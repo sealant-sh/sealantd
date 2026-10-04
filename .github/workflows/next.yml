@@ -1,0 +1,216 @@
+# Prereleases from main (ADR 0015 in sealant-sh/mend, docs/adr/0015-next-channel.md). Every main
+# commit whose `ci` run passed publishes, under one version X.(Y+1).0-next.N
+# (scripts/next-version.mjs):
+#
+# - ghcr.io/sealant-sh/sealantd:<version>, amd64 and arm64, each built natively;
+# - @sealant/runtime-protocol and @sealant/runtime-client <version> on npm's `next` dist-tag, after
+#   the image exists, so every SDK prerelease has its daemon.
+#
+# `latest` (npm and GHCR) moves only from a vX.Y.Z tag, in release.yml. No floating tags: Core pins
+# the exact version.
+#
+# SECURITY: `workflow_run` runs this file as it is on main, never a pull request's copy, and the
+# guard below accepts only a push to this repository's main, not a fork's branch that happens to be
+# called main. npm authenticates with OIDC trusted publishing from the `next` environment (deployable
+# from main only); register it on both packages as a second trusted publisher: repository
+# sealant-sh/sealantd, workflow next.yml, environment next.
+name: next
+
+on:
+  workflow_run:
+    workflows: [ci]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: next
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    if: >-
+      github.repository == 'sealant-sh/sealantd' && github.event.workflow_run.conclusion == 'success'
+      && github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.plan.outputs.version }}
+      sha: ${{ steps.plan.outputs.sha }}
+      publish: ${{ steps.plan.outputs.publish }}
+    steps:
+      # Full history and tags: N counts the commits since the minor's first release.
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+      - name: Resolve the version
+        id: plan
+        env:
+          SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          version=$(node scripts/next-version.mjs HEAD)
+          [[ $version =~ ^[0-9]+\.[0-9]+\.0-next\.[0-9]+$ ]] || {
+            echo "::error::\"$version\" is not a next version."
+            exit 1
+          }
+          # A version already on npm was published completely (npm is the last step): a re-run or a
+          # second run for the same commit publishes nothing again.
+          publish=true
+          if [[ -n $(npm view "@sealant/runtime-client@$version" version 2>/dev/null) ]]; then
+            publish=false
+            echo "sealantd $version is already published; nothing to do."
+          fi
+          {
+            echo "version=$version"
+            echo "sha=$SHA"
+            echo "publish=$publish"
+          } >> "$GITHUB_OUTPUT"
+
+  image:
+    needs: plan
+    if: needs.plan.outputs.publish == 'true'
+    strategy:
+      matrix:
+        platform:
+          - { arch: amd64, runner: blacksmith-4vcpu-ubuntu-2404 }
+          - { arch: arm64, runner: blacksmith-4vcpu-ubuntu-2404-arm }
+    runs-on: ${{ matrix.platform.runner }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.plan.outputs.sha }}
+          persist-credentials: false
+      - uses: useblacksmith/setup-docker-builder@v1
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: build
+        uses: useblacksmith/build-push-action@v2
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: linux/${{ matrix.platform.arch }}
+          provenance: false
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ needs.plan.outputs.sha }}
+            org.opencontainers.image.version=${{ needs.plan.outputs.version }}
+          outputs:
+            type=image,name=ghcr.io/${{ github.repository }},push-by-digest=true,name-canonical=true,push=true
+      - name: Export digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p /tmp/digests
+          touch "/tmp/digests/${DIGEST#sha256:}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: next-digests--${{ matrix.platform.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  image-tag:
+    needs: [plan, image]
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.tag.outputs.digest }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: next-digests--*
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Tag the multi-arch image
+        id: tag
+        working-directory: /tmp/digests
+        env:
+          REPOSITORY: ghcr.io/${{ github.repository }}
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          set -euo pipefail
+          # A version is tagged once. A re-run after a failed npm job keeps the image Core may
+          # already have pulled.
+          if ! docker buildx imagetools inspect "$REPOSITORY:$VERSION" >/dev/null 2>&1; then
+            sources=()
+            for digest in *; do sources+=("$REPOSITORY@sha256:$digest"); done
+            docker buildx imagetools create --tag "$REPOSITORY:$VERSION" "${sources[@]}"
+          fi
+          docker buildx imagetools inspect "$REPOSITORY:$VERSION"
+          digest=$(docker buildx imagetools inspect "$REPOSITORY:$VERSION" --format '{{json .Manifest}}' | jq -r .digest)
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+  npm:
+    needs: [plan, image-tag]
+    # npm trusted publishing (OIDC) needs a GitHub-hosted runner: this job stays off Blacksmith.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: next
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.plan.outputs.sha }}
+          persist-credentials: false
+      - run: corepack enable
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          registry-url: "https://registry.npmjs.org"
+      # --ignore-scripts: never run dependency lifecycle scripts in a publish job.
+      - run: pnpm install --frozen-lockfile --ignore-scripts
+      - name: Set the prerelease version
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          set -euo pipefail
+          # Never a stable version from this workflow: `latest` is release.yml's alone.
+          [[ $VERSION == *-next.* ]] || { echo "::error::$VERSION is not a next version."; exit 1; }
+          pnpm --filter "@sealant/runtime-protocol" --filter "@sealant/runtime-client" \
+            exec npm version "$VERSION" --no-git-tag-version --allow-same-version
+      - run: pnpm -r build
+      - name: Publish to npm under next
+        run:
+          pnpm --filter "@sealant/runtime-protocol" --filter "@sealant/runtime-client" publish
+          --access public --no-git-checks --provenance --tag next
+      - name: Summary
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+          SHA: ${{ needs.plan.outputs.sha }}
+          DIGEST: ${{ needs.image-tag.outputs.digest }}
+        run: |
+          {
+            echo "## sealantd $VERSION"
+            echo
+            echo "From \`$SHA\`."
+            echo
+            echo "- \`ghcr.io/$GITHUB_REPOSITORY:$VERSION\` (\`$DIGEST\`)"
+            echo "- \`@sealant/runtime-protocol@$VERSION\`, \`@sealant/runtime-client@$VERSION\` on npm \`next\`"
+          } >> "$GITHUB_STEP_SUMMARY"

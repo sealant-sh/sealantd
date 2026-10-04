@@ -73,6 +73,8 @@ jobs:
           node-version: 24
       # --ignore-scripts: never run dependency lifecycle scripts (untrusted on fork PRs).
       - run: pnpm install --frozen-lockfile --ignore-scripts
+      # The prerelease version next.yml publishes; the same script lives in Core and Mend.
+      - run: node --test scripts/next-version.test.mjs
       - run: pnpm -r build
       - uses: dtolnay/rust-toolchain@stable # Blacksmith runners don't preinstall Rust
       - run: cargo build -p sealantd # the TypeScript e2e spawns the daemon binary
