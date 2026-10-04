@@ -166,6 +166,12 @@ impl Fixture {
             "{\"openai\":{}}",
         )
         .unwrap();
+        // opencode's MCP server logins (tokens, client secrets): out too.
+        fs::write(
+            home.join(".local/share/opencode/mcp-auth.json"),
+            "{\"server\":{\"tokens\":{\"accessToken\":\"x\"}}}",
+        )
+        .unwrap();
         fs::write(home.join(".local/share/opencode/opencode.db"), b"SQLite").unwrap();
         // A stale lock, always excluded.
         fs::write(root.join(".git/index.lock"), b"").unwrap();
@@ -295,7 +301,11 @@ fn round_trip_materializes_an_identical_workspace() {
 
     let tree_diff = diff_r(&fx.root, &restore, &[".git", ".sealantd"]);
     assert!(tree_diff.is_empty(), "tree differs:\n{tree_diff}");
-    let home_diff = diff_r(&fx.home, &home2, &[".credentials.json", "auth.json"]);
+    let home_diff = diff_r(
+        &fx.home,
+        &home2,
+        &[".credentials.json", "auth.json", "mcp-auth.json"],
+    );
     assert!(home_diff.is_empty(), "harness home differs:\n{home_diff}");
 
     // (d) the `.pack` without `.idx` was skipped; the nested repo otherwise came back.
@@ -312,6 +322,7 @@ fn round_trip_materializes_an_identical_workspace() {
     assert!(!home2.join(".claude/.credentials.json").exists());
     assert!(!home2.join(".pi/agent/auth.json").exists());
     assert!(!home2.join(".local/share/opencode/auth.json").exists());
+    assert!(!home2.join(".local/share/opencode/mcp-auth.json").exists());
     assert!(home2.join(".pi/agent/settings.json").exists());
     assert!(home2.join(".local/share/opencode/opencode.db").exists());
     assert!(home2.join("state.db-shm").exists());
