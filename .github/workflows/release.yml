@@ -13,9 +13,14 @@ permissions:
 jobs:
   # A prerelease tag (vX.Y.Z-anything) would publish to npm `latest` and tag the image `latest`.
   # Prereleases publish from main in next.yml (ADR 0015 in sealant-sh/mend), never from a tag.
+  # And every merge after the Version Packages pull request published another X.Y.Z-next.N: one
+  # built from a commit this tag leaves out sorts below X.Y.Z but holds more. Tag right after the
+  # Version Packages merge, or from a commit that contains it.
   stable-tag:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 5
+    permissions:
+      contents: read
     steps:
       - name: Refuse a prerelease tag
         run: |
@@ -23,6 +28,17 @@ jobs:
             echo "::error::$GITHUB_REF_NAME is not a stable vX.Y.Z tag. Prereleases publish from main."
             exit 1
           }
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+      - name: Refuse a release that leaves out one of its next builds
+        run: >-
+          node scripts/next-version.mjs --stray "$GITHUB_REF_NAME" --npm @sealant/runtime-client
+          HEAD
 
   image:
     needs: stable-tag

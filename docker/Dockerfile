@@ -22,7 +22,7 @@ RUN set -eux; \
       *) echo "unsupported arch $(uname -m)" >&2; exit 1 ;; \
     esac; \
     rustup target add "$target"; \
-    cargo build --release --bin sealantd --bin sealantctl --target "$target"; \
+    cargo build --locked --release --bin sealantd --bin sealantctl --target "$target"; \
     cp "target/$target/release/sealantd" /sealantd; \
     cp "target/$target/release/sealantctl" /sealantctl
 

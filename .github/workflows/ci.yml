@@ -77,5 +77,5 @@ jobs:
       - run: node --test scripts/next-version.test.mjs
       - run: pnpm -r build
       - uses: dtolnay/rust-toolchain@stable # Blacksmith runners don't preinstall Rust
-      - run: cargo build -p sealantd # the TypeScript e2e spawns the daemon binary
+      - run: cargo build --locked -p sealantd # the TypeScript e2e spawns the daemon binary
       - run: pnpm -r test

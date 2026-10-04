@@ -98,8 +98,13 @@ consistent `(binary, SDK)` pair.
 ## Prereleases from main
 
 Every main commit whose `ci` run passed also publishes both artifacts under one prerelease version,
-`X.(Y+1).0-next.N` (`.github/workflows/next.yml`, ADR 0015 in sealant-sh/mend). `vX.Y.Z` is the
-highest stable tag; N counts the commits since that minor's first release (`scripts/next-version.mjs`).
+`B-next.N` (`.github/workflows/next.yml`, ADR 0015 in sealant-sh/mend). B is what the next Version
+Packages pull request would release (patch changesets only: `X.Y.(Z+1)`; any minor: `X.(Y+1).0`); N
+counts the commits since the last stable tag
+(`node scripts/next-version.mjs --package packages/runtime-client`). Only the `publish` job holds the
+npm credential, and it runs no repository code. Tag a release right after its Version Packages
+merge: the release refuses while an npm prerelease of that version came from a commit the tag
+leaves out.
 
 - `ghcr.io/sealant-sh/sealantd:0.20.0-next.N`, amd64 and arm64.
 - `@sealant/runtime-protocol` and `@sealant/runtime-client` `0.20.0-next.N` on npm's `next` dist-tag.

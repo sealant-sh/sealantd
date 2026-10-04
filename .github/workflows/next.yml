@@ -1,6 +1,7 @@
 # Prereleases from main (ADR 0015 in sealant-sh/mend, docs/adr/0015-next-channel.md). Every main
-# commit whose `ci` run passed publishes, under one version X.(Y+1).0-next.N
-# (scripts/next-version.mjs):
+# commit whose `ci` run passed publishes, under one version B-next.N (scripts/next-version.mjs: B is
+# what the next Version Packages pull request would release, N the commits since the last stable
+# tag):
 #
 # - ghcr.io/sealant-sh/sealantd:<version>, amd64 and arm64, each built natively;
 # - @sealant/runtime-protocol and @sealant/runtime-client <version> on npm's `next` dist-tag, after
@@ -11,9 +12,13 @@
 #
 # SECURITY: `workflow_run` runs this file as it is on main, never a pull request's copy, and the
 # guard below accepts only a push to this repository's main, not a fork's branch that happens to be
-# called main. npm authenticates with OIDC trusted publishing from the `next` environment (deployable
-# from main only); register it on both packages as a second trusted publisher: repository
-# sealant-sh/sealantd, workflow next.yml, environment next.
+# called main. The npm credential (OIDC, `id-token: write`) is held only by `publish`, which checks
+# out nothing and runs no repository code: it downloads the tarballs `pack` built, checks each one's
+# name, version and commit, and runs `npm publish --tag next`. A build dependency never sees it.
+# Someone who can merge an edit to this file still could; that needs code-owner review on main
+# (CODEOWNERS covers .github/ and scripts/) and the `next` environment limited to main, both
+# repository settings (ADR 0015, decision 3). Register the publisher on both packages as a second
+# trusted publisher: repository sealant-sh/sealantd, workflow next.yml, environment next.
 name: next
 
 on:
@@ -57,17 +62,23 @@ jobs:
           SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
           set -euo pipefail
-          version=$(node scripts/next-version.mjs HEAD)
-          [[ $version =~ ^[0-9]+\.[0-9]+\.0-next\.[0-9]+$ ]] || {
+          version=$(node scripts/next-version.mjs --package packages/runtime-client HEAD)
+          [[ $version =~ ^[0-9]+\.[0-9]+\.[0-9]+-next\.[0-9]+$ ]] || {
             echo "::error::\"$version\" is not a next version."
             exit 1
           }
-          # A version already on npm was published completely (npm is the last step): a re-run or a
-          # second run for the same commit publishes nothing again.
+          # A version already on npm was published completely (npm is the last step): a re-run of
+          # this commit publishes nothing again. The same version from another commit (an older
+          # commit re-run after a stable tag moved the base) is refused.
           publish=true
           if [[ -n $(npm view "@sealant/runtime-client@$version" version 2>/dev/null) ]]; then
+            published_from=$(npm view "@sealant/runtime-client@$version" gitHead 2>/dev/null || true)
+            if [[ $published_from != "$SHA" ]]; then
+              echo "::error::@sealant/runtime-client@$version was published from ${published_from:-an unknown commit}, not $SHA."
+              exit 1
+            fi
             publish=false
-            echo "sealantd $version is already published; nothing to do."
+            echo "sealantd $version is already published from this commit; nothing to do."
           fi
           {
             echo "version=$version"
@@ -165,15 +176,12 @@ jobs:
           digest=$(docker buildx imagetools inspect "$REPOSITORY:$VERSION" --format '{{json .Manifest}}' | jq -r .digest)
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
 
-  npm:
+  # Builds and packs the two packages. No id-token here: nothing this job runs, the dependencies'
+  # build tools included, can reach the npm credential.
+  pack:
     needs: [plan, image-tag]
-    # npm trusted publishing (OIDC) needs a GitHub-hosted runner: this job stays off Blacksmith.
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 15
-    environment: next
-    permissions:
-      contents: read
-      id-token: write
     steps:
       - uses: actions/checkout@v7
         with:
@@ -183,29 +191,101 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: 24
-          registry-url: "https://registry.npmjs.org"
-      # --ignore-scripts: never run dependency lifecycle scripts in a publish job.
+      # --ignore-scripts: never run dependency lifecycle scripts.
       - run: pnpm install --frozen-lockfile --ignore-scripts
-      - name: Set the prerelease version
+      # The version and the commit go into each package.json: npm records `gitHead`, which the plan
+      # job compares on a re-run and Core's and Mend's release guards read.
+      - name: Set the prerelease version and commit
         env:
           VERSION: ${{ needs.plan.outputs.version }}
+          SHA: ${{ needs.plan.outputs.sha }}
         run: |
           set -euo pipefail
-          # Never a stable version from this workflow: `latest` is release.yml's alone.
-          [[ $VERSION == *-next.* ]] || { echo "::error::$VERSION is not a next version."; exit 1; }
-          pnpm --filter "@sealant/runtime-protocol" --filter "@sealant/runtime-client" \
-            exec npm version "$VERSION" --no-git-tag-version --allow-same-version
+          for package in packages/runtime-protocol packages/runtime-client; do
+            (cd "$package" && npm version "$VERSION" --no-git-tag-version --allow-same-version \
+              && npm pkg set "gitHead=$SHA")
+          done
       - run: pnpm -r build
-      - name: Publish to npm under next
-        run:
-          pnpm --filter "@sealant/runtime-protocol" --filter "@sealant/runtime-client" publish
-          --access public --no-git-checks --provenance --tag next
-      - name: Summary
+      - name: Pack
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/tarballs"
+          for package in packages/runtime-protocol packages/runtime-client; do
+            (cd "$package" && pnpm pack --pack-destination "$RUNNER_TEMP/tarballs")
+          done
+          ls -l "$RUNNER_TEMP/tarballs"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: next-tarballs
+          path: ${{ runner.temp }}/tarballs/*.tgz
+          if-no-files-found: error
+          retention-days: 1
+
+  # Holds the npm credential and runs nothing from the repository: no checkout. It checks each
+  # tarball is ours, this version and this commit, that `next` would move forward, and publishes.
+  publish:
+    needs: [plan, image-tag, pack]
+    # npm trusted publishing (OIDC) needs a GitHub-hosted runner: this job stays off Blacksmith.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: next
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          registry-url: "https://registry.npmjs.org"
+      - uses: actions/download-artifact@v4
+        with:
+          name: next-tarballs
+          path: tarballs
+      - name: Check and publish under next
+        working-directory: tarballs
         env:
           VERSION: ${{ needs.plan.outputs.version }}
           SHA: ${{ needs.plan.outputs.sha }}
           DIGEST: ${{ needs.image-tag.outputs.digest }}
         run: |
+          set -euo pipefail
+          [[ $VERSION =~ ^[0-9]+\.[0-9]+\.[0-9]+-next\.[0-9]+$ ]] || {
+            echo "::error::$VERSION is not a next version."
+            exit 1
+          }
+          # `next` only moves forward: an older commit re-run after a newer one published skips.
+          current=$(npm view @sealant/runtime-client dist-tags.next 2>/dev/null || true)
+          if [[ -n $current ]] && ! node -e '
+            const order = (v) => { const [core, n] = v.split("-next."); return [...core.split(".").map(Number), Number(n ?? Infinity)]; };
+            const [a, b] = [order(process.argv[1]), order(process.argv[2])];
+            const i = a.findIndex((x, k) => x !== b[k]);
+            process.exit(i >= 0 && a[i] > b[i] ? 0 : 1);
+          ' "$VERSION" "$current"; then
+            echo "::notice::npm's next is $current, not older than $VERSION; nothing published."
+            exit 0
+          fi
+          # The protocol first: the client depends on its exact version.
+          for name in runtime-protocol runtime-client; do
+            tarball="sealant-$name-$VERSION.tgz"
+            [[ -f $tarball ]] || { echo "::error::$tarball is missing."; exit 1; }
+            # A re-run after a partial publish: the protocol may already be there.
+            if [[ -n $(npm view "@sealant/$name@$VERSION" version 2>/dev/null) ]]; then
+              echo "@sealant/$name@$VERSION is already published."
+              continue
+            fi
+            # shellcheck disable=SC2016 # JavaScript template literals, not shell expansions
+            tar -xzOf "$tarball" package/package.json | node -e '
+              const manifest = JSON.parse(require("node:fs").readFileSync(0, "utf8"));
+              const [name, version, commit] = process.argv.slice(1);
+              const problems = [
+                manifest.name !== `@sealant/${name}` && `name ${manifest.name}`,
+                manifest.version !== version && `version ${manifest.version}`,
+                !/-next\.\d+$/.test(manifest.version) && `${manifest.version} is not a next version`,
+                manifest.gitHead !== commit && `gitHead ${manifest.gitHead}`,
+              ].filter(Boolean);
+              if (problems.length > 0) { console.error(`::error::${name}: ${problems.join(", ")}`); process.exit(1); }
+            ' "$name" "$VERSION" "$SHA"
+            npm publish "./$tarball" --tag next --access public --provenance --ignore-scripts
+          done
           {
             echo "## sealantd $VERSION"
             echo
