@@ -464,6 +464,9 @@ struct ClassWrite<'i> {
     /// Files the walk found to write, written together by [`Materializer::write_files`] once
     /// every directory they go into exists.
     pending: Vec<FileWrite>,
+    /// The workspace class: a harness credential file it names ([`is_harness_credential`]) is
+    /// never restored.
+    skip_credentials: bool,
 }
 
 /// One file a class writes: its virtual path, where it goes, and what goes in it.
@@ -491,6 +494,17 @@ fn restore_writers() -> usize {
 
 /// A file a chunked class restored: see [`ClassWrite::files`].
 type ClassFile = (String, PathBuf, Option<(u32, i128)>);
+
+/// Whether a workspace-class virtual path is a harness credential file
+/// ([`index::CREDENTIAL_FILES`], under the class's `harness/` root). Capture leaves these out,
+/// but a capture made before a file joined the list still holds it (opencode's `mcp-auth.json`
+/// before #136): a restore never writes one back, so one person's login does not reach the next
+/// session's harness home. The file the platform injected at launch is not the plan's, and the
+/// sweep never sees it (the listing leaves the same files out), so it stays as it is.
+fn is_harness_credential(v: &str) -> bool {
+    v.strip_prefix("harness/")
+        .is_some_and(|rel| index::CREDENTIAL_FILES.contains(&rel))
+}
 
 fn join_virtual(prefix: &str, name: &str) -> String {
     if prefix.is_empty() {
@@ -627,6 +641,7 @@ impl<'a> Materializer<'a> {
                 dirs: Vec::new(),
                 files: Vec::new(),
                 pending: Vec::new(),
+                skip_credentials: true,
             };
             for entry in &root.entries {
                 let Some(target) = roots.workspace_path(&git_dir, &entry.name) else {
@@ -730,6 +745,7 @@ impl<'a> Materializer<'a> {
                 dirs: Vec::new(),
                 files: Vec::new(),
                 pending: Vec::new(),
+                skip_credentials: false,
             };
             self.write_dir(&dirs, &bulk.root, &root, "", &mut write, &mut report)?;
             Self::write_files(&store, &mut write, &mut report)?;
@@ -1265,6 +1281,10 @@ impl<'a> Materializer<'a> {
         for entry in &obj.entries {
             let path = dir.join(entry.os_name());
             let v = join_virtual(vdir, &entry.name);
+            if write.skip_credentials && entry.kind != EntryKind::Dir && is_harness_credential(&v) {
+                tracing::warn!(path = %v, "materialize: a captured harness credential is not restored");
+                continue;
+            }
             write.planned.insert(v.clone());
             if entry.kind != EntryKind::Dir && write.tracked.contains(&v) {
                 continue;
@@ -1670,6 +1690,32 @@ fn set_symlink_mtime(path: &Path, mtime_ns: i128) -> Result<(), MaterializeError
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every credential file, under the workspace class's harness root, is never restored;
+    /// a file of the same name anywhere else is.
+    #[test]
+    fn a_captured_harness_credential_is_never_restored() {
+        for credential in index::CREDENTIAL_FILES {
+            assert!(
+                is_harness_credential(&format!("harness/{credential}")),
+                "{credential}"
+            );
+            assert!(
+                !is_harness_credential(&format!("tree/{credential}")),
+                "{credential}"
+            );
+            assert!(!is_harness_credential(credential), "{credential}");
+        }
+        assert!(is_harness_credential(
+            "harness/.local/share/opencode/mcp-auth.json"
+        ));
+        assert!(!is_harness_credential(
+            "harness/.local/share/opencode/opencode.db"
+        ));
+        assert!(!is_harness_credential(
+            "harness/.local/share/opencode/mcp-auth.json.bak"
+        ));
+    }
 
     /// A directory whose metadata cannot be restored fails the materialize (it used to be
     /// ignored, leaving the directory with whatever mode and mtime the writes gave it).
