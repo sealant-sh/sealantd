@@ -479,6 +479,7 @@ pub fn boot_from(
                 &head.manifest.sections.bulk,
                 &config.platform,
             );
+            let started = std::time::Instant::now();
             let report = materializer
                 .materialize(&manifest.manifest, MaterializeClass::All)
                 .map_err(|error| {
@@ -486,6 +487,7 @@ pub fn boot_from(
                 })?;
             captured_config = report.git_config;
             tracing::info!(
+                elapsed_ms = started.elapsed().as_millis(),
                 files = report.files,
                 bytes = report.bytes,
                 files_skipped = report.files_skipped,

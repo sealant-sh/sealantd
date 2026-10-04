@@ -50,6 +50,7 @@ use std::io::{self, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -460,6 +461,32 @@ struct ClassWrite<'i> {
     /// Every file the class restored, written or reused: (virtual path, path on disk, the mode
     /// and mtime it has; `None` for a hardlink member, which has its canonical's).
     files: Vec<ClassFile>,
+    /// Files the walk found to write, written together by [`Materializer::write_files`] once
+    /// every directory they go into exists.
+    pending: Vec<FileWrite>,
+}
+
+/// One file a class writes: its virtual path, where it goes, and what goes in it.
+struct FileWrite {
+    v: String,
+    dir: PathBuf,
+    path: PathBuf,
+    name: Vec<u8>,
+    chunks: Vec<ChunkId>,
+    mode: u32,
+    mtime: i128,
+}
+
+/// What one writer thread did: the jobs it wrote (by position, with their stat and size), and
+/// the failure that stopped it, if one did.
+type WriterOutcome = (Vec<(usize, FileStat, u64)>, Option<MaterializeError>);
+
+/// Threads a restore writes files on: every core the process may use, up to 16. A restore of a
+/// 127 000-file `node_modules` on an overlay filesystem spent most of its 40 s creating files one
+/// after another (Docker box, 2026-10-04); a copy of the same tree there took 14.8 s on one
+/// thread and 2.1 s on twelve.
+fn restore_writers() -> usize {
+    std::thread::available_parallelism().map_or(4, |n| n.get().min(16))
 }
 
 /// A file a chunked class restored: see [`ClassWrite::files`].
@@ -599,6 +626,7 @@ impl<'a> Materializer<'a> {
                 links: Vec::new(),
                 dirs: Vec::new(),
                 files: Vec::new(),
+                pending: Vec::new(),
             };
             for entry in &root.entries {
                 let Some(target) = roots.workspace_path(&git_dir, &entry.name) else {
@@ -610,20 +638,13 @@ impl<'a> Materializer<'a> {
                 let Some(child) = entry.child.as_ref() else {
                     continue;
                 };
-                self.write_dir(
-                    &store,
-                    &dirs,
-                    child,
-                    &target,
-                    &entry.name,
-                    &mut write,
-                    &mut report,
-                )?;
+                self.write_dir(&dirs, child, &target, &entry.name, &mut write, &mut report)?;
                 if entry.kind == EntryKind::Dir && (entry.name == ".git" || entry.name == "harness")
                 {
                     class_roots.push((target, entry.mode, entry.mtime));
                 }
             }
+            Self::write_files(&store, &mut write, &mut report)?;
             report.git_config = write.planned.contains(".git/config");
             let resolve = |v: &str| roots.workspace_path(&git_dir, v);
             Self::link_all(&write.links, &resolve, &mut report)?;
@@ -708,16 +729,10 @@ impl<'a> Materializer<'a> {
                 links: Vec::new(),
                 dirs: Vec::new(),
                 files: Vec::new(),
+                pending: Vec::new(),
             };
-            self.write_dir(
-                &store,
-                &dirs,
-                &bulk.root,
-                &root,
-                "",
-                &mut write,
-                &mut report,
-            )?;
+            self.write_dir(&dirs, &bulk.root, &root, "", &mut write, &mut report)?;
+            Self::write_files(&store, &mut write, &mut report)?;
             let resolve = |v: &str| Some(root.join(crate::tree::os_of_key(v)));
             Self::link_all(&write.links, &resolve, &mut report)?;
             restored_groups(&mut restored, LinkClass::Bulk, &write.links, &resolve);
@@ -1230,10 +1245,8 @@ impl<'a> Materializer<'a> {
                 .is_some_and(|c| c == known.chunks.as_slice())
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn write_dir(
         &self,
-        store: &ChunkStore,
         dirs: &Dirs,
         key: &str,
         dir: &Path,
@@ -1259,7 +1272,7 @@ impl<'a> Materializer<'a> {
             match entry.kind {
                 EntryKind::Dir => {
                     if let Some(child) = &entry.child {
-                        self.write_dir(store, dirs, child, &path, &v, write, report)?;
+                        self.write_dir(dirs, child, &path, &v, write, report)?;
                         write.dirs.push((path, entry.mode, entry.mtime));
                     }
                 }
@@ -1277,41 +1290,17 @@ impl<'a> Materializer<'a> {
                         }
                         continue;
                     }
-                    // Staged in a file of its own beside it: a name already there (a user's
-                    // `.<name>.capture-tmp`) is never truncated or consumed (review 16 #2).
-                    let (tmp, mut f) = longpath::create_temp(
-                        dir,
-                        &crate::tree::bytes_of(&entry.name),
-                        ".capture-tmp",
-                        0o600,
-                    )
-                    .at("create a staging file in", dir)?;
-                    let written = (|| {
-                        for id in entry.chunks.iter().flatten() {
-                            let data = store.read(id)?;
-                            f.write_all(&data).at("write", &tmp)?;
-                            report.bytes += data.len() as u64;
-                        }
-                        f.set_permissions(fs::Permissions::from_mode(entry.mode))
-                            .at("chmod", &tmp)?;
-                        set_mtime(&f, entry.mtime).at("set the mtime of", &tmp)?;
-                        drop(f);
-                        remove_existing(&path).at("rm", &path)?;
-                        longpath::rename(&tmp, &path).at("rename into", &path)
-                    })();
-                    if let Err(e) = written {
-                        longpath::remove_file(&tmp).ok();
-                        return Err(e);
-                    }
-                    report.files += 1;
-                    let meta = longpath::symlink_metadata(&path).at("stat", &path)?;
-                    write.index.files.insert(
+                    // Written with the class's other files once the walk has made every
+                    // directory (`write_files`).
+                    write.pending.push(FileWrite {
                         v,
-                        IndexedFile {
-                            stat: FileStat::of(&meta),
-                            chunks: entry.chunks.clone().unwrap_or_default(),
-                        },
-                    );
+                        dir: dir.to_path_buf(),
+                        path,
+                        name: crate::tree::bytes_of(&entry.name).into_owned(),
+                        chunks: entry.chunks.clone().unwrap_or_default(),
+                        mode: entry.mode,
+                        mtime: entry.mtime,
+                    });
                 }
                 EntryKind::Symlink => {
                     let target = PathBuf::from(entry.os_target().unwrap_or_default());
@@ -1337,6 +1326,113 @@ impl<'a> Materializer<'a> {
             }
         }
         Ok(())
+    }
+
+    /// Write the files the walk left pending, on [`restore_writers`] threads: each one staged
+    /// beside its path and renamed into place, as one at a time did. The first failure stops the
+    /// rest and is answered; what was written is in the index either way.
+    fn write_files(
+        store: &ChunkStore,
+        write: &mut ClassWrite<'_>,
+        report: &mut MaterializeReport,
+    ) -> Result<(), MaterializeError> {
+        let jobs = std::mem::take(&mut write.pending);
+        if jobs.is_empty() {
+            return Ok(());
+        }
+        let started = std::time::Instant::now();
+        let next = AtomicUsize::new(0);
+        let failed = AtomicBool::new(false);
+        let threads = restore_writers().min(jobs.len());
+        let outcomes: Vec<WriterOutcome> = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..threads)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let mut written = Vec::new();
+                        while !failed.load(Ordering::Relaxed) {
+                            let at = next.fetch_add(1, Ordering::Relaxed);
+                            let Some(job) = jobs.get(at) else { break };
+                            match Self::write_file(store, job) {
+                                Ok((stat, bytes)) => written.push((at, stat, bytes)),
+                                Err(error) => {
+                                    failed.store(true, Ordering::Relaxed);
+                                    return (written, Some(error));
+                                }
+                            }
+                        }
+                        (written, None)
+                    })
+                })
+                .collect();
+            workers
+                .into_iter()
+                .map(|worker| {
+                    worker
+                        .join()
+                        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+                })
+                .collect()
+        });
+        let mut first_error = None;
+        let count = jobs.len();
+        let mut jobs: Vec<Option<FileWrite>> = jobs.into_iter().map(Some).collect();
+        for (written, error) in outcomes {
+            for (at, stat, bytes) in written {
+                let Some(job) = jobs.get_mut(at).and_then(Option::take) else {
+                    continue;
+                };
+                report.files += 1;
+                report.bytes += bytes;
+                write.index.files.insert(
+                    job.v,
+                    IndexedFile {
+                        stat,
+                        chunks: job.chunks,
+                    },
+                );
+            }
+            if first_error.is_none() {
+                first_error = error;
+            }
+        }
+        tracing::debug!(
+            files = count,
+            threads,
+            elapsed_ms = started.elapsed().as_millis(),
+            "materialize: files written"
+        );
+        first_error.map_or(Ok(()), Err)
+    }
+
+    /// One file: staged in a file of its own beside it — a name already there (a user's
+    /// `.<name>.capture-tmp`) is never truncated or consumed (review 16 #2) — then given its mode
+    /// and mtime and renamed over whatever was at its path. Answers its stat and its size.
+    fn write_file(
+        store: &ChunkStore,
+        job: &FileWrite,
+    ) -> Result<(FileStat, u64), MaterializeError> {
+        let (tmp, mut f) = longpath::create_temp(&job.dir, &job.name, ".capture-tmp", 0o600)
+            .at("create a staging file in", &job.dir)?;
+        let mut bytes = 0u64;
+        let written = (|| {
+            for id in &job.chunks {
+                let data = store.read(id)?;
+                f.write_all(&data).at("write", &tmp)?;
+                bytes += data.len() as u64;
+            }
+            f.set_permissions(fs::Permissions::from_mode(job.mode))
+                .at("chmod", &tmp)?;
+            set_mtime(&f, job.mtime).at("set the mtime of", &tmp)?;
+            drop(f);
+            remove_existing(&job.path).at("rm", &job.path)?;
+            longpath::rename(&tmp, &job.path).at("rename into", &job.path)
+        })();
+        if let Err(e) = written {
+            longpath::remove_file(&tmp).ok();
+            return Err(e);
+        }
+        let meta = longpath::symlink_metadata(&job.path).at("stat", &job.path)?;
+        Ok((FileStat::of(&meta), bytes))
     }
 
     fn link_all(
