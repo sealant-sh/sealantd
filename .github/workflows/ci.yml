@@ -15,8 +15,11 @@ on:
 permissions:
   contents: read
 
+# A pull request's new push cancels its previous run. A push to main is never cancelled: each main
+# commit gets its own group, so every one finishes, and `next` (which runs on a passed `ci` of a
+# main push) sees every main commit, not only the last of a quick series.
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
   cancel-in-progress: true
 
 jobs:
