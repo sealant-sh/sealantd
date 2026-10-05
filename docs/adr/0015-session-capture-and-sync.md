@@ -289,6 +289,15 @@ edits made before a move to another executor. The logins themselves live in each
 outside every capture root, and reach the saved directory only through a link; the tables are the
 backstop for a write that broke a link and left a login there.
 
+Ownership comes from the path and an owner map passed at launch (`SEALANT_CAPTURE_OWNER_MAP`),
+never from the capture, which records modes and mtimes only. Each mapped person's `people/<id>/` is
+restored owned by their uid and the shared group: the directory itself 0710, `conversations/` and
+everything under it group-readable and -writable (setgid on directories), every other entry at its
+recorded mode. The worktree and its git directory take the group from their setgid roots (owned by
+the change's owner) and get group write where the owner can write, group execute where the owner
+can execute and setgid on directories, in the same `chmod` the restore makes for each entry. A
+directory absent from the map (a removed member's) is restored as before, root's.
+
 ### Cadence and budgets
 
 Small class: 2 s of quiet after any change, at most every 10 s while the tree stays dirty, at every

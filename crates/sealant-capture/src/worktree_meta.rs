@@ -461,6 +461,10 @@ pub struct MetaScope {
     pub nested: Vec<String>,
     /// Absolute paths left out (the staging directory, the harness home).
     pub skip_abs: Vec<PathBuf>,
+    /// The worktree is the group's (a restore under an owner map, [`crate::owners`]): every
+    /// mode is set with group write where the owner can write, group execute where the owner
+    /// can execute, and setgid on a directory, in the same `chmod`.
+    pub shared_group: bool,
 }
 
 fn under(rel: &[u8], set: &[String]) -> bool {
@@ -1221,7 +1225,7 @@ pub fn apply_over(
             dirs.push(item);
             continue;
         }
-        applied.changed += u64::from(settle(root, &item.0, item.1)?);
+        applied.changed += u64::from(settle(root, &item.0, item.1, scope.shared_group)?);
     }
     let depth = |rel: &[u8]| {
         if rel.is_empty() {
@@ -1232,7 +1236,7 @@ pub fn apply_over(
     };
     dirs.sort_by(|a, b| depth(&b.0).cmp(&depth(&a.0)).then_with(|| a.0.cmp(&b.0)));
     for (rel, e) in dirs {
-        applied.changed += u64::from(settle(root, rel, e)?);
+        applied.changed += u64::from(settle(root, rel, e, scope.shared_group)?);
     }
     // Every link made: the names the links join are one inode (per filesystem: a class's own
     // group that spans two was copied across).
@@ -1561,11 +1565,18 @@ fn relink(canonical: &Path, abs: &Path) -> io::Result<()> {
 }
 
 /// Set one path's mode and mtime where they differ; whether anything changed.
-fn settle(root: &Path, rel: &[u8], e: &MetaEntry) -> Result<bool, MetaError> {
+fn settle(root: &Path, rel: &[u8], e: &MetaEntry, shared_group: bool) -> Result<bool, MetaError> {
     let abs = abs_of(root, rel);
     let meta = longpath::symlink_metadata(&abs).map_err(io_err(rel))?;
     let mut changed = false;
-    if let Some(mode) = e.mode
+    let mode = e.mode.map(|mode| {
+        if shared_group {
+            crate::owners::shared_mode(mode, e.kind == MetaKind::Dir)
+        } else {
+            mode
+        }
+    });
+    if let Some(mode) = mode
         && e.kind != MetaKind::Symlink
         && meta.mode() & 0o7777 != mode
     {
@@ -1621,6 +1632,7 @@ mod tests {
             bulk_dirs: Vec::new(),
             nested: Vec::new(),
             skip_abs: Vec::new(),
+            shared_group: false,
         };
         let scratch = tmp.path().join("scratch");
         let (tree, _) = repo.worktree_tree(&scratch, &scope.excludes).unwrap();

@@ -29,6 +29,13 @@ use crate::shutdown::ShutdownSignal;
 /// Daemon build version.
 pub const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// What this daemon can do beyond the protocol schema, by name ([`Capabilities::supports`]):
+///
+/// - `restore.owner_map`: a capture restore takes an owner map (`SEALANT_CAPTURE_OWNER_MAP`),
+///   gives each person's saved directory to their uid and the worktree to the group
+///   ([`sealant_capture::owners`]), and sets the group's default ACLs at preparation.
+pub const SUPPORTS: &[&str] = &["restore.owner_map"];
+
 /// The environment entry a test marks its processes with, to narrow a sweep to them.
 pub const SWEEP_MARK_ENV: &str = "SEALANTD_SWEEP_MARK";
 
@@ -1114,7 +1121,7 @@ impl Runtime {
         }
     }
 
-    /// Build a capabilities report (honest about what is wired today).
+    /// Build a capabilities report (honest about what is wired today; [`SUPPORTS`]).
     #[must_use]
     pub fn capabilities(&self) -> Capabilities {
         Capabilities {
@@ -1135,6 +1142,7 @@ impl Runtime {
                 pipe_sessions: true,
             },
             limits: self.config.limits,
+            supports: SUPPORTS.iter().map(|s| (*s).to_owned()).collect(),
         }
     }
 

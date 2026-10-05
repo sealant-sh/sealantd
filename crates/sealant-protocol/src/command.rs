@@ -649,6 +649,12 @@ pub struct Capabilities {
     pub features: FeatureMatrix,
     /// Resource limits.
     pub limits: Limits,
+    /// What this daemon can do beyond the schema, by name: `restore.owner_map` (a capture
+    /// restore takes an owner map), `exec.user` and `dotfiles.user` (an execution and the
+    /// dotfiles applier run as a given user). Mend's per-person layout runs on a daemon that
+    /// names all three. A daemon from before this list reports none.
+    #[serde(default)]
+    pub supports: Vec<String>,
 }
 
 /// Result of `runtime.health`.

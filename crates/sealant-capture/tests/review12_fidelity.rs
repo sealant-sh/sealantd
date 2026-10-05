@@ -331,6 +331,7 @@ fn a_split_restored_group_fails_a_strict_apply() {
         bulk_dirs: vec!["node_modules".to_owned()],
         nested: Vec::new(),
         skip_abs: Vec::new(),
+        shared_group: false,
     };
     let doc = worktree_meta::capture(&repo, &tree, &scope, None)
         .unwrap()

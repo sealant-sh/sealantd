@@ -168,6 +168,8 @@ pub struct CaptureConfig {
     pub root: PathBuf,
     /// Harness home (transcripts, agent state); captured in the workspace class.
     pub harness_home: Option<PathBuf>,
+    /// Who owns what a materialize writes ([`crate::owners`]); `None` restores as before.
+    pub owners: Option<crate::owners::OwnerMap>,
     /// Staging directory; default `<root>/.sealantd/capture`.
     pub staging_dir: Option<PathBuf>,
     /// Directory names treated as bulk wherever they appear.
@@ -245,6 +247,7 @@ impl CaptureConfig {
             epoch,
             root: root.to_path_buf(),
             harness_home: None,
+            owners: None,
             staging_dir: None,
             bulk_dirs: index::DEFAULT_BULK_DIRS
                 .iter()
@@ -1345,6 +1348,7 @@ impl CaptureEngine {
         targets.index_dir = self.staging.index_dir();
         targets.staging_dir = self.config.staging_dir();
         targets.bulk_dirs = self.config.bulk_dirs.clone();
+        targets.owners = self.config.owners.clone();
         targets
     }
 
@@ -1622,6 +1626,7 @@ impl CaptureEngine {
             .into_iter()
             .flatten()
             .collect(),
+            shared_group: self.config.owners.is_some(),
         }
     }
 

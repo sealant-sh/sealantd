@@ -327,6 +327,7 @@ pub fn boot_from(
 
     let mut config = CaptureConfig::new(&worktree_id, epoch, working_directory);
     config.harness_home = source.harness_home.clone();
+    config.owners = source.owners.clone();
     // The executor a completed final flush is sealed under: the launch the session token was
     // issued for, as the plan names it (cross-repo decision 5), and nothing else — not the
     // workspace id this daemon was started as, which names a runtime resource, not a launch.
@@ -380,6 +381,13 @@ pub fn boot_from(
         staging_dir: config.staging_dir(),
     };
 
+    // Mend's per-person layout: the worktree is the group's before anything is restored into
+    // it, and the group's default ACL is on it and on the image's shared toolchain directories.
+    if let Some(owners) = &source.owners
+        && !source.recovery
+    {
+        prepare_shared_group(owners, working_directory)?;
+    }
     // A daemon restarting on its own disk finds it at or past the head: staged captures not
     // shipped yet, and whatever changed after the last snap. Materializing the head over it
     // would take that work back, so the disk is left as it is and the queue resumes.
@@ -468,6 +476,7 @@ pub fn boot_from(
             let mut targets =
                 MaterializeTargets::new(working_directory, source.harness_home.clone());
             targets.bulk_dirs = config.bulk_dirs.clone();
+            targets.owners = source.owners.clone();
             let materializer = Materializer::new(sink.as_ref(), targets);
             let mut manifest = materializer
                 .fetch_manifest(&head.manifest_key, &head.capture_id)
@@ -581,6 +590,43 @@ pub fn boot_from(
         layout,
         resumed,
     })
+}
+
+/// The image's directories toolchains share in Mend's per-person layout: their top directories
+/// get the group's default ACL at boot, since an image build drops one set in a `RUN` step.
+pub const SHARED_TOOLCHAIN_DIRS: &[&str] = &["/opt", "/var/cache"];
+
+/// Executor preparation under an owner map: the worktree root owned by the change's owner and
+/// the group, group-writable and setgid, and the group's default ACL on it and on
+/// [`SHARED_TOOLCHAIN_DIRS`]. A filesystem that takes no ACL is reported and the boot goes on:
+/// the restore's modes still make the worktree writable by the group.
+pub(crate) fn prepare_shared_group(
+    owners: &sealant_capture::owners::OwnerMap,
+    working_directory: &Path,
+) -> Result<(), BootError> {
+    owners
+        .prepare_worktree_root(working_directory)
+        .map_err(|error| {
+            BootError::config(format!(
+                "give {} to its owner and group: {error}",
+                working_directory.display()
+            ))
+        })?;
+    let mut dirs: Vec<&Path> = vec![working_directory];
+    dirs.extend(SHARED_TOOLCHAIN_DIRS.iter().map(Path::new));
+    match sealant_capture::owners::apply_default_acl(&dirs, owners.gid) {
+        Ok(()) => tracing::info!(
+            gid = owners.gid,
+            worktree_owner = owners.worktree,
+            people = owners.people.len(),
+            "owner map: the worktree is the group's, default ACLs set"
+        ),
+        Err(error) => tracing::warn!(
+            %error,
+            "owner map: no default ACL; restored modes still give the group write"
+        ),
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -720,6 +766,7 @@ mod tests {
             object_ca_file: None,
             recovery: false,
             launch_id: None,
+            owners: None,
         }
     }
 
@@ -1780,6 +1827,7 @@ mod tests {
         let sink: Arc<dyn BlobSink> = capture_source(tmp.path(), &registrar);
         let named = |launch: &str| CaptureSourceConfig {
             launch_id: Some(launch.to_owned()),
+            owners: None,
             ..source()
         };
         let ws = tmp.path().join("ws");

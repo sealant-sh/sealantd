@@ -371,6 +371,7 @@ fn a_strict_restore_refuses_one_inode_with_two_metadata_promises() {
         bulk_dirs: vec![],
         nested: vec![],
         skip_abs: vec![],
+        shared_group: false,
     };
     let stat = |name: &str| {
         let m = fs::metadata(fx.root.join(name)).unwrap();

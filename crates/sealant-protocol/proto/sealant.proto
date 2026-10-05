@@ -511,6 +511,9 @@ message Capabilities {
   string daemon_version = 6;
   FeatureMatrix features = 7;
   Limits limits = 8;
+  // What this daemon can do beyond the schema, by name (`restore.owner_map`, `exec.user`,
+  // `dotfiles.user`).
+  repeated string supports = 9;
 }
 
 message HealthReport {

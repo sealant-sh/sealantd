@@ -1159,6 +1159,7 @@ impl From<Capabilities> for wire::Capabilities {
             daemon_version: c.daemon_version,
             features: Some(c.features.into()),
             limits: Some(c.limits.into()),
+            supports: c.supports,
         }
     }
 }
@@ -1180,6 +1181,7 @@ impl TryFrom<wire::Capabilities> for Capabilities {
                 .limits
                 .ok_or(WireError::MissingField("Capabilities.limits"))?
                 .into(),
+            supports: c.supports,
         })
     }
 }
