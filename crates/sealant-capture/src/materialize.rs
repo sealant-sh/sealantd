@@ -1700,7 +1700,28 @@ mod tests {
     fn a_captured_harness_credential_is_never_restored() {
         for credential in index::harness_exclusions() {
             let path = credential.path;
+            if credential.kind == index::CredentialKind::Pattern {
+                let example = path.replace('*', "2.sqlite");
+                assert!(
+                    is_harness_credential(&format!("harness/{example}")),
+                    "{path}"
+                );
+                assert!(
+                    is_harness_credential(&format!("harness/people/acct_1/{example}")),
+                    "{path}"
+                );
+                assert!(!is_harness_credential(&format!("tree/{example}")), "{path}");
+                continue;
+            }
             assert!(is_harness_credential(&format!("harness/{path}")), "{path}");
+            assert!(
+                is_harness_credential(&format!("harness/people/acct_1/{path}")),
+                "{path}: under a person's saved directory too"
+            );
+            assert!(
+                !is_harness_credential(&format!("harness/people/{path}")),
+                "{path}: only under a person's directory, not as one"
+            );
             assert!(!is_harness_credential(&format!("tree/{path}")), "{path}");
             assert!(!is_harness_credential(path), "{path}");
             assert_eq!(
