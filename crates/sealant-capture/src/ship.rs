@@ -2122,6 +2122,15 @@ impl Shipper {
             self.waiting.fetch_sub(1, Ordering::SeqCst);
             guard
         } else {
+            // A waiting flush takes the lock first. The worker's bulk upload yields to it and
+            // comes straight back for the lock, and the lock is not fair: the worker, still on
+            // its core, took it again before the woken flush ran, yielded again, and so on — a
+            // thousand times in half a second here, and on arm64 CI a suspend flush beside a
+            // 5 s bulk upload waited 5 to 19 s. The flush counts itself out of `waiting` once
+            // it holds the lock; the worker then waits on the lock behind it.
+            while self.waiting.load(Ordering::SeqCst) > 0 {
+                thread::sleep(Duration::from_millis(1));
+            }
             self.pass.lock()
         };
         let _pass = guard.unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -2661,23 +2670,51 @@ mod tests {
         assert!(staging.pending().unwrap().is_empty());
     }
 
+    /// Over budget, a cycle sleeps until its CPU is back within its fraction of the wall time.
+    /// Held to that, not to a sleep of a set length: the CPU is read from the thread's clock,
+    /// and a thread a loaded runner keeps off the CPU while it burns owes less sleep.
     #[test]
     fn duty_cycle_sleeps_when_over_budget() {
         let mut c = DutyCycle::new(0.5);
-        // Burn CPU.
+        // Burn 40 ms of this thread's CPU (bounded, should the clock not move).
         let mut x = 0u64;
         let start = Instant::now();
-        while start.elapsed() < Duration::from_millis(40) {
+        while thread_cpu().saturating_sub(c.cpu_start) < Duration::from_millis(40)
+            && start.elapsed() < Duration::from_secs(10)
+        {
             x = x
                 .wrapping_mul(6364136223846793005)
                 .wrapping_add(1442695040888963407);
         }
         assert!(x != 1);
+        let burnt = thread_cpu().saturating_sub(c.cpu_start);
+        assert!(burnt >= Duration::from_millis(40), "burnt {burnt:?}");
         c.pace();
-        assert!(c.slept >= Duration::from_millis(20), "slept {:?}", c.slept);
+        // Half a core: the CPU burnt is at most half the wall time once the cycle has paced.
+        let wall = c.started.elapsed();
+        assert!(
+            wall >= burnt * 2,
+            "{burnt:?} of CPU after {wall:?} of wall time (slept {:?})",
+            c.slept
+        );
         let mut never = DutyCycle::new(1.0);
         never.pace();
         assert_eq!(never.slept, Duration::ZERO);
+    }
+
+    /// The debt itself: 100 ms of CPU at half a core owes 200 ms of wall time, less the wall
+    /// time already gone.
+    #[test]
+    fn duty_cycle_owes_the_wall_time_its_cpu_needs() {
+        let mut c = DutyCycle::new(0.5);
+        let owed = c.debt(c.cpu_start + Duration::from_millis(100));
+        let wall = c.started.elapsed();
+        assert!(
+            owed + wall >= Duration::from_millis(200),
+            "owed {owed:?} after {wall:?}"
+        );
+        assert!(owed <= Duration::from_millis(200), "owed {owed:?}");
+        assert_eq!(c.slept, owed, "the debt is counted as slept");
     }
 
     /// CPU charged from helper threads counts like the cycle's own.
@@ -2686,6 +2723,12 @@ mod tests {
         let mut c = DutyCycle::new(0.5);
         c.charge(Duration::from_millis(100));
         c.pace();
-        assert!(c.slept >= Duration::from_millis(50), "slept {:?}", c.slept);
+        // Its own CPU (a few microseconds) plus the 100 ms charged, at half a core.
+        let wall = c.started.elapsed();
+        assert!(
+            wall >= Duration::from_millis(200),
+            "paced to {wall:?} (slept {:?})",
+            c.slept
+        );
     }
 }

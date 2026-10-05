@@ -564,12 +564,9 @@ fn a_due_small_snap_is_not_delayed_by_a_bulk_build() {
         );
         std::thread::sleep(Duration::from_millis(10));
     }
-    std::thread::sleep(Duration::from_millis(700));
-    assert!(
-        runner.snapshot().bulk_running,
-        "the bulk build is still running"
-    );
-
+    // The turn snap is asked for as soon as the build is seen running, not after a wait: the
+    // build that reads the 30 MB starts with the runner, and on a fast runner it was over
+    // within 700 ms of being seen.
     let t0 = Instant::now();
     let turn = runner.snap(CaptureKind::Turn).unwrap();
     let latency = t0.elapsed();

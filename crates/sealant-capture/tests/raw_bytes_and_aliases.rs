@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use sealant_capture::{
     CadenceRunner, CaptureConfig, CaptureEngine, CaptureKind, Class, InMemoryRegistrar, Incomplete,
-    LocalDir, MaterializeClass, MaterializeTargets, Materializer, SnapRequest,
+    LocalDir, MaterializeClass, MaterializeTargets, Materializer, SnapRequest, WatchMode,
 };
 
 const EXECUTOR: &str = "exec-r6";
@@ -156,13 +156,23 @@ fn a_filter_driver_named_in_raw_bytes_never_runs() {
     assert_eq!(fs::read(restored.join("work.txt")).unwrap(), b"work\n");
 }
 
-/// A cadence whose clocks fire fast: the loss window the tests hold a write to.
+/// A cadence whose clocks fire fast — the alias poll runs on the 100 ms maximum interval — and
+/// whose reconcile intervals are out of reach: only the alias poll can find a write no watch
+/// sees.
 fn fast(config: &mut CaptureConfig) {
     config.cadence.quiet = Duration::from_millis(40);
     config.cadence.max_interval = Duration::from_millis(100);
     config.cadence.bulk_quiet = Duration::from_millis(40);
     config.cadence.bulk_max_interval = Duration::from_millis(100);
+    config.cadence.reconcile = Duration::from_secs(600);
+    config.cadence.bulk_reconcile = Duration::from_secs(600);
 }
+
+/// How long a write the alias poll should find may take to reach the chain's head. Locally
+/// well under a second; generous because arm64 CI runners stall for seconds at a time (two
+/// tests of this file missed a 2 s window in the same run). A class the poll never dirties is
+/// not snapped again until its reconcile interval, minutes away ([`fast`]), and still fails.
+const ALIAS_WINDOW: Duration = Duration::from_secs(20);
 
 #[test]
 fn a_write_through_a_bulk_name_of_a_tracked_file_is_captured_within_the_cadence() {
@@ -201,14 +211,14 @@ fn a_write_through_a_bulk_name_of_a_tracked_file_is_captured_within_the_cadence(
         fs::read(fx.root.join("a")).unwrap(),
         b"work changed through bulk alias\n"
     );
-    // Twenty maximum intervals: a class never snapped again fails, one snapped fails no more.
-    let captured = fx.head_restores("a", Duration::from_secs(2));
+    let captured = fx.head_restores("a", ALIAS_WINDOW);
     let snapshot = runner.snapshot();
     runner.stop();
     assert!(
         captured,
-        "the tracked name kept the old bytes for twenty maximum intervals: {snapshot:?}"
+        "the tracked name kept the old bytes for {ALIAS_WINDOW:?}: {snapshot:?}"
     );
+    assert_eq!(snapshot.small_mode, WatchMode::Watched, "{snapshot:?}");
 }
 
 #[test]
@@ -234,15 +244,16 @@ fn a_write_through_a_name_outside_the_workspace_is_captured_within_the_cadence()
     std::thread::sleep(Duration::from_millis(2_200));
 
     fs::write(&alias, b"work changed through external alias\n").unwrap();
-    let captured = fx.head_restores("a", Duration::from_secs(2));
+    let captured = fx.head_restores("a", ALIAS_WINDOW);
     let snapshot = runner.snapshot();
     runner.stop();
     assert!(
         captured,
-        "a write through a name outside the workspace went uncaptured for twenty maximum \
-         intervals: {snapshot:?}"
+        "a write through a name outside the workspace went uncaptured for {ALIAS_WINDOW:?}: \
+         {snapshot:?}"
     );
     assert!(snapshot.aliases_moved > 0, "{snapshot:?}");
+    assert_eq!(snapshot.small_mode, WatchMode::Watched, "{snapshot:?}");
 }
 
 #[test]
@@ -264,7 +275,8 @@ fn a_watched_class_is_read_whole_on_its_reconcile_interval() {
     std::thread::sleep(Duration::from_millis(100));
 
     fs::write(&alias, b"work no watch saw\n").unwrap();
-    let captured = fx.head_restores("a", Duration::from_secs(3));
+    // Generous for the same stalls as [`ALIAS_WINDOW`]; the alias poll is ten minutes away.
+    let captured = fx.head_restores("a", Duration::from_secs(20));
     let snapshot = runner.snapshot();
     runner.stop();
     assert!(captured, "{snapshot:?}");
