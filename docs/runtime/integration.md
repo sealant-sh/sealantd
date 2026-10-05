@@ -102,6 +102,9 @@ one prerelease version, `B-next.N` (`.github/workflows/next.yml`, ADR 0015 in se
 the commit's whole history (`git rev-list --count`); B is the larger of what the pending changesets
 would release and the base of the highest next build already published above the last stable tag
 (`node scripts/next-version.mjs --package packages/runtime-client --npm @sealant/runtime-client-next`).
+`ci` never cancels a main push, and `next` runs one at a time, queued (`queue: max`) in the order
+their `ci` runs passed. `next` only moves forward: an older commit whose `ci` passed after a newer
+commit's published is refused.
 
 - `ghcr.io/sealant-sh/sealantd-next:0.20.0-next.N`, amd64 and arm64.
 - `@sealant/runtime-protocol-next` and `@sealant/runtime-client-next` `0.20.0-next.N` on npm's

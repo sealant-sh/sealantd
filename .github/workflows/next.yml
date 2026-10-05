@@ -34,9 +34,16 @@ on:
 permissions:
   contents: read
 
+# One run at a time, never one cancelled: GitHub keeps one pending run per group unless `queue: max`
+# (up to 100), so without it a third quick merge cancelled the pending second and never published.
+# Runs start in the order they arrive, which is the order their `ci` runs passed, not always commit
+# order: an older commit whose `ci` passed after a newer one's waits behind it and, once the newer
+# one has published, is refused by the forward-only check in `plan`. actionlint 1.7.12 does not know
+# `queue` yet (rhysd/actionlint#657); .github/actionlint.yaml ignores that one finding here.
 concurrency:
   group: next
   cancel-in-progress: false
+  queue: max
 
 jobs:
   plan:
@@ -87,7 +94,8 @@ jobs:
             echo "sealantd $version is already published from this commit; nothing to do."
           fi
           # `next` only moves forward. Every newer commit computes a higher version, so this fails
-          # only for an older commit re-run after a newer one published: loudly, before any build.
+          # only for an older commit whose run comes after a newer one published (a re-run, or a
+          # `ci` that passed after the newer commit's): loudly, before any build.
           # `publish` checks again right before publishing.
           if [[ $publish == true ]]; then
             current=$(node scripts/next-version.mjs --dist-tag @sealant/runtime-client-next next)
