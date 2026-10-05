@@ -658,17 +658,52 @@ impl Shared {
             .take();
     }
 
+    /// What the small-class loop decides on: its clock's next due time, whether the watcher
+    /// overflowed, whether a rebuild was asked for.
+    fn small_wake(st: &State) -> (Option<(Instant, Trigger)>, bool, bool) {
+        (st.small.due(st.small_mode), st.overflowed, st.repair)
+    }
+
+    /// What the bulk-class loop decides on: its clock's next due time.
+    fn bulk_wake(st: &State) -> Option<(Instant, Trigger)> {
+        st.bulk.due(st.bulk_mode)
+    }
+
+    /// Sleep on the cadence condvar until `at` (or a signal; with no `at`, until a signal),
+    /// unless the state changed since the loop read it. A class loop reads its clock, lets go
+    /// of the state lock (to snap, rebuild or drop the watcher) and takes it again to sleep: a
+    /// signal in between notified nobody, and sleeping on the clock read before it would wait
+    /// out the old due time (a watched class's reconcile interval, a minute) with the change
+    /// unseen. The signal's change is in the state, though, so `unchanged` asks the state
+    /// under the lock the sleep releases: when it no longer answers what the loop read, the
+    /// loop goes round again at once.
+    fn sleep_unless_changed(&self, at: Option<Instant>, unchanged: impl Fn(&State) -> bool) {
+        let st = self.state();
+        if st.stop || !unchanged(&st) {
+            return;
+        }
+        match at {
+            Some(at) => drop(
+                self.cv
+                    .wait_timeout(st, at.saturating_duration_since(Instant::now()))
+                    .unwrap_or_else(PoisonError::into_inner),
+            ),
+            None => drop(self.cv.wait(st).unwrap_or_else(PoisonError::into_inner)),
+        }
+    }
+
     /// The small-class loop.
     fn run_small(&self) {
         loop {
-            let (due, overflowed, repair) = {
+            let (seen, repair) = {
                 let mut st = self.state();
                 if st.stop {
                     return;
                 }
                 let repair = std::mem::take(&mut st.repair);
-                (st.small.due(st.small_mode), st.overflowed, repair)
+                (Self::small_wake(&st), repair)
             };
+            let (due, overflowed, _) = seen;
             if repair {
                 match self.engine().repair() {
                     Ok(true) => self.wake_worker(),
@@ -710,21 +745,9 @@ impl Shared {
                     }
                 }
                 Some((at, _)) => {
-                    let st = self.state();
-                    if !st.stop {
-                        drop(
-                            self.cv
-                                .wait_timeout(st, at.saturating_duration_since(now))
-                                .unwrap_or_else(PoisonError::into_inner),
-                        );
-                    }
+                    self.sleep_unless_changed(Some(at), |st| Self::small_wake(st) == seen)
                 }
-                None => {
-                    let st = self.state();
-                    if !st.stop {
-                        drop(self.cv.wait(st).unwrap_or_else(PoisonError::into_inner));
-                    }
-                }
+                None => self.sleep_unless_changed(None, |st| Self::small_wake(st) == seen),
             }
         }
     }
@@ -787,7 +810,7 @@ impl Shared {
                 if st.stop {
                     return;
                 }
-                st.bulk.due(st.bulk_mode)
+                Self::bulk_wake(&st)
             };
             let now = Instant::now();
             match due {
@@ -815,21 +838,9 @@ impl Shared {
                     }
                 }
                 Some((at, _)) => {
-                    let st = self.state();
-                    if !st.stop {
-                        drop(
-                            self.cv
-                                .wait_timeout(st, at.saturating_duration_since(now))
-                                .unwrap_or_else(PoisonError::into_inner),
-                        );
-                    }
+                    self.sleep_unless_changed(Some(at), |st| Self::bulk_wake(st) == due)
                 }
-                None => {
-                    let st = self.state();
-                    if !st.stop {
-                        drop(self.cv.wait(st).unwrap_or_else(PoisonError::into_inner));
-                    }
-                }
+                None => self.sleep_unless_changed(None, |st| Self::bulk_wake(st) == due),
             }
         }
     }

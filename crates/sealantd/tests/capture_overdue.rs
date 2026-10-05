@@ -97,7 +97,9 @@ fn a_snap_waiting_on_a_git_past_its_bound_is_reported_and_the_git_is_killed_at_i
     };
     assert_eq!(overdue.step, "small snap › git add -A", "{overdue:?}");
     assert_eq!(overdue.bound_ms, 300);
-    assert!(overdue.running_ms > 300, "{overdue:?}");
+    // Overdue once it has run longer than its bound; `running_ms` is whole milliseconds,
+    // truncated, so a step 300.4 ms in reads 300.
+    assert!(overdue.running_ms >= overdue.bound_ms, "{overdue:?}");
     assert!(overdue.started_unix_ms > 0);
 
     let snapped = snapping.join().unwrap();

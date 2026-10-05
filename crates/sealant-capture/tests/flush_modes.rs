@@ -13,8 +13,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use sealant_capture::manifest::{BulkState, DirFormat};
@@ -79,15 +79,36 @@ fn files(dir: &Path) -> Vec<(String, Vec<u8>)> {
     out
 }
 
-/// A sink that spends `delay` on every PUT.
+/// A sink that spends `delay` on every PUT, and notes when the first one began.
 struct Slow {
     inner: Arc<LocalDir>,
     delay: Duration,
     puts: AtomicU64,
+    first_put: Mutex<Option<Instant>>,
+}
+
+impl Slow {
+    fn new(inner: Arc<LocalDir>, delay: Duration) -> Arc<Self> {
+        Arc::new(Self {
+            inner,
+            delay,
+            puts: AtomicU64::new(0),
+            first_put: Mutex::new(None),
+        })
+    }
+
+    /// When the first PUT began: when shipping started.
+    fn first_put(&self) -> Option<Instant> {
+        *self.first_put.lock().unwrap()
+    }
 }
 
 impl BlobSink for Slow {
     fn put_if_absent(&self, key: &str, source: BlobSource<'_>) -> Result<PutOutcome, SinkError> {
+        self.first_put
+            .lock()
+            .unwrap()
+            .get_or_insert_with(Instant::now);
         self.puts.fetch_add(1, Ordering::SeqCst);
         std::thread::sleep(self.delay);
         self.inner.put_if_absent(key, source)
@@ -155,11 +176,7 @@ fn restore_head(fx: &Fixture, into: &Path) {
 #[test]
 fn a_final_flush_snaps_a_freshly_changed_bulk_dir_and_waits_for_it() {
     let fx = fixture(40);
-    let slow = Arc::new(Slow {
-        inner: fx.store.clone(),
-        delay: Duration::from_millis(20),
-        puts: AtomicU64::new(0),
-    });
+    let slow = Slow::new(fx.store.clone(), Duration::from_millis(20));
     let runner = runner(slow_config(&fx.root), slow.clone(), &fx);
     runner.start(None);
     // The first final flush captures everything as it was.
@@ -325,30 +342,39 @@ fn a_preempted_scheduled_bulk_build_does_not_resume_after_the_final_flush() {
 /// A final flush given a deadline returns at it — the rest stays staged and is reported, never
 /// dropped, and the flush is not complete (it answered `Ok` before, like a finished one) — and
 /// a final flush without one then finishes the job.
+///
+/// The deadline bounds the shipping, not the snaps ahead of it: the flush returns at the
+/// deadline or, when its snaps outlast it, once the small capture they staged is up. Held to
+/// that, from the first PUT, against a bulk upload that would take seconds longer than the
+/// bound: on a loaded runner the snaps alone took longer than the whole deadline.
 #[test]
 fn a_final_flush_with_a_deadline_returns_at_it_and_keeps_the_rest_staged() {
     let fx = fixture(60);
-    let slow = Arc::new(Slow {
-        inner: fx.store.clone(),
-        delay: Duration::from_millis(20),
-        puts: AtomicU64::new(0),
-    });
+    // One PUT at a time, 50 ms each: well over a hundred objects, ≈ 6 s for all of them.
+    let slow = Slow::new(fx.store.clone(), Duration::from_millis(50));
     let runner = runner(slow_config(&fx.root), slow.clone(), &fx);
+    let deadline = Duration::from_millis(300);
     let start = Instant::now();
-    let flushed = runner.flush(CaptureKind::Final, Some(Duration::from_millis(300)));
-    let took = start.elapsed();
+    let flushed = runner.flush(CaptureKind::Final, Some(deadline));
+    let returned = Instant::now();
     let error = flushed.expect_err("a flush cut short by its deadline is not complete");
     assert!(error.to_string().contains("deadline"), "{error}");
-    assert!(
-        took < Duration::from_secs(2),
-        "returned at its deadline: {took:?}"
-    );
     let pending = runner.staging().pending().unwrap();
     assert!(
         pending.iter().any(|e| e.class == Some(Class::Bulk)),
         "the bulk capture is still staged: {pending:?}"
     );
-    assert!(runner.staging().pending_bytes(&pending) > 0);
+    let left = runner.staging().pending_bytes(&pending);
+    assert!(left > 0);
+    let shipping = slow.first_put().expect("the flush shipped what it could");
+    let due = shipping.max(start + deadline);
+    let late = returned.saturating_duration_since(due);
+    let puts = slow.puts.load(Ordering::SeqCst);
+    assert!(
+        late < Duration::from_millis(1_500),
+        "returned {late:?} past its deadline (snaps {:?}, {puts} PUTs, {left} bytes left)",
+        shipping.saturating_duration_since(start)
+    );
 
     runner.flush(CaptureKind::Final, None).unwrap();
     assert!(runner.staging().pending().unwrap().is_empty());
@@ -365,11 +391,7 @@ fn a_final_flush_with_a_deadline_returns_at_it_and_keeps_the_rest_staged() {
 #[test]
 fn a_suspend_flush_returns_ahead_of_a_bulk_upload() {
     let fx = fixture(60);
-    let slow = Arc::new(Slow {
-        inner: fx.store.clone(),
-        delay: Duration::from_millis(20),
-        puts: AtomicU64::new(0),
-    });
+    let slow = Slow::new(fx.store.clone(), Duration::from_millis(20));
     let mut engine = CaptureEngine::open(slow_config(&fx.root), None).unwrap();
     for (class, seq) in [(Class::Small, 1), (Class::Bulk, 2)] {
         engine
@@ -409,11 +431,7 @@ fn a_suspend_flush_returns_ahead_of_a_bulk_upload() {
 #[test]
 fn pending_bytes_counts_what_is_not_uploaded_yet() {
     let fx = fixture(30);
-    let slow = Arc::new(Slow {
-        inner: fx.store.clone(),
-        delay: Duration::from_millis(10),
-        puts: AtomicU64::new(0),
-    });
+    let slow = Slow::new(fx.store.clone(), Duration::from_millis(10));
     let mut engine = CaptureEngine::open(slow_config(&fx.root), None).unwrap();
     for (class, seq) in [(Class::Small, 1), (Class::Bulk, 2)] {
         engine
