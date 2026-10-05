@@ -46,6 +46,7 @@ const CONSUMED_KEYS: &[&str] = &[
     "SEALANT_CAPTURE_OBJECT_CA_PEM",
     "SEALANT_CAPTURE_OBJECT_CA_FILE",
     "SEALANT_CAPTURE_LAUNCH_ID",
+    "SEALANT_CAPTURE_OWNER_MAP",
     "SEALANT_SWEEP_EXEMPT_FILE",
     "SEALANT_WORKSPACE_MOUNT_HOST_PATH",
     "SEALANT_MOUNT_ALLOWED_STORE_ROOTS",
@@ -1953,6 +1954,12 @@ mod tests {
             r#"{"gid":40000,"worktree":40012,"people":{"acct_a":40012,"acct_b":40031}}"#,
         ));
         let cfg = BootConfig::load(&MapEnv::from_pairs(&with_map)).expect("valid");
+        // Boot's own: never passed through to the harness.
+        assert!(
+            !cfg.passthrough_env
+                .iter()
+                .any(|(k, _)| k == "SEALANT_CAPTURE_OWNER_MAP")
+        );
         match &cfg.source {
             WorkspaceSource::Capture(c) => {
                 let owners = c.owners.as_ref().expect("a map");
