@@ -67,7 +67,8 @@ pub enum Scope {
 }
 
 impl OwnerMap {
-    /// Parse and check a map: no uid or gid 0, and every account id one plain path component.
+    /// Parse and check a map: no uid or gid 0, every account id one plain path component, and no
+    /// uid given to two account ids (one person's saved directory is never handed to another).
     pub fn parse(json: &str) -> Result<Self, String> {
         let map: Self =
             serde_json::from_str(json).map_err(|e| format!("the owner map is not valid: {e}"))?;
@@ -80,7 +81,13 @@ impl OwnerMap {
         if self.gid == 0 || self.worktree == 0 {
             return Err("the owner map names uid or gid 0: root owns nothing by the map".into());
         }
+        let mut seen = std::collections::BTreeMap::new();
         for (id, uid) in &self.people {
+            if let Some(other) = seen.insert(*uid, id) {
+                return Err(format!(
+                    "the owner map gives accounts {other} and {id} the same uid {uid}"
+                ));
+            }
             if id.is_empty() || id == "." || id == ".." || id.contains('/') || id.contains('\0') {
                 return Err(format!(
                     "the owner map names an account id {id:?} that is not a directory name"
@@ -300,6 +307,7 @@ mod tests {
             r#"{"gid":40000,"worktree":1,"people":{"..":2}}"#,
             r#"{"gid":40000,"worktree":1,"people":{"a":0}}"#,
             r#"{"gid":40000,"worktree":1,"extra":1}"#,
+            r#"{"gid":40000,"worktree":40012,"people":{"a":40012,"b":40012}}"#,
             "not json",
         ] {
             assert!(OwnerMap::parse(bad).is_err(), "{bad}");

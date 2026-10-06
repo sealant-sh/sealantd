@@ -89,7 +89,7 @@ fn restore_a_real_worktree() {
 /// run reads these) and the median, p90, min and max. Shared, through `#[path]`, by the variants
 /// that need API this file must not name to keep compiling against older commits.
 #[allow(dead_code)]
-pub fn measure(prepare: impl Fn(&Path, &mut MaterializeTargets)) {
+pub(crate) fn measure(prepare: impl Fn(&Path, &mut MaterializeTargets)) {
     let (Some(source), Some(store), Some(out)) = (
         env_path("RESTORE_MEASURE_SOURCE"),
         env_path("RESTORE_MEASURE_STORE"),

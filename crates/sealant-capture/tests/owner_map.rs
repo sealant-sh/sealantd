@@ -402,3 +402,164 @@ fn the_default_acl_makes_new_files_group_writable() {
     assert!(as_user(BOB, &format!("echo y >> {}/d/f", root.display())));
     assert!(as_user(BOB, &format!("touch {}/d/g", root.display())));
 }
+
+/// P2-4 of the stack's review: in a restored worktree (its files root's, the group's to write),
+/// a person changes the lockfile and runs `pnpm install` / `npm install`, which relink bins and
+/// `chmod` their targets. An experiment, run by hand as root with network, `pnpm` and `npm`:
+/// `SEALANTD_REQUIRE_ROOT_TESTS=1 owner_map --ignored --nocapture install`.
+///
+/// Found on 2026-10-06 (pnpm 12.9.1, npm 9.2.0): pnpm fails (`ERR_PNPM_CMD_SHIM_CHMOD`: it cannot
+/// `chmod` the restored `node_modules/.bin` shim, a file it does not own); npm passes (it ignores
+/// the error). The same holds for any file another person's tool made, not only restored ones.
+/// With `PM_WRAPPER=fowner` the person's processes hold `CAP_FOWNER` (ambient), and both pass.
+#[test]
+#[ignore = "needs root, network, pnpm and npm"]
+fn install_after_a_lockfile_change_as_a_person() {
+    if !root() {
+        return;
+    }
+    let mut failed = Vec::new();
+    for pm in ["pnpm", "npm"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().to_path_buf();
+        chmod(&base, 0o755);
+        // A store and caches the group shares, as the images keep them under /var/cache.
+        let shared = base.join("cache");
+        fs::create_dir_all(&shared).unwrap();
+        std::os::unix::fs::chown(&shared, None, Some(GID)).unwrap();
+        chmod(&shared, 0o2775);
+        sealant_capture::owners::apply_default_acl(&[&shared], GID).unwrap();
+        let bob_home = base.join("bob");
+        fs::create_dir_all(&bob_home).unwrap();
+        std::os::unix::fs::chown(&bob_home, Some(BOB), Some(GID)).unwrap();
+        let env = format!(
+            "HOME={home} npm_config_store_dir={c}/pnpm-store npm_config_cache={c}/npm \
+             XDG_CACHE_HOME={c}/xdg CI=1",
+            home = bob_home.display(),
+            c = shared.display()
+        );
+
+        let root = base.join("ws");
+        fs::create_dir_all(&root).unwrap();
+        git(&root, &["init", "-q", "-b", "main"]);
+        git(&root, &["config", "user.email", "t@t"]);
+        git(&root, &["config", "user.name", "t"]);
+        write(&root.join(".gitignore"), "node_modules/\n", 0o644);
+        write(
+            &root.join("package.json"),
+            r#"{"name":"x","version":"1.0.0","dependencies":{"semver":"7.6.0"}}"#,
+            0o644,
+        );
+        // Installed by root under umask 022, as every capture before the per-person layout.
+        let install = |as_bob: bool, root: &Path| -> (bool, String) {
+            let flags = if pm == "pnpm" {
+                format!(
+                    "--no-frozen-lockfile --store-dir {}/pnpm-store",
+                    shared.display()
+                )
+            } else {
+                String::new()
+            };
+            let script = format!(
+                "cd {} && env {env} {pm} install {flags} 2>&1; echo \"exit=$?\"",
+                root.display()
+            );
+            let out = if as_bob {
+                bob_command(&format!("umask 0002; {script}"))
+                    .env_clear()
+                    .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+                    .output()
+                    .unwrap()
+            } else {
+                Command::new("sh")
+                    .arg("-c")
+                    .arg(format!("umask 022; {script}"))
+                    .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+                    .output()
+                    .unwrap()
+            };
+            let text = String::from_utf8_lossy(&out.stdout).into_owned();
+            (text.trim_end().ends_with("exit=0"), text)
+        };
+        let (ok, text) = install(false, &root);
+        assert!(ok, "{pm} as root: {text}");
+        git(&root, &["add", "-A"]);
+        git(&root, &["commit", "-q", "-m", "deps"]);
+        let fx = Fixture {
+            _tmp: tempfile::tempdir().unwrap(),
+            base: base.clone(),
+            root: root.clone(),
+            home: base.join("home"),
+        };
+        fs::create_dir_all(&fx.home).unwrap();
+        let (repo, _, _) = fx.restore(Some(owners()));
+        // A lockfile change that keeps the restored package with a bin (its bin is relinked and
+        // its target `chmod`ed, a root-owned file) and adds another.
+        write(
+            &repo.join("package.json"),
+            r#"{"name":"x","version":"1.0.0","dependencies":{"semver":"7.6.0","which":"4.0.0"}}"#,
+            0o664,
+        );
+        std::os::unix::fs::chown(repo.join("package.json"), Some(BOB), Some(GID)).unwrap();
+        let (ok, text) = install(true, &repo);
+        eprintln!("== {pm} install as a person after a restore: ok={ok}\n{text}");
+        // And a forced reinstall over every restored package.
+        let forced = bob_command(&format!(
+            "umask 0002; cd {} && env {env} {pm} {} 2>&1; echo \"exit=$?\"",
+            repo.display(),
+            if pm == "pnpm" {
+                format!(
+                    "install --force --store-dir {}/pnpm-store",
+                    shared.display()
+                )
+            } else {
+                "rebuild".to_owned()
+            }
+        ))
+        .env_clear()
+        .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+        .output()
+        .unwrap();
+        let forced = String::from_utf8_lossy(&forced.stdout).into_owned();
+        eprintln!("== {pm} forced, as a person:\n{forced}");
+        let bin = repo.join("node_modules/.bin/semver");
+        eprintln!(
+            "{pm}: node_modules/.bin/semver runs: {}",
+            Command::new(&bin)
+                .arg("--help")
+                .output()
+                .is_ok_and(|o| o.status.success())
+        );
+        if !ok || !forced.trim_end().ends_with("exit=0") {
+            failed.push(pm);
+        }
+    }
+    assert!(failed.is_empty(), "failed as a person: {failed:?}");
+}
+
+/// `sh -c script` as Bob; with `PM_WRAPPER=fowner`, through `setpriv` with `CAP_FOWNER` ambient
+/// (what a person's process would get if the identity switch raised it).
+fn bob_command(script: &str) -> Command {
+    if std::env::var("PM_WRAPPER").as_deref() == Ok("fowner") {
+        let mut c = Command::new("setpriv");
+        c.args([
+            "--reuid",
+            &BOB.to_string(),
+            "--regid",
+            &GID.to_string(),
+            "--clear-groups",
+            "--inh-caps",
+            "+fowner",
+            "--ambient-caps",
+            "+fowner",
+            "sh",
+            "-c",
+            script,
+        ]);
+        c
+    } else {
+        let mut c = Command::new("sh");
+        c.arg("-c").arg(script).uid(BOB).gid(GID);
+        c
+    }
+}

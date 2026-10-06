@@ -114,6 +114,8 @@ pub struct CaptureRuntime {
     observer: Arc<sealant_capture::position::Observer>,
     /// Whether a session ever became this executor's writer ([`crate::unclaimed`]).
     unclaimed: crate::unclaimed::Unclaimed,
+    /// The boot ran under an owner map ([`CaptureStatusReport::owner_map`]).
+    owner_map: bool,
 }
 
 impl std::fmt::Debug for CaptureRuntime {
@@ -145,6 +147,7 @@ impl CaptureRuntime {
         let launch = boot.engine.config().executor.clone();
         let observer = boot.engine.observer();
         let unclaimed = crate::unclaimed::Unclaimed::load(&boot.layout.staging_dir);
+        let owner_map = boot.engine.config().owners.is_some();
         Arc::new(Self {
             runner: CadenceRunner::new(boot.engine, shipper),
             resumed,
@@ -161,6 +164,7 @@ impl CaptureRuntime {
             launch: Mutex::new(launch),
             observer,
             unclaimed,
+            owner_map,
         })
     }
 
@@ -820,6 +824,7 @@ impl CaptureRuntime {
             boot_generation: None,
             observation: None,
             overdue: overdue(),
+            owner_map: self.owner_map,
         }
     }
 
@@ -1982,6 +1987,84 @@ mod tests {
         .unwrap();
         assert!(crate::unclaimed::read(&boot.layout.staging_dir).is_none());
         assert!(!CaptureRuntime::new(boot).unclaimed.release());
+    }
+
+    /// `capture.status` says whether the boot ran under an owner map, so a control plane that
+    /// expects the per-person layout can refuse an executor whose restore ran without one. The
+    /// map names this test's own uid and gid (root's work otherwise).
+    #[test]
+    fn the_status_says_whether_the_boot_ran_under_an_owner_map() {
+        let (uid, gid) = if nix::unistd::geteuid().is_root() {
+            (1, 1)
+        } else {
+            (
+                nix::unistd::geteuid().as_raw(),
+                nix::unistd::getegid().as_raw(),
+            )
+        };
+        let mapped = sealant_capture::owners::OwnerMap {
+            gid,
+            worktree: uid,
+            people: std::collections::BTreeMap::new(),
+        };
+        for owners in [None, Some(mapped)] {
+            let tmp = tempfile::tempdir().unwrap();
+            let src = tmp.path().join("src");
+            std::fs::create_dir_all(&src).unwrap();
+            git(&src, &["init", "-q", "-b", "main"]);
+            git(&src, &["config", "user.email", "t@t"]);
+            git(&src, &["config", "user.name", "t"]);
+            std::fs::write(src.join("lib.rs"), "pub fn f() {}\n").unwrap();
+            git(&src, &["add", "-A"]);
+            git(&src, &["commit", "-q", "-m", "one"]);
+            let sink: Arc<dyn BlobSink> =
+                Arc::new(LocalDir::new(&tmp.path().join("store")).unwrap());
+            let registrar: Arc<dyn Registrar> =
+                Arc::new(InMemoryRegistrar::new("wt-real", 1, None).with_executor("launch-1"));
+            let mut source =
+                CaptureEngine::open(CaptureConfig::new("wt-real", 1, &src), None).unwrap();
+            let shipper = source.shipper(sink.clone(), registrar.clone());
+            source
+                .snap(SnapRequest {
+                    kind: EngineKind::Checkpoint,
+                    class: Class::Small,
+                    seq: 1,
+                })
+                .unwrap();
+            shipper.ship_pending().unwrap();
+            let expected = owners.is_some();
+            let ws = tmp.path().join("ws");
+            let boot = boot_from(
+                registrar,
+                Some(sink),
+                &CaptureSourceConfig {
+                    endpoint: "http://unused".to_owned(),
+                    worktree_id: Some("wt-real".to_owned()),
+                    harness_home: None,
+                    raise_inotify_limit: false,
+                    allow_plaintext: false,
+                    ca_pem: None,
+                    ca_file: None,
+                    object_ca_pem: None,
+                    object_ca_file: None,
+                    recovery: false,
+                    launch_id: None,
+                    owners,
+                },
+                &ws,
+                tmp.path(),
+            )
+            .unwrap();
+            let capture = CaptureRuntime::new(boot);
+            assert_eq!(capture.status().owner_map, expected);
+            capture.runner.stop();
+            if expected {
+                use std::os::unix::fs::MetadataExt;
+                let root = std::fs::metadata(&ws).unwrap();
+                assert_eq!((root.uid(), root.gid()), (uid, gid));
+                assert_ne!(root.mode() & 0o2000, 0, "the worktree root is setgid");
+            }
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

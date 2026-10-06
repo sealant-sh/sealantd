@@ -383,10 +383,17 @@ pub fn boot_from(
 
     // Mend's per-person layout: the worktree is the group's before anything is restored into
     // it, and the group's default ACL is on it and on the image's shared toolchain directories.
-    if let Some(owners) = &source.owners
-        && !source.recovery
-    {
-        prepare_shared_group(owners, working_directory)?;
+    // A recovery boot touches nothing on the disk, but may run on a fresh root filesystem (an
+    // adapter's new container over the kept disk): the toolchain directories get the ACL again.
+    if let Some(owners) = &source.owners {
+        if source.recovery {
+            let dirs: Vec<&Path> = SHARED_TOOLCHAIN_DIRS.iter().map(Path::new).collect();
+            if let Err(error) = sealant_capture::owners::apply_default_acl(&dirs, owners.gid) {
+                tracing::warn!(%error, "owner map: no default ACL on the toolchain directories");
+            }
+        } else {
+            prepare_shared_group(owners, working_directory)?;
+        }
     }
     // A daemon restarting on its own disk finds it at or past the head: staged captures not
     // shipped yet, and whatever changed after the last snap. Materializing the head over it

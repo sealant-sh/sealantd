@@ -214,7 +214,12 @@ the protocol details live in `crates/sealant-capture/src/registrar.rs` and `mani
   whatever the recorded mode. Each mapped person's `people/<id>/` is `chown`ed to their uid entry
   by entry (the directory itself 0710, the rest at its recorded mode); nothing in the worktree is
   `chown`ed. Captures record no owner. Unset, a restore is as before. `runtime.getCapabilities`
-  names `restore.owner_map` in `supports`.
+  names `restore.owner_map` in `supports`. A map that gives two account ids one uid refuses the
+  boot. `capture.status` answers `ownerMap: true` when the boot ran under a map; a control plane
+  that expects the per-person layout refuses an executor that answers `false` (or checks that
+  the working directory's group is the map's gid), since a restore without the map leaves the
+  worktree root's at the recorded modes. A recovery boot sets the toolchain ACLs again and
+  touches nothing on the disk.
 - **Refusals that pause, never adopt.** `plan.get` 409 `worktree-leased` (another launch holds
   the lease; no epoch given, whatever `live_epoch` says): a boot waits (1 s, doubling to 30 s)
   and asks again, touching nothing; a re-plan keeps its identity. `upload.urls` and
