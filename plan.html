@@ -1265,6 +1265,7 @@ stopped</code></pre>
         <li>Use restrictive socket permissions and peer credential validation.</li>
         <li>Exclude runtime secrets from child environments.</li>
         <li>Minimize Linux capabilities and drop privilege after initialization.</li>
+        <li>Set <code>PR_SET_NO_NEW_PRIVS</code> on the daemon, and so on every child: nothing it starts gains privileges through a setuid binary or file capabilities. <strong>Amended for per-person executors</strong> (Mend's ADR 0016, a boot whose capture source carries an owner map): there every person has passwordless <code>sudo</code>, which no-new-privileges would break, so the daemon leaves it unset. Such an executor is root by design, not a sandbox: its boundary is the executor itself. Every other executor keeps it. The daemon logs which posture it took and reports <code>noNewPrivileges</code> in its capabilities.</li>
         <li>Set close-on-exec on daemon-only descriptors.</li>
         <li>Use validated paths and symlink-safe operations.</li>
         <li>Do not construct shell commands through string concatenation.</li>

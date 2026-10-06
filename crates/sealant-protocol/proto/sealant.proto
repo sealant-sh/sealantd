@@ -524,6 +524,9 @@ message Capabilities {
   // Why a process run as a person holds no CAP_FOWNER here (no-new-privileges, the bounding set,
   // a daemon that is not root); absent when it holds it.
   optional string person_capabilities_withheld = 11;
+  // Whether no-new-privileges is set on the daemon and so on everything it starts: true in every
+  // executor but a per-person one (a boot under an owner map), where every person has sudo.
+  bool no_new_privileges = 12;
 }
 
 message HealthReport {

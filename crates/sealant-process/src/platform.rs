@@ -38,6 +38,20 @@ pub fn set_no_new_privs() -> bool {
     false
 }
 
+/// Whether no-new-privileges is set on the calling thread (and so on every child it starts).
+#[cfg(target_os = "linux")]
+#[must_use]
+pub fn no_new_privs() -> bool {
+    nix::sys::prctl::get_no_new_privs().unwrap_or(false)
+}
+
+/// Off Linux there is no `no_new_privs`.
+#[cfg(not(target_os = "linux"))]
+#[must_use]
+pub fn no_new_privs() -> bool {
+    false
+}
+
 /// Whether the kernel supports `pidfd_open(2)` (Linux >= 5.3).
 #[cfg(target_os = "linux")]
 #[must_use]

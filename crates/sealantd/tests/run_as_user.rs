@@ -92,16 +92,29 @@ impl Client {
         Self::start_withholding(workspace, child_env, Vec::new())
     }
 
-    /// With `child_env` and the injector's declared harness keys (`person_withheld`).
+    /// With `child_env` and the injector's declared harness keys (`person_withheld`), as a
+    /// per-person executor's daemon: no no-new-privileges (a boot under an owner map).
     fn start_withholding(
         workspace: &Path,
         child_env: Vec<sealant_protocol::EnvVar>,
         person_withheld: Vec<String>,
     ) -> Self {
+        Self::start_posture(workspace, child_env, person_withheld, false)
+    }
+
+    /// With the daemon's no-new-privileges posture given (`true`: every executor but a
+    /// per-person one). Setting it is irreversible on the calling thread.
+    fn start_posture(
+        workspace: &Path,
+        child_env: Vec<sealant_protocol::EnvVar>,
+        person_withheld: Vec<String>,
+        no_new_privileges: bool,
+    ) -> Self {
         let mut config = RuntimeConfig::new(new_runtime_id());
         config.workspace_root = workspace.to_path_buf();
         config.child_env = child_env;
         config.person_withheld = person_withheld;
+        config.no_new_privileges = no_new_privileges;
         let runtime = Runtime::new(config, Arc::new(ShutdownSignal::new(1000)));
         runtime.mark_healthy();
         let (_sd_tx, sd_rx) = watch::channel(false);
@@ -843,6 +856,8 @@ async fn pnpm_installs_as_a_second_person_in_a_restored_worktree() {
         force = pnpm("--force"),
         o = out.display()
     );
+    // Whether the environment itself imposes no-new-privileges, read before the daemon starts.
+    let environment_nnp = sealant_process::platform::no_new_privs();
     // The daemon's child environment carries PATH, as boot's passthrough does (node and pnpm
     // may live outside the default PATH, as on CI runners).
     let mut client = Client::start_with(
@@ -857,7 +872,12 @@ async fn pnpm_installs_as_a_second_person_in_a_restored_worktree() {
     let status = wait_for(&out);
     let log = std::fs::read_to_string(base.join("pnpm-as-bob.log")).unwrap_or_default();
     if withheld.is_some() {
-        // No CAP_FOWNER (sealantd's own no-new-privileges): pnpm fails as it did before it.
+        // A per-person daemon withholds CAP_FOWNER only where the environment imposes
+        // no-new-privileges (a container run with it): pnpm fails as it did before it.
+        assert!(
+            environment_nnp,
+            "a per-person daemon withheld CAP_FOWNER: {withheld:?}"
+        );
         // pnpm 12 says ERR_PNPM_CMD_SHIM_CHMOD; pnpm 9 a bare EPERM on the chmod.
         assert!(
             log.contains("ERR_PNPM_CMD_SHIM_CHMOD")
@@ -1036,4 +1056,108 @@ async fn the_image_s_person_environment_reaches_every_person_s_process_and_not_r
     );
     assert!(env.lines().any(|l| l == "MISE_DATA_DIR=/opt/mise"), "{env}");
     assert!(!env.contains("SEALANT_SNEAKY"), "{env}");
+}
+
+/// Removes the test's sudoers entry when dropped.
+struct SudoersEntry;
+
+impl SudoersEntry {
+    const PATH: &str = "/etc/sudoers.d/mtest-sealantd";
+
+    /// Passwordless sudo for the test person, as Core's images give the `mend` group.
+    fn add() -> Self {
+        std::fs::create_dir_all("/etc/sudoers.d").unwrap();
+        std::fs::write(Self::PATH, format!("{BOB} ALL=(ALL) NOPASSWD: ALL\n")).unwrap();
+        std::fs::set_permissions(
+            Self::PATH,
+            std::os::unix::fs::PermissionsExt::from_mode(0o440),
+        )
+        .unwrap();
+        Self
+    }
+}
+
+impl Drop for SudoersEntry {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(Self::PATH);
+    }
+}
+
+/// `sudo -n true` as the person, through a daemon of the given posture, on a thread of its own
+/// (no-new-privileges cannot be unset): its exit line, and what the daemon reports.
+fn sudo_as_person(no_new_privileges: bool) -> (String, sealant_protocol::Capabilities) {
+    std::thread::spawn(move || {
+        let tokio = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        tokio.block_on(async move {
+            let dir = scratch();
+            let out = dir.path().join("sudo");
+            let mut client = Client::start_posture(
+                dir.path(),
+                vec![var(
+                    "PATH",
+                    "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                )],
+                Vec::new(),
+                no_new_privileges,
+            );
+            let caps = match ok(client.request(Command::RuntimeGetCapabilities).await) {
+                Some(CommandResult::Capabilities(c)) => c,
+                other => panic!("capabilities: {other:?}"),
+            };
+            ok(client
+                .request(Command::Exec(exec(
+                    format!(
+                        "sudo -n true > {0}.log 2>&1; echo \"exit=$?\" > {0}.tmp && mv {0}.tmp {0}",
+                        out.display()
+                    ),
+                    Some(BOB),
+                )))
+                .await);
+            let status = wait_for(&out);
+            let log = std::fs::read_to_string(dir.path().join("sudo.log")).unwrap_or_default();
+            (format!("{status}{log}"), caps)
+        })
+    })
+    .join()
+    .unwrap()
+}
+
+/// In a per-person executor (a boot under an owner map), the daemon leaves no-new-privileges
+/// unset: a person's passwordless `sudo` works (Mend's ADR 0016), the person holds `CAP_FOWNER`,
+/// and `runtime.getCapabilities` says `noNewPrivileges: false`.
+#[test]
+fn in_a_per_person_executor_a_person_s_sudo_works() {
+    if !ready() {
+        return;
+    }
+    if sealant_process::platform::no_new_privs() {
+        eprintln!("this environment sets no-new-privileges itself: sudo cannot work in it");
+        return;
+    }
+    let _sudoers = SudoersEntry::add();
+    let (seen, caps) = sudo_as_person(false);
+    assert!(seen.starts_with("exit=0\n"), "sudo as a person:\n{seen}");
+    assert!(!caps.no_new_privileges, "{caps:?}");
+    assert_eq!(caps.person_capabilities, ["CAP_FOWNER"], "{caps:?}");
+}
+
+/// Every other executor keeps no-new-privileges (plan §18): the same `sudo -n true` is refused,
+/// and the daemon says `noNewPrivileges: true`.
+#[test]
+fn elsewhere_no_new_privileges_stays_and_sudo_is_refused() {
+    if !ready() {
+        return;
+    }
+    let _sudoers = SudoersEntry::add();
+    let (seen, caps) = sudo_as_person(true);
+    assert!(
+        !seen.starts_with("exit=0\n"),
+        "sudo worked under no-new-privileges:\n{seen}"
+    );
+    assert!(seen.contains("no new privileges"), "{seen}");
+    assert!(caps.no_new_privileges, "{caps:?}");
+    assert!(caps.person_capabilities.is_empty(), "{caps:?}");
 }

@@ -74,6 +74,13 @@ pub struct RuntimeConfig {
     /// here: they reach every person.
     #[serde(default)]
     pub person_withheld: Vec<String>,
+    /// Set `PR_SET_NO_NEW_PRIVS` on the daemon (plan §18), inherited by every child: no child
+    /// gains privileges through a setuid binary or file capabilities. On by default. Off only in
+    /// a per-person executor (a boot under an owner map, Mend's ADR 0016): every person there has
+    /// passwordless `sudo`, which no-new-privileges would break, so it is root by design, not a
+    /// sandbox.
+    #[serde(default = "default_true")]
+    pub no_new_privileges: bool,
     /// Child user id to drop to, when configured.
     #[serde(default)]
     pub child_uid: Option<u32>,
@@ -144,6 +151,11 @@ pub fn default_limits() -> Limits {
     }
 }
 
+/// [`RuntimeConfig::no_new_privileges`]'s default.
+fn default_true() -> bool {
+    true
+}
+
 impl RuntimeConfig {
     /// Construct a configuration with safe defaults for the given runtime id.
     #[must_use]
@@ -158,6 +170,7 @@ impl RuntimeConfig {
             child_env: Vec::new(),
             redact_literals: Vec::new(),
             person_withheld: Vec::new(),
+            no_new_privileges: true,
             child_uid: None,
             child_gid: None,
             limits: default_limits(),

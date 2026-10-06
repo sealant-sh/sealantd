@@ -211,7 +211,18 @@ fn prepare(
     } else {
         tracing::warn!("not Linux; child-subreaper is a no-op (boot is intended for containers)");
     }
-    let _ = sealant_process::platform::set_no_new_privs();
+    // No-new-privileges (plan §18) on every executor but a per-person one: there every person
+    // has passwordless sudo (Mend's ADR 0016), which no-new-privileges would break, so it is root
+    // by design, not a sandbox.
+    if keeps_no_new_privileges(config) {
+        let engaged = sealant_process::platform::set_no_new_privs();
+        tracing::info!(engaged, "privilege posture: no-new-privileges set");
+    } else {
+        tracing::info!(
+            "privilege posture: per-person executor (owner map): no-new-privileges not set, so \
+             every person's sudo works"
+        );
+    }
 
     // Step 3: workspace prep.
     prepare_workspace(config)?;
@@ -420,7 +431,14 @@ fn into_runtime_config(config: &BootConfig, secret_env: &[(String, String)]) -> 
     // A process run as a person never gets the launcher's declared harness logins; the
     // project's secrets (the secret environment) reach every person.
     runtime_config.person_withheld = config.declared_harness_keys.clone();
+    runtime_config.no_new_privileges = keeps_no_new_privileges(config);
     runtime_config
+}
+
+/// Whether this boot sets no-new-privileges (plan §18): every boot but a per-person executor's,
+/// one whose capture source carries an owner map (Mend's ADR 0016: every person has sudo there).
+fn keeps_no_new_privileges(config: &BootConfig) -> bool {
+    !matches!(&config.source, WorkspaceSource::Capture(c) if c.owners.is_some())
 }
 
 /// Compute the harness child's base environment, in precedence order (later wins): the non-secret
@@ -1206,5 +1224,42 @@ mod tests {
         let with = harness_child_env(&config, &[]);
         assert_eq!(lookup(&with, "APP_MODE"), Some("review"));
         assert!(into_runtime_config(&config, &[]).redact_literals.is_empty());
+    }
+
+    /// No-new-privileges stays on every executor but a per-person one: a boot whose capture
+    /// source carries an owner map (Mend's ADR 0016) leaves it off, so every person's sudo works.
+    #[test]
+    fn only_a_per_person_executor_leaves_no_new_privileges_off() {
+        let clone = boot_config(&[]);
+        assert!(keeps_no_new_privileges(&clone));
+        assert!(into_runtime_config(&clone, &[]).no_new_privileges);
+        let capture = |owners| {
+            let mut config = boot_config(&[]);
+            config.source = WorkspaceSource::Capture(config::CaptureSourceConfig {
+                endpoint: "http://unused".to_owned(),
+                worktree_id: None,
+                harness_home: None,
+                raise_inotify_limit: false,
+                allow_plaintext: false,
+                ca_pem: None,
+                ca_file: None,
+                object_ca_pem: None,
+                object_ca_file: None,
+                recovery: false,
+                launch_id: None,
+                owners,
+            });
+            config
+        };
+        let without_map = capture(None);
+        assert!(keeps_no_new_privileges(&without_map));
+        assert!(into_runtime_config(&without_map, &[]).no_new_privileges);
+        let per_person = capture(Some(sealant_capture::owners::OwnerMap {
+            gid: 40000,
+            worktree: 40012,
+            people: std::collections::BTreeMap::new(),
+        }));
+        assert!(!keeps_no_new_privileges(&per_person));
+        assert!(!into_runtime_config(&per_person, &[]).no_new_privileges);
     }
 }

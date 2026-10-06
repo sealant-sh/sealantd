@@ -57,7 +57,11 @@ other languages from the same `.proto`.
 
 - The control socket is `0600` and validated by peer uid (`SO_PEERCRED` on Linux, fail-closed);
   additional uids may be permitted via `allowed_peer_uids`.
-- `PR_SET_NO_NEW_PRIVS` is set at startup; children cannot escalate via setuid binaries.
+- `PR_SET_NO_NEW_PRIVS` is set at startup; children cannot escalate via setuid binaries. A
+  per-person executor (a boot whose capture source carries an owner map, Mend's ADR 0016) leaves it
+  unset: every person there has passwordless `sudo`, so it is root by design, not a sandbox. Boot
+  logs the posture (`privilege posture: …`), and `runtime.getCapabilities` reports
+  `noNewPrivileges`.
 - `max_processes` / `max_sessions` are enforced; overflow is rejected with `policy-denied`.
 - Captured I/O is redacted for configured secret literals and high-confidence token shapes; masked
   spans set `transform.redacted` and increment `redactedEvents`.

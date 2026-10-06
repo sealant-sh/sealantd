@@ -83,8 +83,14 @@ The daemon runs as root, and so does every process it starts, unless the request
   Mend's ADR 0016 and Core's image probe require. Under no-new-privileges `sudo` cannot work, so
   the capability is withheld there, and `runtime.getCapabilities` says so
   (`personCapabilities` empty, `personCapabilitiesWithheld` the reason); pnpm then fails to
-  relink bins as a person. **sealantd sets no-new-privileges on itself** (plan §18, at boot and in
-  the runtime), so today every executor withholds it, and no person's `sudo` works either.
+  relink bins as a person.
+- **No-new-privileges.** sealantd sets it on itself (plan §18), at boot and in the runtime, and so
+  on everything it starts, **except in a per-person executor** (a boot whose capture source carries
+  an owner map): every person there has passwordless `sudo` (Mend's ADR 0016), which
+  no-new-privileges would break, so that executor is root by design, not a sandbox, and its
+  persons hold `CAP_FOWNER`. Boot logs which posture it took, and `runtime.getCapabilities`
+  reports `noNewPrivileges`. An orchestrator can still impose it (a Kubernetes
+  `allowPrivilegeEscalation: false`); then `sudo` and `CAP_FOWNER` are gone there too.
 - Root, a user in root's group, or a user the passwd database does not have, is refused.
   `openSftp` takes no user yet: an SFTP bridge runs as root.
 - The dotfiles applier runs as a user into their passwd home, its commands with a clean
