@@ -164,11 +164,35 @@ impl ProcessRuntime {
             .clone()
             .map_or_else(|| self.config.workspace_root.clone(), Into::into);
 
+        // A named user: resolved here, its private directories made, its identity set in the
+        // child before exec ([`crate::identity`]).
+        let run_as = args
+            .user
+            .as_deref()
+            .map(crate::identity::RunAs::resolve)
+            .transpose()
+            .map_err(ControlError::invalid_argument)?;
+        if let Some(user) = &run_as {
+            user.prepare_dirs().map_err(|e| {
+                ControlError::process_start_failed(format!(
+                    "the private directories of user {}: {e}",
+                    user.name
+                ))
+            })?;
+        }
+
         let mut command = tokio::process::Command::new(&args.executable);
         command.args(&args.args);
         command.env_clear();
         for var in &self.config.child_env {
             command.env(&var.key, &var.value);
+        }
+        // The user's identity over the daemon's child environment, under the caller's overlay.
+        if let Some(user) = &run_as {
+            for (key, value) in user.env() {
+                command.env(key, value);
+            }
+            user.apply(command.as_std_mut());
         }
         for var in &args.env {
             command.env(&var.key, &var.value);
@@ -647,6 +671,7 @@ mod tests {
 
     fn exec_args(executable: &str, args: &[&str]) -> ExecArgs {
         ExecArgs {
+            user: None,
             execution_id: None,
             session_id: None,
             executable: executable.to_owned(),

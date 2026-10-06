@@ -166,6 +166,11 @@ pub struct ExecArgs {
     /// Signal to send first on graceful termination (defaults to `SIGTERM`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub graceful_signal: Option<Signal>,
+    /// Run as this user (a login name or a decimal uid, looked up in the passwd database): its
+    /// uid, groups, `HOME`, `USER`, `LOGNAME` and `SHELL`, umask `0002`, and a private `TMPDIR`
+    /// and `XDG_RUNTIME_DIR`. Absent: as the daemon's child environment says (root).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
 }
 
 /// Arguments to `execution.start`.
@@ -223,6 +228,9 @@ pub struct OpenSessionArgs {
     /// How the leader is wired: a pseudoterminal (default) or plain pipes.
     #[serde(default)]
     pub mode: SessionMode,
+    /// Run the leader as this user, as [`ExecArgs::user`] does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
 }
 
 /// How a session's leader is wired to the daemon.
@@ -322,6 +330,88 @@ pub struct OpenSftpArgs {
     /// Working directory for the sftp-server process.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+}
+
+/// Arguments to `dotfiles.apply`: apply a person's dotfiles into their home, as their user (Mend's
+/// per-person layout: a person's first process in an executor someone else launched). At least
+/// one of `repository` and `archiveDir`; the repository applies first, as at boot.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DotfilesApplyArgs {
+    /// The user to apply as: a login name or a decimal uid. Their passwd home is the target.
+    pub user: String,
+    /// A dotfiles repository to clone and apply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository: Option<DotfilesRepository>,
+    /// A directory of caller-staged archives (`manifest.json` and `*.tar.gz`, as
+    /// `SEALANT_DOTFILES_ARCHIVE_DIR` holds them).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive_dir: Option<String>,
+    /// The execution the bootstrap process belongs to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_id: Option<ExecutionId>,
+}
+
+/// A dotfiles repository, as the boot's `SEALANT_DOTFILES_*` names one.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DotfilesRepository {
+    /// Clone URL.
+    pub url: String,
+    /// Branch or ref; absent clones the remote's default branch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference: Option<String>,
+    /// `auto` (default), `chezmoi`, `stow` or `copy`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manager: Option<String>,
+    /// `home` (default) or `config`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    /// Run the bootstrap command once the files are applied.
+    #[serde(default)]
+    pub bootstrap: bool,
+    /// The bootstrap command, relative to the checkout (default `./install.sh`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bootstrap_command: Option<String>,
+    /// HTTP username for the clone (default `x-access-token`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_username: Option<String>,
+    /// HTTP token for the clone. Never logged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_token: Option<String>,
+}
+
+impl std::fmt::Debug for DotfilesRepository {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DotfilesRepository")
+            .field("url", &self.url)
+            .field("reference", &self.reference)
+            .field("manager", &self.manager)
+            .field("target", &self.target)
+            .field("bootstrap", &self.bootstrap)
+            .field("bootstrap_command", &self.bootstrap_command)
+            .field("http_username", &self.http_username)
+            .field(
+                "http_token",
+                &self.http_token.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
+}
+
+/// Result of `dotfiles.apply`: answered once every file is applied, before any bootstrap ends.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DotfilesApplied {
+    /// The login name applied as.
+    pub user: String,
+    /// The home applied into.
+    pub home: String,
+    /// The bootstrap commands, started as one managed process running as the user (its
+    /// `process.started` / `process.exited` and output say how `./install.sh` goes); absent when
+    /// no tree had one to run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bootstrap: Option<ExecAccepted>,
 }
 
 /// The set of control commands. Adjacently tagged: `{ "cmd": ..., "args": ... }`.
@@ -503,6 +593,10 @@ pub enum Command {
     /// from there. Idempotent: a plan that names what the executor already has does nothing.
     #[serde(rename = "capture.replan")]
     CaptureReplan,
+    /// Apply a person's dotfiles into their home, as their user; `./install.sh` runs after, as
+    /// a managed process of that user.
+    #[serde(rename = "dotfiles.apply")]
+    DotfilesApply(Box<DotfilesApplyArgs>),
 }
 
 /// What a `capture.flush` waits for.
@@ -571,6 +665,7 @@ impl Command {
             Self::CaptureStatus => "capture.status",
             Self::LeaseEpoch => "lease.epoch",
             Self::CaptureReplan => "capture.replan",
+            Self::DotfilesApply(_) => "dotfiles.apply",
         }
     }
 }
@@ -1193,6 +1288,8 @@ pub enum CommandResult {
     LeaseEpoch(LeaseEpochReport),
     /// The plan was fetched again and the workspace brought to it.
     CaptureReplanned(CaptureReplanned),
+    /// A person's dotfiles were applied.
+    DotfilesApplied(DotfilesApplied),
     /// Generic acknowledgement with no data.
     Accepted,
 }
@@ -1204,6 +1301,7 @@ mod tests {
     #[test]
     fn exec_command_round_trips_adjacently_tagged() {
         let cmd = Command::Exec(ExecArgs {
+            user: None,
             execution_id: Some(ExecutionId::new("run-1")),
             session_id: None,
             executable: "/bin/echo".to_owned(),

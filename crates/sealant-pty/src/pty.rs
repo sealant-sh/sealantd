@@ -49,9 +49,9 @@ pub fn spawn(
     args: &[String],
     cwd: &Path,
     env: &[(String, String)],
-    cols: u16,
-    rows: u16,
+    (cols, rows): (u16, u16),
     term: &str,
+    run_as: Option<&sealant_process::identity::RunAs>,
 ) -> io::Result<PtyChild> {
     let winsize = nix::pty::Winsize {
         ws_row: rows,
@@ -63,6 +63,13 @@ pub fn spawn(
     let master = pty.master;
     let slave = pty.slave;
     set_nonblocking(master.as_raw_fd())?;
+    // A leader that runs as a user owns its terminal, as a login gives one (`ttyname` and
+    // `/dev/pts/N` opened by path work for it, `mesg` and GnuPG's pinentry included).
+    if let Some(user) = run_as {
+        std::os::unix::fs::fchown(&slave, Some(user.uid), None)?;
+        nix::sys::stat::fchmod(&slave, nix::sys::stat::Mode::from_bits_truncate(0o620))
+            .map_err(to_io)?;
+    }
 
     // The child gets three handles to the slave for stdin/stdout/stderr.
     let stdin = slave.try_clone()?;
@@ -95,6 +102,11 @@ pub fn spawn(
             }
             Ok(())
         });
+    }
+    // The user last: the controlling terminal is taken as root, and the identity is the
+    // leader's from exec on.
+    if let Some(user) = run_as {
+        user.apply(command.as_std_mut());
     }
 
     // Spawn through the process-wide gate: sealantd is PID 1 in the workspace and its orphan

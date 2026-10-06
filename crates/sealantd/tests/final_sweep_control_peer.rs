@@ -212,6 +212,7 @@ async fn a_final_flush_sweeps_the_relay_and_the_final_flush_asked_again_answers_
     assert!(runtime.install_capture(capture.clone()));
     let harness = runtime
         .spawn_managed(ExecArgs {
+            user: None,
             execution_id: None,
             session_id: None,
             executable: "/bin/sh".to_owned(),

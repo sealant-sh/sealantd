@@ -1151,6 +1151,7 @@ dependencies = [
 name = "sealant-process"
 version = "0.0.0"
 dependencies = [
+ "libc",
  "nix",
  "sealant-protocol",
  "sealant-runtime-core",

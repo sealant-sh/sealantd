@@ -13,7 +13,7 @@
 
 pub mod capture;
 pub mod config;
-mod dotfiles;
+pub(crate) mod dotfiles;
 mod error;
 mod git;
 pub mod lock;
@@ -557,8 +557,31 @@ async fn boot_serve(
     // adapter and the gateway treat the socket as the readiness signal, and everything they inject
     // after readiness (credential files into $HOME) must never race a dotfiles apply that writes
     // the same tree.
+    // `SEALANT_DOTFILES_USER`: the home and identity both applies run under (a person's, in
+    // Mend's per-person layout); a user the passwd database does not have fails the boot.
+    let dotfiles_home = match config.dotfiles_user.as_deref() {
+        None => Ok(dotfiles::Home::root()),
+        Some(user) => sealant_process::identity::RunAs::resolve(user)
+            .map(dotfiles::Home::of)
+            .map_err(|e| BootError::Dotfiles(format!("SEALANT_DOTFILES_USER: {e}"))),
+    };
+    let dotfiles_home = match dotfiles_home {
+        Ok(home) => home,
+        Err(error) if config.dotfiles.is_some() || config.dotfiles_archives.is_some() => {
+            tracing::error!(%error, "dotfiles apply failed");
+            eprintln!("sealantd boot: {error}");
+            let code = final_capture(&runtime, ExitCode::FAILURE).await;
+            return shutdown_before_control(&runtime, code).await;
+        }
+        Err(_) => dotfiles::Home::root(),
+    };
     if let Some(dotfiles) = config.dotfiles.as_ref().filter(|_| !config.recovery)
-        && let Err(error) = dotfiles::apply(dotfiles, &ssh_runtime_dir(&config))
+        && let Err(error) = dotfiles::apply_repository(
+            dotfiles,
+            &ssh_runtime_dir(&config),
+            &dotfiles_home,
+            dotfiles::BootstrapMode::Inline,
+        )
     {
         tracing::error!(%error, "dotfiles apply failed");
         eprintln!("sealantd boot: {error}");
@@ -570,7 +593,8 @@ async fn boot_serve(
         .dotfiles_archives
         .as_ref()
         .filter(|_| !config.recovery)
-        && let Err(error) = dotfiles::apply_archives(dir)
+        && let Err(error) =
+            dotfiles::apply_archives_into(dir, &dotfiles_home, dotfiles::BootstrapMode::Inline)
     {
         tracing::error!(%error, "dotfiles archive apply failed");
         eprintln!("sealantd boot: {error}");
@@ -837,6 +861,7 @@ async fn run_lifecycle_step(
         .clone()
         .unwrap_or_else(|| config.workspace.working_directory.clone());
     let args = ExecArgs {
+        user: None,
         execution_id: runtime.default_execution_id(),
         session_id: None,
         executable,
@@ -896,6 +921,7 @@ fn launch_harness(runtime: &Arc<Runtime>, config: &BootConfig) -> Result<Process
     };
 
     let exec_args = ExecArgs {
+        user: None,
         execution_id: runtime.default_execution_id(),
         session_id: None,
         executable,

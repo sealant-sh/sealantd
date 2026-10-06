@@ -1827,6 +1827,7 @@ mod tests {
             .dispatch(ControlRequest::new(
                 RequestId::new("x1"),
                 Command::Exec(sealant_protocol::ExecArgs {
+                    user: None,
                     execution_id: None,
                     session_id: None,
                     executable: "/bin/sh".to_owned(),
@@ -2345,6 +2346,7 @@ mod tests {
 
     fn sh(script: &str, cwd: &Path) -> sealant_protocol::ExecArgs {
         sealant_protocol::ExecArgs {
+            user: None,
             execution_id: None,
             session_id: None,
             executable: "/bin/sh".to_owned(),

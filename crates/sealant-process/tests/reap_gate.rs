@@ -51,6 +51,7 @@ async fn reaper_never_steals_fast_exiting_owned_children() {
         runtime
             .exec(
                 ExecArgs {
+                    user: None,
                     execution_id: None,
                     session_id: None,
                     executable: "/bin/true".to_owned(),

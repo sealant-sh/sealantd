@@ -31,10 +31,16 @@ pub const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// What this daemon can do beyond the protocol schema, by name ([`Capabilities::supports`]):
 ///
+/// - `dotfiles.user`: the dotfiles applier runs as a given user into their home, at boot
+///   (`SEALANT_DOTFILES_USER`) and through `dotfiles.apply`, which answers once the files are
+///   applied and runs `./install.sh` after them as a managed process of that user.
+/// - `exec.user`: `exec` and `openSession` take a `user` ([`sealant_process::identity`]).
 /// - `restore.owner_map`: a capture restore takes an owner map (`SEALANT_CAPTURE_OWNER_MAP`),
 ///   gives each person's saved directory to their uid and the worktree to the group
 ///   ([`sealant_capture::owners`]), and sets the group's default ACLs at preparation.
-pub const SUPPORTS: &[&str] = &["restore.owner_map"];
+///
+/// `sealantd capabilities --json` prints the same list without booting.
+pub const SUPPORTS: &[&str] = &["dotfiles.user", "exec.user", "restore.owner_map"];
 
 /// The environment entry a test marks its processes with, to narrow a sweep to them.
 pub const SWEEP_MARK_ENV: &str = "SEALANTD_SWEEP_MARK";
@@ -828,6 +834,7 @@ impl Runtime {
                 | Command::OpenSftp(_)
                 | Command::BindMount { .. }
                 | Command::ExecutionStart(_)
+                | Command::DotfilesApply(_)
         );
         match self.capture() {
             Some(capture) if admits => capture.admit_writer(command.name()),
@@ -1192,6 +1199,7 @@ impl Runtime {
                     | Command::ExecutionStart(_)
                     | Command::BindMount { .. }
                     | Command::CaptureReplan
+                    | Command::DotfilesApply(_)
             )
         {
             return ControlResponse::error(rid, Self::admission_closed_error());
@@ -1423,6 +1431,15 @@ impl Runtime {
                     }
                 }
             },
+            Command::DotfilesApply(args) => {
+                self.note_execution(args.execution_id.as_ref());
+                match crate::dotfiles_verb::apply(&self.processes, args, rid.clone()).await {
+                    Ok(applied) => {
+                        ControlResponse::ok_with(rid, CommandResult::DotfilesApplied(applied))
+                    }
+                    Err(error) => ControlResponse::error(rid, error),
+                }
+            }
             // Streaming commands are routed through dispatch_streaming (they need the ConnHandle).
             Command::AttachSession(_)
             | Command::DetachSession { .. }

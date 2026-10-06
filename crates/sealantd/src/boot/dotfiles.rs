@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use sealant_process::CommandGateExt;
+use sealant_process::identity::RunAs;
 use serde::Deserialize;
 
 use crate::boot::config::{
@@ -64,18 +65,71 @@ const STOW_METADATA: &[&str] = &[
 
 /// Where dotfiles are applied, and the identity every command that applies them runs under.
 #[derive(Debug, Clone)]
-struct Home {
+pub(crate) struct Home {
     dir: PathBuf,
-    user: &'static str,
+    user: String,
+    /// A person's user (Mend's per-person layout): every command runs as them, and every file
+    /// the applier writes itself is theirs. `None`: root, into `/root`.
+    run_as: Option<RunAs>,
+}
+
+/// What [`apply_tree`] does with a tree's bootstrap command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BootstrapMode {
+    /// Run it before the next tree is applied, and fail the apply when it fails (boot).
+    Inline,
+    /// Leave it to the caller, who runs it once every file is applied (`dotfiles.apply`).
+    Defer,
+}
+
+/// A bootstrap command left to the caller ([`BootstrapMode::Defer`]): run `command` in `dir`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PendingBootstrap {
+    pub(crate) dir: PathBuf,
+    pub(crate) command: String,
 }
 
 impl Home {
     /// The workspace home: `/root`, as root.
-    fn root() -> Self {
+    pub(crate) fn root() -> Self {
         Self {
             dir: PathBuf::from(HOME_DIR),
-            user: HOME_USER,
+            user: HOME_USER.to_owned(),
+            run_as: None,
         }
+    }
+
+    /// A person's home: their passwd home, as their user.
+    pub(crate) fn of(run_as: RunAs) -> Self {
+        Self {
+            dir: run_as.home.clone(),
+            user: run_as.name.clone(),
+            run_as: Some(run_as),
+        }
+    }
+
+    /// The home directory.
+    pub(crate) fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// The owner of what the applier writes itself: the person's, or `None` for root.
+    fn owner(&self) -> Option<(u32, u32)> {
+        self.run_as.as_ref().map(|u| (u.uid, u.gid))
+    }
+
+    /// `mkdir -p path`, every directory it makes under the home given to the home's user.
+    fn mkdir(&self, path: &Path) -> Result<(), BootError> {
+        std::fs::create_dir_all(path).map_err(|e| BootError::io_path("mkdir -p", path, e))?;
+        if let Some(owner) = self.owner() {
+            for dir in path.ancestors() {
+                if dir == self.dir || !dir.starts_with(&self.dir) {
+                    break;
+                }
+                give(dir, Some(owner))?;
+            }
+        }
+        Ok(())
     }
 
     /// Where the dotfiles repo is checked out.
@@ -100,10 +154,16 @@ impl Home {
     /// `prepare_workspace`), and a runtime that starts PID 1 without `HOME` (a MicroVM's init)
     /// would otherwise leave `chezmoi apply` and `./install.sh` resolving `~` to nothing.
     fn identify<'c>(&self, command: &'c mut Command) -> &'c mut Command {
+        if let Some(user) = &self.run_as {
+            // The person's whole identity: groups, umask, the private TMPDIR and
+            // XDG_RUNTIME_DIR, their SHELL ([`sealant_process::identity`]).
+            command.envs(user.env());
+            user.apply(command);
+        }
         command
             .env("HOME", &self.dir)
-            .env("USER", self.user)
-            .env("LOGNAME", self.user);
+            .env("USER", &self.user)
+            .env("LOGNAME", &self.user);
         for key in XDG_BASE_DIRS {
             command.env_remove(key);
         }
@@ -111,23 +171,35 @@ impl Home {
     }
 }
 
-/// Apply runtime dotfiles. Returns once application completes (or errors).
-///
-/// # Errors
-/// Returns [`BootError::Dotfiles`] (or a wrapped I/O/command error) on failure.
-pub(crate) fn apply(config: &DotfilesConfig, runtime_dir: &Path) -> Result<(), BootError> {
-    let home = Home::root();
+/// Clone the dotfiles repository and apply it into `home`, as its user. With
+/// [`BootstrapMode::Defer`] the bootstrap is answered instead of run. `runtime_dir` holds the
+/// askpass shim for a root home; a person's goes in their private `TMPDIR`, the only place their
+/// user can run it from.
+pub(crate) fn apply_repository(
+    config: &DotfilesConfig,
+    runtime_dir: &Path,
+    home: &Home,
+    mode: BootstrapMode,
+) -> Result<Option<PendingBootstrap>, BootError> {
     let checkout = home.checkout_dir();
     if let Some(parent) = checkout.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| BootError::io_path("mkdir -p", parent, e))?;
+        home.mkdir(parent)?;
     }
     if checkout.exists() {
         std::fs::remove_dir_all(&checkout)
             .map_err(|e| BootError::io_path("rm -rf", &checkout, e))?;
     }
 
-    let askpass = materialize_askpass(config, runtime_dir)?;
-    let clone_result = clone_dotfiles(config, &checkout, askpass.as_deref(), &home);
+    let askpass_dir = match &home.run_as {
+        Some(user) => {
+            user.prepare_dirs()
+                .map_err(|e| BootError::io_path("mkdir", &user.tmpdir(), e))?;
+            user.tmpdir()
+        }
+        None => runtime_dir.to_path_buf(),
+    };
+    let askpass = materialize_askpass(config, &askpass_dir, home.owner())?;
+    let clone_result = clone_dotfiles(config, &checkout, askpass.as_deref(), home);
     if let Some(path) = &askpass {
         let _ = std::fs::remove_file(path);
     }
@@ -139,7 +211,8 @@ pub(crate) fn apply(config: &DotfilesConfig, runtime_dir: &Path) -> Result<(), B
         config.target,
         config.bootstrap,
         &config.bootstrap_command,
-        &home,
+        home,
+        mode,
     )
 }
 
@@ -151,7 +224,8 @@ fn apply_tree(
     bootstrap: bool,
     bootstrap_command: &str,
     home: &Home,
-) -> Result<(), BootError> {
+    mode: BootstrapMode,
+) -> Result<Option<PendingBootstrap>, BootError> {
     let resolution = detect_manager(manager, checkout);
     tracing::info!(
         requested = requested_name(manager),
@@ -163,11 +237,52 @@ fn apply_tree(
     match resolution.manager {
         ResolvedManager::Chezmoi => apply_chezmoi(checkout, home)?,
         ResolvedManager::Stow => apply_stow(checkout, &target_dir, home)?,
-        ResolvedManager::Copy => apply_copy(checkout, &target_dir)?,
+        ResolvedManager::Copy => apply_copy(checkout, &target_dir, home)?,
     }
 
-    if bootstrap {
-        run_bootstrap(checkout, bootstrap_command, home)?;
+    if !bootstrap {
+        return Ok(None);
+    }
+    match mode {
+        BootstrapMode::Inline => {
+            run_bootstrap(checkout, bootstrap_command, home)?;
+            Ok(None)
+        }
+        BootstrapMode::Defer => Ok(pending_bootstrap(checkout, bootstrap_command)),
+    }
+}
+
+/// The bootstrap `command` of the tree at `checkout`, when the script it names is there.
+fn pending_bootstrap(checkout: &Path, command: &str) -> Option<PendingBootstrap> {
+    if checkout.join(command.trim_start_matches("./")).exists() {
+        Some(PendingBootstrap {
+            dir: checkout.to_path_buf(),
+            command: command.to_owned(),
+        })
+    } else {
+        tracing::info!(command, "dotfiles bootstrap command absent; skipping");
+        None
+    }
+}
+
+/// Give `path` (not following a symlink) to `owner`, when there is one.
+fn give(path: &Path, owner: Option<(u32, u32)>) -> Result<(), BootError> {
+    if let Some((uid, gid)) = owner {
+        std::os::unix::fs::lchown(path, Some(uid), Some(gid))
+            .map_err(|e| BootError::io_path("chown", path, e))?;
+    }
+    Ok(())
+}
+
+/// Give everything under `dir`, and `dir`, to `owner`.
+fn give_tree(dir: &Path, owner: Option<(u32, u32)>) -> Result<(), BootError> {
+    if owner.is_none() {
+        return Ok(());
+    }
+    for entry in walkdir::WalkDir::new(dir) {
+        let entry =
+            entry.map_err(|e| BootError::Dotfiles(format!("walking {}: {e}", dir.display())))?;
+        give(entry.path(), owner)?;
     }
     Ok(())
 }
@@ -200,16 +315,14 @@ fn default_true() -> bool {
     true
 }
 
-/// Apply caller-provided dotfiles archives from `dir`, in manifest order.
-///
-/// # Errors
-/// Returns [`BootError::Dotfiles`] (or a wrapped I/O/command error) on failure; any failure
-/// aborts boot like the repo-based path.
-pub(crate) fn apply_archives(dir: &Path) -> Result<(), BootError> {
-    apply_archives_into(dir, &Home::root())
-}
-
-fn apply_archives_into(dir: &Path, home: &Home) -> Result<(), BootError> {
+/// Apply the archives in `dir` into `home`, in manifest order; with [`BootstrapMode::Defer`]
+/// every bootstrap is answered, in that order, instead of run.
+pub(crate) fn apply_archives_into(
+    dir: &Path,
+    home: &Home,
+    mode: BootstrapMode,
+) -> Result<Vec<PendingBootstrap>, BootError> {
+    let mut pending = Vec::new();
     let manifest_path = dir.join("manifest.json");
     let raw = std::fs::read_to_string(&manifest_path)
         .map_err(|e| BootError::io_path("read", &manifest_path, e))?;
@@ -229,10 +342,10 @@ fn apply_archives_into(dir: &Path, home: &Home) -> Result<(), BootError> {
             std::fs::remove_dir_all(&staging)
                 .map_err(|e| BootError::io_path("rm -rf", &staging, e))?;
         }
-        std::fs::create_dir_all(&staging)
-            .map_err(|e| BootError::io_path("mkdir -p", &staging, e))?;
+        home.mkdir(&staging)?;
         extract_archive(&archive, &staging)?;
-        apply_tree(
+        give_tree(&staging, home.owner())?;
+        pending.extend(apply_tree(
             &staging,
             entry.manager.unwrap_or(DotfilesManager::Auto),
             entry.target.unwrap_or(DotfilesTarget::Home),
@@ -242,9 +355,10 @@ fn apply_archives_into(dir: &Path, home: &Home) -> Result<(), BootError> {
                 .as_deref()
                 .unwrap_or(DEFAULT_DOTFILES_BOOTSTRAP_COMMAND),
             home,
-        )?;
+            mode,
+        )?);
     }
-    Ok(())
+    Ok(pending)
 }
 
 fn extract_archive(archive: &Path, staging: &Path) -> Result<(), BootError> {
@@ -262,6 +376,7 @@ fn extract_archive(archive: &Path, staging: &Path) -> Result<(), BootError> {
 fn materialize_askpass(
     config: &DotfilesConfig,
     runtime_dir: &Path,
+    owner: Option<(u32, u32)>,
 ) -> Result<Option<PathBuf>, BootError> {
     let Some(token) = &config.http_token else {
         return Ok(None);
@@ -275,6 +390,7 @@ fn materialize_askpass(
     std::fs::write(&path, script).map_err(|e| BootError::io_path("write", &path, e))?;
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
         .map_err(|e| BootError::io_path("chmod", &path, e))?;
+    give(&path, owner)?;
     Ok(Some(path))
 }
 
@@ -534,8 +650,7 @@ fn apply_chezmoi(checkout: &Path, home: &Home) -> Result<(), BootError> {
 /// path both provide fails the apply with stow's own conflict error instead of one side winning
 /// quietly. Loose top-level files (`README.md`) are not packages and are left out, as stow does.
 fn apply_stow(checkout: &Path, target_dir: &Path, home: &Home) -> Result<(), BootError> {
-    std::fs::create_dir_all(target_dir)
-        .map_err(|e| BootError::io_path("mkdir -p", target_dir, e))?;
+    home.mkdir(target_dir)?;
     let top = TopLevel::scan(checkout).map_err(|e| BootError::io_path("read_dir", checkout, e))?;
     if !top.home_entries.is_empty() {
         tracing::info!(
@@ -543,7 +658,7 @@ fn apply_stow(checkout: &Path, target_dir: &Path, home: &Home) -> Result<(), Boo
             "stow: top-level dot entries are not packages; copying them into the target"
         );
         for name in &top.home_entries {
-            copy_entry(&checkout.join(name), &target_dir.join(name))?;
+            copy_entry(&checkout.join(name), &target_dir.join(name), home.owner())?;
         }
     }
     if !top.loose_files.is_empty() {
@@ -569,21 +684,21 @@ fn apply_stow(checkout: &Path, target_dir: &Path, home: &Home) -> Result<(), Boo
     Ok(())
 }
 
-fn apply_copy(checkout: &Path, target_dir: &Path) -> Result<(), BootError> {
-    std::fs::create_dir_all(target_dir)
-        .map_err(|e| BootError::io_path("mkdir -p", target_dir, e))?;
-    copy_tree(checkout, target_dir)
+fn apply_copy(checkout: &Path, target_dir: &Path, home: &Home) -> Result<(), BootError> {
+    home.mkdir(target_dir)?;
+    copy_tree(checkout, target_dir, home.owner())
 }
 
 /// Recursively copy the dotfiles tree into the target, skipping the `.git` directory.
-fn copy_tree(src: &Path, dst: &Path) -> Result<(), BootError> {
+/// Every entry it writes is given to `owner`, when there is one.
+fn copy_tree(src: &Path, dst: &Path, owner: Option<(u32, u32)>) -> Result<(), BootError> {
     let entries = std::fs::read_dir(src).map_err(|e| BootError::io_path("read_dir", src, e))?;
     for entry in entries.flatten() {
         let name = entry.file_name();
         if name == ".git" {
             continue;
         }
-        copy_entry(&entry.path(), &dst.join(&name))?;
+        copy_entry(&entry.path(), &dst.join(&name), owner)?;
     }
     Ok(())
 }
@@ -595,13 +710,14 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<(), BootError> {
 /// the file an earlier one's link points at. A directory is merged into whatever directory is at
 /// its destination, including one reached through a symlink: a directory stow folded into an
 /// earlier archive's staging tree receives the later archive's files there.
-fn copy_entry(from: &Path, to: &Path) -> Result<(), BootError> {
+fn copy_entry(from: &Path, to: &Path, owner: Option<(u32, u32)>) -> Result<(), BootError> {
     let file_type = std::fs::symlink_metadata(from)
         .map_err(|e| BootError::io_path("stat", from, e))?
         .file_type();
     if file_type.is_dir() {
         std::fs::create_dir_all(to).map_err(|e| BootError::io_path("mkdir -p", to, e))?;
-        return copy_tree(from, to);
+        give(to, owner)?;
+        return copy_tree(from, to, owner);
     }
     remove_non_directory(to)?;
     if file_type.is_symlink() {
@@ -610,7 +726,7 @@ fn copy_entry(from: &Path, to: &Path) -> Result<(), BootError> {
     } else {
         std::fs::copy(from, to).map_err(|e| BootError::io_path("copy", to, e))?;
     }
-    Ok(())
+    give(to, owner)
 }
 
 /// Remove whatever non-directory sits at `path`. A directory is left for the caller's own
@@ -713,7 +829,8 @@ mod tests {
             Self {
                 home: Home {
                     dir: home_dir,
-                    user: HOME_USER,
+                    user: HOME_USER.to_owned(),
+                    run_as: None,
                 },
                 archives,
                 work,
@@ -746,7 +863,7 @@ mod tests {
         }
 
         fn apply(&self) -> Result<(), BootError> {
-            apply_archives_into(&self.archives, &self.home)
+            apply_archives_into(&self.archives, &self.home, BootstrapMode::Inline).map(|_| ())
         }
 
         fn home_path(&self, path: &str) -> PathBuf {
@@ -903,7 +1020,7 @@ mod tests {
         std::fs::create_dir_all(src.path().join("nested")).expect("nested");
         std::fs::write(src.path().join("nested/file"), b"hi").expect("write");
 
-        copy_tree(src.path(), dst.path()).expect("copy");
+        copy_tree(src.path(), dst.path(), None).expect("copy");
         assert!(dst.path().join(".vimrc").exists());
         assert!(dst.path().join("nested/file").exists());
         assert!(!dst.path().join(".git").exists());
@@ -918,7 +1035,7 @@ mod tests {
         std::fs::write(src.path().join("real"), b"x").expect("write");
         std::os::unix::fs::symlink("real", src.path().join(".relative")).expect("symlink");
 
-        copy_tree(src.path(), dst.path()).expect("a dangling link does not fail the copy");
+        copy_tree(src.path(), dst.path(), None).expect("a dangling link does not fail the copy");
         assert_eq!(
             std::fs::read_link(dst.path().join(".dangling")).expect("link"),
             Path::new("/nonexistent/sealant/target")
@@ -939,7 +1056,7 @@ mod tests {
         std::os::unix::fs::symlink(&outside, dst.path().join(".zshrc")).expect("symlink");
         std::fs::write(src.path().join(".zshrc"), b"later\n").expect("write");
 
-        copy_tree(src.path(), dst.path()).expect("copy");
+        copy_tree(src.path(), dst.path(), None).expect("copy");
         let written = dst.path().join(".zshrc");
         assert!(!written.symlink_metadata().expect("meta").is_symlink());
         assert_eq!(std::fs::read_to_string(written).expect("read"), "later\n");
@@ -981,7 +1098,8 @@ mod tests {
             r#"{"archives":[{"file":"../evil.tar.gz"}]}"#,
         )
         .expect("write");
-        let err = apply_archives(dir.path()).expect_err("traversal must be rejected");
+        let err = apply_archives_into(dir.path(), &Home::root(), BootstrapMode::Inline)
+            .expect_err("traversal must be rejected");
         assert!(format!("{err}").contains("plain basename"));
     }
 

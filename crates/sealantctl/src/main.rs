@@ -206,6 +206,7 @@ async fn main() -> ExitCode {
             wait,
         } => (
             Command::Exec(ExecArgs {
+                user: None,
                 execution_id: None,
                 session_id: None,
                 executable,

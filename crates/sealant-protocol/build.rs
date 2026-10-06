@@ -8,6 +8,8 @@ fn main() {
     prost_build::Config::new()
         // The status report is the largest result by far; boxed, it does not size every other.
         .boxed(".sealant.v1.CommandResult.result.capture_status")
+        // A dotfiles repository carries several strings: boxed, it does not size every command.
+        .boxed(".sealant.v1.Command.command.dotfiles_apply")
         .compile_protos(&["proto/sealant.proto"], &["proto"])
         .expect("compile sealant.proto");
     println!("cargo:rerun-if-changed=proto/sealant.proto");

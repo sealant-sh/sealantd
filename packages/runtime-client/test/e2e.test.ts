@@ -62,7 +62,9 @@ test("starts daemon, execs, streams typed events, gets the result, and shuts dow
     assert.equal(caps.features?.ioCapture, true);
     assert.equal(caps.features?.pty, true);
     // Mend's per-person layout runs only on a daemon that names what it needs.
-    assert.ok(caps.supports.includes("restore.owner_map"));
+    for (const name of ["exec.user", "dotfiles.user", "restore.owner_map"]) {
+      assert.ok(caps.supports.includes(name), name);
+    }
 
     const events = client.events();
     const accepted = await client.exec({ executable: "/bin/echo", args: ["hello"] });

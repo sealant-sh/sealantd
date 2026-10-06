@@ -16,3 +16,4 @@ run_as_root() {
 }
 
 run_as_root sealant-capture owner_map
+run_as_root sealantd run_as_user

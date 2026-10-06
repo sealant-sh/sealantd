@@ -13,14 +13,14 @@ use crate::{
     CaptureClassSnaps, CaptureFlushKind, CaptureKind, CaptureMethod, CaptureMode, CaptureOverdue,
     CapturePolicy, CaptureReplanned, CaptureStaged, CaptureStatusReport, ClientMessage, Command,
     CommandResult, Confidence, ControlError, ControlErrorCode, ControlRequest, ControlResponse,
-    Encoding, EnvVar, EventEnvelope, EventPayload, ExecAccepted, ExecArgs, ExecutionStartArgs,
-    ExitReason, Feature, FeatureMatrix, FeatureState, ForwardOpened, ForwardProtocol, HealthReport,
-    IoChunk, LeaseEpochReport, Limits, NetworkMode, OpenForwardArgs, OpenSessionArgs, OpenSftpArgs,
-    ProcessAttached, ProcessExited, ProcessList, ProcessStarted, ProcessState, ProcessSummary,
-    ResponseOutcome, RuntimeHeartbeat, RuntimeMetrics, RuntimeState, RuntimeStateChanged,
-    ServerMessage, SessionList, SessionOpened, SessionSummary, SftpOpened, ShutdownAccepted,
-    Signal, StreamAttached, StreamEnd, StreamFrame, StreamKind, StreamPayload, TelemetryDropped,
-    TransformMeta,
+    DotfilesApplied, DotfilesApplyArgs, DotfilesRepository, Encoding, EnvVar, EventEnvelope,
+    EventPayload, ExecAccepted, ExecArgs, ExecutionStartArgs, ExitReason, Feature, FeatureMatrix,
+    FeatureState, ForwardOpened, ForwardProtocol, HealthReport, IoChunk, LeaseEpochReport, Limits,
+    NetworkMode, OpenForwardArgs, OpenSessionArgs, OpenSftpArgs, ProcessAttached, ProcessExited,
+    ProcessList, ProcessStarted, ProcessState, ProcessSummary, ResponseOutcome, RuntimeHeartbeat,
+    RuntimeMetrics, RuntimeState, RuntimeStateChanged, ServerMessage, SessionList, SessionOpened,
+    SessionSummary, SftpOpened, ShutdownAccepted, Signal, StreamAttached, StreamEnd, StreamFrame,
+    StreamKind, StreamPayload, TelemetryDropped, TransformMeta,
 };
 use crate::{
     FileChange, FileChangeKind, FileDiffAvailable, FileEntry, FileSnapshotCompleted, FileType,
@@ -798,6 +798,7 @@ impl From<ExecArgs> for wire::ExecArgs {
             capture: a.capture.map(Into::into),
             graceful_signal: a.graceful_signal.map(enum_i32::<_, wire::Signal>),
             attach: a.attach,
+            user: a.user,
         }
     }
 }
@@ -817,6 +818,7 @@ impl TryFrom<wire::ExecArgs> for ExecArgs {
             capture: a.capture.map(TryInto::try_into).transpose()?,
             graceful_signal: a.graceful_signal.map(signal).transpose()?,
             attach: a.attach,
+            user: a.user,
         })
     }
 }
@@ -833,6 +835,7 @@ impl From<OpenSessionArgs> for wire::OpenSessionArgs {
             rows: u32::from(a.rows),
             term: a.term,
             mode: enum_i32::<_, wire::SessionMode>(a.mode),
+            user: a.user,
         }
     }
 }
@@ -849,6 +852,7 @@ impl TryFrom<wire::OpenSessionArgs> for OpenSessionArgs {
             rows: a.rows as u16,
             term: a.term,
             mode: session_mode_or_default(a.mode)?,
+            user: a.user,
         })
     }
 }
@@ -1037,6 +1041,21 @@ impl From<Command> for wire::command::Command {
             Command::CaptureStatus => W::CaptureStatus(wire::Empty {}),
             Command::LeaseEpoch => W::LeaseEpoch(wire::Empty {}),
             Command::CaptureReplan => W::CaptureReplan(wire::Empty {}),
+            Command::DotfilesApply(a) => W::DotfilesApply(Box::new(wire::DotfilesApplyArgs {
+                user: a.user,
+                repository: a.repository.map(|r| wire::DotfilesRepository {
+                    url: r.url,
+                    reference: r.reference,
+                    manager: r.manager,
+                    target: r.target,
+                    bootstrap: r.bootstrap,
+                    bootstrap_command: r.bootstrap_command,
+                    http_username: r.http_username,
+                    http_token: r.http_token,
+                }),
+                archive_dir: a.archive_dir,
+                execution_id: opt_id(a.execution_id),
+            })),
             Command::AttachSession(a) => W::AttachSession(a.into()),
             Command::DetachSession { channel_id } => W::DetachSession(wire::DetachSessionArgs {
                 channel_id: channel_id.into_inner(),
@@ -1125,6 +1144,21 @@ impl TryFrom<wire::command::Command> for Command {
             W::CaptureStatus(_) => Command::CaptureStatus,
             W::LeaseEpoch(_) => Command::LeaseEpoch,
             W::CaptureReplan(_) => Command::CaptureReplan,
+            W::DotfilesApply(a) => Command::DotfilesApply(Box::new(DotfilesApplyArgs {
+                user: a.user,
+                repository: a.repository.map(|r| DotfilesRepository {
+                    url: r.url,
+                    reference: r.reference,
+                    manager: r.manager,
+                    target: r.target,
+                    bootstrap: r.bootstrap,
+                    bootstrap_command: r.bootstrap_command,
+                    http_username: r.http_username,
+                    http_token: r.http_token,
+                }),
+                archive_dir: a.archive_dir,
+                execution_id: a.execution_id.map(ExecutionId::new),
+            })),
             W::AttachSession(a) => Command::AttachSession(a.try_into()?),
             W::DetachSession(a) => Command::DetachSession {
                 channel_id: ChannelId::new(a.channel_id),
@@ -1481,6 +1515,16 @@ impl From<CommandResult> for wire::command_result::Result {
                 channel_id: s.channel_id.into_inner(),
             }),
             CommandResult::SessionOutput(o) => W::SessionOutput(o.into()),
+            CommandResult::DotfilesApplied(d) => W::DotfilesApplied(wire::DotfilesApplied {
+                user: d.user,
+                home: d.home,
+                bootstrap: d.bootstrap.map(|a| wire::ExecAccepted {
+                    process_id: a.process_id.into_inner(),
+                    pid: a.pid,
+                    pgid: a.pgid,
+                    pidfd: a.pidfd,
+                }),
+            }),
             CommandResult::Accepted => W::Accepted(wire::Empty {}),
         }
     }
@@ -1623,6 +1667,16 @@ impl TryFrom<wire::command_result::Result> for CommandResult {
                 channel_id: ChannelId::new(s.channel_id),
             }),
             W::SessionOutput(o) => CommandResult::SessionOutput(o.try_into()?),
+            W::DotfilesApplied(d) => CommandResult::DotfilesApplied(DotfilesApplied {
+                user: d.user,
+                home: d.home,
+                bootstrap: d.bootstrap.map(|a| ExecAccepted {
+                    process_id: ProcessId::new(a.process_id),
+                    pid: a.pid,
+                    pgid: a.pgid,
+                    pidfd: a.pidfd,
+                }),
+            }),
             W::Accepted(_) => CommandResult::Accepted,
         })
     }
@@ -1893,6 +1947,7 @@ mod tests {
         let msg = ClientMessage::Request(ControlRequest::new(
             RequestId::new("req_1"),
             Command::Exec(ExecArgs {
+                user: Some("m3kq7xj2a".to_owned()),
                 execution_id: Some(ExecutionId::new("run-7")),
                 session_id: None,
                 executable: "/bin/echo".to_owned(),
@@ -1920,6 +1975,7 @@ mod tests {
         let msg = ClientMessage::Request(ControlRequest::new(
             RequestId::new("req_2"),
             Command::OpenSession(OpenSessionArgs {
+                user: Some("40031".to_owned()),
                 execution_id: Some(ExecutionId::new("run-8")),
                 shell: Some("codex".to_owned()),
                 args: vec!["app-server".to_owned()],
@@ -1946,9 +2002,11 @@ mod tests {
             rows: 24,
             term: None,
             mode: 0,
+            user: None,
         };
         let args = OpenSessionArgs::try_from(wire_args).expect("decode");
         assert_eq!(args.mode, crate::SessionMode::Pty);
+        assert_eq!(args.user, None);
     }
 
     #[test]

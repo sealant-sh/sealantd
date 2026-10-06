@@ -25,6 +25,7 @@ const MAX: u32 = 8 * 1024 * 1024;
 
 fn exec_args(executable: &str, args: &[&str]) -> ExecArgs {
     ExecArgs {
+        user: None,
         execution_id: None,
         session_id: None,
         executable: executable.to_owned(),
@@ -271,6 +272,7 @@ async fn in_process_session_open_write_resize_close() {
         ControlRequest::new(
             RequestId::new("s1"),
             Command::OpenSession(sealant_protocol::OpenSessionArgs {
+                user: None,
                 execution_id: None,
                 shell: None,
                 args: vec![],
@@ -385,6 +387,7 @@ async fn open_session(
         ControlRequest::new(
             RequestId::new(rid),
             Command::OpenSession(OpenSessionArgs {
+                user: None,
                 execution_id: None,
                 shell: Some("/bin/sh".to_owned()),
                 args: vec![],

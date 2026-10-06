@@ -66,6 +66,7 @@ const CONSUMED_KEYS: &[&str] = &[
     "SEALANT_DOTFILES_HTTP_USERNAME",
     "SEALANT_DOTFILES_HTTP_TOKEN",
     "SEALANT_DOTFILES_ARCHIVE_DIR",
+    "SEALANT_DOTFILES_USER",
     "SEALANT_SECRET_ENV_FILE",
     "SEALANT_WORKSPACE_DOCKER_HOST",
     "SEALANT_LIFECYCLE_SETUP_JSON",
@@ -511,6 +512,11 @@ pub struct BootConfig {
     /// Directory holding caller-provided dotfiles archives (manifest.json + *.tar.gz), when
     /// configured. Applied after the repo-based dotfiles, before the control socket binds.
     pub dotfiles_archives: Option<PathBuf>,
+    /// `SEALANT_DOTFILES_USER`: the user the dotfiles (repository and archives) are applied as,
+    /// into their passwd home, `./install.sh` included (Mend's per-person layout: the
+    /// launcher's). The user must be in the image's passwd database at boot. Unset: root, into
+    /// `/root`.
+    pub dotfiles_user: Option<String>,
     /// File holding the launcher-provided secret environment (a JSON object, name → value), when
     /// configured. Read once at boot by [`load_secret_env`]; the values are injected into the
     /// harness child environment explicitly (bypassing the secret-name scrub, since these are
@@ -643,6 +649,10 @@ impl BootConfig {
             .get("SEALANT_DOTFILES_ARCHIVE_DIR")
             .filter(|s| !s.is_empty())
             .map(PathBuf::from);
+        let dotfiles_user = env
+            .get("SEALANT_DOTFILES_USER")
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty());
         let secret_env_file = env
             .get("SEALANT_SECRET_ENV_FILE")
             .filter(|s| !s.is_empty())
@@ -759,6 +769,7 @@ impl BootConfig {
             clone_auth,
             dotfiles,
             dotfiles_archives,
+            dotfiles_user,
             secret_env_file,
             lifecycle,
             foreground,
@@ -1745,6 +1756,21 @@ mod tests {
         ])
         .expect_err("should fail without token");
         assert!(format!("{err}").contains("SEALANT_DOTFILES_HTTP_TOKEN"));
+    }
+
+    /// `SEALANT_DOTFILES_USER` names the user boot applies the dotfiles as; it is boot's own,
+    /// never passed through to the harness.
+    #[test]
+    fn dotfiles_user_is_read_and_consumed() {
+        let cfg = load_with(&[]).expect("valid");
+        assert_eq!(cfg.dotfiles_user, None);
+        let cfg = load_with(&[("SEALANT_DOTFILES_USER", " m3kq7xj2a ")]).expect("valid");
+        assert_eq!(cfg.dotfiles_user.as_deref(), Some("m3kq7xj2a"));
+        assert!(
+            !cfg.passthrough_env
+                .iter()
+                .any(|(k, _)| k == "SEALANT_DOTFILES_USER")
+        );
     }
 
     #[test]

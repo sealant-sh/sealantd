@@ -53,6 +53,26 @@ names the path it could not), the control socket's directory (`SEALANT_CONTROL_S
 `$HOME/.local/state/sealantd/session-journals` (root's default, `/var/lib/sealantd/…`, is not
 one it can create). The harness's `HOME` stays `/root`.
 
+### Processes as a person's user
+
+The daemon runs as root, and so does every process it starts, unless the request names a user
+(Mend's per-person layout):
+
+- `exec` and `openSession` take `user`, a login name or a decimal uid. The process starts as
+  exactly that passwd entry: its uid, primary group and supplementary groups (`initgroups`), its
+  `HOME`, `USER`, `LOGNAME` and `SHELL`, umask `0002`, and a private `TMPDIR` (`/tmp/u-<uid>`) and
+  `XDG_RUNTIME_DIR` (`/run/user/<uid>`), both 0700 and the user's. The caller's `env` still wins
+  (a caller may point `HOME` elsewhere on purpose). A PTY leader owns its terminal. Root, or a user
+  the passwd database does not have, is refused.
+- The dotfiles applier runs as a user into their passwd home: at boot with
+  `SEALANT_DOTFILES_USER` (the user must be in the image's passwd database then), and through
+  `dotfiles.apply { user, repository?, archiveDir? }`, which answers once every file is applied and
+  runs `./install.sh` after them as a managed process of that user, named in the answer
+  (`bootstrap`), so the caller can start the person's agent beside it.
+- `runtime.getCapabilities` names `exec.user`, `dotfiles.user` and `restore.owner_map` in
+  `supports`. `sealantd capabilities --json` prints the same, with the version, without booting,
+  for an image build to record.
+
 ## Capture store: what Core and Mend rely on
 
 A capture-source workspace (`SEALANT_WORKSPACE_SOURCE=capture`, ADR-0015) keeps its work product
