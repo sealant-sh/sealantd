@@ -13,7 +13,7 @@ use sealantd::shutdown::ShutdownSignal;
 
 /// On a fresh thread: whether it had no-new-privileges before, after `Runtime::new` with
 /// `no_new_privileges`, and what the runtime reports.
-fn posture(no_new_privileges: bool) -> (bool, bool, bool) {
+fn posture(no_new_privileges: bool) -> (Option<bool>, Option<bool>, Option<bool>) {
     std::thread::spawn(move || {
         let before = sealant_process::platform::no_new_privs();
         let tokio = tokio::runtime::Builder::new_current_thread()
@@ -38,20 +38,26 @@ fn posture(no_new_privileges: bool) -> (bool, bool, bool) {
 fn a_daemon_sets_no_new_privileges_by_default() {
     assert!(RuntimeConfig::new(new_runtime_id()).no_new_privileges);
     let (_, after, reported) = posture(true);
-    assert!(after, "no-new-privileges is not set");
-    assert!(reported, "the runtime does not report it");
+    assert_eq!(after, Some(true), "no-new-privileges is not set");
+    assert_eq!(reported, Some(true), "the runtime does not report it");
 }
 
 /// A per-person executor's daemon leaves it unset (where the environment did not set it first:
-/// it cannot be unset), and reports that.
+/// it cannot be unset), and reports that. With `SEALANTD_REQUIRE_NNP_FREE=1` (CI's hosted
+/// runners impose none) an environment that imposes it fails the test instead of passing it
+/// with nothing proven.
 #[test]
 fn a_per_person_daemon_leaves_no_new_privileges_unset() {
     let (before, after, reported) = posture(false);
-    if before {
+    if before != Some(false) {
+        assert!(
+            std::env::var("SEALANTD_REQUIRE_NNP_FREE").as_deref() != Ok("1"),
+            "SEALANTD_REQUIRE_NNP_FREE=1 but this environment imposes no-new-privileges"
+        );
         eprintln!("this environment sets no-new-privileges itself: nothing to leave unset");
-        assert!(after && reported);
+        assert_eq!((after, reported), (before, before));
         return;
     }
-    assert!(!after, "no-new-privileges was set");
-    assert!(!reported, "the runtime reports it set");
+    assert_eq!(after, Some(false), "no-new-privileges was set");
+    assert_eq!(reported, Some(false), "the runtime reports it set");
 }

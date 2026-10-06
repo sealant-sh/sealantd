@@ -85,12 +85,15 @@ The daemon runs as root, and so does every process it starts, unless the request
   (`personCapabilities` empty, `personCapabilitiesWithheld` the reason); pnpm then fails to
   relink bins as a person.
 - **No-new-privileges.** sealantd sets it on itself (plan §18), at boot and in the runtime, and so
-  on everything it starts, **except in a per-person executor** (a boot whose capture source carries
-  an owner map): every person there has passwordless `sudo` (Mend's ADR 0016), which
+  on everything it starts, **except in a per-person executor** (a root daemon whose capture source
+  carries an owner map naming at least one person): every person there has passwordless `sudo`
+  (Mend's ADR 0016), which
   no-new-privileges would break, so that executor is root by design, not a sandbox, and its
-  persons hold `CAP_FOWNER`. Boot logs which posture it took, and `runtime.getCapabilities`
-  reports `noNewPrivileges`. An orchestrator can still impose it (a Kubernetes
-  `allowPrivilegeEscalation: false`); then `sudo` and `CAP_FOWNER` are gone there too.
+  persons hold `CAP_FOWNER`. A map naming nobody, or a daemon that is not root, keeps it. Boot
+  logs the posture it took and the state it found (when an orchestrator imposed no-new-privileges,
+  a Kubernetes `allowPrivilegeEscalation: false`, it says no person's `sudo` will work), and
+  `runtime.getCapabilities` reports `noNewPrivileges` (absent: unknown, an older daemon or one that
+  could not read it).
 - Root, a user in root's group, or a user the passwd database does not have, is refused.
   `openSftp` takes no user yet: an SFTP bridge runs as root.
 - The dotfiles applier runs as a user into their passwd home, its commands with a clean

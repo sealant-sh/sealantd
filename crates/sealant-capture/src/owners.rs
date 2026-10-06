@@ -21,6 +21,11 @@
 //!   entry in the map) is restored as before: root's, at its recorded mode.
 //!
 //! Without a map nothing changes.
+//!
+//! A map also decides the daemon's privilege posture: a root daemon booted with an owner map that
+//! names at least one person is a per-person executor, and does not set no-new-privileges (plan
+//! §18 as amended, Mend's ADR 0016: every person there has passwordless `sudo`, so the executor is
+//! root by design, not a sandbox). Pass a map only for a per-person launch.
 
 use std::collections::BTreeMap;
 use std::io;

@@ -46,6 +46,7 @@ fn ready() -> bool {
     );
     static USERS: std::sync::Once = std::sync::Once::new();
     USERS.call_once(|| {
+        SudoersEntry::sweep();
         let run = |args: &[&str]| {
             let out = Std::new(args[0]).args(&args[1..]).output().unwrap();
             let err = String::from_utf8_lossy(&out.stderr);
@@ -857,7 +858,7 @@ async fn pnpm_installs_as_a_second_person_in_a_restored_worktree() {
         o = out.display()
     );
     // Whether the environment itself imposes no-new-privileges, read before the daemon starts.
-    let environment_nnp = sealant_process::platform::no_new_privs();
+    let environment_nnp = sealant_process::platform::no_new_privs() != Some(false);
     // The daemon's child environment carries PATH, as boot's passthrough does (node and pnpm
     // may live outside the default PATH, as on CI runners).
     let mut client = Client::start_with(
@@ -877,6 +878,12 @@ async fn pnpm_installs_as_a_second_person_in_a_restored_worktree() {
         assert!(
             environment_nnp,
             "a per-person daemon withheld CAP_FOWNER: {withheld:?}"
+        );
+        // The root suite proves the per-person posture: an environment that imposes
+        // no-new-privileges cannot, so it fails the suite rather than pass it unproven.
+        assert!(
+            std::env::var("SEALANTD_REQUIRE_ROOT_TESTS").as_deref() != Ok("1"),
+            "SEALANTD_REQUIRE_ROOT_TESTS=1 in an environment that imposes no-new-privileges"
         );
         // pnpm 12 says ERR_PNPM_CMD_SHIM_CHMOD; pnpm 9 a bare EPERM on the chmod.
         assert!(
@@ -1058,28 +1065,48 @@ async fn the_image_s_person_environment_reaches_every_person_s_process_and_not_r
     assert!(!env.contains("SEALANT_SNEAKY"), "{env}");
 }
 
-/// Removes the test's sudoers entry when dropped.
-struct SudoersEntry;
+/// The test's sudoers entry, under a name of this process's own (two runs never share one), and
+/// removed when dropped, a panic's unwinding included. One a killed run left behind is removed
+/// by the next ([`SudoersEntry::sweep`], from `ready`). Root's work, on a CI runner or in a
+/// container: it gives the test person passwordless root while it exists.
+struct SudoersEntry {
+    path: PathBuf,
+}
 
 impl SudoersEntry {
-    const PATH: &str = "/etc/sudoers.d/mtest-sealantd";
+    const DIR: &str = "/etc/sudoers.d";
+    const PREFIX: &str = "mtest-sealantd-";
 
     /// Passwordless sudo for the test person, as Core's images give the `mend` group.
     fn add() -> Self {
-        std::fs::create_dir_all("/etc/sudoers.d").unwrap();
-        std::fs::write(Self::PATH, format!("{BOB} ALL=(ALL) NOPASSWD: ALL\n")).unwrap();
-        std::fs::set_permissions(
-            Self::PATH,
-            std::os::unix::fs::PermissionsExt::from_mode(0o440),
-        )
-        .unwrap();
-        Self
+        std::fs::create_dir_all(Self::DIR).unwrap();
+        let path = PathBuf::from(Self::DIR).join(format!("{}{}", Self::PREFIX, std::process::id()));
+        std::fs::write(&path, format!("{BOB} ALL=(ALL) NOPASSWD: ALL\n")).unwrap();
+        std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o440))
+            .unwrap();
+        Self { path }
+    }
+
+    /// Remove every entry an earlier run left (a run killed before its drop).
+    fn sweep() {
+        let Ok(entries) = std::fs::read_dir(Self::DIR) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(Self::PREFIX)
+            {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
     }
 }
 
 impl Drop for SudoersEntry {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(Self::PATH);
+        let _ = std::fs::remove_file(&self.path);
     }
 }
 
@@ -1133,14 +1160,18 @@ fn in_a_per_person_executor_a_person_s_sudo_works() {
     if !ready() {
         return;
     }
-    if sealant_process::platform::no_new_privs() {
+    if sealant_process::platform::no_new_privs() != Some(false) {
+        assert!(
+            std::env::var("SEALANTD_REQUIRE_ROOT_TESTS").as_deref() != Ok("1"),
+            "SEALANTD_REQUIRE_ROOT_TESTS=1 in an environment that imposes no-new-privileges"
+        );
         eprintln!("this environment sets no-new-privileges itself: sudo cannot work in it");
         return;
     }
     let _sudoers = SudoersEntry::add();
     let (seen, caps) = sudo_as_person(false);
     assert!(seen.starts_with("exit=0\n"), "sudo as a person:\n{seen}");
-    assert!(!caps.no_new_privileges, "{caps:?}");
+    assert_eq!(caps.no_new_privileges, Some(false), "{caps:?}");
     assert_eq!(caps.person_capabilities, ["CAP_FOWNER"], "{caps:?}");
 }
 
@@ -1158,6 +1189,6 @@ fn elsewhere_no_new_privileges_stays_and_sudo_is_refused() {
         "sudo worked under no-new-privileges:\n{seen}"
     );
     assert!(seen.contains("no new privileges"), "{seen}");
-    assert!(caps.no_new_privileges, "{caps:?}");
+    assert_eq!(caps.no_new_privileges, Some(true), "{caps:?}");
     assert!(caps.person_capabilities.is_empty(), "{caps:?}");
 }

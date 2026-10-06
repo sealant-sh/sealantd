@@ -21,3 +21,4 @@ run_as_root() {
 run_as_root sealant-capture owner_map
 # One thread: a test sets the daemon's own environment (what a person's commands must not see).
 run_as_root sealantd run_as_user --test-threads 1
+run_as_root sealantd boot_privilege_posture

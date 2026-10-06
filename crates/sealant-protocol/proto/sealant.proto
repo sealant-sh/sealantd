@@ -526,7 +526,8 @@ message Capabilities {
   optional string person_capabilities_withheld = 11;
   // Whether no-new-privileges is set on the daemon and so on everything it starts: true in every
   // executor but a per-person one (a boot under an owner map), where every person has sudo.
-  bool no_new_privileges = 12;
+  // Absent: unknown (an older daemon, which always set it, or one that could not read it).
+  optional bool no_new_privileges = 12;
 }
 
 message HealthReport {

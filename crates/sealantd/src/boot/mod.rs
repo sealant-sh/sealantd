@@ -214,14 +214,25 @@ fn prepare(
     // No-new-privileges (plan §18) on every executor but a per-person one: there every person
     // has passwordless sudo (Mend's ADR 0016), which no-new-privileges would break, so it is root
     // by design, not a sandbox.
-    if keeps_no_new_privileges(config) {
+    // Decided once (`BootConfig::no_new_privileges`); the runtime reads the same field.
+    if config.no_new_privileges {
         let engaged = sealant_process::platform::set_no_new_privs();
         tracing::info!(engaged, "privilege posture: no-new-privileges set");
     } else {
-        tracing::info!(
-            "privilege posture: per-person executor (owner map): no-new-privileges not set, so \
-             every person's sudo works"
-        );
+        match sealant_process::platform::no_new_privs() {
+            Some(false) => tracing::info!(
+                "privilege posture: per-person executor (owner map): no-new-privileges not set, \
+                 so every person's sudo works"
+            ),
+            Some(true) => tracing::warn!(
+                "privilege posture: per-person executor (owner map), but the environment imposed \
+                 no-new-privileges: no person's sudo will work, and no person gets CAP_FOWNER"
+            ),
+            None => tracing::warn!(
+                "privilege posture: per-person executor (owner map), but no-new-privileges cannot \
+                 be read: whether a person's sudo works is unknown"
+            ),
+        }
     }
 
     // Step 3: workspace prep.
@@ -431,14 +442,8 @@ fn into_runtime_config(config: &BootConfig, secret_env: &[(String, String)]) -> 
     // A process run as a person never gets the launcher's declared harness logins; the
     // project's secrets (the secret environment) reach every person.
     runtime_config.person_withheld = config.declared_harness_keys.clone();
-    runtime_config.no_new_privileges = keeps_no_new_privileges(config);
+    runtime_config.no_new_privileges = config.no_new_privileges;
     runtime_config
-}
-
-/// Whether this boot sets no-new-privileges (plan §18): every boot but a per-person executor's,
-/// one whose capture source carries an owner map (Mend's ADR 0016: every person has sudo there).
-fn keeps_no_new_privileges(config: &BootConfig) -> bool {
-    !matches!(&config.source, WorkspaceSource::Capture(c) if c.owners.is_some())
 }
 
 /// Compute the harness child's base environment, in precedence order (later wins): the non-secret
@@ -1226,16 +1231,19 @@ mod tests {
         assert!(into_runtime_config(&config, &[]).redact_literals.is_empty());
     }
 
-    /// No-new-privileges stays on every executor but a per-person one: a boot whose capture
-    /// source carries an owner map (Mend's ADR 0016) leaves it off, so every person's sudo works.
+    /// No-new-privileges stays on every executor but a per-person one: a root daemon whose
+    /// capture source carries an owner map naming someone. The posture is decided once, in the
+    /// boot config, and the runtime config takes the same value.
     #[test]
     fn only_a_per_person_executor_leaves_no_new_privileges_off() {
         let clone = boot_config(&[]);
-        assert!(keeps_no_new_privileges(&clone));
-        assert!(into_runtime_config(&clone, &[]).no_new_privileges);
+        assert!(config::privilege_posture(&clone.source, true));
+        assert_eq!(
+            into_runtime_config(&clone, &[]).no_new_privileges,
+            clone.no_new_privileges
+        );
         let capture = |owners| {
-            let mut config = boot_config(&[]);
-            config.source = WorkspaceSource::Capture(config::CaptureSourceConfig {
+            WorkspaceSource::Capture(config::CaptureSourceConfig {
                 endpoint: "http://unused".to_owned(),
                 worktree_id: None,
                 harness_home: None,
@@ -1248,18 +1256,27 @@ mod tests {
                 recovery: false,
                 launch_id: None,
                 owners,
-            });
-            config
+            })
         };
-        let without_map = capture(None);
-        assert!(keeps_no_new_privileges(&without_map));
-        assert!(into_runtime_config(&without_map, &[]).no_new_privileges);
-        let per_person = capture(Some(sealant_capture::owners::OwnerMap {
+        let map = |people: &[(&str, u32)]| sealant_capture::owners::OwnerMap {
             gid: 40000,
             worktree: 40012,
-            people: std::collections::BTreeMap::new(),
-        }));
-        assert!(!keeps_no_new_privileges(&per_person));
+            people: people.iter().map(|(k, v)| ((*k).to_owned(), *v)).collect(),
+        };
+        // Without a map, with a map that names nobody, or in a daemon that is not root: kept.
+        assert!(config::privilege_posture(&capture(None), true));
+        assert!(config::privilege_posture(&capture(Some(map(&[]))), true));
+        assert!(config::privilege_posture(
+            &capture(Some(map(&[("acct_a", 40012)]))),
+            false
+        ));
+        // A root daemon with an owner map naming someone: a per-person executor.
+        assert!(!config::privilege_posture(
+            &capture(Some(map(&[("acct_a", 40012)]))),
+            true
+        ));
+        let mut per_person = boot_config(&[]);
+        per_person.no_new_privileges = false;
         assert!(!into_runtime_config(&per_person, &[]).no_new_privileges);
     }
 }
