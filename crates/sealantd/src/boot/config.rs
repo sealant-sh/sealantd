@@ -30,6 +30,20 @@ const DEFAULT_HTTP_USERNAME: &str = "x-access-token";
 /// Default dotfiles bootstrap command.
 pub(crate) const DEFAULT_DOTFILES_BOOTSTRAP_COMMAND: &str = "./install.sh";
 
+/// Whether a boot of `source` sets no-new-privileges (plan §18, as amended): every boot but a
+/// per-person executor's, which is a root daemon whose capture source carries an owner map with
+/// at least one person (Mend's ADR 0016: every person there has passwordless `sudo`, which
+/// no-new-privileges would break). A map that names nobody is no per-person launch, and a daemon
+/// that is not root runs nobody as a person: both keep it.
+#[must_use]
+pub fn privilege_posture(source: &WorkspaceSource, is_root: bool) -> bool {
+    let per_person = matches!(
+        source,
+        WorkspaceSource::Capture(c) if c.owners.as_ref().is_some_and(|o| !o.people.is_empty())
+    );
+    !(per_person && is_root)
+}
+
 /// All `SEALANT_*` keys this loader consumes. Used to compute the harness passthrough environment
 /// (every other env var) and to redact secrets from it.
 const CONSUMED_KEYS: &[&str] = &[
@@ -536,6 +550,10 @@ pub struct BootConfig {
     /// The harness credentials the injector declared (`SEALANT_HARNESS_ENV_KEYS`): passed through
     /// to root's harness, never to a process run as a person (they are the launcher's logins).
     pub declared_harness_keys: Vec<String>,
+    /// Whether this boot sets no-new-privileges (plan §18), decided once here and read by both
+    /// places that set it (boot's preparation and the runtime): every boot but a per-person
+    /// executor's ([`privilege_posture`]).
+    pub no_new_privileges: bool,
     /// The workspace's own Docker daemon (`SEALANT_WORKSPACE_DOCKER_HOST`, or a `DOCKER_HOST`
     /// Core reserves for one): the final capture stops its containers.
     pub workspace_docker: Option<crate::docker::DockerEndpoint>,
@@ -765,6 +783,7 @@ impl BootConfig {
             env.get("DOCKER_HOST").as_deref(),
         );
 
+        let no_new_privileges = privilege_posture(&source, nix::unistd::geteuid().is_root());
         Ok(Self {
             workspace,
             source,
@@ -783,6 +802,7 @@ impl BootConfig {
             control,
             passthrough_env,
             declared_harness_keys,
+            no_new_privileges,
             workspace_docker,
             recovery,
             sweep_exempt_file: env

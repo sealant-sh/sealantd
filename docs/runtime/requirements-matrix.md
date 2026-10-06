@@ -162,7 +162,8 @@ unavailable without caps); proxied DNS resolution is captured as `resolvedIps`.
   secrets (values of secret-looking env vars) and high-confidence token shapes (`sk-`, `ghp_`,
   `AKIA`, …); masked spans become `***REDACTED***` with `transform.redacted = true` and bump the
   `redactedEvents` health counter. Binary-safe; never silent.
-- **No-new-privs**: `PR_SET_NO_NEW_PRIVS` at startup so children can't escalate via setuid binaries.
+- **No-new-privs**: `PR_SET_NO_NEW_PRIVS` at startup so children can't escalate via setuid binaries,
+  except in a per-person executor (an owner map; Mend's ADR 0016), where every person has `sudo`.
 - **Fuzzing**: a `fuzz/` cargo-fuzz crate (libFuzzer targets for `decode_client`/`decode_server`/
   `decode_event`) for CI, plus an in-gate seeded robustness test (`decoders_never_panic_on_arbitrary_input`,
   60k random + bit-flipped-valid inputs) that runs clean in `cargo test`.

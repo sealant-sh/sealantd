@@ -759,6 +759,12 @@ pub struct Capabilities {
     /// person then. `None` when it holds it, and from an older daemon.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub person_capabilities_withheld: Option<String>,
+    /// Whether no-new-privileges is set on the daemon, and so on everything it starts: true in
+    /// every executor (plan §18) but a per-person one (a boot under an owner map), where every
+    /// person has `sudo` (Mend's ADR 0016). `None` is unknown: an older daemon that did not report
+    /// it (which always set it), or a daemon that could not read it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub no_new_privileges: Option<bool>,
 }
 
 /// Result of `runtime.health`.

@@ -1196,6 +1196,7 @@ impl From<Capabilities> for wire::Capabilities {
             supports: c.supports,
             person_capabilities: c.person_capabilities,
             person_capabilities_withheld: c.person_capabilities_withheld,
+            no_new_privileges: c.no_new_privileges,
         }
     }
 }
@@ -1220,6 +1221,7 @@ impl TryFrom<wire::Capabilities> for Capabilities {
             supports: c.supports,
             person_capabilities: c.person_capabilities,
             person_capabilities_withheld: c.person_capabilities_withheld,
+            no_new_privileges: c.no_new_privileges,
         })
     }
 }
@@ -1395,7 +1397,7 @@ impl From<CommandResult> for wire::command_result::Result {
         use wire::command_result::Result as W;
         match r {
             CommandResult::Health(h) => W::Health(h.into()),
-            CommandResult::Capabilities(c) => W::Capabilities(c.into()),
+            CommandResult::Capabilities(c) => W::Capabilities(Box::new(c.into())),
             CommandResult::ExecAccepted(a) => W::ExecAccepted(wire::ExecAccepted {
                 process_id: a.process_id.into_inner(),
                 pid: a.pid,
@@ -1539,7 +1541,7 @@ impl TryFrom<wire::command_result::Result> for CommandResult {
         use wire::command_result::Result as W;
         Ok(match r {
             W::Health(h) => CommandResult::Health(h.try_into()?),
-            W::Capabilities(c) => CommandResult::Capabilities(c.try_into()?),
+            W::Capabilities(c) => CommandResult::Capabilities((*c).try_into()?),
             W::ExecAccepted(a) => CommandResult::ExecAccepted(ExecAccepted {
                 process_id: ProcessId::new(a.process_id),
                 pid: a.pid,

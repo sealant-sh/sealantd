@@ -281,8 +281,9 @@ impl Runtime {
         // Become a child subreaper so double-forked orphans reparent here (and the reaper can
         // collect them). Harmless and idempotent; a no-op off Linux.
         let subreaper = sealant_process::platform::set_child_subreaper();
-        // Defense in depth: children can never escalate via setuid binaries (plan §18).
-        if sealant_process::platform::set_no_new_privs() {
+        // Defense in depth: children can never escalate via setuid binaries (plan §18), except in
+        // a per-person executor, where every person has sudo by design (Mend's ADR 0016).
+        if config.no_new_privileges && sealant_process::platform::set_no_new_privs() {
             tracing::debug!("PR_SET_NO_NEW_PRIVS engaged");
         }
         let pidfd_supported = sealant_process::platform::pidfd_supported();
@@ -1156,6 +1157,7 @@ impl Runtime {
             },
             person_capabilities_withheld: sealant_process::identity::fowner_withheld()
                 .map(str::to_owned),
+            no_new_privileges: sealant_process::platform::no_new_privs(),
         }
     }
 

@@ -298,6 +298,12 @@ the change's owner) and get the owner's read, write and execute bits copied to t
 comes back 0660) and setgid on directories, in the same `chmod` the restore makes for each entry. A
 directory absent from the map (a removed member's) is restored as before, root's.
 
+The owner map also decides the daemon's privilege posture: a root daemon booted with an owner map
+that names at least one person is a per-person executor, and does not set no-new-privileges (plan
+§18 as amended, Mend's ADR 0016: every person there has passwordless `sudo`, so it is root by
+design, not a sandbox). Without a map, or with one that names nobody, no-new-privileges is set as
+for every other executor. A launcher passes a map only for a per-person launch.
+
 ### Cadence and budgets
 
 Small class: 2 s of quiet after any change, at most every 10 s while the tree stays dirty, at every
