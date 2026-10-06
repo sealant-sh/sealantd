@@ -521,6 +521,7 @@ fn a_tracked_hardlink_group_whose_bytes_differ_is_never_relinked() {
         bulk_dirs: Vec::new(),
         nested: Vec::new(),
         skip_abs: Vec::new(),
+        shared_group: false,
     };
     let doc = worktree_meta::capture(&repo, &tree, &scope, None)
         .unwrap()

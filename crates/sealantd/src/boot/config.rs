@@ -46,6 +46,7 @@ const CONSUMED_KEYS: &[&str] = &[
     "SEALANT_CAPTURE_OBJECT_CA_PEM",
     "SEALANT_CAPTURE_OBJECT_CA_FILE",
     "SEALANT_CAPTURE_LAUNCH_ID",
+    "SEALANT_CAPTURE_OWNER_MAP",
     "SEALANT_SWEEP_EXEMPT_FILE",
     "SEALANT_WORKSPACE_MOUNT_HOST_PATH",
     "SEALANT_MOUNT_ALLOWED_STORE_ROOTS",
@@ -256,6 +257,10 @@ pub struct CaptureSourceConfig {
     /// it (`launch`), and a plan that answers another `executor` refuses the boot. Unset, the
     /// first `plan.get` names the launch this disk last served, when it recorded one.
     pub launch_id: Option<String>,
+    /// `SEALANT_CAPTURE_OWNER_MAP`: who owns what the restore writes (Mend's per-person layout,
+    /// [`sealant_capture::owners`]): `{"gid":…,"worktree":…,"people":{"<account id>":uid}}`.
+    /// Unset, everything is restored as before, root's at the recorded modes.
+    pub owners: Option<sealant_capture::owners::OwnerMap>,
 }
 
 /// How the workspace working directory is provisioned.
@@ -893,6 +898,15 @@ impl BootConfig {
                         .get("SEALANT_CAPTURE_LAUNCH_ID")
                         .map(|s| s.trim().to_owned())
                         .filter(|s| !s.is_empty()),
+                    owners: env
+                        .get("SEALANT_CAPTURE_OWNER_MAP")
+                        .filter(|s| !s.trim().is_empty())
+                        .map(|s| {
+                            sealant_capture::owners::OwnerMap::parse(&s).map_err(|e| {
+                                BootError::config(format!("SEALANT_CAPTURE_OWNER_MAP: {e}"))
+                            })
+                        })
+                        .transpose()?,
                 }))
             }
             Some(other) => Err(BootError::config(format!(
@@ -1914,6 +1928,60 @@ mod tests {
             &cfg.source,
             WorkspaceSource::Capture(c) if c.worktree_id.as_deref() == Some("wt-1")
         ));
+    }
+
+    /// The owner map rides the capture spec (`SEALANT_CAPTURE_OWNER_MAP`); unset, a restore is as
+    /// before, and a map that does not parse or names uid 0 refuses the boot.
+    #[test]
+    fn capture_source_reads_the_owner_map() {
+        let mut pairs: Vec<(&str, &str)> = base_pairs()
+            .into_iter()
+            .filter(|(k, _)| *k != "SEALANT_WORKSPACE_REPO_URL")
+            .collect();
+        pairs.extend_from_slice(&[
+            ("SEALANT_WORKSPACE_SOURCE", "capture"),
+            (
+                "SEALANT_CAPTURE_ENDPOINT",
+                "https://mend.example/api/session/abc",
+            ),
+        ]);
+        let cfg = BootConfig::load(&MapEnv::from_pairs(&pairs)).expect("valid");
+        assert!(matches!(&cfg.source, WorkspaceSource::Capture(c) if c.owners.is_none()));
+
+        let mut with_map = pairs.clone();
+        with_map.push((
+            "SEALANT_CAPTURE_OWNER_MAP",
+            r#"{"gid":40000,"worktree":40012,"people":{"acct_a":40012,"acct_b":40031}}"#,
+        ));
+        let cfg = BootConfig::load(&MapEnv::from_pairs(&with_map)).expect("valid");
+        // Boot's own: never passed through to the harness.
+        assert!(
+            !cfg.passthrough_env
+                .iter()
+                .any(|(k, _)| k == "SEALANT_CAPTURE_OWNER_MAP")
+        );
+        match &cfg.source {
+            WorkspaceSource::Capture(c) => {
+                let owners = c.owners.as_ref().expect("a map");
+                assert_eq!((owners.gid, owners.worktree), (40000, 40012));
+                assert_eq!(owners.people.get("acct_b"), Some(&40031));
+            }
+            other => panic!("expected capture source, got {other:?}"),
+        }
+
+        for bad in [
+            r#"{"gid":0,"worktree":1}"#,
+            "{",
+            r#"{"gid":1,"worktree":1,"people":{"a/b":2}}"#,
+        ] {
+            let mut pairs = pairs.clone();
+            pairs.push(("SEALANT_CAPTURE_OWNER_MAP", bad));
+            let error = BootConfig::load(&MapEnv::from_pairs(&pairs)).expect_err(bad);
+            assert!(
+                error.to_string().contains("SEALANT_CAPTURE_OWNER_MAP"),
+                "{error}"
+            );
+        }
     }
 
     /// A recovery boot is asked for by `SEALANT_RECOVERY` (an adapter that starts a new

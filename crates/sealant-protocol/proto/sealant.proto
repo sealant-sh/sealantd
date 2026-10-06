@@ -511,6 +511,9 @@ message Capabilities {
   string daemon_version = 6;
   FeatureMatrix features = 7;
   Limits limits = 8;
+  // What this daemon can do beyond the schema, by name (`restore.owner_map`, `exec.user`,
+  // `dotfiles.user`).
+  repeated string supports = 9;
 }
 
 message HealthReport {
@@ -715,6 +718,10 @@ message CaptureStatusReport {
   // own limit, and the snap fails (`snaps`) and is taken again. Of several, the innermost.
   // Absent while nothing is past its bound, and from an older daemon.
   CaptureOverdue overdue = 31;
+  // This executor restores under an owner map (SEALANT_CAPTURE_OWNER_MAP): its worktree root was
+  // given to the change's owner and the group at boot. False without a map and from an older
+  // daemon: a control plane expecting the per-person layout refuses the executor then.
+  bool owner_map = 32;
 }
 // A capture step past its bound (`CaptureStatusReport.overdue`).
 message CaptureOverdue {

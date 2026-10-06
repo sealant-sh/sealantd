@@ -649,6 +649,12 @@ pub struct Capabilities {
     pub features: FeatureMatrix,
     /// Resource limits.
     pub limits: Limits,
+    /// What this daemon can do beyond the schema, by name: `restore.owner_map` (a capture
+    /// restore takes an owner map), `exec.user` and `dotfiles.user` (an execution and the
+    /// dotfiles applier run as a given user). Mend's per-person layout runs on a daemon that
+    /// names all three. A daemon from before this list reports none.
+    #[serde(default)]
+    pub supports: Vec<String>,
 }
 
 /// Result of `runtime.health`.
@@ -1066,6 +1072,14 @@ pub struct CaptureStatusReport {
     /// is past its bound, and from an older daemon.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub overdue: Option<CaptureOverdue>,
+    /// This executor restores under an owner map (`SEALANT_CAPTURE_OWNER_MAP`, Mend's per-person
+    /// layout): its worktree root was given to the change's owner and the group at boot, and
+    /// every restore gives people their directories and the group its bits. `false` from a boot
+    /// without a map, and from an older daemon: a control plane that expects the per-person
+    /// layout refuses the executor then (a restore without the map leaves the worktree root's
+    /// at the recorded modes, which no person can edit).
+    #[serde(default)]
+    pub owner_map: bool,
 }
 
 /// A capture step past its bound ([`CaptureStatusReport::overdue`]).

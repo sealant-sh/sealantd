@@ -22,6 +22,7 @@ pub mod keys;
 pub mod longpath;
 pub mod manifest;
 pub mod materialize;
+pub mod owners;
 pub mod pack;
 pub mod position;
 mod readahead;

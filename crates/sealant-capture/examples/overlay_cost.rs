@@ -39,6 +39,7 @@ fn main() {
         bulk_dirs: DEFAULT_BULK_DIRS.iter().map(|s| (*s).to_owned()).collect(),
         nested: repo.nested_repositories(None).expect("nested"),
         skip_abs: Vec::new(),
+        shared_group: false,
     };
     let mut times = Vec::with_capacity(iterations);
     let mut last = None;

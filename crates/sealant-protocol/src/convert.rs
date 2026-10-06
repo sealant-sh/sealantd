@@ -1159,6 +1159,7 @@ impl From<Capabilities> for wire::Capabilities {
             daemon_version: c.daemon_version,
             features: Some(c.features.into()),
             limits: Some(c.limits.into()),
+            supports: c.supports,
         }
     }
 }
@@ -1180,6 +1181,7 @@ impl TryFrom<wire::Capabilities> for Capabilities {
                 .limits
                 .ok_or(WireError::MissingField("Capabilities.limits"))?
                 .into(),
+            supports: c.supports,
         })
     }
 }
@@ -1443,6 +1445,7 @@ impl From<CommandResult> for wire::command_result::Result {
                         running_ms: o.running_ms,
                         bound_ms: o.bound_ms,
                     }),
+                    owner_map: c.owner_map,
                 }))
             }
             CommandResult::LeaseEpoch(l) => W::LeaseEpoch(wire::LeaseEpochReport {
@@ -1585,6 +1588,7 @@ impl TryFrom<wire::command_result::Result> for CommandResult {
                     running_ms: o.running_ms,
                     bound_ms: o.bound_ms,
                 }),
+                owner_map: c.owner_map,
             })),
             W::LeaseEpoch(l) => CommandResult::LeaseEpoch(LeaseEpochReport {
                 epoch: l.epoch,
@@ -2195,6 +2199,7 @@ mod tests {
                 boot_id: Some("0123456789abcdef0123456789abcdef".to_owned()),
                 boot_generation: Some(2),
                 observation: Some(41),
+                owner_map: true,
                 overdue: Some(CaptureOverdue {
                     step: "small snap › git cat-file --batch-check".to_owned(),
                     started_unix_ms: 1_790_000_000_000,
@@ -2234,6 +2239,7 @@ mod tests {
                 boot_generation: None,
                 observation: None,
                 overdue: None,
+                owner_map: false,
             })),
             CommandResult::LeaseEpoch(LeaseEpochReport {
                 epoch: 2,

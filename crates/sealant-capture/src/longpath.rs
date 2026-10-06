@@ -491,6 +491,22 @@ pub fn set_mode(path: &Path, mode: u32) -> io::Result<()> {
     .map_err(nix_err)
 }
 
+/// Give `path` an owner and group without following a symlink (`lchown`), at any length.
+pub fn lchown(path: &Path, uid: u32, gid: u32) -> io::Result<()> {
+    if fits(path) {
+        return std::os::unix::fs::lchown(path, Some(uid), Some(gid));
+    }
+    let at = at(path)?;
+    nix::unistd::fchownat(
+        at.dir.fd(),
+        at.name.as_os_str(),
+        Some(nix::unistd::Uid::from_raw(uid)),
+        Some(nix::unistd::Gid::from_raw(gid)),
+        AtFlags::AT_SYMLINK_NOFOLLOW,
+    )
+    .map_err(nix_err)
+}
+
 /// Set `path`'s mtime (nanoseconds since the epoch) without following a symlink, so a symlink
 /// gets its own mtime and a file is not opened (its mode may forbid that).
 pub fn set_mtime_nofollow(path: &Path, mtime_ns: i128) -> io::Result<()> {

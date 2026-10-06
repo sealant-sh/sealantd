@@ -43,6 +43,9 @@ jobs:
       - run: cargo test --workspace
         env:
           SEALANTD_REQUIRE_DOTFILES_TOOLS: "1"
+      # Ownership on restore needs root (chown, a process as another uid): the test binaries
+      # built above run again under sudo, where they fail instead of skipping.
+      - run: scripts/ci-root-tests.sh
 
   # The released daemon runs on arm64 too (Graviton MicroVMs), so the same tests run natively
   # there. fmt is architecture-independent and stays on the job above.

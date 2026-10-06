@@ -64,6 +64,7 @@ use crate::manifest::{
     EncodedManifest, FORMAT_DIR_OBJECTS, FORMAT_DIR_PACKS, FsckStatus, MAX_SECTION_FORMAT,
     Manifest, TreeRef, WORKTREE_META_FORMAT, WorktreeMeta,
 };
+use crate::owners::{self, OwnerMap};
 use crate::pack::{PackError, PackReader};
 use crate::roots::ClassRoots;
 use crate::sink::{BlobSink, SinkError};
@@ -206,6 +207,10 @@ pub struct MaterializeReport {
     pub dir_objects_fetched: u64,
     /// Git packs installed (not counting the ones already there).
     pub git_packs: u64,
+    /// Entries given an owner by the owner map ([`MaterializeTargets::owners`]): every entry of
+    /// a person's saved directory the restore wrote or reused with another owner, and the
+    /// worktree and git roots. Nothing else is `chown`ed, whatever the size of the worktree.
+    pub owned: u64,
     /// Paths the worktree checkout touched: the tree diff for a delta checkout, `None` for a
     /// full one (nothing was known about the disk) or when the git class was not asked for.
     pub git_paths_changed: Option<u64>,
@@ -239,6 +244,9 @@ pub struct MaterializeTargets {
     pub staging_dir: PathBuf,
     /// Directory names treated as bulk wherever they appear.
     pub bulk_dirs: Vec<String>,
+    /// Who owns what the restore writes, and the group bits it adds ([`crate::owners`]);
+    /// `None` restores as before: root's, at the recorded modes.
+    pub owners: Option<OwnerMap>,
 }
 
 impl MaterializeTargets {
@@ -257,6 +265,7 @@ impl MaterializeTargets {
                 .iter()
                 .map(|s| (*s).to_owned())
                 .collect(),
+            owners: None,
         }
     }
 
@@ -467,6 +476,27 @@ struct ClassWrite<'i> {
     /// The workspace class: a harness credential file it names ([`is_harness_credential`]) is
     /// never restored.
     skip_credentials: bool,
+    /// The owner map, when the restore has one.
+    owners: Option<&'i OwnerMap>,
+    /// The bulk class: every path is the worktree's.
+    bulk: bool,
+    /// Directories and symlinks to give an owner once the class is written: (path, uid, gid).
+    owned: Vec<(PathBuf, u32, u32)>,
+}
+
+impl ClassWrite<'_> {
+    /// The mode a path recorded `mode` is restored with, and the owner it is given.
+    fn restored(&self, v: &str, mode: u32, dir: bool) -> (u32, Option<(u32, u32)>) {
+        let Some(owners) = self.owners else {
+            return (mode, None);
+        };
+        let scope = if self.bulk {
+            owners::Scope::Shared
+        } else {
+            owners.scope_of_workspace(v)
+        };
+        (owners::restored_mode(scope, mode, dir), owners.owner(scope))
+    }
 }
 
 /// One file a class writes: its virtual path, where it goes, and what goes in it.
@@ -478,6 +508,8 @@ struct FileWrite {
     chunks: Vec<ChunkId>,
     mode: u32,
     mtime: i128,
+    /// The owner the file is given (a person's saved directory), before its mode.
+    owner: Option<(u32, u32)>,
 }
 
 /// What one writer thread did: the jobs it wrote (by position, with their stat and size), and
@@ -569,6 +601,13 @@ impl<'a> Materializer<'a> {
             state.save(&self.targets.index_dir)?;
         }
         fs::create_dir_all(&self.targets.root).at("mkdir -p", &self.targets.root)?;
+        if let Some(owners) = &self.targets.owners {
+            owners.prepare_worktree_root(&self.targets.root).at(
+                "give the worktree root to its owner and group",
+                &self.targets.root,
+            )?;
+            report.owned += 1;
+        }
         fs::create_dir_all(&self.targets.cache_dir).at("mkdir -p", &self.targets.cache_dir)?;
         let roots = self.targets.roots();
         // Every content and dir pack the asked classes need, fetched up front and in parallel;
@@ -643,6 +682,9 @@ impl<'a> Materializer<'a> {
                 files: Vec::new(),
                 pending: Vec::new(),
                 skip_credentials: true,
+                owners: self.targets.owners.as_ref(),
+                bulk: false,
+                owned: Vec::new(),
             };
             for entry in &root.entries {
                 let Some(target) = roots.workspace_path(&git_dir, &entry.name) else {
@@ -657,7 +699,22 @@ impl<'a> Materializer<'a> {
                 self.write_dir(&dirs, child, &target, &entry.name, &mut write, &mut report)?;
                 if entry.kind == EntryKind::Dir && (entry.name == ".git" || entry.name == "harness")
                 {
-                    class_roots.push((target, entry.mode, entry.mtime));
+                    // The git directory is the group's, owned by the change's owner; the
+                    // harness home stays root's.
+                    let mode = match &self.targets.owners {
+                        Some(owners) if entry.name == ".git" => {
+                            std::os::unix::fs::lchown(
+                                &target,
+                                Some(owners.worktree),
+                                Some(owners.gid),
+                            )
+                            .at("chown", &target)?;
+                            report.owned += 1;
+                            owners::shared_mode(entry.mode, true)
+                        }
+                        _ => entry.mode,
+                    };
+                    class_roots.push((target, mode, entry.mtime));
                 }
             }
             Self::write_files(&store, &mut write, &mut report)?;
@@ -711,6 +768,7 @@ impl<'a> Materializer<'a> {
                 )?;
             }
             refresh_linked(write.index, &write.links, &resolve);
+            Self::give_owners(&write.owned, &mut report)?;
             Self::restore_dirs(&write.dirs)?;
             restored_files.extend(
                 std::mem::take(&mut write.files)
@@ -747,6 +805,9 @@ impl<'a> Materializer<'a> {
                 files: Vec::new(),
                 pending: Vec::new(),
                 skip_credentials: false,
+                owners: self.targets.owners.as_ref(),
+                bulk: true,
+                owned: Vec::new(),
             };
             self.write_dir(&dirs, &bulk.root, &root, "", &mut write, &mut report)?;
             Self::write_files(&store, &mut write, &mut report)?;
@@ -772,6 +833,7 @@ impl<'a> Materializer<'a> {
                 &mut report,
             )?;
             refresh_linked(write.index, &write.links, &resolve);
+            Self::give_owners(&write.owned, &mut report)?;
             Self::restore_dirs(&write.dirs)?;
             restored_files.extend(
                 std::mem::take(&mut write.files)
@@ -964,6 +1026,7 @@ impl<'a> Materializer<'a> {
                 .into_iter()
                 .flatten()
                 .collect(),
+            shared_group: t.owners.is_some(),
         })
     }
 
@@ -1296,20 +1359,33 @@ impl<'a> Materializer<'a> {
                 EntryKind::Dir => {
                     if let Some(child) = &entry.child {
                         self.write_dir(dirs, child, &path, &v, write, report)?;
-                        write.dirs.push((path, entry.mode, entry.mtime));
+                        let (mode, owner) = write.restored(&v, entry.mode, true);
+                        if let Some((uid, gid)) = owner {
+                            write.owned.push((path.clone(), uid, gid));
+                        }
+                        write.dirs.push((path, mode, entry.mtime));
                     }
                 }
                 EntryKind::File => {
+                    let (mode, owner) = write.restored(&v, entry.mode, false);
                     write
                         .files
-                        .push((v.clone(), path.clone(), Some((entry.mode, entry.mtime))));
+                        .push((v.clone(), path.clone(), Some((mode, entry.mtime))));
                     if Self::file_matches(&v, entry, &path, write.index) {
                         report.files_skipped += 1;
                         report.bytes_skipped += entry.size;
-                        if let Ok(meta) = longpath::symlink_metadata(&path)
-                            && meta.mode() & 0o7777 != entry.mode
-                        {
-                            longpath::set_mode(&path, entry.mode).at("chmod", &path)?;
+                        if let Ok(meta) = longpath::symlink_metadata(&path) {
+                            // A reused file is given its owner before its mode (a `chown`
+                            // clears setuid and setgid).
+                            if let Some((uid, gid)) = owner
+                                && (meta.uid(), meta.gid()) != (uid, gid)
+                            {
+                                longpath::lchown(&path, uid, gid).at("chown", &path)?;
+                                report.owned += 1;
+                            }
+                            if meta.mode() & 0o7777 != mode {
+                                longpath::set_mode(&path, mode).at("chmod", &path)?;
+                            }
                         }
                         continue;
                     }
@@ -1321,17 +1397,26 @@ impl<'a> Materializer<'a> {
                         path,
                         name: crate::tree::bytes_of(&entry.name).into_owned(),
                         chunks: entry.chunks.clone().unwrap_or_default(),
-                        mode: entry.mode,
+                        mode,
                         mtime: entry.mtime,
+                        owner,
                     });
                 }
                 EntryKind::Symlink => {
                     let target = PathBuf::from(entry.os_target().unwrap_or_default());
+                    let (_, owner) = write.restored(&v, entry.mode, false);
                     if longpath::read_link(&path).is_ok_and(|t| t == target) {
-                        if longpath::symlink_metadata(&path)
-                            .is_ok_and(|m| index::mtime_ns(&m) != entry.mtime)
+                        let meta = longpath::symlink_metadata(&path).ok();
+                        if meta
+                            .as_ref()
+                            .is_some_and(|m| index::mtime_ns(m) != entry.mtime)
                         {
                             set_symlink_mtime(&path, entry.mtime)?;
+                        }
+                        if let Some((uid, gid)) = owner
+                            && meta.is_some_and(|m| (m.uid(), m.gid()) != (uid, gid))
+                        {
+                            write.owned.push((path, uid, gid));
                         }
                         continue;
                     }
@@ -1339,11 +1424,15 @@ impl<'a> Materializer<'a> {
                     longpath::symlink(&target, &path).at("symlink", &path)?;
                     set_symlink_mtime(&path, entry.mtime)?;
                     report.symlinks += 1;
+                    if let Some((uid, gid)) = owner {
+                        write.owned.push((path, uid, gid));
+                    }
                 }
                 EntryKind::HardlinkGroup => {
                     if let Some(canonical) = &entry.target {
+                        let (mode, _) = write.restored(&v, entry.mode, false);
                         write.files.push((v.clone(), path.clone(), None));
-                        write.links.push((canonical.clone(), path, entry.mode));
+                        write.links.push((canonical.clone(), path, mode));
                     }
                 }
             }
@@ -1406,6 +1495,7 @@ impl<'a> Materializer<'a> {
                 };
                 report.files += 1;
                 report.bytes += bytes;
+                report.owned += u64::from(job.owner.is_some());
                 write.index.files.insert(
                     job.v,
                     IndexedFile {
@@ -1442,6 +1532,9 @@ impl<'a> Materializer<'a> {
                 let data = store.read(id)?;
                 f.write_all(&data).at("write", &tmp)?;
                 bytes += data.len() as u64;
+            }
+            if let Some((uid, gid)) = job.owner {
+                std::os::unix::fs::fchown(&f, Some(uid), Some(gid)).at("chown", &tmp)?;
             }
             f.set_permissions(fs::Permissions::from_mode(job.mode))
                 .at("chmod", &tmp)?;
@@ -1550,6 +1643,19 @@ impl<'a> Materializer<'a> {
             }
         }
         index.files.retain(|v, _| planned.contains(v));
+        Ok(())
+    }
+
+    /// Give each directory and symlink its owner ([`ClassWrite::owned`]), before the directories'
+    /// modes are set (a `chown` clears setuid and setgid on what it changes).
+    fn give_owners(
+        owned: &[(PathBuf, u32, u32)],
+        report: &mut MaterializeReport,
+    ) -> Result<(), MaterializeError> {
+        for (path, uid, gid) in owned {
+            longpath::lchown(path, *uid, *gid).at("chown", path)?;
+            report.owned += 1;
+        }
         Ok(())
     }
 
