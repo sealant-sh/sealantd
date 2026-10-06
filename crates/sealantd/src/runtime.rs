@@ -31,9 +31,9 @@ pub const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// What this daemon can do beyond the protocol schema, by name ([`Capabilities::supports`]):
 ///
-/// - `dotfiles.user`: the dotfiles applier runs as a given user into their home, at boot
-///   (`SEALANT_DOTFILES_USER`) and through `dotfiles.apply`, which answers once the files are
-///   applied and runs `./install.sh` after them as a managed process of that user.
+/// - `dotfiles.user`: the dotfiles applier runs as a given user into their home through
+///   `dotfiles.apply`, which answers once the files are applied and runs `./install.sh` after
+///   them as a managed process of that user.
 /// - `exec.user`: `exec` and `openSession` take a `user` ([`sealant_process::identity`]).
 /// - `restore.owner_map`: a capture restore takes an owner map (`SEALANT_CAPTURE_OWNER_MAP`),
 ///   gives each person's saved directory to their uid and the worktree to the group

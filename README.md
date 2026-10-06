@@ -64,11 +64,12 @@ The daemon runs as root, and so does every process it starts, unless the request
   `XDG_RUNTIME_DIR` (`/run/user/<uid>`), both 0700 and the user's. The caller's `env` still wins
   (a caller may point `HOME` elsewhere on purpose). A PTY leader owns its terminal. Root, or a user
   the passwd database does not have, is refused.
-- The dotfiles applier runs as a user into their passwd home: at boot with
-  `SEALANT_DOTFILES_USER` (the user must be in the image's passwd database then), and through
-  `dotfiles.apply { user, repository?, archiveDir? }`, which answers once every file is applied and
-  runs `./install.sh` after them as a managed process of that user, named in the answer
-  (`bootstrap`), so the caller can start the person's agent beside it.
+- The dotfiles applier runs as a user into their passwd home through
+  `dotfiles.apply { user, repository?, archiveDir? }`, once the user exists (the launcher's
+  included: Mend calls it after making users at prepare). It answers once every file is applied
+  and runs `./install.sh` after them as a managed process of that user, named in the answer
+  (`bootstrap`), so the caller can start the person's agent beside it. Boot applies root's
+  dotfiles into `/root` as before; no user needs to exist at boot.
 - `runtime.getCapabilities` names `exec.user`, `dotfiles.user` and `restore.owner_map` in
   `supports`. `sealantd capabilities --json` prints the same, with the version, without booting,
   for an image build to record.

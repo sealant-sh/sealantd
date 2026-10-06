@@ -557,24 +557,9 @@ async fn boot_serve(
     // adapter and the gateway treat the socket as the readiness signal, and everything they inject
     // after readiness (credential files into $HOME) must never race a dotfiles apply that writes
     // the same tree.
-    // `SEALANT_DOTFILES_USER`: the home and identity both applies run under (a person's, in
-    // Mend's per-person layout); a user the passwd database does not have fails the boot.
-    let dotfiles_home = match config.dotfiles_user.as_deref() {
-        None => Ok(dotfiles::Home::root()),
-        Some(user) => sealant_process::identity::RunAs::resolve(user)
-            .map(dotfiles::Home::of)
-            .map_err(|e| BootError::Dotfiles(format!("SEALANT_DOTFILES_USER: {e}"))),
-    };
-    let dotfiles_home = match dotfiles_home {
-        Ok(home) => home,
-        Err(error) if config.dotfiles.is_some() || config.dotfiles_archives.is_some() => {
-            tracing::error!(%error, "dotfiles apply failed");
-            eprintln!("sealantd boot: {error}");
-            let code = final_capture(&runtime, ExitCode::FAILURE).await;
-            return shutdown_before_control(&runtime, code).await;
-        }
-        Err(_) => dotfiles::Home::root(),
-    };
+    // Boot applies dotfiles as root into `/root`. A person's (the launcher's included, in Mend's
+    // per-person layout) go through `dotfiles.apply` once their user exists.
+    let dotfiles_home = dotfiles::Home::root();
     if let Some(dotfiles) = config.dotfiles.as_ref().filter(|_| !config.recovery)
         && let Err(error) = dotfiles::apply_repository(
             dotfiles,
