@@ -4,9 +4,9 @@
 //! without touching a capture.
 //!
 //! - **The worktree, its git directory and every person's shared conversations**
-//!   (`people/<id>/conversations/`) are the group's: each mode gets group write where the owner
-//!   can write and group execute where the owner can execute, and a directory gets setgid, in the
-//!   one `chmod` the restore already makes for the entry. Every existing capture was made by root
+//!   (`people/<id>/conversations/`) are the group's: each mode gets the owner's read, write and
+//!   execute bits copied to the group (0644 → 0664, 0600 → 0660, never 0620), and a directory
+//!   gets setgid, in the one `chmod` the restore already makes for the entry. Every existing capture was made by root
 //!   with umask 022 (files 0644, directories 0755); restored as recorded under a default ACL they
 //!   would be read-only to the group. Under `conversations/` the group also gets read and write
 //!   whatever the recorded mode (Claude Code writes its transcripts 0600). No entry of the
@@ -30,10 +30,8 @@ use std::process::Command;
 
 use serde::{Deserialize, Serialize};
 
+pub use crate::index::CONVERSATIONS_DIR;
 use crate::index::PEOPLE_DIR;
-
-/// The directory under a person's saved directory that holds the conversations a session shares.
-pub const CONVERSATIONS_DIR: &str = "conversations";
 
 /// A person's saved directory itself: the group may pass through, not list or read.
 pub const PERSON_DIR_MODE: u32 = 0o710;
@@ -144,7 +142,7 @@ impl OwnerMap {
     }
 
     /// Make the worktree root the group's before anything is restored into it: owned by the
-    /// change's owner and the group, group-writable where the owner can write, setgid, so every
+    /// change's owner and the group, with the owner's bits copied to the group, setgid, so every
     /// entry the restore and git create under it takes the group. Two calls, whatever the tree.
     pub fn prepare_worktree_root(&self, root: &Path) -> io::Result<()> {
         std::fs::create_dir_all(root)?;
@@ -169,11 +167,11 @@ pub fn restored_mode(scope: Scope, mode: u32, dir: bool) -> u32 {
     }
 }
 
-/// `mode` with group write where the owner can write, group execute where the owner can
-/// execute, and setgid on a directory (a raw `chmod` would clear it).
+/// `mode` with the owner's read, write and execute bits copied to the group (whatever the group
+/// had is kept), and setgid on a directory (a raw `chmod` would clear it).
 #[must_use]
 pub fn shared_mode(mode: u32, dir: bool) -> u32 {
-    let mut m = mode | ((mode & 0o200) >> 3) | ((mode & 0o100) >> 3);
+    let mut m = mode | ((mode & 0o700) >> 3);
     if dir {
         m |= 0o2000;
     }
@@ -267,9 +265,12 @@ mod tests {
         assert_eq!(restored_mode(s, 0o755, false), 0o775);
         assert_eq!(restored_mode(s, 0o755, true), 0o2775);
         assert_eq!(restored_mode(s, 0o444, false), 0o444);
-        // Only write and execute are copied, never read: a file its owner kept unreadable stays so.
-        assert_eq!(restored_mode(s, 0o600, false), 0o620);
-        assert_eq!(restored_mode(s, 0o700, true), 0o2730);
+        // The owner's read is copied too: never a group that can write and not read.
+        assert_eq!(restored_mode(s, 0o600, false), 0o660);
+        assert_eq!(restored_mode(s, 0o700, true), 0o2770);
+        assert_eq!(restored_mode(s, 0o640, false), 0o660);
+        assert_eq!(restored_mode(s, 0o400, false), 0o440);
+        assert_eq!(restored_mode(s, 0o200, false), 0o220);
         let c = Scope::Conversation(1);
         assert_eq!(restored_mode(c, 0o600, false), 0o660);
         assert_eq!(restored_mode(c, 0o400, false), 0o460);

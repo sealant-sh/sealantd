@@ -118,10 +118,13 @@ fn fixture(packages: usize) -> Fixture {
     write(&root.join("src/deep/lib.rs"), "fn f() {}\n", 0o644);
     write(&root.join("run.sh"), "#!/bin/sh\n", 0o755);
     write(&root.join("ro.txt"), "read only\n", 0o444);
+    write(&root.join("tracked-600.txt"), "owner only\n", 0o600);
     git(&root, &["add", "-A"]);
     git(&root, &["commit", "-q", "-m", "one"]);
     write(&root.join("notes.md"), "untracked\n", 0o644);
     write(&root.join("ro-untracked.txt"), "read only\n", 0o444);
+    write(&root.join("private/key.txt"), "owner only\n", 0o600);
+    chmod(&root.join("private"), 0o700);
     for p in 0..packages {
         write(
             &root.join(format!("node_modules/pkg{}/lib/m{p}.js", p % 100)),
@@ -222,6 +225,8 @@ fn a_root_made_capture_comes_back_writable_by_every_person() {
         format!("touch {r}/node_modules/pkg1/lib/new.js"),
         format!("rm {r}/src/deep/lib.rs && echo again > {r}/src/deep/lib.rs"),
         format!("touch {r}/new-at-root && mkdir {r}/.git/refs/heads/bob"),
+        format!("cat {r}/tracked-600.txt {r}/private/key.txt >/dev/null && ls {r}/private"),
+        format!("echo x >> {r}/private/key.txt && touch {r}/private/new"),
     ] {
         assert!(as_user(BOB, &script), "as bob: {script}");
     }
@@ -236,6 +241,10 @@ fn a_root_made_capture_comes_back_writable_by_every_person() {
     assert_eq!(stat(&repo.join("node_modules/pkg1")).2, 0o2775);
     assert_eq!(stat(&repo.join("ro.txt")).2, 0o444);
     assert_eq!(stat(&repo.join("ro-untracked.txt")).2, 0o444);
+    // The owner's read goes to the group with the write: 0600 comes back 0660, never 0620.
+    assert_eq!(stat(&repo.join("tracked-600.txt")).2, 0o660);
+    assert_eq!(stat(&repo.join("private/key.txt")).2, 0o660);
+    assert_eq!(stat(&repo.join("private")).2, 0o2770);
     // Made by bob in a setgid directory: the group's.
     assert_eq!(stat(&repo.join("src/deep/new.rs")).1, GID);
 }

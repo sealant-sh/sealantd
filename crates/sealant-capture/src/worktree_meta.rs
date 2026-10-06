@@ -462,8 +462,8 @@ pub struct MetaScope {
     /// Absolute paths left out (the staging directory, the harness home).
     pub skip_abs: Vec<PathBuf>,
     /// The worktree is the group's (a restore under an owner map, [`crate::owners`]): every
-    /// mode is set with group write where the owner can write, group execute where the owner
-    /// can execute, and setgid on a directory, in the same `chmod`.
+    /// mode is set with the owner's read, write and execute bits copied to the group, and setgid
+    /// on a directory, in the same `chmod`.
     pub shared_group: bool,
 }
 

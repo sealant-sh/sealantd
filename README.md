@@ -208,9 +208,9 @@ the protocol details live in `crates/sealant-capture/src/registrar.rs` and `mani
   (`{"gid":40000,"worktree":<change owner's uid>,"people":{"<account id>":<uid>}}`). At boot the
   worktree root is given to the change's owner and the group, made group-writable and setgid, and
   the group's default ACL is set on it and on `/opt` and `/var/cache` (one `setfacl`). On every
-  restore, the worktree, its git directory and each `people/<id>/conversations/` get group write
-  where the owner can write, group execute where the owner can execute and setgid on directories,
-  in the `chmod` the restore already makes; under `conversations/` the group also reads and writes
+  restore, the worktree, its git directory and each `people/<id>/conversations/` get the owner's
+  read, write and execute bits copied to the group (0644 → 0664, 0600 → 0660) and setgid on
+  directories, in the `chmod` the restore already makes; under `conversations/` the group also reads and writes
   whatever the recorded mode. Each mapped person's `people/<id>/` is `chown`ed to their uid entry
   by entry (the directory itself 0710, the rest at its recorded mode); nothing in the worktree is
   `chown`ed. Captures record no owner. Unset, a restore is as before. `runtime.getCapabilities`

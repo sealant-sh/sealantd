@@ -294,8 +294,8 @@ never from the capture, which records modes and mtimes only. Each mapped person'
 restored owned by their uid and the shared group: the directory itself 0710, `conversations/` and
 everything under it group-readable and -writable (setgid on directories), every other entry at its
 recorded mode. The worktree and its git directory take the group from their setgid roots (owned by
-the change's owner) and get group write where the owner can write, group execute where the owner
-can execute and setgid on directories, in the same `chmod` the restore makes for each entry. A
+the change's owner) and get the owner's read, write and execute bits copied to the group (a 0600 file
+comes back 0660) and setgid on directories, in the same `chmod` the restore makes for each entry. A
 directory absent from the map (a removed member's) is restored as before, root's.
 
 ### Cadence and budgets
