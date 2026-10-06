@@ -785,7 +785,12 @@ async fn pnpm_installs_as_a_second_person_in_a_restored_worktree() {
         force = pnpm("--force"),
         o = out.display()
     );
-    let mut client = Client::start(base);
+    // The daemon's child environment carries PATH, as boot's passthrough does (node and pnpm
+    // may live outside the default PATH, as on CI runners).
+    let mut client = Client::start_with(
+        base,
+        vec![var("PATH", &std::env::var("PATH").unwrap_or_default())],
+    );
     ok(client.request(Command::Exec(exec(script, Some(BOB)))).await);
     let status = wait_for(&out);
     let log = std::fs::read_to_string(base.join("pnpm-as-bob.log")).unwrap_or_default();
