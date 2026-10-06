@@ -1194,6 +1194,8 @@ impl From<Capabilities> for wire::Capabilities {
             features: Some(c.features.into()),
             limits: Some(c.limits.into()),
             supports: c.supports,
+            person_capabilities: c.person_capabilities,
+            person_capabilities_withheld: c.person_capabilities_withheld,
         }
     }
 }
@@ -1216,6 +1218,8 @@ impl TryFrom<wire::Capabilities> for Capabilities {
                 .ok_or(WireError::MissingField("Capabilities.limits"))?
                 .into(),
             supports: c.supports,
+            person_capabilities: c.person_capabilities,
+            person_capabilities_withheld: c.person_capabilities_withheld,
         })
     }
 }

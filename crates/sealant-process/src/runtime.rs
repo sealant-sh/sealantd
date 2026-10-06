@@ -185,7 +185,11 @@ impl ProcessRuntime {
         command.args(&args.args);
         command.env_clear();
         // A person's process inherits none of the launcher's tokens or the daemon's own keys.
-        let inherited = |key: &str| run_as.is_none() || !crate::identity::withheld_from_person(key);
+        let inherited = |key: &str| {
+            run_as.is_none()
+                || !(crate::identity::withheld_from_person(key)
+                    || self.config.person_withheld.iter().any(|k| k == key))
+        };
         for var in self.config.child_env.iter().filter(|v| inherited(&v.key)) {
             command.env(&var.key, &var.value);
         }

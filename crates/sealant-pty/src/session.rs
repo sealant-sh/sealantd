@@ -340,8 +340,11 @@ impl SessionRuntime {
             })?;
         }
         // A person's leader inherits none of the launcher's tokens or the daemon's own keys.
-        let inherited =
-            |key: &str| run_as.is_none() || !sealant_process::identity::withheld_from_person(key);
+        let inherited = |key: &str| {
+            run_as.is_none()
+                || !(sealant_process::identity::withheld_from_person(key)
+                    || self.config.person_withheld.iter().any(|k| k == key))
+        };
         let mut env: Vec<(String, String)> = self
             .config
             .child_env

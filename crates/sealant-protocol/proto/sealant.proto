@@ -519,6 +519,11 @@ message Capabilities {
   // What this daemon can do beyond the schema, by name (`restore.owner_map`, `exec.user`,
   // `dotfiles.user`).
   repeated string supports = 9;
+  // The capabilities a process run as a person holds here: CAP_FOWNER, or none.
+  repeated string person_capabilities = 10;
+  // Why a process run as a person holds no CAP_FOWNER here (no-new-privileges, the bounding set,
+  // a daemon that is not root); absent when it holds it.
+  optional string person_capabilities_withheld = 11;
 }
 
 message HealthReport {

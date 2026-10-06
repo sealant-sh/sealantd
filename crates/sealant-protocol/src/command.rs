@@ -750,6 +750,15 @@ pub struct Capabilities {
     /// names all three. A daemon from before this list reports none.
     #[serde(default)]
     pub supports: Vec<String>,
+    /// The capabilities a process run as a person holds in this daemon: `CAP_FOWNER`, or none.
+    /// Empty from an older daemon.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub person_capabilities: Vec<String>,
+    /// Why a process run as a person holds no `CAP_FOWNER` here (no-new-privileges is set, the
+    /// daemon's bounding set lacks it, or the daemon is not root): pnpm cannot relink bins as a
+    /// person then. `None` when it holds it, and from an older daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub person_capabilities_withheld: Option<String>,
 }
 
 /// Result of `runtime.health`.

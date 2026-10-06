@@ -533,6 +533,9 @@ pub struct BootConfig {
     pub control: ControlConfig,
     /// Passthrough environment for the harness child (non-consumed, non-secret).
     pub passthrough_env: Vec<(String, String)>,
+    /// The harness credentials the injector declared (`SEALANT_HARNESS_ENV_KEYS`): passed through
+    /// to root's harness, never to a process run as a person (they are the launcher's logins).
+    pub declared_harness_keys: Vec<String>,
     /// The workspace's own Docker daemon (`SEALANT_WORKSPACE_DOCKER_HOST`, or a `DOCKER_HOST`
     /// Core reserves for one): the final capture stops its containers.
     pub workspace_docker: Option<crate::docker::DockerEndpoint>,
@@ -735,6 +738,17 @@ impl BootConfig {
         };
 
         let passthrough_env = passthrough_env(env);
+        let declared_harness_keys = env
+            .get("SEALANT_HARNESS_ENV_KEYS")
+            .map(|declared| {
+                declared
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|k| !k.is_empty())
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default();
         let recovery = recovery_requested(env, Path::new(RECOVERY_MARKER));
         match &mut source {
             WorkspaceSource::Capture(capture) => capture.recovery = recovery,
@@ -768,6 +782,7 @@ impl BootConfig {
             shells,
             control,
             passthrough_env,
+            declared_harness_keys,
             workspace_docker,
             recovery,
             sweep_exempt_file: env
@@ -1870,6 +1885,15 @@ mod tests {
         assert!(!keys.contains(&"UNLISTED_TOKEN"));
         assert!(!keys.contains(&"SEALANT_HARNESS_ENV_KEYS"));
         assert!(!keys.contains(&"SEALANT_WORKSPACE_HTTP_TOKEN"));
+        // Declared, they are the launcher's logins: never a person's.
+        assert_eq!(
+            cfg.declared_harness_keys,
+            [
+                "MY_PROVIDER_TOKEN",
+                "EXTRA_SECRET",
+                "SEALANT_WORKSPACE_HTTP_TOKEN"
+            ]
+        );
     }
 
     #[test]

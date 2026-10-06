@@ -97,6 +97,11 @@ pub fn run_boot(log_level: &str, recovery: bool) -> ExitCode {
         }
     };
 
+    // Said once, where a person's processes would run without CAP_FOWNER (pnpm cannot relink
+    // bins as a person then); `runtime.getCapabilities` says the same.
+    if let Some(reason) = sealant_process::identity::fowner_withheld() {
+        tracing::info!(%reason, "processes run as a person hold no CAP_FOWNER");
+    }
     run_supervised(config, secret_env, capture_boot)
 }
 
@@ -412,6 +417,9 @@ fn into_runtime_config(config: &BootConfig, secret_env: &[(String, String)]) -> 
     // the prep-set identity vars. Every secret value seeds the I/O redactor whatever its name.
     runtime_config.child_env = harness_child_env(config, secret_env);
     runtime_config.redact_literals = secret_env.iter().map(|(_, value)| value.clone()).collect();
+    // A process run as a person never gets the launcher's declared harness logins; the
+    // project's secrets (the secret environment) reach every person.
+    runtime_config.person_withheld = config.declared_harness_keys.clone();
     runtime_config
 }
 

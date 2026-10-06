@@ -25,13 +25,15 @@ use nix::unistd::{Gid, Uid, User};
 /// The umask a person's processes run with: what they create is the group's to write.
 pub const PERSON_UMASK: u32 = 0o002;
 
-/// Variables a person's process never inherits from the daemon's environment, by name: logins
-/// and tokens the launcher's container may carry (a provider token in the environment wins over
-/// the person's own login file), the daemon's own `SEALANT_*` configuration, an agent socket or
-/// askpass that would sign as someone else, and the XDG base directories, which point into
-/// root's home. Anything that looks like a secret by name is withheld too
-/// ([`withheld_from_person`]). The caller's own overlay is not filtered: what it names, it
-/// meant.
+/// Variables a person's process never inherits from the daemon's environment, by name: the
+/// logins a harness or `gh` would spend in place of the person's own (a provider token in the
+/// environment wins over the person's login file), an agent socket or askpass that would sign as
+/// someone else, and the XDG base directories, which point into root's home; and every
+/// `SEALANT_*` name ([`withheld_from_person`]). Nothing else is withheld by its name: the
+/// project's secrets (Mend's, through the launcher's secret environment, under any name) are
+/// the project's, meant for every agent in it. The injector's declared harness keys are withheld
+/// too, by the runtime (`RuntimeConfig::person_withheld`). The caller's own overlay is not
+/// filtered: what it names, it meant.
 pub const WITHHELD: &[&str] = &[
     "CLAUDE_CODE_OAUTH_TOKEN",
     "ANTHROPIC_API_KEY",
@@ -45,10 +47,6 @@ pub const WITHHELD: &[&str] = &[
     "GH_TOKEN",
     "GH_ENTERPRISE_TOKEN",
     "GITHUB_ENTERPRISE_TOKEN",
-    "GITLAB_TOKEN",
-    "AWS_ACCESS_KEY_ID",
-    "AWS_SECRET_ACCESS_KEY",
-    "AWS_SESSION_TOKEN",
     "MEND_SESSION_TOKEN",
     "SSH_AUTH_SOCK",
     "SSH_ASKPASS",
@@ -61,13 +59,18 @@ pub const WITHHELD: &[&str] = &[
     "XDG_CACHE_HOME",
 ];
 
-/// The image's environment for a person's processes (Core's images write it): one literal
-/// `KEY=VALUE` per line, applied to every process run as a person (exec, session, the dotfiles
-/// commands) and never to root. `PATH_PREPEND` goes in front of the base `PATH`. Blank lines,
-/// `#` lines (a version marker), lines without `=`, names that are not variable names, the
-/// identity's own names and names a person never inherits ([`withheld_from_person`]) are
-/// skipped. A missing or unreadable file changes nothing.
+/// The image's environment for a person's processes (Core's images write it, sealant#330): its
+/// first line is exactly [`PERSON_ENV_VERSION_LINE`], then one literal `KEY=VALUE` per line,
+/// applied to every process run as a person (exec, session, the dotfiles commands) and never to
+/// root. `PATH_PREPEND` goes in front of the base `PATH`. Blank lines, other `#` lines, lines
+/// without `=`, names that are not variable names, the identity's own names, names a person
+/// never inherits ([`withheld_from_person`]), secret-looking names ([`looks_secret`]) and lines
+/// holding a NUL byte are skipped. A missing or unreadable file changes nothing; a file whose
+/// first line is not that version applies nothing, and says why in the log.
 pub const PERSON_ENV_FILE: &str = "/etc/sealant/person-env";
+
+/// The first line of a [`PERSON_ENV_FILE`] this build reads.
+pub const PERSON_ENV_VERSION_LINE: &str = "# person-env 1";
 
 /// The `PATH` a person's process gets when the daemon's environment has none.
 pub const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
@@ -91,19 +94,41 @@ pub fn person_env(base_path: Option<&str>) -> Vec<(String, String)> {
 /// [`person_env`] from the file at `path`.
 #[must_use]
 pub fn person_env_at(path: &Path, base_path: Option<&str>) -> Vec<(String, String)> {
-    std::fs::read_to_string(path)
-        .map_or_else(|_| Vec::new(), |text| parse_person_env(&text, base_path))
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    match parse_person_env(&text, base_path) {
+        Ok(env) => env,
+        Err(reason) => {
+            tracing::warn!(path = %path.display(), %reason, "person environment not applied");
+            Vec::new()
+        }
+    }
 }
 
 /// The variables of a [`PERSON_ENV_FILE`] text, in order (a later line of one name wins where the
-/// caller applies them in order); `PATH_PREPEND` becomes `PATH`, in front of `base_path`.
-#[must_use]
-pub fn parse_person_env(text: &str, base_path: Option<&str>) -> Vec<(String, String)> {
+/// caller applies them in order); `PATH_PREPEND` becomes `PATH`, in front of `base_path`. `Err`
+/// (nothing applies) when the first line is not [`PERSON_ENV_VERSION_LINE`].
+pub fn parse_person_env(
+    text: &str,
+    base_path: Option<&str>,
+) -> Result<Vec<(String, String)>, String> {
+    let mut lines = text.lines();
+    let first = lines.next().map(|l| l.trim_end_matches('\r'));
+    if first != Some(PERSON_ENV_VERSION_LINE) {
+        return Err(match first {
+            Some(line) if line.starts_with("# person-env ") => format!(
+                "it is version {:?}; this sealantd reads {PERSON_ENV_VERSION_LINE:?}",
+                line.trim_start_matches("# person-env ")
+            ),
+            _ => format!("its first line is not {PERSON_ENV_VERSION_LINE:?}"),
+        });
+    }
     let mut out = Vec::new();
     let mut prepend: Vec<&str> = Vec::new();
-    for line in text.lines() {
+    for line in lines {
         let line = line.trim_end_matches('\r');
-        if line.trim().is_empty() || line.trim_start().starts_with('#') {
+        if line.trim().is_empty() || line.trim_start().starts_with('#') || line.contains('\0') {
             continue;
         }
         let Some((key, value)) = line.split_once('=') else {
@@ -123,7 +148,11 @@ pub fn parse_person_env(text: &str, base_path: Option<&str>) -> Vec<(String, Str
             }
             continue;
         }
-        if key == "PATH" || IDENTITY_KEYS.contains(&key) || withheld_from_person(key) {
+        if key == "PATH"
+            || IDENTITY_KEYS.contains(&key)
+            || withheld_from_person(key)
+            || looks_secret(key)
+        {
             continue;
         }
         out.push((key.to_owned(), value.to_owned()));
@@ -132,10 +161,11 @@ pub fn parse_person_env(text: &str, base_path: Option<&str>) -> Vec<(String, Str
         let base = base_path.unwrap_or(DEFAULT_PATH);
         out.push(("PATH".to_owned(), format!("{}:{base}", prepend.join(":"))));
     }
-    out
+    Ok(out)
 }
 
-/// Name fragments of a secret (as the boot's passthrough filter reads them).
+/// Name fragments of a secret (as the boot's passthrough filter reads them): a name the image's
+/// person environment never sets ([`looks_secret`]).
 const SECRET_MARKERS: &[&str] = &[
     "TOKEN",
     "SECRET",
@@ -146,15 +176,19 @@ const SECRET_MARKERS: &[&str] = &[
 ];
 
 /// Whether a person's process never inherits `key` from the daemon's environment: a
-/// [`WITHHELD`] name, any `SEALANT_*` name, or a name that looks like a secret (a
-/// [`SECRET_MARKERS`] fragment, or ending in `_KEY`).
+/// [`WITHHELD`] name or any `SEALANT_*` name.
 #[must_use]
 pub fn withheld_from_person(key: &str) -> bool {
     let upper = key.to_ascii_uppercase();
-    upper.starts_with("SEALANT_")
-        || WITHHELD.contains(&upper.as_str())
-        || SECRET_MARKERS.iter().any(|m| upper.contains(m))
-        || upper.ends_with("_KEY")
+    upper.starts_with("SEALANT_") || WITHHELD.contains(&upper.as_str())
+}
+
+/// Whether `key` looks like a secret by its name (a [`SECRET_MARKERS`] fragment, or ending in
+/// `_KEY`): the image's person environment never sets one.
+#[must_use]
+pub fn looks_secret(key: &str) -> bool {
+    let upper = key.to_ascii_uppercase();
+    SECRET_MARKERS.iter().any(|m| upper.contains(m)) || upper.ends_with("_KEY")
 }
 
 /// A user a process runs as, resolved from the passwd and group databases.
@@ -269,6 +303,7 @@ impl RunAs {
     pub fn apply(&self, command: &mut std::process::Command) {
         let groups: Vec<libc::gid_t> = self.groups.clone();
         let (uid, gid) = (self.uid, self.gid);
+
         // SAFETY: the closure runs in the forked child before exec. It allocates nothing (the
         // group list was built in the parent and is only read) and makes only system calls:
         // setgroups, setgid, prctl, setuid, capset and umask. setuid comes after the group
@@ -282,13 +317,25 @@ impl RunAs {
                 if libc::setgid(gid) == -1 {
                     return Err(io::Error::last_os_error());
                 }
-                if libc::prctl(libc::PR_SET_KEEPCAPS, 1, 0, 0, 0) == -1 {
+                // Decided here, in the child, from exactly what it inherited
+                // ([`fowner_withheld`]); without the capability, setuid alone clears every set.
+                let fowner = libc::prctl(libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) == 0
+                    && libc::prctl(
+                        libc::PR_CAPBSET_READ,
+                        libc::c_ulong::from(CAP_FOWNER),
+                        0,
+                        0,
+                        0,
+                    ) == 1;
+                if fowner && libc::prctl(libc::PR_SET_KEEPCAPS, 1, 0, 0, 0) == -1 {
                     return Err(io::Error::last_os_error());
                 }
                 if libc::setuid(uid) == -1 {
                     return Err(io::Error::last_os_error());
                 }
-                keep_only_fowner()?;
+                if fowner {
+                    keep_only_fowner()?;
+                }
                 libc::umask(PERSON_UMASK);
                 Ok(())
             });
@@ -300,9 +347,49 @@ impl RunAs {
 /// changing the mode, times and other owner-only attributes of a file it does not own. In a
 /// shared worktree every file is someone else's (restored ones are root's, a joiner's are the
 /// joiner's), and package managers `chmod` what they relink (pnpm fails without it:
-/// `ERR_PNPM_CMD_SHIM_CHMOD`). Within what the person's passwordless `sudo` already allows (Mend's
-/// ADR 0016); nothing else of root's is kept.
+/// `ERR_PNPM_CMD_SHIM_CHMOD`).
+///
+/// It amounts to root: whoever can `chmod` any file can read and write any file (`chmod` it
+/// first), and can make a setuid root binary or plant `/etc/ld.so.preload`. It adds nothing only
+/// where the person already has root through a working setuid `sudo`: the gate Mend's ADR 0016
+/// and Core's image probe require. So it is never granted under no-new-privileges, where `sudo`
+/// cannot work ([`fowner_withheld`]); nothing else of root's is ever kept.
 pub const CAP_FOWNER: u32 = 3;
+
+/// Why a process run as a person from this thread runs without [`CAP_FOWNER`], or `None` when it
+/// holds it. The child decides from what it inherits, and this reads the same facts on the
+/// calling thread (no-new-privileges is per thread, inherited by threads and children made
+/// after it is set): under no-new-privileges (sealantd's own, plan §18, or a Kubernetes
+/// `allowPrivilegeEscalation: false`), where `sudo` cannot work and the capability would amount
+/// to root; where the bounding set lacks it; and in a daemon that is not root. pnpm then fails
+/// to relink bins as a person (`ERR_PNPM_CMD_SHIM_CHMOD`), and `runtime.getCapabilities` says so.
+#[must_use]
+pub fn fowner_withheld() -> Option<&'static str> {
+    if !nix::unistd::geteuid().is_root() {
+        return Some("the daemon is not root");
+    }
+    // SAFETY: prctl takes integer arguments only.
+    let no_new_privs = unsafe { libc::prctl(libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) };
+    if no_new_privs != 0 {
+        return Some(
+            "no-new-privileges is set: sudo cannot work, and CAP_FOWNER would amount to root",
+        );
+    }
+    // SAFETY: as above.
+    let bounded = unsafe {
+        libc::prctl(
+            libc::PR_CAPBSET_READ,
+            libc::c_ulong::from(CAP_FOWNER),
+            0,
+            0,
+            0,
+        )
+    };
+    if bounded != 1 {
+        return Some("the daemon's bounding set lacks CAP_FOWNER");
+    }
+    None
+}
 
 /// `_LINUX_CAPABILITY_VERSION_3`: two 32-bit words per set.
 const CAPABILITY_VERSION_3: u32 = 0x2008_0522;
@@ -383,6 +470,12 @@ fn private_dir(dir: &Path, uid: u32, gid: u32) -> io::Result<()> {
             if (meta.uid(), meta.gid(), meta.mode() & 0o7777) == (uid, gid, 0o700) {
                 return Ok(());
             }
+            // Someone else made it: whatever they planted inside goes with it (std's
+            // `remove_dir_all` never follows a symlink out of the tree).
+            if meta.uid() != uid {
+                std::fs::remove_dir_all(dir)?;
+                make_dir(dir)?;
+            }
         }
         Ok(_) => {
             std::fs::remove_file(dir)?;
@@ -420,26 +513,45 @@ mod tests {
 
     #[test]
     fn the_image_s_person_environment_is_read_as_literal_lines() {
-        let text = "# sealant person-env 1\r\nPATH_PREPEND=/opt/mise/shims\nMISE_DATA_DIR=/opt/mise\n\
-                    \nnot a line\n1BAD=x\nBAD-NAME=x\nHOME=/nope\nPATH=/replaced\nSEALANT_X=y\n\
-                    NPM_TOKEN=t\nQUOTED=\"a b\" $HOME\nEMPTY=\nMISE_DATA_DIR=/opt/mise2\n";
+        // Core's marker and lines as its images write them (sealant#330), then the edge cases.
+        let text = "# person-env 1\r\nPATH_PREPEND=/opt/npm-global/bin:/opt/pnpm/bin:/opt/pnpm\n\
+                    pnpm_config_store_dir=/var/cache/pnpm/store\nnpm_config_prefix=/opt/npm-global\n\
+                    MISE_DATA_DIR=/opt/mise\n# a comment\n\nnot a line\n1BAD=x\nBAD-NAME=x\n\
+                    HOME=/nope\nPATH=/replaced\nSEALANT_X=y\nNPM_TOKEN=t\nNUL=a\0b\n\
+                    QUOTED=\"a b\" $HOME\nEMPTY=\nMISE_DATA_DIR=/opt/mise2\n";
         assert_eq!(
-            parse_person_env(text, Some("/usr/bin:/bin")),
+            parse_person_env(text, Some("/usr/bin:/bin")).unwrap(),
             vec![
+                (
+                    "pnpm_config_store_dir".to_owned(),
+                    "/var/cache/pnpm/store".to_owned()
+                ),
+                ("npm_config_prefix".to_owned(), "/opt/npm-global".to_owned()),
                 ("MISE_DATA_DIR".to_owned(), "/opt/mise".to_owned()),
                 ("QUOTED".to_owned(), "\"a b\" $HOME".to_owned()),
                 ("EMPTY".to_owned(), String::new()),
                 ("MISE_DATA_DIR".to_owned(), "/opt/mise2".to_owned()),
                 (
                     "PATH".to_owned(),
-                    "/opt/mise/shims:/usr/bin:/bin".to_owned()
+                    "/opt/npm-global/bin:/opt/pnpm/bin:/opt/pnpm:/usr/bin:/bin".to_owned()
                 ),
             ]
         );
         assert_eq!(
-            parse_person_env("PATH_PREPEND=/a\nPATH_PREPEND=/b\n", None),
+            parse_person_env("# person-env 1\nPATH_PREPEND=/a\nPATH_PREPEND=/b\n", None).unwrap(),
             vec![("PATH".to_owned(), format!("/a:/b:{DEFAULT_PATH}"))]
         );
+        // A missing or unknown version applies nothing, and says why.
+        for (text, why) in [
+            ("# person-env 2\nA=1\n", "version \"2\""),
+            ("A=1\n", "first line"),
+            ("# sealant person-env 1\nA=1\n", "first line"),
+            ("\n# person-env 1\nA=1\n", "first line"),
+            ("", "first line"),
+        ] {
+            let err = parse_person_env(text, None).unwrap_err();
+            assert!(err.contains(why), "{text:?}: {err}");
+        }
         assert!(person_env_at(Path::new("/nonexistent/person-env"), None).is_empty());
     }
 
@@ -459,30 +571,37 @@ mod tests {
             "GH_TOKEN",
             "GITHUB_TOKEN",
             "gh_token",
+            "ANTHROPIC_API_KEY",
             "SEALANT_DOTFILES_HTTP_TOKEN",
             "SEALANT_WORKSPACE_AUTH_KEY_BASE64",
             "SEALANT_CAPTURE_ENDPOINT",
             "MEND_SESSION_TOKEN",
-            "NPM_TOKEN",
-            "MY_SERVICE_PASSWORD",
-            "STRIPE_SECRET",
-            "DEPLOY_KEY",
-            "AWS_ACCESS_KEY_ID",
             "SSH_AUTH_SOCK",
             "XDG_CONFIG_HOME",
         ] {
             assert!(withheld_from_person(withheld), "{withheld}");
         }
+        // A project's secrets, under whatever name, are the project's: they reach its people.
         for kept in [
             "PATH",
             "LANG",
-            "TERM",
-            "NODE_OPTIONS",
-            "KEYBOARD",
-            "COLORTERM",
+            "NPM_TOKEN",
+            "STRIPE_SECRET_KEY",
+            "DATABASE_PASSWORD",
+            "DEPLOY_KEY",
+            "AWS_ACCESS_KEY_ID",
         ] {
             assert!(!withheld_from_person(kept), "{kept}");
         }
+        for secret in [
+            "NPM_TOKEN",
+            "STRIPE_SECRET_KEY",
+            "DATABASE_PASSWORD",
+            "DEPLOY_KEY",
+        ] {
+            assert!(looks_secret(secret), "{secret}");
+        }
+        assert!(!looks_secret("MISE_DATA_DIR"));
     }
 
     /// A file (or a symlink) squatting a user's private directory is replaced by the directory,
@@ -502,7 +621,14 @@ mod tests {
         private_dir(&link, uid, gid).unwrap();
         let fresh = tmp.path().join("a/u-fresh");
         private_dir(&fresh, uid, gid).unwrap();
-        for dir in [file, link, fresh] {
+        // A directory of the user's own with another mode keeps what is in it.
+        let own = tmp.path().join("u-own");
+        std::fs::create_dir(&own).unwrap();
+        std::fs::write(own.join("kept"), "x").unwrap();
+        std::fs::set_permissions(&own, std::fs::Permissions::from_mode(0o755)).unwrap();
+        private_dir(&own, uid, gid).unwrap();
+        assert!(own.join("kept").exists());
+        for dir in [file, link, fresh, own] {
             let meta = std::fs::symlink_metadata(&dir).unwrap();
             assert!(meta.is_dir(), "{}", dir.display());
             assert_eq!(meta.mode() & 0o7777, 0o700);

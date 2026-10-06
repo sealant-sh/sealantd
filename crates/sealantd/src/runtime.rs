@@ -1150,6 +1150,12 @@ impl Runtime {
             },
             limits: self.config.limits,
             supports: SUPPORTS.iter().map(|s| (*s).to_owned()).collect(),
+            person_capabilities: match sealant_process::identity::fowner_withheld() {
+                None => vec!["CAP_FOWNER".to_owned()],
+                Some(_) => Vec::new(),
+            },
+            person_capabilities_withheld: sealant_process::identity::fowner_withheld()
+                .map(str::to_owned),
         }
     }
 

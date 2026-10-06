@@ -89,9 +89,19 @@ impl Client {
 
     /// With `child_env`: the daemon's child environment (the passthrough of PID 1's).
     fn start_with(workspace: &Path, child_env: Vec<sealant_protocol::EnvVar>) -> Self {
+        Self::start_withholding(workspace, child_env, Vec::new())
+    }
+
+    /// With `child_env` and the injector's declared harness keys (`person_withheld`).
+    fn start_withholding(
+        workspace: &Path,
+        child_env: Vec<sealant_protocol::EnvVar>,
+        person_withheld: Vec<String>,
+    ) -> Self {
         let mut config = RuntimeConfig::new(new_runtime_id());
         config.workspace_root = workspace.to_path_buf();
         config.child_env = child_env;
+        config.person_withheld = person_withheld;
         let runtime = Runtime::new(config, Arc::new(ShutdownSignal::new(1000)));
         runtime.mark_healthy();
         let (_sd_tx, sd_rx) = watch::channel(false);
@@ -239,6 +249,12 @@ async fn an_execution_runs_as_the_user_it_names() {
         return;
     }
     let dir = scratch();
+    // Someone else (root here) made the user's private TMPDIR, and planted something in it: it
+    // is emptied and given to the user.
+    let squat = PathBuf::from(format!("/tmp/u-{BOB_UID}"));
+    let _ = std::fs::remove_dir_all(&squat);
+    std::fs::create_dir_all(&squat).unwrap();
+    std::fs::write(squat.join("planted"), "x").unwrap();
     let mut client = Client::start(dir.path());
     for (name, user) in [("by-name", BOB.to_owned()), ("by-uid", BOB_UID.to_string())] {
         let out = dir.path().join(name);
@@ -247,6 +263,7 @@ async fn an_execution_runs_as_the_user_it_names() {
             .await);
         assert_eq!(wait_for(&out), expected_identity(), "{name}");
     }
+    assert!(!squat.join("planted").exists(), "a planted file stayed");
     let out = dir.path().join("as-root");
     ok(client
         .request(Command::Exec(exec(
@@ -484,13 +501,22 @@ async fn a_person_s_process_inherits_no_token_and_no_daemon_key() {
         "CLAUDE_CODE_OAUTH_TOKEN",
         "SEALANT_DOTFILES_HTTP_TOKEN",
         "SEALANT_CAPTURE_ENDPOINT",
-        "NPM_TOKEN",
         "SSH_AUTH_SOCK",
         "XDG_CONFIG_HOME",
+        "DECLARED_LOGIN",
     ];
     let mut child_env: Vec<_> = leaks.iter().map(|k| var(k, "launcher-value")).collect();
     child_env.push(var("KEEP_ME", "1"));
-    let mut client = Client::start_with(dir.path(), child_env);
+    // The project's secrets, as the launcher's secret environment puts them in the daemon's
+    // child environment: the project's, so they reach every person.
+    let project = [
+        ("NPM_TOKEN", "npm-secret"),
+        ("STRIPE_SECRET_KEY", "sk"),
+        ("DATABASE_PASSWORD", "pw"),
+    ];
+    child_env.extend(project.iter().map(|(k, v)| var(k, v)));
+    let mut client =
+        Client::start_withholding(dir.path(), child_env, vec!["DECLARED_LOGIN".to_owned()]);
     let dump = |out: &Path| {
         format!(
             "env > {0}.tmp && echo end >> {0}.tmp && mv {0}.tmp {0}",
@@ -525,6 +551,12 @@ async fn a_person_s_process_inherits_no_token_and_no_daemon_key() {
             );
         }
         assert!(env.lines().any(|l| l == "KEEP_ME=1"), "{name}:\n{env}");
+        for (key, value) in project {
+            assert!(
+                env.lines().any(|l| l == format!("{key}={value}")),
+                "{name}: the project's {key} did not reach the person:\n{env}"
+            );
+        }
         assert!(env.lines().any(|l| l == format!("USER={BOB}")), "{name}");
     }
     assert!(person.lines().any(|l| l == "EXPLICIT=1"));
@@ -629,7 +661,9 @@ async fn a_person_s_dotfiles_commands_get_a_clean_environment() {
 
 /// A person's process holds exactly one capability, `CAP_FOWNER`, ambient (so the programs it
 /// runs keep it), and no secure-exec mode (the loader keeps `LD_LIBRARY_PATH`): it can `chmod` a
-/// root-owned file in a shared worktree, as `sudo` already lets it.
+/// root-owned file in a shared worktree, as `sudo` already lets it. Under no-new-privileges,
+/// where `sudo` cannot work and the capability would amount to root, it holds none, and
+/// `runtime.getCapabilities` says why.
 #[tokio::test]
 async fn a_person_s_process_holds_cap_fowner_and_nothing_else() {
     if !ready() {
@@ -651,8 +685,30 @@ async fn a_person_s_process_holds_cap_fowner_and_nothing_else() {
     );
     args.env = vec![var("LD_LIBRARY_PATH", "/opt/x")];
     let mut client = Client::start(dir.path());
+    let caps = match ok(client.request(Command::RuntimeGetCapabilities).await) {
+        Some(CommandResult::Capabilities(c)) => c,
+        other => panic!("capabilities: {other:?}"),
+    };
     ok(client.request(Command::Exec(args)).await);
     let seen = wait_for(&out);
+    // The daemon reports what its children inherit: sealantd sets no-new-privileges on itself
+    // (plan §18), as an orchestrator may, and then a person holds no CAP_FOWNER.
+    if let Some(reason) = &caps.person_capabilities_withheld {
+        assert!(caps.person_capabilities.is_empty(), "{caps:?}");
+        assert!(reason.contains("no-new-privileges"), "{caps:?}");
+        for line in [
+            "CapInh:\t0000000000000000",
+            "CapPrm:\t0000000000000000",
+            "CapEff:\t0000000000000000",
+            "CapAmb:\t0000000000000000",
+        ] {
+            assert!(seen.lines().any(|l| l == line), "{line} missing:\n{seen}");
+        }
+        assert!(!seen.lines().any(|l| l == "chmod-ok"), "{seen}");
+        return;
+    }
+    assert_eq!(caps.person_capabilities, ["CAP_FOWNER"], "{caps:?}");
+    assert_eq!(caps.person_capabilities_withheld, None);
     for line in [
         "CapInh:\t0000000000000008",
         "CapPrm:\t0000000000000008",
@@ -680,7 +736,9 @@ async fn a_person_s_process_holds_cap_fowner_and_nothing_else() {
 /// a second person, not the change's owner, runs `pnpm install` after a lockfile change that
 /// keeps a restored package with a bin (pnpm rewrites the shim and `chmod`s it), then
 /// `pnpm install --force`, through sealantd's own exec as that person. Without the capability the
-/// first fails with `ERR_PNPM_CMD_SHIM_CHMOD`. Needs network and pnpm.
+/// first fails with `ERR_PNPM_CMD_SHIM_CHMOD`, which is what a daemon under no-new-privileges
+/// gives (sealantd sets it on itself, plan §18); `owner_map.rs` covers the capability's success
+/// path without it. Needs network and pnpm.
 #[tokio::test]
 async fn pnpm_installs_as_a_second_person_in_a_restored_worktree() {
     use sealant_capture::{
@@ -791,9 +849,18 @@ async fn pnpm_installs_as_a_second_person_in_a_restored_worktree() {
         base,
         vec![var("PATH", &std::env::var("PATH").unwrap_or_default())],
     );
+    let withheld = match ok(client.request(Command::RuntimeGetCapabilities).await) {
+        Some(CommandResult::Capabilities(c)) => c.person_capabilities_withheld,
+        other => panic!("capabilities: {other:?}"),
+    };
     ok(client.request(Command::Exec(exec(script, Some(BOB)))).await);
     let status = wait_for(&out);
     let log = std::fs::read_to_string(base.join("pnpm-as-bob.log")).unwrap_or_default();
+    if withheld.is_some() {
+        // No CAP_FOWNER (sealantd's own no-new-privileges): pnpm fails as it did before it.
+        assert!(log.contains("ERR_PNPM_CMD_SHIM_CHMOD"), "{status}\n{log}");
+        return;
+    }
     assert_eq!(status, "exit=0\n", "pnpm as a second person:\n{log}");
     assert!(repo.join("node_modules/which").exists(), "{log}");
 }
@@ -821,7 +888,7 @@ async fn the_image_s_person_environment_reaches_every_person_s_process_and_not_r
     let _file = PersonEnvFile;
     std::fs::write(
         sealant_process::identity::PERSON_ENV_FILE,
-        "# sealant person-env 1\nPATH_PREPEND=/opt/mise/shims\nMISE_DATA_DIR=/opt/mise\n\
+        "# person-env 1\nPATH_PREPEND=/opt/mise/shims\nMISE_DATA_DIR=/opt/mise\n\
          not a line\n1BAD=x\nHOME=/nope\nSEALANT_SNEAKY=y\nFROM_BOTH=file\nCALLER_WINS=file\n",
     )
     .unwrap();
@@ -881,6 +948,27 @@ async fn the_image_s_person_environment_reaches_every_person_s_process_and_not_r
         "root got the person file:\n{root}"
     );
     assert!(root.lines().any(|l| l == "PATH=/usr/bin:/bin"), "{root}");
+
+    // A version this sealantd does not read applies nothing.
+    std::fs::write(
+        sealant_process::identity::PERSON_ENV_FILE,
+        "# person-env 2\nMISE_DATA_DIR=/opt/mise\nPATH_PREPEND=/opt/mise/shims\n",
+    )
+    .unwrap();
+    ok(client
+        .request(Command::Exec(exec(dump(&dir.path().join("v2")), Some(BOB))))
+        .await);
+    let v2 = wait_for(&dir.path().join("v2"));
+    assert!(
+        !v2.contains("MISE_DATA_DIR"),
+        "a version 2 file applied:\n{v2}"
+    );
+    assert!(v2.lines().any(|l| l == "PATH=/usr/bin:/bin"), "{v2}");
+    std::fs::write(
+        sealant_process::identity::PERSON_ENV_FILE,
+        "# person-env 1\nPATH_PREPEND=/opt/mise/shims\nMISE_DATA_DIR=/opt/mise\n",
+    )
+    .unwrap();
 
     // The dotfiles commands of a person's apply: chezmoi, a stand-in writing its environment.
     let evidence = dir.path().join("chezmoi-env");
