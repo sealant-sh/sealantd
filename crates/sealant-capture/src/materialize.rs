@@ -1714,10 +1714,13 @@ mod tests {
                 continue;
             }
             assert!(is_harness_credential(&format!("harness/{path}")), "{path}");
-            assert_eq!(
+            assert!(
                 is_harness_credential(&format!("harness/people/acct_1/{path}")),
-                !index::SAVED_IN_PERSON_DIR.contains(&path),
-                "{path}: under a person's saved directory too, unless that directory keeps it"
+                "{path}: under a person's saved directory too"
+            );
+            assert!(
+                is_harness_credential(&format!("harness/people/acct_1/conversations/s1/{path}")),
+                "{path}: and under a shared conversation"
             );
             assert!(
                 !is_harness_credential(&format!("harness/people/{path}")),

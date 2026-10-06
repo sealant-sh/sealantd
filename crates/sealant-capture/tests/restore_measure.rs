@@ -10,8 +10,9 @@
 //! ```
 //!
 //! The store is made on the first run and reused after (its head is in `head.json` beside it), so
-//! two builds measure the same capture. Only public API that predates the change under measure is
-//! used, so the same file runs against the previous commit for the "before" numbers.
+//! two builds measure the same capture. This file names only API that predates the per-person
+//! stack, so it compiles against `main` for the "before" numbers; a variant that needs newer API
+//! (`restore_measure_owners.rs`) includes it and calls [`measure`].
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -78,6 +79,17 @@ fn head(source: &Path, home: Option<&Path>, store: &Path) -> (String, String) {
 #[test]
 #[ignore = "a measurement over a real worktree: set RESTORE_MEASURE_* and run with --ignored"]
 fn restore_a_real_worktree() {
+    measure(|_root, _targets| {});
+}
+
+/// Restore the store's head `RESTORE_MEASURE_RUNS` times into fresh directories, timing each from
+/// `prepare` (called first, with the run's worktree root and targets: what a variant does before a
+/// restore, an executor's preparation included) to the end of the materialize. Prints one
+/// `restore-run <seconds> <files> <bytes>` line per run (a runner interleaving two builds run by
+/// run reads these) and the median, p90, min and max. Shared, through `#[path]`, by the variants
+/// that need API this file must not name to keep compiling against older commits.
+#[allow(dead_code)]
+pub fn measure(prepare: impl Fn(&Path, &mut MaterializeTargets)) {
     let (Some(source), Some(store), Some(out)) = (
         env_path("RESTORE_MEASURE_SOURCE"),
         env_path("RESTORE_MEASURE_STORE"),
@@ -99,9 +111,12 @@ fn restore_a_real_worktree() {
         let home = out.join(format!("run-{run}/harness-home"));
         if let Some(parent) = root.parent() {
             fs::remove_dir_all(parent).ok();
+            fs::create_dir_all(parent).unwrap();
         }
-        let materializer = Materializer::new(&sink, MaterializeTargets::new(&root, Some(home)));
+        let mut targets = MaterializeTargets::new(&root, Some(home));
         let started = Instant::now();
+        prepare(&root, &mut targets);
+        let materializer = Materializer::new(&sink, targets);
         let manifest = materializer
             .fetch_manifest(&manifest_key, &capture_id)
             .unwrap();
@@ -111,18 +126,19 @@ fn restore_a_real_worktree() {
         let wall = started.elapsed();
         walls.push(wall.as_secs_f64());
         eprintln!(
-            "run {run}: {:.2} s, {} files, {} bytes written, {} packs fetched",
+            "restore-run {:.3} {} {}",
             wall.as_secs_f64(),
             report.files,
-            report.bytes,
-            report.packs_fetched
+            report.bytes
         );
         fs::remove_dir_all(root.parent().unwrap()).ok();
     }
     walls.sort_by(f64::total_cmp);
+    let at = |q: f64| walls[((walls.len() - 1) as f64 * q).round() as usize];
     eprintln!(
-        "restore: median {:.2} s, min {:.2} s, max {:.2} s over {runs} runs",
-        walls[walls.len() / 2],
+        "restore: median {:.2} s, p90 {:.2} s, min {:.2} s, max {:.2} s over {runs} runs",
+        at(0.5),
+        at(0.9),
         walls[0],
         walls[walls.len() - 1]
     );
