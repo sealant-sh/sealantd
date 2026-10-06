@@ -323,18 +323,53 @@ impl SessionRuntime {
             .clone()
             .map_or_else(|| self.config.workspace_root.clone(), Into::into);
         let term = args.term.clone().unwrap_or_else(|| DEFAULT_TERM.to_owned());
+        // A named user: resolved here, its private directories made, its identity set in the
+        // leader before exec ([`sealant_process::identity`]).
+        let run_as = args
+            .user
+            .as_deref()
+            .map(sealant_process::identity::RunAs::resolve)
+            .transpose()
+            .map_err(ControlError::invalid_argument)?;
+        if let Some(user) = &run_as {
+            user.prepare_dirs().map_err(|e| {
+                ControlError::new(
+                    sealant_protocol::ControlErrorCode::ProcessStartFailed,
+                    format!("the private directories of user {}: {e}", user.name),
+                )
+            })?;
+        }
+        // A person's leader inherits none of the launcher's tokens or the daemon's own keys.
+        let inherited = |key: &str| {
+            run_as.is_none()
+                || !(sealant_process::identity::withheld_from_person(key)
+                    || self.config.person_withheld.iter().any(|k| k == key))
+        };
         let mut env: Vec<(String, String)> = self
             .config
             .child_env
             .iter()
+            .filter(|v| inherited(&v.key))
             .map(|v| (v.key.clone(), v.value.clone()))
             .collect();
+        // The user's identity over the daemon's child environment and the image's person
+        // environment (`sealant_process::identity::PERSON_ENV_FILE`), under the caller's overlay.
+        if let Some(user) = &run_as {
+            let base_path = env
+                .iter()
+                .rev()
+                .find(|(key, _)| key == "PATH")
+                .map(|(_, value)| value.clone());
+            env.extend(sealant_process::identity::person_env(base_path.as_deref()));
+            env.extend(user.env());
+        }
         env.extend(args.env.iter().map(|v| (v.key.clone(), v.value.clone())));
         env.extend(
             self.extra_env
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .iter()
+                .filter(|(key, _)| inherited(key))
                 .cloned(),
         );
 
@@ -347,13 +382,21 @@ impl SessionRuntime {
                     child,
                     pid,
                     spawned,
-                } = pty::spawn(&shell, &args.args, &cwd, &env, args.cols, args.rows, &term)
-                    .map_err(|e| {
-                        ControlError::new(
-                            sealant_protocol::ControlErrorCode::PtyAllocationFailed,
-                            format!("{shell}: {e}"),
-                        )
-                    })?;
+                } = pty::spawn(
+                    &shell,
+                    &args.args,
+                    &cwd,
+                    &env,
+                    (args.cols, args.rows),
+                    &term,
+                    run_as.as_ref(),
+                )
+                .map_err(|e| {
+                    ControlError::new(
+                        sealant_protocol::ControlErrorCode::PtyAllocationFailed,
+                        format!("{shell}: {e}"),
+                    )
+                })?;
                 let master = Arc::new(master);
                 (
                     child,
@@ -374,7 +417,7 @@ impl SessionRuntime {
                     child,
                     pid,
                     spawned,
-                } = pipe::spawn(&shell, &args.args, &cwd, &env).map_err(|e| {
+                } = pipe::spawn(&shell, &args.args, &cwd, &env, run_as.as_ref()).map_err(|e| {
                     ControlError::new(
                         sealant_protocol::ControlErrorCode::ProcessStartFailed,
                         format!("{shell}: {e}"),
@@ -1339,6 +1382,7 @@ mod tests {
 
     fn session_args(args: &[&str], cols: u16, rows: u16) -> OpenSessionArgs {
         OpenSessionArgs {
+            user: None,
             execution_id: None,
             shell: Some("/bin/sh".to_owned()),
             args: args.iter().map(|s| (*s).to_owned()).collect(),
@@ -1932,6 +1976,7 @@ mod tests {
 
     fn pipe_args(args: &[&str]) -> OpenSessionArgs {
         OpenSessionArgs {
+            user: None,
             mode: SessionMode::Pipe,
             ..session_args(args, 0, 0)
         }

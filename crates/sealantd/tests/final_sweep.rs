@@ -68,6 +68,7 @@ fn boot(base: &Path) -> (CaptureBoot, Arc<InMemoryRegistrar>) {
 fn sh(script: &str, cwd: &Path) -> ExecArgs {
     let pgid = nix::unistd::getpgid(None).expect("this process's group");
     ExecArgs {
+        user: None,
         execution_id: None,
         session_id: None,
         executable: "/bin/sh".to_owned(),

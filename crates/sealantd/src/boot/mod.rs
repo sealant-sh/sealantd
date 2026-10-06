@@ -13,7 +13,7 @@
 
 pub mod capture;
 pub mod config;
-mod dotfiles;
+pub(crate) mod dotfiles;
 mod error;
 mod git;
 pub mod lock;
@@ -97,6 +97,11 @@ pub fn run_boot(log_level: &str, recovery: bool) -> ExitCode {
         }
     };
 
+    // Said once, where a person's processes would run without CAP_FOWNER (pnpm cannot relink
+    // bins as a person then); `runtime.getCapabilities` says the same.
+    if let Some(reason) = sealant_process::identity::fowner_withheld() {
+        tracing::info!(%reason, "processes run as a person hold no CAP_FOWNER");
+    }
     run_supervised(config, secret_env, capture_boot)
 }
 
@@ -412,6 +417,9 @@ fn into_runtime_config(config: &BootConfig, secret_env: &[(String, String)]) -> 
     // the prep-set identity vars. Every secret value seeds the I/O redactor whatever its name.
     runtime_config.child_env = harness_child_env(config, secret_env);
     runtime_config.redact_literals = secret_env.iter().map(|(_, value)| value.clone()).collect();
+    // A process run as a person never gets the launcher's declared harness logins; the
+    // project's secrets (the secret environment) reach every person.
+    runtime_config.person_withheld = config.declared_harness_keys.clone();
     runtime_config
 }
 
@@ -557,8 +565,16 @@ async fn boot_serve(
     // adapter and the gateway treat the socket as the readiness signal, and everything they inject
     // after readiness (credential files into $HOME) must never race a dotfiles apply that writes
     // the same tree.
+    // Boot applies dotfiles as root into `/root`. A person's (the launcher's included, in Mend's
+    // per-person layout) go through `dotfiles.apply` once their user exists.
+    let dotfiles_home = dotfiles::Home::root();
     if let Some(dotfiles) = config.dotfiles.as_ref().filter(|_| !config.recovery)
-        && let Err(error) = dotfiles::apply(dotfiles, &ssh_runtime_dir(&config))
+        && let Err(error) = dotfiles::apply_repository(
+            dotfiles,
+            &ssh_runtime_dir(&config),
+            &dotfiles_home,
+            dotfiles::BootstrapMode::Inline,
+        )
     {
         tracing::error!(%error, "dotfiles apply failed");
         eprintln!("sealantd boot: {error}");
@@ -570,7 +586,8 @@ async fn boot_serve(
         .dotfiles_archives
         .as_ref()
         .filter(|_| !config.recovery)
-        && let Err(error) = dotfiles::apply_archives(dir)
+        && let Err(error) =
+            dotfiles::apply_archives_into(dir, &dotfiles_home, dotfiles::BootstrapMode::Inline)
     {
         tracing::error!(%error, "dotfiles archive apply failed");
         eprintln!("sealantd boot: {error}");
@@ -837,6 +854,7 @@ async fn run_lifecycle_step(
         .clone()
         .unwrap_or_else(|| config.workspace.working_directory.clone());
     let args = ExecArgs {
+        user: None,
         execution_id: runtime.default_execution_id(),
         session_id: None,
         executable,
@@ -896,6 +914,7 @@ fn launch_harness(runtime: &Arc<Runtime>, config: &BootConfig) -> Result<Process
     };
 
     let exec_args = ExecArgs {
+        user: None,
         execution_id: runtime.default_execution_id(),
         session_id: None,
         executable,

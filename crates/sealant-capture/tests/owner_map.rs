@@ -403,21 +403,20 @@ fn the_default_acl_makes_new_files_group_writable() {
     assert!(as_user(BOB, &format!("touch {}/d/g", root.display())));
 }
 
-/// P2-4 of the stack's review: in a restored worktree (its files root's, the group's to write),
-/// a person changes the lockfile and runs `pnpm install` / `npm install`, which relink bins and
-/// `chmod` their targets. An experiment, run by hand as root with network, `pnpm` and `npm`:
-/// `SEALANTD_REQUIRE_ROOT_TESTS=1 owner_map --ignored --nocapture install`.
-///
-/// Found on 2026-10-06 (pnpm 12.9.1, npm 9.2.0): pnpm fails (`ERR_PNPM_CMD_SHIM_CHMOD`: it cannot
-/// `chmod` the restored `node_modules/.bin` shim, a file it does not own); npm passes (it ignores
-/// the error). The same holds for any file another person's tool made, not only restored ones.
-/// With `PM_WRAPPER=fowner` the person's processes hold `CAP_FOWNER` (ambient), and both pass.
+/// In a restored worktree (its files root's, the group's to write), a second person changes the
+/// lockfile and runs `pnpm install` and `npm install`, then `pnpm install --force` and
+/// `npm rebuild`, started through sealantd's own identity switch
+/// (`sealant_process::identity::RunAs::apply`). pnpm relinks bins with a `chmod`, so it needs
+/// `CAP_FOWNER`: it passes where the person gets it, and fails with `ERR_PNPM_CMD_SHIM_CHMOD`
+/// where no-new-privileges withholds it (npm ignores the error). Needs root, network, pnpm and
+/// npm; it makes a group and a user for the person.
 #[test]
-#[ignore = "needs root, network, pnpm and npm"]
 fn install_after_a_lockfile_change_as_a_person() {
     if !root() {
         return;
     }
+    person_user();
+    let fowner = sealant_process::identity::fowner_withheld().is_none();
     let mut failed = Vec::new();
     for pm in ["pnpm", "npm"] {
         let tmp = tempfile::tempdir().unwrap();
@@ -530,36 +529,66 @@ fn install_after_a_lockfile_change_as_a_person() {
                 .output()
                 .is_ok_and(|o| o.status.success())
         );
-        if !ok || !forced.trim_end().ends_with("exit=0") {
+        let passed = ok && forced.trim_end().ends_with("exit=0");
+        if pm == "pnpm" && !fowner {
+            // pnpm 12 says ERR_PNPM_CMD_SHIM_CHMOD; pnpm 9 a bare EPERM on the chmod.
+            assert!(
+                text.contains("ERR_PNPM_CMD_SHIM_CHMOD")
+                    || text.contains("EPERM: operation not permitted, chmod"),
+                "{text}"
+            );
+        } else if !passed {
             failed.push(pm);
         }
     }
     assert!(failed.is_empty(), "failed as a person: {failed:?}");
 }
 
-/// `sh -c script` as Bob; with `PM_WRAPPER=fowner`, through `setpriv` with `CAP_FOWNER` ambient
-/// (what a person's process would get if the identity switch raised it).
+/// A passwd entry for [`BOB`] (uid 40031, primary group [`GID`]), so sealantd's identity switch
+/// can resolve it. Made once; one already there is kept.
+fn person_user() {
+    static MADE: std::sync::Once = std::sync::Once::new();
+    MADE.call_once(|| {
+        let has = |db: &str, key: u32| {
+            Command::new("getent")
+                .args([db, &key.to_string()])
+                .output()
+                .is_ok_and(|o| o.status.success())
+        };
+        if !has("group", GID) {
+            assert!(
+                Command::new("groupadd")
+                    .args(["-g", &GID.to_string(), "mtestmend"])
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        if !has("passwd", BOB) {
+            assert!(
+                Command::new("useradd")
+                    .args([
+                        "-m",
+                        "-u",
+                        &BOB.to_string(),
+                        "-g",
+                        &GID.to_string(),
+                        "mtestperson"
+                    ])
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+    });
+}
+
+/// `sh -c script` as Bob, started as sealantd starts a person's process.
 fn bob_command(script: &str) -> Command {
-    if std::env::var("PM_WRAPPER").as_deref() == Ok("fowner") {
-        let mut c = Command::new("setpriv");
-        c.args([
-            "--reuid",
-            &BOB.to_string(),
-            "--regid",
-            &GID.to_string(),
-            "--clear-groups",
-            "--inh-caps",
-            "+fowner",
-            "--ambient-caps",
-            "+fowner",
-            "sh",
-            "-c",
-            script,
-        ]);
-        c
-    } else {
-        let mut c = Command::new("sh");
-        c.arg("-c").arg(script).uid(BOB).gid(GID);
-        c
-    }
+    let mut c = Command::new("sh");
+    c.arg("-c").arg(script);
+    sealant_process::identity::RunAs::resolve(&BOB.to_string())
+        .unwrap()
+        .apply(&mut c);
+    c
 }

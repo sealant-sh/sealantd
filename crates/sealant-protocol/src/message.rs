@@ -161,6 +161,7 @@ mod tests {
         let msg = ClientMessage::Request(ControlRequest::new(
             RequestId::new("req_1"),
             Command::Exec(ExecArgs {
+                user: None,
                 execution_id: None,
                 session_id: None,
                 executable: "/bin/true".to_owned(),

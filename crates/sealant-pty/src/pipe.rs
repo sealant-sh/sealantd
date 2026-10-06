@@ -39,6 +39,7 @@ pub fn spawn(
     args: &[String],
     cwd: &Path,
     env: &[(String, String)],
+    run_as: Option<&sealant_process::identity::RunAs>,
 ) -> io::Result<PipeChild> {
     let mut command = tokio::process::Command::new(program);
     command.args(args);
@@ -62,6 +63,10 @@ pub fn spawn(
             }
             Ok(())
         });
+    }
+    // The user last: setsid needs no privilege, and the identity is the leader's from exec on.
+    if let Some(user) = run_as {
+        user.apply(command.as_std_mut());
     }
 
     // Spawn through the process-wide gate: sealantd is PID 1 in the workspace and its orphan

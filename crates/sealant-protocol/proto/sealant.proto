@@ -342,6 +342,8 @@ message ExecArgs {
   optional CapturePolicy capture = 10;
   optional Signal graceful_signal = 11;
   bool attach = 12;
+  // Run as this user: a login name or a decimal uid.
+  optional string user = 13;
 }
 
 message ExecutionStartArgs {
@@ -378,6 +380,8 @@ message OpenSessionArgs {
   optional string term = 8;
   // Defaults to PTY when unspecified (wire compatibility with pre-pipe clients).
   SessionMode mode = 9;
+  // Run the leader as this user: a login name or a decimal uid.
+  optional string user = 10;
 }
 
 message RuntimeGracefulShutdownArgs { optional uint64 grace_millis = 1; }
@@ -497,6 +501,7 @@ message Command {
     Empty capture_status = 30;
     Empty lease_epoch = 31;
     Empty capture_replan = 32;
+    DotfilesApplyArgs dotfiles_apply = 33;
   }
 }
 
@@ -514,6 +519,11 @@ message Capabilities {
   // What this daemon can do beyond the schema, by name (`restore.owner_map`, `exec.user`,
   // `dotfiles.user`).
   repeated string supports = 9;
+  // The capabilities a process run as a person holds here: CAP_FOWNER, or none.
+  repeated string person_capabilities = 10;
+  // Why a process run as a person holds no CAP_FOWNER here (no-new-privileges, the bounding set,
+  // a daemon that is not root); absent when it holds it.
+  optional string person_capabilities_withheld = 11;
 }
 
 message HealthReport {
@@ -539,6 +549,29 @@ message HealthReport {
 }
 
 message ExecAccepted { string process_id = 1; int32 pid = 2; int32 pgid = 3; bool pidfd = 4; }
+
+// `dotfiles.apply`: a person's dotfiles applied into their home, as their user.
+message DotfilesRepository {
+  string url = 1;
+  optional string reference = 2;
+  optional string manager = 3;
+  optional string target = 4;
+  bool bootstrap = 5;
+  optional string bootstrap_command = 6;
+  optional string http_username = 7;
+  optional string http_token = 8;
+}
+message DotfilesApplyArgs {
+  string user = 1;
+  optional DotfilesRepository repository = 2;
+  optional string archive_dir = 3;
+  optional string execution_id = 4;
+}
+message DotfilesApplied {
+  string user = 1;
+  string home = 2;
+  optional ExecAccepted bootstrap = 3;
+}
 message SessionOpened { string session_id = 1; string process_id = 2; int32 pid = 3; }
 
 message ProcessSummary {
@@ -768,6 +801,7 @@ message CommandResult {
     CaptureStatusReport capture_status = 16;
     LeaseEpochReport lease_epoch = 17;
     CaptureReplanned capture_replanned = 18;
+    DotfilesApplied dotfiles_applied = 19;
   }
 }
 

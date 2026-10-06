@@ -11,6 +11,7 @@ pub mod boot;
 pub mod capture;
 pub(crate) mod control_frontends;
 pub mod docker;
+pub(crate) mod dotfiles_verb;
 pub mod runtime;
 pub mod shutdown;
 pub mod sweep;

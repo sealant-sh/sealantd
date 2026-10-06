@@ -15,7 +15,9 @@ sealant-runtime-core = { workspace = true }
 sealant-telemetry = { workspace = true }
 tokio = { workspace = true }
 nix = { workspace = true }
+libc = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+tempfile = { workspace = true }
 tokio = { workspace = true }

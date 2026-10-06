@@ -53,6 +53,52 @@ names the path it could not), the control socket's directory (`SEALANT_CONTROL_S
 `$HOME/.local/state/sealantd/session-journals` (root's default, `/var/lib/sealantd/…`, is not
 one it can create). The harness's `HOME` stays `/root`.
 
+### Processes as a person's user
+
+The daemon runs as root, and so does every process it starts, unless the request names a user
+(Mend's per-person layout):
+
+- `exec` and `openSession` take `user`, a login name or a decimal uid. The process starts as
+  exactly that passwd entry: its uid, primary group and supplementary groups (`initgroups`), its
+  `HOME`, `USER`, `LOGNAME` and `SHELL`, umask `0002`, and a private `TMPDIR` (`/tmp/u-<uid>`) and
+  `XDG_RUNTIME_DIR` (`/run/user/<uid>`), both 0700 and the user's. Of the daemon's own child
+  environment it inherits no login that is not its own and nothing of the daemon's: no harness or
+  provider login (`CLAUDE_CODE_OAUTH_TOKEN`, `GH_TOKEN`, `GITHUB_TOKEN`, `ANTHROPIC_API_KEY`, …,
+  `sealant_process::identity::WITHHELD`), no harness key the injector declared
+  (`SEALANT_HARNESS_ENV_KEYS`), no `SEALANT_*` key, no agent socket or askpass, no XDG base
+  directory. The project's secrets (the launcher's secret environment, Mend's `--secret`
+  values, under any name) do reach it: they are the project's. Then the image's
+  `/etc/sealant/person-env` applies: its first line must be exactly `# person-env 1` (any other
+  first line applies nothing and is logged), then one literal `KEY=VALUE` per line; `PATH_PREPEND`
+  goes in front of the base `PATH`; `#` lines, malformed lines, lines with a NUL byte, identity
+  names, names a person never gets and secret-looking names are skipped; a missing file changes
+  nothing; never to root. The caller's `env` still applies, last (a caller may point `HOME`
+  elsewhere on purpose). A PTY leader owns its terminal.
+- **`CAP_FOWNER`.** Where the daemon runs without no-new-privileges, as root, with `CAP_FOWNER`
+  in its bounding set, a person's process holds that one capability, ambient (so the programs it
+  runs keep it): it can change the mode and times of files it does not own, which every file in a
+  shared worktree is (pnpm relinks bins with a `chmod`). It amounts to root: whoever can `chmod`
+  any file can then read and write it, make a setuid root binary or plant `/etc/ld.so.preload`. It
+  adds nothing only where the person already has root through a working setuid `sudo`, the gate
+  Mend's ADR 0016 and Core's image probe require. Under no-new-privileges `sudo` cannot work, so
+  the capability is withheld there, and `runtime.getCapabilities` says so
+  (`personCapabilities` empty, `personCapabilitiesWithheld` the reason); pnpm then fails to
+  relink bins as a person. **sealantd sets no-new-privileges on itself** (plan §18, at boot and in
+  the runtime), so today every executor withholds it, and no person's `sudo` works either.
+- Root, a user in root's group, or a user the passwd database does not have, is refused.
+  `openSftp` takes no user yet: an SFTP bridge runs as root.
+- The dotfiles applier runs as a user into their passwd home, its commands with a clean
+  environment (`PATH`, the locale, `TERM` and the person's identity; nothing of the daemon's),
+  through
+  `dotfiles.apply { user, repository?, archiveDir? }`, once the user exists (the launcher's
+  included: Mend calls it after making users at prepare). It answers once every file is applied
+  and runs `./install.sh` after them as a managed process of that user, named in the answer
+  (`bootstrap`), so the caller can start the person's agent beside it. Boot applies root's
+  dotfiles into `/root` as before; no user needs to exist at boot.
+- `runtime.getCapabilities` names `exec.user`, `dotfiles.user` and `restore.owner_map` in
+  `supports`. `sealantd capabilities --json` prints the same, with the version, without booting,
+  for an image build to record.
+
 ## Capture store: what Core and Mend rely on
 
 A capture-source workspace (`SEALANT_WORKSPACE_SOURCE=capture`, ADR-0015) keeps its work product

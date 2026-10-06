@@ -34,6 +34,55 @@ enum Command {
     /// run the control server in-process and supervise the harness. Configured entirely via the
     /// `SEALANT_*` environment contract.
     Boot(BootArgs),
+    /// Print what this build can do, without booting, binding or touching anything: the
+    /// `supports` list `runtime.getCapabilities` answers (`exec.user`, `dotfiles.user`,
+    /// `restore.owner_map`), with the version. An image build runs it to record whether the
+    /// image can run Mend's per-person layout before any executor starts.
+    Capabilities(CapabilitiesArgs),
+}
+
+/// Arguments to `sealantd capabilities`.
+#[derive(Debug, Args)]
+struct CapabilitiesArgs {
+    /// One JSON object instead of one name per line.
+    #[arg(long)]
+    json: bool,
+}
+
+/// What `sealantd capabilities --json` prints: the build's own facts, the same a booted daemon
+/// reports in `runtime.getCapabilities`.
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OfflineCapabilities {
+    schema_version: u32,
+    daemon_version: &'static str,
+    os: &'static str,
+    arch: &'static str,
+    supports: &'static [&'static str],
+}
+
+fn print_capabilities(args: &CapabilitiesArgs) -> ExitCode {
+    let report = OfflineCapabilities {
+        schema_version: sealant_protocol::SCHEMA_VERSION,
+        daemon_version: crate::runtime::DAEMON_VERSION,
+        os: std::env::consts::OS,
+        arch: std::env::consts::ARCH,
+        supports: crate::runtime::SUPPORTS,
+    };
+    if args.json {
+        match serde_json::to_string(&report) {
+            Ok(json) => println!("{json}"),
+            Err(error) => {
+                eprintln!("sealantd capabilities: {error}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        for name in report.supports {
+            println!("{name}");
+        }
+    }
+    ExitCode::SUCCESS
 }
 
 /// Arguments to `sealantd boot`. Everything else comes from `SEALANT_*` env.
@@ -172,6 +221,7 @@ pub fn run() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
         Some(Command::Boot(args)) => crate::boot::run_boot(&args.log_level, args.recovery),
+        Some(Command::Capabilities(args)) => print_capabilities(&args),
         None => run_serve(cli.serve),
     }
 }

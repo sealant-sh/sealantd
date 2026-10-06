@@ -68,6 +68,12 @@ pub struct RuntimeConfig {
     /// serialized: this list must not reach a config dump, fingerprint, or telemetry payload.
     #[serde(default, skip_serializing)]
     pub redact_literals: Vec<String>,
+    /// `child_env` names a process run as a person never inherits, beyond the named list
+    /// (`sealant_process::identity::WITHHELD`): the harness credentials the injector declared
+    /// (`SEALANT_HARNESS_ENV_KEYS`), which are the launcher's logins. The project's secrets are not
+    /// here: they reach every person.
+    #[serde(default)]
+    pub person_withheld: Vec<String>,
     /// Child user id to drop to, when configured.
     #[serde(default)]
     pub child_uid: Option<u32>,
@@ -151,6 +157,7 @@ impl RuntimeConfig {
             default_shell: "/bin/bash".to_owned(),
             child_env: Vec::new(),
             redact_literals: Vec::new(),
+            person_withheld: Vec::new(),
             child_uid: None,
             child_gid: None,
             limits: default_limits(),

@@ -164,11 +164,51 @@ impl ProcessRuntime {
             .clone()
             .map_or_else(|| self.config.workspace_root.clone(), Into::into);
 
+        // A named user: resolved here, its private directories made, its identity set in the
+        // child before exec ([`crate::identity`]).
+        let run_as = args
+            .user
+            .as_deref()
+            .map(crate::identity::RunAs::resolve)
+            .transpose()
+            .map_err(ControlError::invalid_argument)?;
+        if let Some(user) = &run_as {
+            user.prepare_dirs().map_err(|e| {
+                ControlError::process_start_failed(format!(
+                    "the private directories of user {}: {e}",
+                    user.name
+                ))
+            })?;
+        }
+
         let mut command = tokio::process::Command::new(&args.executable);
         command.args(&args.args);
         command.env_clear();
-        for var in &self.config.child_env {
+        // A person's process inherits none of the launcher's tokens or the daemon's own keys.
+        let inherited = |key: &str| {
+            run_as.is_none()
+                || !(crate::identity::withheld_from_person(key)
+                    || self.config.person_withheld.iter().any(|k| k == key))
+        };
+        for var in self.config.child_env.iter().filter(|v| inherited(&v.key)) {
             command.env(&var.key, &var.value);
+        }
+        // The user's identity over the daemon's child environment and the image's person
+        // environment ([`crate::identity::PERSON_ENV_FILE`]), under the caller's overlay.
+        if let Some(user) = &run_as {
+            let base_path = self
+                .config
+                .child_env
+                .iter()
+                .find(|v| v.key == "PATH")
+                .map(|v| v.value.as_str());
+            for (key, value) in crate::identity::person_env(base_path) {
+                command.env(key, value);
+            }
+            for (key, value) in user.env() {
+                command.env(key, value);
+            }
+            user.apply(command.as_std_mut());
         }
         for var in &args.env {
             command.env(&var.key, &var.value);
@@ -178,6 +218,7 @@ impl ProcessRuntime {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .iter()
+            .filter(|(key, _)| inherited(key))
         {
             command.env(key, value);
         }
@@ -647,6 +688,7 @@ mod tests {
 
     fn exec_args(executable: &str, args: &[&str]) -> ExecArgs {
         ExecArgs {
+            user: None,
             execution_id: None,
             session_id: None,
             executable: executable.to_owned(),
