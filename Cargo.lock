@@ -1156,6 +1156,7 @@ dependencies = [
  "sealant-protocol",
  "sealant-runtime-core",
  "sealant-telemetry",
+ "tempfile",
  "tokio",
  "tracing",
 ]

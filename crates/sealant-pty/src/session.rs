@@ -339,10 +339,14 @@ impl SessionRuntime {
                 )
             })?;
         }
+        // A person's leader inherits none of the launcher's tokens or the daemon's own keys.
+        let inherited =
+            |key: &str| run_as.is_none() || !sealant_process::identity::withheld_from_person(key);
         let mut env: Vec<(String, String)> = self
             .config
             .child_env
             .iter()
+            .filter(|v| inherited(&v.key))
             .map(|v| (v.key.clone(), v.value.clone()))
             .collect();
         // The user's identity over the daemon's child environment, under the caller's overlay.
@@ -355,6 +359,7 @@ impl SessionRuntime {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .iter()
+                .filter(|(key, _)| inherited(key))
                 .cloned(),
         );
 

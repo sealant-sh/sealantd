@@ -33,6 +33,13 @@ const XDG_BASE_DIRS: &[&str] = &[
     "XDG_CACHE_HOME",
 ];
 
+/// The only variables of the daemon's environment a person's dotfiles commands get: where to find
+/// programs, and the locale and terminal. Everything else comes from their identity.
+const PERSON_ENV_KEYS: &[&str] = &["PATH", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "TERM"];
+
+/// `PATH` for a person's dotfiles commands when the daemon has none.
+const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
 /// Top-level dot entries that are repository or stow metadata rather than dotfiles, so they do
 /// not make a tree "mixed" and are never copied into the home by the stow manager.
 ///
@@ -155,8 +162,19 @@ impl Home {
     /// would otherwise leave `chezmoi apply` and `./install.sh` resolving `~` to nothing.
     fn identify<'c>(&self, command: &'c mut Command) -> &'c mut Command {
         if let Some(user) = &self.run_as {
-            // The person's whole identity: groups, umask, the private TMPDIR and
+            // A clean, explicit environment: nothing of the daemon's own (its `SEALANT_*`
+            // secrets, the launcher's tokens) reaches a person's clone, chezmoi, stow or script;
+            // then the person's whole identity: groups, umask, the private TMPDIR and
             // XDG_RUNTIME_DIR, their SHELL ([`sealant_process::identity`]).
+            command.env_clear();
+            for key in PERSON_ENV_KEYS {
+                if let Ok(value) = std::env::var(key) {
+                    command.env(key, value);
+                }
+            }
+            if std::env::var_os("PATH").is_none() {
+                command.env("PATH", DEFAULT_PATH);
+            }
             command.envs(user.env());
             user.apply(command);
         }

@@ -84,8 +84,14 @@ struct Client {
 
 impl Client {
     fn start(workspace: &Path) -> Self {
+        Self::start_with(workspace, Vec::new())
+    }
+
+    /// With `child_env`: the daemon's child environment (the passthrough of PID 1's).
+    fn start_with(workspace: &Path, child_env: Vec<sealant_protocol::EnvVar>) -> Self {
         let mut config = RuntimeConfig::new(new_runtime_id());
         config.workspace_root = workspace.to_path_buf();
+        config.child_env = child_env;
         let runtime = Runtime::new(config, Arc::new(ShutdownSignal::new(1000)));
         runtime.mark_healthy();
         let (_sd_tx, sd_rx) = watch::channel(false);
@@ -454,4 +460,169 @@ async fn spawn_timing() {
             );
         }
     }
+}
+
+fn var(key: &str, value: &str) -> sealant_protocol::EnvVar {
+    sealant_protocol::EnvVar {
+        key: key.to_owned(),
+        value: value.to_owned(),
+    }
+}
+
+/// The daemon's environment carries the launcher's tokens and its own keys: a process run as a
+/// person sees none of them (exec and session alike), keeps what is not a secret, and gets what
+/// the caller names explicitly; a process run as root still gets them.
+#[tokio::test]
+async fn a_person_s_process_inherits_no_token_and_no_daemon_key() {
+    if !ready() {
+        return;
+    }
+    let dir = scratch();
+    let leaks = [
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "SEALANT_DOTFILES_HTTP_TOKEN",
+        "SEALANT_CAPTURE_ENDPOINT",
+        "NPM_TOKEN",
+        "SSH_AUTH_SOCK",
+        "XDG_CONFIG_HOME",
+    ];
+    let mut child_env: Vec<_> = leaks.iter().map(|k| var(k, "launcher-value")).collect();
+    child_env.push(var("KEEP_ME", "1"));
+    let mut client = Client::start_with(dir.path(), child_env);
+    let dump = |out: &Path| {
+        format!(
+            "env > {0}.tmp && echo end >> {0}.tmp && mv {0}.tmp {0}",
+            out.display()
+        )
+    };
+
+    let mut args = exec(dump(&dir.path().join("person")), Some(BOB));
+    args.env = vec![var("EXPLICIT", "1")];
+    ok(client.request(Command::Exec(args)).await);
+    let person = wait_for(&dir.path().join("person"));
+    ok(client
+        .request(Command::OpenSession(OpenSessionArgs {
+            user: Some(BOB.to_owned()),
+            execution_id: None,
+            shell: Some("/bin/sh".to_owned()),
+            args: vec!["-c".to_owned(), dump(&dir.path().join("session"))],
+            cwd: None,
+            env: vec![],
+            cols: 80,
+            rows: 24,
+            term: None,
+            mode: SessionMode::Pipe,
+        }))
+        .await);
+    let session = wait_for(&dir.path().join("session"));
+    for (name, env) in [("exec", &person), ("session", &session)] {
+        for leak in leaks {
+            assert!(
+                !env.lines().any(|l| l.starts_with(&format!("{leak}="))),
+                "{name}: {leak} reached the person:\n{env}"
+            );
+        }
+        assert!(env.lines().any(|l| l == "KEEP_ME=1"), "{name}:\n{env}");
+        assert!(env.lines().any(|l| l == format!("USER={BOB}")), "{name}");
+    }
+    assert!(person.lines().any(|l| l == "EXPLICIT=1"));
+
+    ok(client
+        .request(Command::Exec(exec(dump(&dir.path().join("root")), None)))
+        .await);
+    let root = wait_for(&dir.path().join("root"));
+    assert!(
+        root.lines().any(|l| l == "GH_TOKEN=launcher-value"),
+        "{root}"
+    );
+}
+
+/// The dotfiles commands a person's apply runs (here chezmoi, a stand-in that writes its
+/// environment) get a clean environment: none of the daemon's own `SEALANT_*` secrets or the
+/// launcher's tokens, from PID 1's environment.
+#[tokio::test]
+async fn a_person_s_dotfiles_commands_get_a_clean_environment() {
+    if !ready() {
+        return;
+    }
+    let dir = scratch();
+    let evidence = dir.path().join("chezmoi-env");
+    let bin = dir.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::write(
+        bin.join("chezmoi"),
+        format!(
+            "#!/bin/sh\nenv > {0}.tmp && id -u >> {0}.tmp && mv {0}.tmp {0}\n",
+            evidence.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(
+        bin.join("chezmoi"),
+        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+    )
+    .unwrap();
+    // SAFETY: this binary runs its tests on one thread when root (scripts/ci-root-tests.sh), and
+    // nothing else reads the environment while it is set.
+    unsafe {
+        std::env::set_var(
+            "PATH",
+            format!(
+                "{}:{}",
+                bin.display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        );
+        std::env::set_var("SEALANT_DOTFILES_HTTP_TOKEN", "daemon-secret");
+        std::env::set_var("GH_TOKEN", "launcher-token");
+    }
+    let tree = dir.path().join("tree");
+    std::fs::create_dir_all(&tree).unwrap();
+    std::fs::write(tree.join("dot_mtestrc"), "x\n").unwrap();
+    let archives = dir.path().join("archives");
+    std::fs::create_dir_all(&archives).unwrap();
+    assert!(
+        Std::new("tar")
+            .arg("-czf")
+            .arg(archives.join("0.tar.gz"))
+            .arg("-C")
+            .arg(&tree)
+            .arg(".")
+            .status()
+            .unwrap()
+            .success()
+    );
+    std::fs::write(
+        archives.join("manifest.json"),
+        r#"{"archives":[{"file":"0.tar.gz","manager":"chezmoi","bootstrap":false}]}"#,
+    )
+    .unwrap();
+    let mut client = Client::start(dir.path());
+    ok(client
+        .request(Command::DotfilesApply(Box::new(DotfilesApplyArgs {
+            user: BOB.to_owned(),
+            repository: None,
+            archive_dir: Some(archives.display().to_string()),
+            execution_id: None,
+        })))
+        .await);
+    let env = std::fs::read_to_string(&evidence).expect("chezmoi ran");
+    // SAFETY: as above.
+    unsafe {
+        std::env::remove_var("SEALANT_DOTFILES_HTTP_TOKEN");
+        std::env::remove_var("GH_TOKEN");
+    }
+    assert!(
+        env.ends_with(&format!("{BOB_UID}\n")),
+        "chezmoi ran as the person:\n{env}"
+    );
+    assert!(!env.contains("daemon-secret"), "{env}");
+    assert!(!env.contains("launcher-token"), "{env}");
+    assert!(!env.lines().any(|l| l.starts_with("SEALANT_")), "{env}");
+    assert!(
+        env.lines().any(|l| l == format!("HOME=/home/{BOB}")),
+        "{env}"
+    );
 }

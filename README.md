@@ -61,10 +61,17 @@ The daemon runs as root, and so does every process it starts, unless the request
 - `exec` and `openSession` take `user`, a login name or a decimal uid. The process starts as
   exactly that passwd entry: its uid, primary group and supplementary groups (`initgroups`), its
   `HOME`, `USER`, `LOGNAME` and `SHELL`, umask `0002`, and a private `TMPDIR` (`/tmp/u-<uid>`) and
-  `XDG_RUNTIME_DIR` (`/run/user/<uid>`), both 0700 and the user's. The caller's `env` still wins
-  (a caller may point `HOME` elsewhere on purpose). A PTY leader owns its terminal. Root, or a user
-  the passwd database does not have, is refused.
-- The dotfiles applier runs as a user into their passwd home through
+  `XDG_RUNTIME_DIR` (`/run/user/<uid>`), both 0700 and the user's. Of the daemon's own child
+  environment it inherits nothing that is a login or the daemon's: no provider token
+  (`CLAUDE_CODE_OAUTH_TOKEN`, `GH_TOKEN`, `GITHUB_TOKEN`, …), no `SEALANT_*` key, no agent socket
+  or askpass, no XDG base directory, nothing whose name looks like a secret
+  (`sealant_process::identity::withheld_from_person`). The caller's `env` still applies, last (a
+  caller may point `HOME` elsewhere on purpose). A PTY leader owns its terminal. Root, a user in
+  root's group, or a user the passwd database does not have, is refused. `openSftp` takes no user
+  yet: an SFTP bridge runs as root.
+- The dotfiles applier runs as a user into their passwd home, its commands with a clean
+  environment (`PATH`, the locale, `TERM` and the person's identity; nothing of the daemon's),
+  through
   `dotfiles.apply { user, repository?, archiveDir? }`, once the user exists (the launcher's
   included: Mend calls it after making users at prepare). It answers once every file is applied
   and runs `./install.sh` after them as a managed process of that user, named in the answer

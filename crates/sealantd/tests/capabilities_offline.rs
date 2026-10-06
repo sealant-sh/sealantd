@@ -22,6 +22,20 @@ async fn the_offline_report_is_the_booted_one() {
         .output()
         .expect("run sealantd capabilities");
     assert!(offline.status.success());
+    // The exact shape Core's image probe parses (sealant#327 reads `supports`): one line, these
+    // keys in this order, nothing else. A change here is a change to that contract.
+    let printed = String::from_utf8(offline.stdout.clone()).unwrap();
+    assert_eq!(
+        printed,
+        format!(
+            "{{\"schemaVersion\":{},\"daemonVersion\":\"{}\",\"os\":\"{}\",\"arch\":\"{}\",\
+             \"supports\":[\"dotfiles.user\",\"exec.user\",\"restore.owner_map\"]}}\n",
+            sealant_protocol::SCHEMA_VERSION,
+            env!("CARGO_PKG_VERSION"),
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+        )
+    );
     let offline: serde_json::Value =
         serde_json::from_slice(&offline.stdout).expect("one JSON object");
 

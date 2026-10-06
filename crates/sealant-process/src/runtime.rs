@@ -184,7 +184,9 @@ impl ProcessRuntime {
         let mut command = tokio::process::Command::new(&args.executable);
         command.args(&args.args);
         command.env_clear();
-        for var in &self.config.child_env {
+        // A person's process inherits none of the launcher's tokens or the daemon's own keys.
+        let inherited = |key: &str| run_as.is_none() || !crate::identity::withheld_from_person(key);
+        for var in self.config.child_env.iter().filter(|v| inherited(&v.key)) {
             command.env(&var.key, &var.value);
         }
         // The user's identity over the daemon's child environment, under the caller's overlay.
@@ -202,6 +204,7 @@ impl ProcessRuntime {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .iter()
+            .filter(|(key, _)| inherited(key))
         {
             command.env(key, value);
         }

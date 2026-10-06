@@ -8,12 +8,14 @@ command -v setfacl >/dev/null || sudo apt-get install -y --no-install-recommends
 
 run_as_root() {
   local package=$1 target=$2
+  shift 2
   local bin
   bin=$(cargo test -p "$package" --test "$target" --no-run --message-format=json \
     | jq -r --arg t "$target" 'select(.executable != null and .target.name == $t) | .executable')
   echo "root: $package --test $target"
-  sudo env SEALANTD_REQUIRE_ROOT_TESTS=1 PATH="$PATH" "$bin"
+  sudo env SEALANTD_REQUIRE_ROOT_TESTS=1 PATH="$PATH" "$bin" "$@"
 }
 
 run_as_root sealant-capture owner_map
-run_as_root sealantd run_as_user
+# One thread: a test sets the daemon's own environment (what a person's commands must not see).
+run_as_root sealantd run_as_user --test-threads 1
