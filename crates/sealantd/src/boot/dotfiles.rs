@@ -38,7 +38,7 @@ const XDG_BASE_DIRS: &[&str] = &[
 const PERSON_ENV_KEYS: &[&str] = &["PATH", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "TERM"];
 
 /// `PATH` for a person's dotfiles commands when the daemon has none.
-const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+const DEFAULT_PATH: &str = sealant_process::identity::DEFAULT_PATH;
 
 /// Top-level dot entries that are repository or stow metadata rather than dotfiles, so they do
 /// not make a tree "mixed" and are never copied into the home by the stow manager.
@@ -172,9 +172,10 @@ impl Home {
                     command.env(key, value);
                 }
             }
-            if std::env::var_os("PATH").is_none() {
-                command.env("PATH", DEFAULT_PATH);
-            }
+            let base_path = std::env::var("PATH").unwrap_or_else(|_| DEFAULT_PATH.to_owned());
+            command.env("PATH", &base_path);
+            // The image's person environment, then the identity.
+            command.envs(sealant_process::identity::person_env(Some(&base_path)));
             command.envs(user.env());
             user.apply(command);
         }
@@ -360,7 +361,13 @@ pub(crate) fn apply_archives_into(
             std::fs::remove_dir_all(&staging)
                 .map_err(|e| BootError::io_path("rm -rf", &staging, e))?;
         }
-        home.mkdir(&staging)?;
+        // Extracted while the staging directory is still root's (tar restores times and modes,
+        // which takes `CAP_FOWNER` on a directory root does not own), then given to the person.
+        if let Some(parent) = staging.parent() {
+            home.mkdir(parent)?;
+        }
+        std::fs::create_dir_all(&staging)
+            .map_err(|e| BootError::io_path("mkdir -p", &staging, e))?;
         extract_archive(&archive, &staging)?;
         give_tree(&staging, home.owner())?;
         pending.extend(apply_tree(

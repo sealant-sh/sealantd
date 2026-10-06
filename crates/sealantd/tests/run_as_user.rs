@@ -626,3 +626,316 @@ async fn a_person_s_dotfiles_commands_get_a_clean_environment() {
         "{env}"
     );
 }
+
+/// A person's process holds exactly one capability, `CAP_FOWNER`, ambient (so the programs it
+/// runs keep it), and no secure-exec mode (the loader keeps `LD_LIBRARY_PATH`): it can `chmod` a
+/// root-owned file in a shared worktree, as `sudo` already lets it.
+#[tokio::test]
+async fn a_person_s_process_holds_cap_fowner_and_nothing_else() {
+    if !ready() {
+        return;
+    }
+    let dir = scratch();
+    let owned = dir.path().join("roots-file");
+    std::fs::write(&owned, "x").unwrap();
+    std::fs::set_permissions(&owned, std::os::unix::fs::PermissionsExt::from_mode(0o644)).unwrap();
+    let out = dir.path().join("caps");
+    let mut args = exec(
+        format!(
+            "{{ grep -E '^Cap(Inh|Prm|Eff|Amb)' /proc/self/status; sh -c 'grep ^CapAmb /proc/self/status'; \
+             chmod 664 {f} && echo chmod-ok; echo \"ld=$LD_LIBRARY_PATH\"; }} > {o}.tmp && mv {o}.tmp {o}",
+            f = owned.display(),
+            o = out.display()
+        ),
+        Some(BOB),
+    );
+    args.env = vec![var("LD_LIBRARY_PATH", "/opt/x")];
+    let mut client = Client::start(dir.path());
+    ok(client.request(Command::Exec(args)).await);
+    let seen = wait_for(&out);
+    for line in [
+        "CapInh:\t0000000000000008",
+        "CapPrm:\t0000000000000008",
+        "CapEff:\t0000000000000008",
+        "CapAmb:\t0000000000000008",
+    ] {
+        assert!(seen.lines().any(|l| l == line), "{line} missing:\n{seen}");
+    }
+    assert_eq!(
+        seen.lines()
+            .filter(|l| *l == "CapAmb:\t0000000000000008")
+            .count(),
+        2,
+        "a child keeps it:\n{seen}"
+    );
+    assert!(seen.lines().any(|l| l == "chmod-ok"), "{seen}");
+    assert!(
+        seen.lines().any(|l| l == "ld=/opt/x"),
+        "secure-exec mode:\n{seen}"
+    );
+    assert_eq!(std::fs::metadata(&owned).unwrap().mode() & 0o777, 0o664);
+}
+
+/// The reason for `CAP_FOWNER`: in a restored worktree (its files root's, the group's to write)
+/// a second person, not the change's owner, runs `pnpm install` after a lockfile change that
+/// keeps a restored package with a bin (pnpm rewrites the shim and `chmod`s it), then
+/// `pnpm install --force`, through sealantd's own exec as that person. Without the capability the
+/// first fails with `ERR_PNPM_CMD_SHIM_CHMOD`. Needs network and pnpm.
+#[tokio::test]
+async fn pnpm_installs_as_a_second_person_in_a_restored_worktree() {
+    use sealant_capture::{
+        CaptureConfig, CaptureEngine, CaptureKind, Class, InMemoryRegistrar, LocalDir,
+        MaterializeClass, MaterializeTargets, Materializer, SnapRequest,
+    };
+    if !ready() {
+        return;
+    }
+    if Std::new("pnpm").arg("--version").output().is_err() {
+        panic!("pnpm is required for this test (scripts/ci-root-tests.sh installs it)");
+    }
+    let dir = scratch();
+    let base = dir.path();
+    let git = |root: &Path, args: &[&str]| {
+        let out = Std::new("git")
+            .current_dir(root)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}");
+    };
+    // A store the group shares, as the images keep it under /var/cache.
+    let store = base.join("pnpm-store");
+    std::fs::create_dir_all(&store).unwrap();
+    std::os::unix::fs::chown(&store, None, Some(GID)).unwrap();
+    std::fs::set_permissions(&store, std::os::unix::fs::PermissionsExt::from_mode(0o2775)).unwrap();
+    sealant_capture::owners::apply_default_acl(&[&store], GID).unwrap();
+
+    // Installed by root under umask 022, as every capture before the per-person layout.
+    let src = base.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    git(&src, &["init", "-q", "-b", "main"]);
+    git(&src, &["config", "user.email", "t@t"]);
+    git(&src, &["config", "user.name", "t"]);
+    std::fs::write(src.join(".gitignore"), "node_modules/\n").unwrap();
+    std::fs::write(
+        src.join("package.json"),
+        r#"{"name":"x","version":"1.0.0","dependencies":{"semver":"7.6.0"}}"#,
+    )
+    .unwrap();
+    let pnpm = |flags: &str| {
+        format!(
+            "CI=1 pnpm install --no-frozen-lockfile --store-dir {} {flags}",
+            store.display()
+        )
+    };
+    let root_install = Std::new("sh")
+        .arg("-c")
+        .arg(format!("umask 022; cd {} && {}", src.display(), pnpm("")))
+        .output()
+        .unwrap();
+    assert!(
+        root_install.status.success(),
+        "pnpm as root: {}",
+        String::from_utf8_lossy(&root_install.stdout)
+    );
+    git(&src, &["add", "-A"]);
+    git(&src, &["commit", "-q", "-m", "deps"]);
+
+    // Captured, and restored under an owner map whose change owner is someone else.
+    let sink = Arc::new(LocalDir::new(&base.join("cas")).unwrap());
+    let registrar = Arc::new(InMemoryRegistrar::new("wt-pnpm", 1, None));
+    let mut config = CaptureConfig::new("wt-pnpm", 1, &src);
+    config.racy_window = Duration::ZERO;
+    let mut engine = CaptureEngine::open(config, None).unwrap();
+    for (seq, class) in [(1, Class::Small), (2, Class::Bulk)] {
+        engine
+            .snap(SnapRequest {
+                kind: CaptureKind::Auto,
+                class,
+                seq,
+            })
+            .unwrap();
+    }
+    engine
+        .shipper(sink.clone(), registrar.clone())
+        .ship_pending()
+        .unwrap();
+    let owners = sealant_capture::owners::OwnerMap {
+        gid: GID,
+        worktree: BOB_UID + 1,
+        people: std::collections::BTreeMap::new(),
+    };
+    let repo = base.join("restore/repo");
+    owners.prepare_worktree_root(&repo).unwrap();
+    sealant_capture::owners::apply_default_acl(&[&repo], GID).unwrap();
+    let mut targets = MaterializeTargets::new(&repo, None);
+    targets.owners = Some(owners);
+    Materializer::new(sink.as_ref(), targets)
+        .materialize(&registrar.head().unwrap().manifest, MaterializeClass::All)
+        .unwrap();
+
+    // The second person changes the lockfile, installs, and reinstalls by force.
+    let out = base.join("pnpm-as-bob");
+    let script = format!(
+        "cd {r} && printf '%s' '{{\"name\":\"x\",\"version\":\"1.0.0\",\"dependencies\":{{\"semver\":\"7.6.0\",\"which\":\"4.0.0\"}}}}' > package.json \
+         && {install} > {o}.log 2>&1 && {force} >> {o}.log 2>&1 && ./node_modules/.bin/semver 1.2.3 >> {o}.log 2>&1; \
+         echo \"exit=$?\" > {o}.tmp && mv {o}.tmp {o}",
+        r = repo.display(),
+        install = pnpm(""),
+        force = pnpm("--force"),
+        o = out.display()
+    );
+    let mut client = Client::start(base);
+    ok(client.request(Command::Exec(exec(script, Some(BOB)))).await);
+    let status = wait_for(&out);
+    let log = std::fs::read_to_string(base.join("pnpm-as-bob.log")).unwrap_or_default();
+    assert_eq!(status, "exit=0\n", "pnpm as a second person:\n{log}");
+    assert!(repo.join("node_modules/which").exists(), "{log}");
+}
+
+/// Removes `/etc/sealant/person-env` when dropped (the test that writes it may fail).
+struct PersonEnvFile;
+
+impl Drop for PersonEnvFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(sealant_process::identity::PERSON_ENV_FILE);
+    }
+}
+
+/// The image's `/etc/sealant/person-env` reaches every process run as a person (exec, session,
+/// the dotfiles commands) and never root: `PATH_PREPEND` in front of the base `PATH`, its other
+/// variables over the daemon's environment, under the caller's explicit ones; the version line,
+/// malformed lines and names a person never gets are skipped.
+#[tokio::test]
+async fn the_image_s_person_environment_reaches_every_person_s_process_and_not_root() {
+    if !ready() {
+        return;
+    }
+    let dir = scratch();
+    std::fs::create_dir_all("/etc/sealant").unwrap();
+    let _file = PersonEnvFile;
+    std::fs::write(
+        sealant_process::identity::PERSON_ENV_FILE,
+        "# sealant person-env 1\nPATH_PREPEND=/opt/mise/shims\nMISE_DATA_DIR=/opt/mise\n\
+         not a line\n1BAD=x\nHOME=/nope\nSEALANT_SNEAKY=y\nFROM_BOTH=file\nCALLER_WINS=file\n",
+    )
+    .unwrap();
+    let dump = |out: &Path| {
+        format!(
+            "env > {0}.tmp && echo end >> {0}.tmp && mv {0}.tmp {0}",
+            out.display()
+        )
+    };
+    let mut client = Client::start_with(
+        dir.path(),
+        vec![var("PATH", "/usr/bin:/bin"), var("FROM_BOTH", "daemon")],
+    );
+    let mut args = exec(dump(&dir.path().join("exec")), Some(BOB));
+    args.env = vec![var("CALLER_WINS", "caller")];
+    ok(client.request(Command::Exec(args)).await);
+    ok(client
+        .request(Command::OpenSession(OpenSessionArgs {
+            user: Some(BOB.to_owned()),
+            execution_id: None,
+            shell: Some("/bin/sh".to_owned()),
+            args: vec!["-c".to_owned(), dump(&dir.path().join("session"))],
+            cwd: None,
+            env: vec![var("CALLER_WINS", "caller")],
+            cols: 80,
+            rows: 24,
+            term: None,
+            mode: SessionMode::Pipe,
+        }))
+        .await);
+    for name in ["exec", "session"] {
+        let env = wait_for(&dir.path().join(name));
+        let has = |line: &str| env.lines().any(|l| l == line);
+        assert!(has("PATH=/opt/mise/shims:/usr/bin:/bin"), "{name}:\n{env}");
+        assert!(has("MISE_DATA_DIR=/opt/mise"), "{name}:\n{env}");
+        assert!(
+            has("FROM_BOTH=file"),
+            "{name}: the file over the daemon:\n{env}"
+        );
+        assert!(
+            has("CALLER_WINS=caller"),
+            "{name}: the caller over the file:\n{env}"
+        );
+        assert!(
+            has(&format!("HOME=/home/{BOB}")),
+            "{name}: the identity wins:\n{env}"
+        );
+        assert!(!env.contains("SEALANT_SNEAKY"), "{name}:\n{env}");
+        assert!(!env.contains("1BAD"), "{name}:\n{env}");
+    }
+    ok(client
+        .request(Command::Exec(exec(dump(&dir.path().join("root")), None)))
+        .await);
+    let root = wait_for(&dir.path().join("root"));
+    assert!(
+        !root.contains("MISE_DATA_DIR"),
+        "root got the person file:\n{root}"
+    );
+    assert!(root.lines().any(|l| l == "PATH=/usr/bin:/bin"), "{root}");
+
+    // The dotfiles commands of a person's apply: chezmoi, a stand-in writing its environment.
+    let evidence = dir.path().join("chezmoi-env");
+    let bin = dir.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::write(
+        bin.join("chezmoi"),
+        format!(
+            "#!/bin/sh\nenv > {0}.tmp && mv {0}.tmp {0}\n",
+            evidence.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(
+        bin.join("chezmoi"),
+        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+    )
+    .unwrap();
+    let old_path = std::env::var("PATH").unwrap_or_default();
+    let daemon_path = format!("{}:{old_path}", bin.display());
+    // SAFETY: this binary runs its tests on one thread when root (scripts/ci-root-tests.sh).
+    unsafe { std::env::set_var("PATH", &daemon_path) };
+    let tree = dir.path().join("tree");
+    std::fs::create_dir_all(&tree).unwrap();
+    std::fs::write(tree.join("dot_mtestrc"), "x\n").unwrap();
+    let archives = dir.path().join("archives");
+    std::fs::create_dir_all(&archives).unwrap();
+    assert!(
+        Std::new("tar")
+            .arg("-czf")
+            .arg(archives.join("0.tar.gz"))
+            .arg("-C")
+            .arg(&tree)
+            .arg(".")
+            .status()
+            .unwrap()
+            .success()
+    );
+    std::fs::write(
+        archives.join("manifest.json"),
+        r#"{"archives":[{"file":"0.tar.gz","manager":"chezmoi","bootstrap":false}]}"#,
+    )
+    .unwrap();
+    let applied = client
+        .request(Command::DotfilesApply(Box::new(DotfilesApplyArgs {
+            user: BOB.to_owned(),
+            repository: None,
+            archive_dir: Some(archives.display().to_string()),
+            execution_id: None,
+        })))
+        .await;
+    // SAFETY: as above.
+    unsafe { std::env::set_var("PATH", &old_path) };
+    ok(applied);
+    let env = std::fs::read_to_string(&evidence).expect("chezmoi ran");
+    assert!(
+        env.lines()
+            .any(|l| l == format!("PATH=/opt/mise/shims:{daemon_path}")),
+        "{env}"
+    );
+    assert!(env.lines().any(|l| l == "MISE_DATA_DIR=/opt/mise"), "{env}");
+    assert!(!env.contains("SEALANT_SNEAKY"), "{env}");
+}

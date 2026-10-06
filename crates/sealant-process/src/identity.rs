@@ -1,15 +1,16 @@
 //! Running a process as a given user (Mend's per-person layout, its ADR 0016): an execution, a
 //! session or the dotfiles applier names a user, and the process starts as exactly that user —
 //! the passwd entry's uid, primary group and supplementary groups (`initgroups`), its `HOME`,
-//! `USER`, `LOGNAME` and `SHELL`, umask `0002`, and a private `TMPDIR` (`/tmp/u-<uid>`) and
-//! `XDG_RUNTIME_DIR` (`/run/user/<uid>`), both 0700 and the user's. Every child inherits it.
+//! `USER`, `LOGNAME` and `SHELL`, umask `0002`, a private `TMPDIR` (`/tmp/u-<uid>`) and
+//! `XDG_RUNTIME_DIR` (`/run/user/<uid>`), both 0700 and the user's, and one capability,
+//! [`CAP_FOWNER`] (ambient). Every child inherits it.
 //!
 //! What the daemon's environment carries is filtered first ([`withheld_from_person`]): a
 //! person's process never inherits the launcher's tokens or the daemon's `SEALANT_*` keys.
 //!
 //! The user is looked up in the parent (the passwd and group databases may allocate and take
-//! locks); the forked child only makes the async-signal-safe calls `setgroups`, `setgid`,
-//! `setuid` and `umask`, in that order, before `exec`. A process for which no user is named runs
+//! locks); the forked child only makes system calls, `setgroups`, `setgid`, `prctl`, `setuid`,
+//! `capset` and `umask`, before `exec`. A process for which no user is named runs
 //! as before.
 #![allow(unsafe_code)]
 
@@ -59,6 +60,80 @@ pub const WITHHELD: &[&str] = &[
     "XDG_STATE_HOME",
     "XDG_CACHE_HOME",
 ];
+
+/// The image's environment for a person's processes (Core's images write it): one literal
+/// `KEY=VALUE` per line, applied to every process run as a person (exec, session, the dotfiles
+/// commands) and never to root. `PATH_PREPEND` goes in front of the base `PATH`. Blank lines,
+/// `#` lines (a version marker), lines without `=`, names that are not variable names, the
+/// identity's own names and names a person never inherits ([`withheld_from_person`]) are
+/// skipped. A missing or unreadable file changes nothing.
+pub const PERSON_ENV_FILE: &str = "/etc/sealant/person-env";
+
+/// The `PATH` a person's process gets when the daemon's environment has none.
+pub const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
+/// Names the identity sets ([`RunAs::env`]); an image file never overrides them.
+const IDENTITY_KEYS: &[&str] = &[
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "TMPDIR",
+    "XDG_RUNTIME_DIR",
+];
+
+/// [`PERSON_ENV_FILE`]'s variables over a base `PATH` (`None`: [`DEFAULT_PATH`]).
+#[must_use]
+pub fn person_env(base_path: Option<&str>) -> Vec<(String, String)> {
+    person_env_at(Path::new(PERSON_ENV_FILE), base_path)
+}
+
+/// [`person_env`] from the file at `path`.
+#[must_use]
+pub fn person_env_at(path: &Path, base_path: Option<&str>) -> Vec<(String, String)> {
+    std::fs::read_to_string(path)
+        .map_or_else(|_| Vec::new(), |text| parse_person_env(&text, base_path))
+}
+
+/// The variables of a [`PERSON_ENV_FILE`] text, in order (a later line of one name wins where the
+/// caller applies them in order); `PATH_PREPEND` becomes `PATH`, in front of `base_path`.
+#[must_use]
+pub fn parse_person_env(text: &str, base_path: Option<&str>) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut prepend: Vec<&str> = Vec::new();
+    for line in text.lines() {
+        let line = line.trim_end_matches('\r');
+        if line.trim().is_empty() || line.trim_start().starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let name_ok = key
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+        if !name_ok {
+            continue;
+        }
+        if key == "PATH_PREPEND" {
+            if !value.is_empty() {
+                prepend.push(value);
+            }
+            continue;
+        }
+        if key == "PATH" || IDENTITY_KEYS.contains(&key) || withheld_from_person(key) {
+            continue;
+        }
+        out.push((key.to_owned(), value.to_owned()));
+    }
+    if !prepend.is_empty() {
+        let base = base_path.unwrap_or(DEFAULT_PATH);
+        out.push(("PATH".to_owned(), format!("{}:{base}", prepend.join(":"))));
+    }
+    out
+}
 
 /// Name fragments of a secret (as the boot's passthrough filter reads them).
 const SECRET_MARKERS: &[&str] = &[
@@ -189,15 +264,16 @@ impl RunAs {
         Ok(())
     }
 
-    /// Start `command` as this user: groups, group, user and umask set in the child before
-    /// `exec`, after any setup registered before this call (a session's `setsid`).
+    /// Start `command` as this user: groups, group, user, [`CAP_FOWNER`] and umask set in the
+    /// child before `exec`, after any setup registered before this call (a session's `setsid`).
     pub fn apply(&self, command: &mut std::process::Command) {
         let groups: Vec<libc::gid_t> = self.groups.clone();
         let (uid, gid) = (self.uid, self.gid);
         // SAFETY: the closure runs in the forked child before exec. It allocates nothing (the
-        // group list was built in the parent and is only read) and calls only async-signal-safe
-        // functions: setgroups, setgid, setuid and umask. setuid comes last: once it drops
-        // root, the others would be refused.
+        // group list was built in the parent and is only read) and makes only system calls:
+        // setgroups, setgid, prctl, setuid, capset and umask. setuid comes after the group
+        // calls (once it drops root, they would be refused); capset after setuid, which with
+        // PR_SET_KEEPCAPS keeps root's permitted set for capset to narrow.
         unsafe {
             command.pre_exec(move || {
                 if libc::setgroups(groups.len(), groups.as_ptr()) == -1 {
@@ -206,13 +282,92 @@ impl RunAs {
                 if libc::setgid(gid) == -1 {
                     return Err(io::Error::last_os_error());
                 }
+                if libc::prctl(libc::PR_SET_KEEPCAPS, 1, 0, 0, 0) == -1 {
+                    return Err(io::Error::last_os_error());
+                }
                 if libc::setuid(uid) == -1 {
                     return Err(io::Error::last_os_error());
                 }
+                keep_only_fowner()?;
                 libc::umask(PERSON_UMASK);
                 Ok(())
             });
         }
+    }
+}
+
+/// The one capability a person's process holds, ambient so every program it runs keeps it:
+/// changing the mode, times and other owner-only attributes of a file it does not own. In a
+/// shared worktree every file is someone else's (restored ones are root's, a joiner's are the
+/// joiner's), and package managers `chmod` what they relink (pnpm fails without it:
+/// `ERR_PNPM_CMD_SHIM_CHMOD`). Within what the person's passwordless `sudo` already allows (Mend's
+/// ADR 0016); nothing else of root's is kept.
+pub const CAP_FOWNER: u32 = 3;
+
+/// `_LINUX_CAPABILITY_VERSION_3`: two 32-bit words per set.
+const CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+
+/// `struct __user_cap_header_struct`.
+#[repr(C)]
+struct CapHeader {
+    version: u32,
+    pid: libc::c_int,
+}
+
+/// `struct __user_cap_data_struct`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CapData {
+    effective: u32,
+    permitted: u32,
+    inheritable: u32,
+}
+
+/// In the child, after `setuid` kept root's permitted set (`PR_SET_KEEPCAPS`): narrow every set
+/// to [`CAP_FOWNER`] and raise it as ambient, so it survives `exec` (a program without file
+/// capabilities keeps its ambient set, and no secure-exec mode is entered: nothing grew). Where
+/// the capability is not in the bounding set (a pod that drops it), every set is emptied instead
+/// and the process runs without it. Never leaves anything else of root's: a failure to drop
+/// everything fails the start.
+fn keep_only_fowner() -> io::Result<()> {
+    let bit = 1u32 << CAP_FOWNER;
+    let set = |data: [CapData; 2]| -> libc::c_long {
+        let mut header = CapHeader {
+            version: CAPABILITY_VERSION_3,
+            pid: 0,
+        };
+        // SAFETY: capset reads the header and two data words from valid, live memory.
+        unsafe { libc::syscall(libc::SYS_capset, &raw mut header, data.as_ptr()) }
+    };
+    let none = CapData {
+        effective: 0,
+        permitted: 0,
+        inheritable: 0,
+    };
+    let fowner = CapData {
+        effective: bit,
+        permitted: bit,
+        inheritable: bit,
+    };
+    if set([fowner, none]) == 0 {
+        // SAFETY: prctl takes integer arguments only.
+        let raised = unsafe {
+            libc::prctl(
+                libc::PR_CAP_AMBIENT,
+                libc::PR_CAP_AMBIENT_RAISE,
+                libc::c_ulong::from(CAP_FOWNER),
+                0,
+                0,
+            )
+        };
+        if raised == 0 {
+            return Ok(());
+        }
+    }
+    if set([none, none]) == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
     }
 }
 
@@ -241,8 +396,10 @@ fn private_dir(dir: &Path, uid: u32, gid: u32) -> io::Result<()> {
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
         .open(dir)
         .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", dir.display())))?;
-    std::os::unix::fs::fchown(&opened, Some(uid), Some(gid))?;
-    opened.set_permissions(std::fs::Permissions::from_mode(0o700))
+    // The mode while it is still root's, then the owner: changing the mode of a file one does
+    // not own takes `CAP_FOWNER`, which a daemon in a pod that drops it lacks.
+    opened.set_permissions(std::fs::Permissions::from_mode(0o700))?;
+    std::os::unix::fs::fchown(&opened, Some(uid), Some(gid))
 }
 
 /// `mkdir dir` (its parent made if missing); one made meanwhile is fine.
@@ -260,6 +417,31 @@ fn make_dir(dir: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_image_s_person_environment_is_read_as_literal_lines() {
+        let text = "# sealant person-env 1\r\nPATH_PREPEND=/opt/mise/shims\nMISE_DATA_DIR=/opt/mise\n\
+                    \nnot a line\n1BAD=x\nBAD-NAME=x\nHOME=/nope\nPATH=/replaced\nSEALANT_X=y\n\
+                    NPM_TOKEN=t\nQUOTED=\"a b\" $HOME\nEMPTY=\nMISE_DATA_DIR=/opt/mise2\n";
+        assert_eq!(
+            parse_person_env(text, Some("/usr/bin:/bin")),
+            vec![
+                ("MISE_DATA_DIR".to_owned(), "/opt/mise".to_owned()),
+                ("QUOTED".to_owned(), "\"a b\" $HOME".to_owned()),
+                ("EMPTY".to_owned(), String::new()),
+                ("MISE_DATA_DIR".to_owned(), "/opt/mise2".to_owned()),
+                (
+                    "PATH".to_owned(),
+                    "/opt/mise/shims:/usr/bin:/bin".to_owned()
+                ),
+            ]
+        );
+        assert_eq!(
+            parse_person_env("PATH_PREPEND=/a\nPATH_PREPEND=/b\n", None),
+            vec![("PATH".to_owned(), format!("/a:/b:{DEFAULT_PATH}"))]
+        );
+        assert!(person_env_at(Path::new("/nonexistent/person-env"), None).is_empty());
+    }
 
     #[test]
     fn root_and_unknown_users_are_refused() {

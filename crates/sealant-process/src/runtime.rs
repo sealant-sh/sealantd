@@ -189,8 +189,18 @@ impl ProcessRuntime {
         for var in self.config.child_env.iter().filter(|v| inherited(&v.key)) {
             command.env(&var.key, &var.value);
         }
-        // The user's identity over the daemon's child environment, under the caller's overlay.
+        // The user's identity over the daemon's child environment and the image's person
+        // environment ([`crate::identity::PERSON_ENV_FILE`]), under the caller's overlay.
         if let Some(user) = &run_as {
+            let base_path = self
+                .config
+                .child_env
+                .iter()
+                .find(|v| v.key == "PATH")
+                .map(|v| v.value.as_str());
+            for (key, value) in crate::identity::person_env(base_path) {
+                command.env(key, value);
+            }
             for (key, value) in user.env() {
                 command.env(key, value);
             }

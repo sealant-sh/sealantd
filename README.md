@@ -65,9 +65,17 @@ The daemon runs as root, and so does every process it starts, unless the request
   environment it inherits nothing that is a login or the daemon's: no provider token
   (`CLAUDE_CODE_OAUTH_TOKEN`, `GH_TOKEN`, `GITHUB_TOKEN`, …), no `SEALANT_*` key, no agent socket
   or askpass, no XDG base directory, nothing whose name looks like a secret
-  (`sealant_process::identity::withheld_from_person`). The caller's `env` still applies, last (a
-  caller may point `HOME` elsewhere on purpose). A PTY leader owns its terminal. Root, a user in
-  root's group, or a user the passwd database does not have, is refused. `openSftp` takes no user
+  (`sealant_process::identity::withheld_from_person`). Then the image's
+  `/etc/sealant/person-env` applies (one literal `KEY=VALUE` per line; `PATH_PREPEND` goes in
+  front of the base `PATH`; `#` lines, malformed lines, identity names and names a person never
+  gets are skipped; a missing file changes nothing), never to root. The caller's `env` still
+  applies, last (a caller may point `HOME` elsewhere on purpose). A PTY leader owns its terminal. The process holds one
+  capability, `CAP_FOWNER`, ambient (so the programs it runs keep it): it can change the mode and
+  times of files it does not own, which every file in a shared worktree is (pnpm relinks bins
+  with a `chmod`), within what the person's passwordless `sudo` already allows. Nothing else of
+  root's is kept. Where the daemon's bounding set lacks `CAP_FOWNER`, the process starts without
+  it; the restore under an owner map needs it too. Root, a user in root's group, or a user the
+  passwd database does not have, is refused. `openSftp` takes no user
   yet: an SFTP bridge runs as root.
 - The dotfiles applier runs as a user into their passwd home, its commands with a clean
   environment (`PATH`, the locale, `TERM` and the person's identity; nothing of the daemon's),

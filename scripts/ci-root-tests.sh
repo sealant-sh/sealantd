@@ -5,6 +5,8 @@
 set -euo pipefail
 
 command -v setfacl >/dev/null || sudo apt-get install -y --no-install-recommends acl
+# `run_as_user` runs pnpm as a person in a restored worktree (it needs the registry too).
+command -v pnpm >/dev/null || sudo npm install -g pnpm@9
 
 run_as_root() {
   local package=$1 target=$2

@@ -65,10 +65,12 @@ pub fn spawn(
     set_nonblocking(master.as_raw_fd())?;
     // A leader that runs as a user owns its terminal, as a login gives one (`ttyname` and
     // `/dev/pts/N` opened by path work for it, `mesg` and GnuPG's pinentry included).
+    // The mode first, while the terminal is root's, then the owner: changing the mode of a file
+    // one does not own takes `CAP_FOWNER`.
     if let Some(user) = run_as {
-        std::os::unix::fs::fchown(&slave, Some(user.uid), None)?;
         nix::sys::stat::fchmod(&slave, nix::sys::stat::Mode::from_bits_truncate(0o620))
             .map_err(to_io)?;
+        std::os::unix::fs::fchown(&slave, Some(user.uid), None)?;
     }
 
     // The child gets three handles to the slave for stdin/stdout/stderr.

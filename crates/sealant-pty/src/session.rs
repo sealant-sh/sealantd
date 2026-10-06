@@ -349,8 +349,15 @@ impl SessionRuntime {
             .filter(|v| inherited(&v.key))
             .map(|v| (v.key.clone(), v.value.clone()))
             .collect();
-        // The user's identity over the daemon's child environment, under the caller's overlay.
+        // The user's identity over the daemon's child environment and the image's person
+        // environment (`sealant_process::identity::PERSON_ENV_FILE`), under the caller's overlay.
         if let Some(user) = &run_as {
+            let base_path = env
+                .iter()
+                .rev()
+                .find(|(key, _)| key == "PATH")
+                .map(|(_, value)| value.clone());
+            env.extend(sealant_process::identity::person_env(base_path.as_deref()));
             env.extend(user.env());
         }
         env.extend(args.env.iter().map(|v| (v.key.clone(), v.value.clone())));
