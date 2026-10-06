@@ -84,6 +84,10 @@ pub enum CredentialKind {
     File,
     /// This path and every path under it.
     Dir,
+    /// Every name in one directory that matches a pattern with one `*` in its last component
+    /// (`codex-db/logs_*`, `codex-db/*-shm`), and every path under such a name. The `*` stands
+    /// for any run of characters but `/`; everything else matches exactly.
+    Pattern,
 }
 
 /// One path under the harness home that is never captured, and never restored from a capture:
@@ -278,7 +282,12 @@ pub const HARNESS_CREDENTIALS: &[HarnessExclusion] = &[
 /// unpacks its runtime into `.codex/packages/` (about 427 MB) and starts an app-server daemon that
 /// keeps its state and its control socket beside it; captured, every later executor of the
 /// worktree would restore the runtime, and a daemon's state from a machine where it no longer runs.
-/// Each is rebuilt when Codex next needs it. ADR-0015 lists these apart from the credentials.
+/// Each is rebuilt when Codex next needs it. In a person's saved directory Codex keeps its
+/// databases in `codex-db/` (`CODEX_SQLITE_HOME`): the thread index and memory database are
+/// conversation state and are saved, WAL included, but the logs database is the machine's, and
+/// so is every `-shm` file there (SQLite rebuilds one when the database opens, and a stale one
+/// restored beside a different WAL is the risky case). ADR-0015 lists these apart from the
+/// credentials.
 pub const HARNESS_MACHINE_STATE: &[HarnessExclusion] = &[
     HarnessExclusion {
         harness: "codex",
@@ -298,7 +307,37 @@ pub const HARNESS_MACHINE_STATE: &[HarnessExclusion] = &[
         kind: CredentialKind::Dir,
         holds: "that daemon's control socket",
     },
+    HarnessExclusion {
+        harness: "codex",
+        path: "codex-db/logs_*",
+        kind: CredentialKind::Pattern,
+        holds: "Codex's logs database (`CODEX_SQLITE_HOME`), its WAL and shared memory included",
+    },
+    HarnessExclusion {
+        harness: "codex",
+        path: "codex-db/*-shm",
+        kind: CredentialKind::Pattern,
+        holds: "SQLite's shared-memory index beside each Codex database, rebuilt when one opens",
+    },
 ];
+
+/// Where Mend keeps each person's saved directory under the harness home (ADR 0016 of Mend, the
+/// per-person layout): `people/<account id>/`, laid out as that person's own home is. The tables
+/// apply under every one of them as they do at the root: a write that broke a link from the
+/// person's home into their saved directory (a harness replacing `~/.codex` with a real
+/// directory, a tool writing through a stale link) leaves a login in the saved directory, and it
+/// is still never captured or restored.
+pub const PEOPLE_DIR: &str = "people";
+
+/// The directory under a person's saved directory that holds the conversations a session shares.
+pub const CONVERSATIONS_DIR: &str = "conversations";
+
+/// What a shared conversation (`people/<id>/conversations/<session>/`) never saves, relative to
+/// it, beside the tables (which apply there too): Claude Code's file history, which the
+/// conversation home links there by that name. It holds a copy of every file the agent edits, a
+/// secret file included, and secret files are never captured (Mend's ADR 0010); it is excluded
+/// everywhere else by [`HARNESS_CREDENTIALS`]. A directory, left out with everything under it.
+pub const NEVER_SAVED_IN_CONVERSATION: &[&str] = &["file-history"];
 
 /// Every path the harness home never captures or restores: the credentials, then the machine state.
 pub fn harness_exclusions() -> impl Iterator<Item = &'static HarnessExclusion> {
@@ -307,10 +346,55 @@ pub fn harness_exclusions() -> impl Iterator<Item = &'static HarnessExclusion> {
 
 /// Whether a path relative to the harness home (`/`-separated) is never captured
 /// ([`harness_exclusions`]): a listed file or a sibling named after it with a suffix, a listed
-/// directory, or anything under one.
+/// directory, a name a listed pattern matches, or anything under one; at the root of the home
+/// or under any person's saved directory (`people/<id>/`, [`PEOPLE_DIR`]), and under any shared
+/// conversation (`people/<id>/conversations/<session>/`), where [`NEVER_SAVED_IN_CONVERSATION`]
+/// is left out too.
 #[must_use]
 pub fn is_harness_excluded_path(rel: &str) -> bool {
     let rel = rel.trim_matches('/');
+    if excluded_in_home(rel) {
+        return true;
+    }
+    let Some(in_person) = person_relative(rel) else {
+        return false;
+    };
+    if excluded_in_home(in_person) {
+        return true;
+    }
+    conversation_relative(in_person).is_some_and(|in_conversation| {
+        excluded_in_home(in_conversation)
+            || NEVER_SAVED_IN_CONVERSATION.iter().any(|dir| {
+                in_conversation
+                    .strip_prefix(dir)
+                    .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+            })
+    })
+}
+
+/// `rel` (relative to a person's saved directory) relative to the shared conversation it is
+/// under (`conversations/<session>/<rest>` → `<rest>`), or `None`.
+fn conversation_relative(rel: &str) -> Option<&str> {
+    let (session, rest) = rel
+        .strip_prefix(CONVERSATIONS_DIR)?
+        .strip_prefix('/')?
+        .split_once('/')?;
+    (!session.is_empty() && !rest.is_empty()).then_some(rest)
+}
+
+/// `rel` relative to the person's saved directory it is under (`people/<id>/<rest>` → `<rest>`),
+/// or `None` when it is not under one (the directory itself included).
+fn person_relative(rel: &str) -> Option<&str> {
+    let (id, rest) = rel
+        .strip_prefix(PEOPLE_DIR)?
+        .strip_prefix('/')?
+        .split_once('/')?;
+    (!id.is_empty() && !rest.is_empty()).then_some(rest)
+}
+
+/// [`is_harness_excluded_path`] for a path relative to one home's root (the harness home's, or a
+/// person's saved directory's, or a shared conversation's).
+fn excluded_in_home(rel: &str) -> bool {
     harness_exclusions().any(|c| match c.kind {
         CredentialKind::File => rel
             .strip_prefix(c.path)
@@ -318,7 +402,26 @@ pub fn is_harness_excluded_path(rel: &str) -> bool {
         CredentialKind::Dir => rel
             .strip_prefix(c.path)
             .is_some_and(|rest| rest.is_empty() || rest.starts_with('/')),
+        CredentialKind::Pattern => pattern_matches(c.path, rel),
     })
+}
+
+/// Whether `rel` is a name `pattern` matches ([`CredentialKind::Pattern`]), or under one.
+fn pattern_matches(pattern: &str, rel: &str) -> bool {
+    let (dir, name_pattern) = pattern.rsplit_once('/').unwrap_or(("", pattern));
+    let in_dir = if dir.is_empty() {
+        Some(rel)
+    } else {
+        rel.strip_prefix(dir).and_then(|r| r.strip_prefix('/'))
+    };
+    let Some(in_dir) = in_dir else {
+        return false;
+    };
+    let name = in_dir.split('/').next().unwrap_or_default();
+    let Some((before, after)) = name_pattern.split_once('*') else {
+        return name == name_pattern;
+    };
+    name.len() >= before.len() + after.len() && name.starts_with(before) && name.ends_with(after)
 }
 
 /// The daemon's own directory under the workspace root (staging lives beneath it).
@@ -1959,6 +2062,101 @@ impl<'a> TreeBuilder<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every table applies under each person's saved directory as at the root, the sibling rule
+    /// included, and only one level down (`people/<id>/`); Codex's logs database and every
+    /// `-shm` file in `codex-db/` are machine state, its other databases and their WALs are not.
+    #[test]
+    fn the_tables_apply_under_every_person_s_saved_directory() {
+        for excluded in [
+            "people/acct_1/.codex/auth.json",
+            "people/acct_1/.codex/auth.json.lock",
+            "people/acct_1/.codex/auth.json.tmp-123",
+            "people/acct_1/.claude/.credentials.json",
+            "people/acct_1/.pi/agent/auth.json",
+            "people/acct_1/.local/share/opencode/mcp-auth.json",
+            "people/acct_1/.codex/packages/standalone/codex",
+            "people/acct_2/.mend/pi-profile-kept/a/mcp.json",
+            "/people/acct_1/.codex/auth.json/",
+            "people/acct_1/codex-db/logs_2.sqlite",
+            "people/acct_1/codex-db/logs_2.sqlite-wal",
+            "people/acct_1/codex-db/logs_2.sqlite-shm",
+            "people/acct_1/codex-db/state_5.sqlite-shm",
+            "people/acct_1/codex-db/memories_1.sqlite-shm",
+            "codex-db/logs_2.sqlite",
+            "codex-db/goals_1.sqlite-shm",
+        ] {
+            assert!(is_harness_excluded_path(excluded), "{excluded}");
+        }
+        for kept in [
+            "people",
+            "people/acct_1",
+            "people/acct_1/.codex",
+            "people/acct_1/.codex/sessions/2026/10/06/rollout.jsonl",
+            "people/acct_1/.codex/config.toml",
+            "people/acct_1/.claude/projects/-workspace-repo/s.jsonl",
+            "people/acct_1/.pi/agent/auth.jsonl",
+            "people/acct_1/codex-db",
+            "people/acct_1/codex-db/state_5.sqlite",
+            "people/acct_1/codex-db/state_5.sqlite-wal",
+            "people/acct_1/codex-db/memories_1.sqlite",
+            "people/acct_1/codex-db/logs",
+            "people/acct_1/conversations/s1/sessions/rollout.jsonl",
+            "people/.codex/auth.json",
+            "people/acct_1/nested/.codex/auth.json",
+            "xpeople/acct_1/.codex/auth.json",
+            "state.db-shm",
+            ".codex/state_5.sqlite-shm",
+            "people/acct_1/state.db-shm",
+        ] {
+            assert!(!is_harness_excluded_path(kept), "{kept}");
+        }
+    }
+
+    /// Claude Code's file history is never saved: not at the root of the home, not in a
+    /// person's saved directory, not in a shared conversation. It holds a copy of every file the
+    /// agent edits, a secret file included. The tables also apply relative to a shared
+    /// conversation, as a backstop.
+    #[test]
+    fn file_history_is_never_saved_and_the_tables_reach_shared_conversations() {
+        for excluded in [
+            ".claude/file-history/0b5e/v1@2",
+            "people/acct_1/.claude/file-history",
+            "people/acct_1/.claude/file-history/0b5e/v1@2",
+            "people/acct_1/conversations/s1/file-history",
+            "people/acct_1/conversations/s1/file-history/0b5e/v1@2",
+            "people/acct_1/conversations/s1/.claude/file-history/0b5e/v1@2",
+            "people/acct_1/conversations/s1/.codex/auth.json",
+            "people/acct_1/conversations/s1/.claude/.credentials.json.lock",
+            "people/acct_1/.claude/backups/.claude.json.backup.1",
+        ] {
+            assert!(is_harness_excluded_path(excluded), "{excluded}");
+        }
+        for kept in [
+            "people/acct_1/conversations/s1/file-historyx/a",
+            "people/acct_1/conversations/s1/projects/-workspace-repo/s1.jsonl",
+            "people/acct_1/conversations/s1/tasks/s1/1.json",
+            "people/acct_1/conversations/s1/sessions/rollout.jsonl",
+        ] {
+            assert!(!is_harness_excluded_path(kept), "{kept}");
+        }
+    }
+
+    #[test]
+    fn a_pattern_matches_one_name_in_its_directory_and_what_is_under_it() {
+        assert!(pattern_matches("d/logs_*", "d/logs_2.sqlite"));
+        assert!(pattern_matches("d/logs_*", "d/logs_"));
+        assert!(pattern_matches("d/logs_*", "d/logs_x/inside"));
+        assert!(!pattern_matches("d/logs_*", "d/logslogs"));
+        assert!(!pattern_matches("d/logs_*", "e/logs_2"));
+        assert!(!pattern_matches("d/logs_*", "d/x/logs_2"));
+        assert!(!pattern_matches("d/logs_*", "dd/logs_2"));
+        assert!(pattern_matches("d/*-shm", "d/a.sqlite-shm"));
+        assert!(pattern_matches("d/*-shm", "d/-shm"));
+        assert!(!pattern_matches("d/*-shm", "d/a.sqlite-shm2"));
+        assert!(!pattern_matches("d/a*a", "d/a"));
+        assert!(pattern_matches("d/a*a", "d/aa"));
+    }
 
     #[derive(Default)]
     struct MemSink(HashMap<ChunkId, Vec<u8>>);

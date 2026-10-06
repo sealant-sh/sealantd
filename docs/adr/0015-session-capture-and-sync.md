@@ -265,6 +265,29 @@ and the state of a daemon that no longer runs. Codex rebuilds each when it next 
 | `.codex/packages/` | codex | the Codex runtime a hand-run `codex` unpacks (about 427 MB) |
 | `.codex/app-server-daemon/` | codex | the state of an app-server daemon running on that machine |
 | `.codex/app-server-control/` | codex | that daemon's control socket |
+| `codex-db/logs_*` | codex | Codex's logs database (`CODEX_SQLITE_HOME`), its WAL and shared memory included |
+| `codex-db/*-shm` | codex | SQLite's shared-memory index beside each Codex database, rebuilt when one opens |
+
+A `*` in a path stands for any run of characters but `/`, in its last component only.
+`codex-db/` is where Codex keeps its databases in a person's saved directory (`CODEX_SQLITE_HOME`):
+its thread index and memory database are conversation state and are saved, their WAL included; its
+logs database and every `-shm` file there are the machine's.
+
+### Per-person saved directories
+
+Mend's per-person layout keeps each person's saved directory under the harness home at
+`people/<account id>/`, laid out as that person's home is (`people/<id>/.claude/projects/`,
+`people/<id>/.codex/sessions/`, `people/<id>/codex-db/`). Both tables apply under every
+`people/<id>/` exactly as at the root, the sibling rule included: `people/<id>/.codex/auth.json`,
+`people/<id>/.pi/agent/auth.json.lock` and `people/<id>/codex-db/logs_2.sqlite` are never captured,
+and a capture that holds one never restores it. They apply relative to every shared conversation
+(`people/<id>/conversations/<session>/`) as well, and a shared conversation also never saves
+`file-history/`, where the conversation home links Claude Code's file history. File history is
+never saved anywhere: it holds a copy of every file the agent edits, a secret file included, and
+secret files are never captured (Mend's ADR 0010). The accepted cost: `/rewind` cannot restore
+edits made before a move to another executor. The logins themselves live in each person's home,
+outside every capture root, and reach the saved directory only through a link; the tables are the
+backstop for a write that broke a link and left a login there.
 
 ### Cadence and budgets
 

@@ -73,6 +73,11 @@ fn transcript_bytes(len: usize, seed: u64) -> Vec<u8> {
     out
 }
 
+/// A name a [`CredentialKind::Pattern`] entry matches: its `*` filled in.
+fn pattern_example(pattern: &str) -> String {
+    pattern.replace('*', "2.sqlite")
+}
+
 struct Fixture {
     _tmp: tempfile::TempDir,
     base: PathBuf,
@@ -195,6 +200,11 @@ impl Fixture {
                 CredentialKind::Dir => {
                     fs::create_dir_all(at.join("nested")).unwrap();
                     fs::write(at.join("nested/token"), "x").unwrap();
+                }
+                CredentialKind::Pattern => {
+                    let at = home.join(pattern_example(credential.path));
+                    fs::create_dir_all(at.parent().unwrap()).unwrap();
+                    fs::write(&at, "machine").unwrap();
                 }
             }
         }
@@ -359,6 +369,10 @@ fn round_trip_materializes_an_identical_workspace() {
             "{} came back",
             credential.path
         );
+        if credential.kind == CredentialKind::Pattern {
+            let back = home2.join(pattern_example(credential.path));
+            assert!(fs::symlink_metadata(&back).is_err(), "{back:?} came back");
+        }
         if credential.kind == CredentialKind::File {
             for sibling in [".mend-seed-12", ".lock"] {
                 let back = home2.join(format!("{}{sibling}", credential.path));
@@ -864,7 +878,7 @@ fn the_adr_lists_every_harness_exclusion() {
         table
             .iter()
             .map(|c| match c.kind {
-                CredentialKind::File => c.path.to_owned(),
+                CredentialKind::File | CredentialKind::Pattern => c.path.to_owned(),
                 CredentialKind::Dir => format!("{}/", c.path),
             })
             .collect()
