@@ -3,7 +3,8 @@
 //! tables apply under every one of them as at the root: no person's login is captured, or
 //! restored into anyone's executor, from a saved directory either. Codex's databases live in
 //! `people/<id>/codex-db/`: the thread index and memory database are saved with their WAL, the
-//! logs database and every `-shm` file are not.
+//! logs database and every `-shm` file are not. Claude's file history is saved in a person's own
+//! directory and never in a shared conversation.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -47,7 +48,7 @@ fn write(path: &Path, bytes: &str) {
 /// pattern matches, and Codex's logs database with its WAL and shared memory.
 fn never_saved() -> Vec<String> {
     let mut paths = Vec::new();
-    for c in index::harness_exclusions() {
+    for c in index::harness_exclusions().filter(|c| !index::SAVED_IN_PERSON_DIR.contains(&c.path)) {
         match c.kind {
             CredentialKind::File => {
                 paths.push(c.path.to_owned());
@@ -68,6 +69,9 @@ fn never_saved() -> Vec<String> {
     ] {
         paths.push(format!("codex-db/{name}"));
     }
+    // A shared conversation never saves Claude's file history.
+    paths.push("conversations/s1/file-history/0b5e/v1@2".to_owned());
+    paths.push("conversations/s1/.claude/file-history/0b5e/v1@2".to_owned());
     paths
 }
 
@@ -86,6 +90,8 @@ const SAVED: &[&str] = &[
     "codex-db/memories_1.sqlite",
     "codex-db/memories_1.sqlite-wal",
     "conversations/s1/sessions/rollout-2.jsonl",
+    // A person's own file history (`/rewind`) is theirs, saved in their directory.
+    ".claude/file-history/0b5e/v1@2",
 ];
 
 struct Fixture {
@@ -210,8 +216,9 @@ fn a_person_s_saved_directory_is_captured_and_restored_without_a_login() {
     assert!(home2.join(".codex/config.toml").exists());
 }
 
-/// A capture made before this rule holds a regular `auth.json` and a Codex `-shm` in a person's
-/// saved directory: a restore writes back neither, and restores everything beside them.
+/// A capture made before this rule holds a regular `auth.json`, a Codex `-shm` and a shared
+/// conversation's file history in a person's saved directory: a restore writes back none of
+/// them, and restores everything beside them, the person's own file history included.
 #[test]
 fn a_legacy_capture_s_login_in_a_person_s_directory_is_never_restored() {
     const T: i128 = 1_700_000_000_000_000_000;
@@ -250,9 +257,45 @@ fn a_legacy_capture_s_login_in_a_person_s_directory_is_never_restored() {
         DirEntry::file("state_5.sqlite-shm", 0o644, 0, T, vec![]),
         DirEntry::file("state_5.sqlite-wal", 0o644, 0, T, vec![]),
     ]));
+    // Claude's file history: in the person's own directory (kept) and in a shared
+    // conversation (never restored).
+    let history = || {
+        put(DirObject::new(vec![DirEntry::file(
+            "v1@2",
+            0o600,
+            0,
+            T,
+            vec![],
+        )]))
+    };
+    let own_history = put(DirObject::new(vec![DirEntry::dir(
+        "0b5e",
+        0o700,
+        T,
+        history(),
+    )]));
+    let claude = put(DirObject::new(vec![DirEntry::dir(
+        "file-history",
+        0o700,
+        T,
+        own_history,
+    )]));
+    let shared_history = put(DirObject::new(vec![DirEntry::dir(
+        "0b5e",
+        0o700,
+        T,
+        history(),
+    )]));
+    let session = put(DirObject::new(vec![
+        DirEntry::dir("file-history", 0o700, T, shared_history),
+        DirEntry::file("s1.jsonl", 0o600, 0, T, vec![]),
+    ]));
+    let conversations = put(DirObject::new(vec![DirEntry::dir("s1", 0o770, T, session)]));
     let alice = put(DirObject::new(vec![
+        DirEntry::dir(".claude", 0o755, T, claude),
         DirEntry::dir(".codex", 0o755, T, codex),
         DirEntry::dir("codex-db", 0o755, T, codex_db),
+        DirEntry::dir("conversations", 0o710, T, conversations),
     ]));
     let people = put(DirObject::new(vec![DirEntry::dir(
         "acct_alice",
@@ -279,7 +322,10 @@ fn a_legacy_capture_s_login_in_a_person_s_directory_is_never_restored() {
     assert!(p.join(".codex/config.toml").exists());
     assert!(p.join("codex-db/state_5.sqlite").exists());
     assert!(p.join("codex-db/state_5.sqlite-wal").exists());
+    assert!(p.join(".claude/file-history/0b5e/v1@2").exists());
+    assert!(p.join("conversations/s1/s1.jsonl").exists());
     for gone in [
+        "conversations/s1/file-history",
         ".codex/auth.json",
         ".codex/auth.json.mend-seed-3",
         "codex-db/logs_2.sqlite",

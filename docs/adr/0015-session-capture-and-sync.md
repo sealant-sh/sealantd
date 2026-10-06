@@ -280,7 +280,12 @@ Mend's per-person layout keeps each person's saved directory under the harness h
 `people/<id>/.codex/sessions/`, `people/<id>/codex-db/`). Both tables apply under every
 `people/<id>/` exactly as at the root, the sibling rule included: `people/<id>/.codex/auth.json`,
 `people/<id>/.pi/agent/auth.json.lock` and `people/<id>/codex-db/logs_2.sqlite` are never captured,
-and a capture that holds one never restores it. The logins themselves live in each person's home,
+and a capture that holds one never restores it. One entry is kept there: Claude Code's
+file history (`people/<id>/.claude/file-history/`, `/rewind`) is that person's own conversation
+state, saved in their directory and restored only into it. A shared conversation
+(`people/<id>/conversations/<session>/`) never saves file history (`file-history/`,
+`.claude/file-history/`): it holds copies of files a sender's process edited, which can come from
+that sender's home. The logins themselves live in each person's home,
 outside every capture root, and reach the saved directory only through a link; the tables are the
 backstop for a write that broke a link and left a login there.
 

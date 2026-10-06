@@ -1714,9 +1714,10 @@ mod tests {
                 continue;
             }
             assert!(is_harness_credential(&format!("harness/{path}")), "{path}");
-            assert!(
+            assert_eq!(
                 is_harness_credential(&format!("harness/people/acct_1/{path}")),
-                "{path}: under a person's saved directory too"
+                !index::SAVED_IN_PERSON_DIR.contains(&path),
+                "{path}: under a person's saved directory too, unless that directory keeps it"
             );
             assert!(
                 !is_harness_credential(&format!("harness/people/{path}")),

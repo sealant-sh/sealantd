@@ -329,6 +329,19 @@ pub const HARNESS_MACHINE_STATE: &[HarnessExclusion] = &[
 /// is still never captured or restored.
 pub const PEOPLE_DIR: &str = "people";
 
+/// Table entries a person's saved directory keeps (`people/<id>/<entry>`) though the root of the
+/// harness home does not: Claude Code's file history (`/rewind`) is that person's own conversation
+/// state there, restored only into their own directory, never into the next session's shared home.
+pub const SAVED_IN_PERSON_DIR: &[&str] = &[".claude/file-history"];
+
+/// The directory under a person's saved directory that holds the conversations a session shares.
+pub const CONVERSATIONS_DIR: &str = "conversations";
+
+/// What a shared conversation (`people/<id>/conversations/<session>/`) never saves, relative to
+/// it: Claude Code's file history, copies of the files a sender's process edited, which can come
+/// from that sender's home. Each is a directory, left out with everything under it.
+pub const NEVER_SAVED_IN_CONVERSATION: &[&str] = &["file-history", ".claude/file-history"];
+
 /// Every path the harness home never captures or restores: the credentials, then the machine state.
 pub fn harness_exclusions() -> impl Iterator<Item = &'static HarnessExclusion> {
     HARNESS_CREDENTIALS.iter().chain(HARNESS_MACHINE_STATE)
@@ -337,11 +350,38 @@ pub fn harness_exclusions() -> impl Iterator<Item = &'static HarnessExclusion> {
 /// Whether a path relative to the harness home (`/`-separated) is never captured
 /// ([`harness_exclusions`]): a listed file or a sibling named after it with a suffix, a listed
 /// directory, a name a listed pattern matches, or anything under one; at the root of the home
-/// or under any person's saved directory (`people/<id>/`, [`PEOPLE_DIR`]).
+/// or under any person's saved directory (`people/<id>/`, [`PEOPLE_DIR`]), where
+/// [`SAVED_IN_PERSON_DIR`] is kept. Under a shared conversation
+/// (`people/<id>/conversations/<session>/`), [`NEVER_SAVED_IN_CONVERSATION`] is left out too.
 #[must_use]
 pub fn is_harness_excluded_path(rel: &str) -> bool {
     let rel = rel.trim_matches('/');
-    excluded_in_home(rel) || person_relative(rel).is_some_and(excluded_in_home)
+    if excluded_in_home(rel, &[]) {
+        return true;
+    }
+    let Some(in_person) = person_relative(rel) else {
+        return false;
+    };
+    if excluded_in_home(in_person, SAVED_IN_PERSON_DIR) {
+        return true;
+    }
+    conversation_relative(in_person).is_some_and(|in_conversation| {
+        NEVER_SAVED_IN_CONVERSATION.iter().any(|dir| {
+            in_conversation
+                .strip_prefix(dir)
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+        })
+    })
+}
+
+/// `rel` (relative to a person's saved directory) relative to the shared conversation it is
+/// under (`conversations/<session>/<rest>` → `<rest>`), or `None`.
+fn conversation_relative(rel: &str) -> Option<&str> {
+    let (session, rest) = rel
+        .strip_prefix(CONVERSATIONS_DIR)?
+        .strip_prefix('/')?
+        .split_once('/')?;
+    (!session.is_empty() && !rest.is_empty()).then_some(rest)
 }
 
 /// `rel` relative to the person's saved directory it is under (`people/<id>/<rest>` → `<rest>`),
@@ -355,17 +395,19 @@ fn person_relative(rel: &str) -> Option<&str> {
 }
 
 /// [`is_harness_excluded_path`] for a path relative to one home's root (the harness home's, or a
-/// person's saved directory's).
-fn excluded_in_home(rel: &str) -> bool {
-    harness_exclusions().any(|c| match c.kind {
-        CredentialKind::File => rel
-            .strip_prefix(c.path)
-            .is_some_and(|rest| rest.is_empty() || rest.starts_with('.')),
-        CredentialKind::Dir => rel
-            .strip_prefix(c.path)
-            .is_some_and(|rest| rest.is_empty() || rest.starts_with('/')),
-        CredentialKind::Pattern => pattern_matches(c.path, rel),
-    })
+/// person's saved directory's), every entry but those in `kept`.
+fn excluded_in_home(rel: &str, kept: &[&str]) -> bool {
+    harness_exclusions()
+        .filter(|c| !kept.contains(&c.path))
+        .any(|c| match c.kind {
+            CredentialKind::File => rel
+                .strip_prefix(c.path)
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with('.')),
+            CredentialKind::Dir => rel
+                .strip_prefix(c.path)
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with('/')),
+            CredentialKind::Pattern => pattern_matches(c.path, rel),
+        })
 }
 
 /// Whether `rel` is a name `pattern` matches ([`CredentialKind::Pattern`]), or under one.
@@ -2035,7 +2077,6 @@ mod tests {
             "people/acct_1/.codex/auth.json.lock",
             "people/acct_1/.codex/auth.json.tmp-123",
             "people/acct_1/.claude/.credentials.json",
-            "people/acct_1/.claude/backups/.claude.json.backup.1",
             "people/acct_1/.pi/agent/auth.json",
             "people/acct_1/.local/share/opencode/mcp-auth.json",
             "people/acct_1/.codex/packages/standalone/codex",
@@ -2073,6 +2114,32 @@ mod tests {
             "people/acct_1/state.db-shm",
         ] {
             assert!(!is_harness_excluded_path(kept), "{kept}");
+        }
+    }
+
+    /// Claude Code's file history is a person's own conversation state in their saved directory
+    /// (saved there, restored only there), and never saved in a shared conversation, where it
+    /// can hold copies of files from a sender's home; at the root of the home it stays out.
+    #[test]
+    fn file_history_is_saved_in_a_person_s_directory_and_never_in_a_shared_conversation() {
+        for kept in [
+            "people/acct_1/.claude/file-history",
+            "people/acct_1/.claude/file-history/0b5e/v1@2",
+            "people/acct_1/conversations/s1/file-historyx/a",
+            "people/acct_1/conversations/s1/projects/-workspace-repo/s1.jsonl",
+            "people/acct_1/conversations/s1/tasks/s1/1.json",
+        ] {
+            assert!(!is_harness_excluded_path(kept), "{kept}");
+        }
+        for excluded in [
+            ".claude/file-history/0b5e/v1@2",
+            "people/acct_1/conversations/s1/file-history",
+            "people/acct_1/conversations/s1/file-history/0b5e/v1@2",
+            "people/acct_1/conversations/s1/.claude/file-history/0b5e/v1@2",
+            // The rest of the tables still apply in a person's directory.
+            "people/acct_1/.claude/backups/.claude.json.backup.1",
+        ] {
+            assert!(is_harness_excluded_path(excluded), "{excluded}");
         }
     }
 
