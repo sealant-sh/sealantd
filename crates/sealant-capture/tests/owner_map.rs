@@ -531,7 +531,12 @@ fn install_after_a_lockfile_change_as_a_person() {
         );
         let passed = ok && forced.trim_end().ends_with("exit=0");
         if pm == "pnpm" && !fowner {
-            assert!(text.contains("ERR_PNPM_CMD_SHIM_CHMOD"), "{text}");
+            // pnpm 12 says ERR_PNPM_CMD_SHIM_CHMOD; pnpm 9 a bare EPERM on the chmod.
+            assert!(
+                text.contains("ERR_PNPM_CMD_SHIM_CHMOD")
+                    || text.contains("EPERM: operation not permitted, chmod"),
+                "{text}"
+            );
         } else if !passed {
             failed.push(pm);
         }

@@ -858,7 +858,12 @@ async fn pnpm_installs_as_a_second_person_in_a_restored_worktree() {
     let log = std::fs::read_to_string(base.join("pnpm-as-bob.log")).unwrap_or_default();
     if withheld.is_some() {
         // No CAP_FOWNER (sealantd's own no-new-privileges): pnpm fails as it did before it.
-        assert!(log.contains("ERR_PNPM_CMD_SHIM_CHMOD"), "{status}\n{log}");
+        // pnpm 12 says ERR_PNPM_CMD_SHIM_CHMOD; pnpm 9 a bare EPERM on the chmod.
+        assert!(
+            log.contains("ERR_PNPM_CMD_SHIM_CHMOD")
+                || log.contains("EPERM: operation not permitted, chmod"),
+            "{status}\n{log}"
+        );
         return;
     }
     assert_eq!(status, "exit=0\n", "pnpm as a second person:\n{log}");
