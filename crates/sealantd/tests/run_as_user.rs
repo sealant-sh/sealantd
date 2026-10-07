@@ -471,6 +471,7 @@ async fn dotfiles_apply_as_the_user_and_answer_before_install_sh_ends() {
         (".mtest-bin/hello", 0o755),
         (".mtest-bin", 0o777 & !umask),
         (".config/mtest", 0o777 & !umask),
+        (".local/share/sealant-dotfiles/0", 0o777 & !umask),
         (".local/share/sealant-dotfiles/0/.mtest-bin", 0o750),
         (".local/share/sealant-dotfiles/0/install.sh", 0o755),
     ] {
@@ -578,7 +579,8 @@ async fn apply_refused(client: &mut Client, user: &str, archives: &Path) -> Stri
 
 /// The thread a person's dotfiles are written on (`RunAs::as_fs_user`) reaches the filesystem as
 /// them, with their groups, and holds no capability; a file only root may read is out of its
-/// reach. The calling thread is root as before.
+/// reach, and it may start no process. The calling thread is root as before, and the process
+/// as dumpable as it was.
 #[test]
 fn the_dotfiles_writer_thread_is_the_person_and_holds_nothing_of_root() {
     if !ready() {
@@ -599,14 +601,22 @@ fn the_dotfiles_writer_thread_is_the_person_and_holds_nothing_of_root() {
     std::fs::write(&roots, "root's\n").unwrap();
     std::fs::set_permissions(&roots, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
     let user = sealant_process::identity::RunAs::resolve(BOB).unwrap();
-    let (status, read) = user
+    let dumpable = sealant_process::identity::process_dumpable();
+    assert_eq!(dumpable, 1, "a root daemon starts dumpable");
+    let (status, read, spawned) = user
         .as_fs_user(|| {
+            use sealant_process::CommandGateExt;
             (
                 std::fs::read_to_string("/proc/thread-self/status").unwrap(),
                 std::fs::read_to_string(&roots).map_err(|e| e.kind()),
+                // A child of this thread would run as root: the gate refuses it.
+                Std::new("true").status_gated().map_err(|e| e.kind()),
             )
         })
         .unwrap();
+    assert_eq!(spawned.err(), Some(std::io::ErrorKind::PermissionDenied));
+    // The filesystem uid change made the process non-dumpable; the caller put it back.
+    assert_eq!(sealant_process::identity::process_dumpable(), dumpable);
     // Real, effective, saved and filesystem ids: only the filesystem ones are the person's.
     assert_eq!(field(&status, "Uid:")[3], BOB_UID.to_string(), "{status}");
     assert_eq!(field(&status, "Gid:")[3], GID.to_string(), "{status}");

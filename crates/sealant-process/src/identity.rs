@@ -354,22 +354,63 @@ impl RunAs {
     /// would change every thread's). The thread exits when `work` returns, so no other work
     /// ever runs with what it gave up. A panic in `work` resumes on the caller.
     ///
+    /// **`work` must never start a process.** Only the thread's filesystem identity is the
+    /// user's: its real, effective and saved uid stay 0 (so the user cannot signal the daemon),
+    /// and `execve` resets the filesystem uid to the effective one, so a child of this thread
+    /// would run as full root while the code reads "as the person". A person's commands start
+    /// from another thread, through [`RunAs::apply`]. The process gate enforces it: a spawn
+    /// through [`crate::spawn`] from this thread fails ([`on_fs_user_thread`]).
+    ///
+    /// Changing a thread's filesystem uid makes the kernel mark the whole process
+    /// non-dumpable (no core dump, `/proc/<pid>` pinned to root). That serves nothing here,
+    /// and the daemon's other threads never take a person's identity (their real and effective
+    /// uid, which ptrace and `/proc` check, stay root's on every thread), so once `work` has
+    /// returned the caller puts back the dumpable state it found.
+    ///
     /// # Errors
     /// The thread could not take the identity (a daemon without `CAP_SETUID` and `CAP_SETGID`):
     /// `work` does not run.
     pub fn as_fs_user<T: Send>(&self, work: impl FnOnce() -> T + Send) -> io::Result<T> {
         let (groups, uid, gid) = (&self.groups, self.uid, self.gid);
-        std::thread::scope(|scope| {
-            let thread = scope.spawn(move || {
-                become_fs_user(groups, uid, gid)?;
-                Ok(work())
-            });
-            match thread.join() {
-                Ok(result) => result,
-                Err(panic) => std::panic::resume_unwind(panic),
-            }
-        })
+        let dumpable = process_dumpable();
+        let joined = std::thread::scope(|scope| {
+            scope
+                .spawn(move || {
+                    ON_FS_USER_THREAD.with(|on| on.set(true));
+                    become_fs_user(groups, uid, gid)?;
+                    Ok(work())
+                })
+                .join()
+        });
+        if dumpable == 1 {
+            // SAFETY: as above.
+            unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 1, 0, 0, 0) };
+        }
+        match joined {
+            Ok(result) => result,
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
     }
+}
+
+thread_local! {
+    /// Set on a thread [`RunAs::as_fs_user`] runs work on.
+    static ON_FS_USER_THREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The process's dumpable state as `PR_GET_DUMPABLE` answers it: 1 dumpable, 0 not, 2 dumpable
+/// as `fs.suid_dumpable` says.
+#[must_use]
+pub fn process_dumpable() -> i32 {
+    // SAFETY: prctl takes integer arguments only.
+    unsafe { libc::prctl(libc::PR_GET_DUMPABLE, 0, 0, 0, 0) }
+}
+
+/// Whether the calling thread acts with a person's filesystem identity
+/// ([`RunAs::as_fs_user`]): a process it started would run as root, so none may start.
+#[must_use]
+pub fn on_fs_user_thread() -> bool {
+    ON_FS_USER_THREAD.with(std::cell::Cell::get)
 }
 
 /// On the calling thread only: the supplementary groups, filesystem gid and filesystem uid

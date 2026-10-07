@@ -403,11 +403,13 @@ fn apply_archives_staged_in(
             }
             Some(staging) => {
                 let unpacked = staging.dir.join(index.to_string());
-                unpack_checked(&archive, &unpacked)?;
+                let copy = staging.dir.join(format!("{index}.tar.gz"));
+                unpack_checked(&archive, &copy, &unpacked, &UnpackLimits::from_env())?;
                 mirror_into_home(&unpacked, &tree, home)?;
                 // Root's own directory: nothing of the person's is in it.
                 std::fs::remove_dir_all(&unpacked)
                     .map_err(|e| BootError::io_path("rm -rf", &unpacked, e))?;
+                std::fs::remove_file(&copy).map_err(|e| BootError::io_path("rm", &copy, e))?;
             }
         }
         pending.extend(apply_tree(
@@ -446,8 +448,13 @@ struct RootStaging {
 
 impl RootStaging {
     /// Make `root` the daemon's own private directory (a link or file planted there is replaced,
-    /// a directory someone else made is removed), remove what a previous daemon left in it, and
-    /// make this apply's directory inside.
+    /// a directory someone else made is removed), remove what an earlier daemon with this
+    /// daemon's pid left in it, and make this apply's directory inside.
+    ///
+    /// Every name is `<pid>-<incarnation>-<n>`. Only this pid's entries of another incarnation
+    /// are removed: that daemon is gone, since the pid is now this one's (a PID 1 restarted in
+    /// its container). Another pid's entries are left alone, a daemon beside this one sharing
+    /// `/run` included; what a dead one left goes with `/run` at the next boot.
     fn create(root: &Path) -> Result<Self, BootError> {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         if let Some(parent) = root.parent() {
@@ -459,24 +466,77 @@ impl RootStaging {
             nix::unistd::getegid().as_raw(),
         )
         .map_err(|e| BootError::io_path("make private directory", root, e))?;
-        let pid = std::process::id();
-        let ours = format!("{pid}-");
+        let pid = format!("{}-", std::process::id());
+        let ours = format!("{pid}{}-", incarnation());
         let entries =
             std::fs::read_dir(root).map_err(|e| BootError::io_path("read_dir", root, e))?;
         for entry in entries.flatten() {
-            if !entry.file_name().to_string_lossy().starts_with(&ours) {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with(&pid) && !name.starts_with(&ours) {
                 let _ = remove_tree(&entry.path());
             }
         }
         let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let dir = root.join(format!("{ours}{n}"));
-        // A daemon that is PID 1 again after a restart may meet its own leftover of this name.
-        remove_tree(&dir)?;
         std::fs::DirBuilder::new()
             .mode(0o700)
             .create(&dir)
             .map_err(|e| BootError::io_path("mkdir", &dir, e))?;
         Ok(Self { dir })
+    }
+}
+
+/// This daemon's run, as a name: the time it first staged an apply, in nanoseconds, in hex. Two
+/// daemons that had the same pid never share it.
+fn incarnation() -> &'static str {
+    static TOKEN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    TOKEN.get_or_init(|| {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        format!("{:x}", now.as_nanos())
+    })
+}
+
+/// The most a person's archive may unpack to, read from its listing before anything is
+/// extracted: what it unpacks lands in root's staging under `/run` (a tmpfs on a MicroVM, and
+/// the filesystem of the control socket), then twice in the home.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct UnpackLimits {
+    /// Every file's size, summed.
+    total: u64,
+    /// One file's size.
+    per_file: u64,
+}
+
+impl UnpackLimits {
+    /// The total cap's variable, in bytes.
+    const TOTAL_ENV: &str = "SEALANT_DOTFILES_MAX_UNPACKED_BYTES";
+    /// The per-file cap's variable, in bytes.
+    const PER_FILE_ENV: &str = "SEALANT_DOTFILES_MAX_FILE_BYTES";
+    const DEFAULT_TOTAL: u64 = 256 << 20;
+    const DEFAULT_PER_FILE: u64 = 64 << 20;
+
+    /// The caps the daemon's environment sets, else 256 MiB in all and 64 MiB a file. A value
+    /// that is not a whole number of bytes is ignored, and says so in the log.
+    fn from_env() -> Self {
+        let read = |key: &str, default: u64| match std::env::var(key) {
+            Err(_) => default,
+            Ok(value) => value.trim().parse().unwrap_or_else(|_| {
+                tracing::warn!(
+                    key,
+                    value,
+                    default,
+                    "not a number of bytes; the default applies"
+                );
+                default
+            }),
+        };
+        Self {
+            total: read(Self::TOTAL_ENV, Self::DEFAULT_TOTAL),
+            per_file: read(Self::PER_FILE_ENV, Self::DEFAULT_PER_FILE),
+        }
     }
 }
 
@@ -488,41 +548,64 @@ impl Drop for RootStaging {
     }
 }
 
-/// Unpack `archive` as root into `into` (made here, 0700, inside root's own staging
-/// directory), refusing an archive that could reach outside it.
+/// Unpack `archive` as root into `into` (made here, inside root's own 0700 staging directory),
+/// refusing an archive that could reach outside it or unpack to more than `limits`.
 ///
-/// Before anything is written, every entry must be a file, a directory or a link, with a
-/// relative path free of `..`, that does not lie under a link the archive makes (where `tar`
-/// would write through it). `tar` then extracts without owners (`--no-same-owner`), and what it
-/// made is checked again: nothing but files, directories and links, and no file with a link
-/// outside the tree.
-fn unpack_checked(archive: &Path, into: &Path) -> Result<(), BootError> {
+/// The archive is read once, through one descriptor opened without following a link, into
+/// `copy` (root's, beside `into`); everything after reads that copy, so whoever can write the
+/// archive's directory cannot change it between the checks and the extraction. Before anything
+/// is extracted, every entry must be a file, a directory or a link, with a relative path free of
+/// `..`, that does not lie under a link the archive makes (where `tar` would write through it);
+/// a hard link's target must be another entry of the archive, by such a path; and the sizes the
+/// listing gives must stay within `limits`. `tar` then extracts without owners
+/// (`--no-same-owner`), and what it made is checked again: nothing but files, directories and
+/// links, and no file with a link outside the tree.
+fn unpack_checked(
+    archive: &Path,
+    copy: &Path,
+    into: &Path,
+    limits: &UnpackLimits,
+) -> Result<(), BootError> {
+    use std::os::unix::fs::OpenOptionsExt;
     let refuse =
         |why: String| BootError::Dotfiles(format!("dotfiles archive {}: {why}", archive.display()));
-    let meta =
-        std::fs::symlink_metadata(archive).map_err(|e| BootError::io_path("stat", archive, e))?;
+    let mut source = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW)
+        .open(archive)
+        .map_err(|e| BootError::io_path("open", archive, e))?;
+    let meta = source
+        .metadata()
+        .map_err(|e| BootError::io_path("stat", archive, e))?;
     if !meta.is_file() {
         return Err(refuse("not a regular file".to_owned()));
     }
+    let mut kept = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(copy)
+        .map_err(|e| BootError::io_path("create", copy, e))?;
+    std::io::copy(&mut source, &mut kept).map_err(|e| BootError::io_path("copy", copy, e))?;
+    drop(kept);
     // The two listings at once: each is a `tar` and a gunzip of the whole archive.
-    let (names, kinds) = std::thread::scope(|scope| {
-        let kinds = scope.spawn(|| list_archive(archive, true));
-        let names = list_archive(archive, false);
-        let kinds = kinds
+    let (names, verbose) = std::thread::scope(|scope| {
+        let verbose = scope.spawn(|| list_archive(copy, true));
+        let names = list_archive(copy, false);
+        let verbose = verbose
             .join()
             .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-        (names, kinds)
+        (names, verbose)
     });
-    check_members(&names?, &kinds?).map_err(refuse)?;
-    std::fs::DirBuilder::new()
-        .mode(0o700)
-        .create(into)
-        .map_err(|e| BootError::io_path("mkdir", into, e))?;
+    check_members(&names?, &verbose?, limits).map_err(refuse)?;
+    // The tree's own mode as `tar` leaves it, as it was in the home: the 0700 directory around
+    // it keeps it root's only.
+    std::fs::create_dir(into).map_err(|e| BootError::io_path("mkdir", into, e))?;
     run_checked(
         Command::new("tar")
             .arg("--no-same-owner")
             .arg("-xzf")
-            .arg(archive)
+            .arg(copy)
             .arg("-C")
             .arg(into),
         "tar -xzf",
@@ -531,7 +614,7 @@ fn unpack_checked(archive: &Path, into: &Path) -> Result<(), BootError> {
 }
 
 /// `tar -tzf archive`, one member per line (`tar` escapes a newline in a name); with `verbose`,
-/// `tar -tvzf`, whose lines start with the member's type.
+/// `tar -tvzf`: the member's type and mode, owner, size, time, name, and a link's target.
 fn list_archive(archive: &Path, verbose: bool) -> Result<String, BootError> {
     let output = Command::new("tar")
         .arg(if verbose { "-tvzf" } else { "-tzf" })
@@ -560,34 +643,69 @@ fn member_key(name: &str) -> String {
 }
 
 /// The member listing's verdict: `Err` names the first entry refused, and why. `names` is
-/// `tar -t`'s listing and `kinds` `tar -tv`'s, line for line.
-fn check_members(names: &str, kinds: &str) -> Result<(), String> {
+/// `tar -t`'s listing and `verbose` `tar -tv`'s, line for line.
+fn check_members(names: &str, verbose: &str, limits: &UnpackLimits) -> Result<(), String> {
     let names: Vec<&str> = names.lines().collect();
-    let kinds: Vec<char> = kinds
-        .lines()
-        .map(|l| l.chars().next().unwrap_or('?'))
-        .collect();
-    if names.len() != kinds.len() {
+    let lines: Vec<&str> = verbose.lines().collect();
+    if names.len() != lines.len() {
         return Err(format!(
             "its listings disagree ({} names, {} entries)",
             names.len(),
-            kinds.len()
+            lines.len()
         ));
     }
     let mut links = std::collections::HashSet::new();
     let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    for (name, kind) in names.iter().zip(&kinds) {
-        *seen.entry(member_key(name)).or_default() += 1;
+    let mut hard_links = Vec::new();
+    let mut total: u64 = 0;
+    for (name, line) in names.iter().zip(&lines) {
+        let key = member_key(name);
+        *seen.entry(key.clone()).or_default() += 1;
         if name.starts_with('/') {
             return Err(format!("entry {name:?} has an absolute path"));
         }
         if name.split('/').any(|c| c == "..") {
             return Err(format!("entry {name:?} has a `..` in its path"));
         }
-        match kind {
-            '-' | 'd' => {}
-            'l' | 'h' => {
-                links.insert(member_key(name));
+        match line.chars().next().unwrap_or('?') {
+            'd' => {}
+            '-' => {
+                let size = line
+                    .split_whitespace()
+                    .nth(2)
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .ok_or_else(|| format!("entry {name:?}: its size cannot be read"))?;
+                if size > limits.per_file {
+                    return Err(format!(
+                        "entry {name:?} unpacks to {size} bytes, over the {} a file may \
+                         ({})",
+                        limits.per_file,
+                        UnpackLimits::PER_FILE_ENV
+                    ));
+                }
+                total = total.saturating_add(size);
+                if total > limits.total {
+                    return Err(format!(
+                        "it unpacks to more than {} bytes ({})",
+                        limits.total,
+                        UnpackLimits::TOTAL_ENV
+                    ));
+                }
+            }
+            kind @ ('l' | 'h') => {
+                if key.is_empty() {
+                    return Err(format!("entry {name:?} is a link at the archive's root"));
+                }
+                if kind == 'h' {
+                    let target = line
+                        .find(&format!(" {name} link to "))
+                        .map(|at| &line[at + name.len() + " link to ".len() + 1..])
+                        .ok_or_else(|| {
+                            format!("entry {name:?}: its hard link's target cannot be read")
+                        })?;
+                    hard_links.push((*name, target));
+                }
+                links.insert(key);
             }
             other => {
                 return Err(format!(
@@ -597,6 +715,19 @@ fn check_members(names: &str, kinds: &str) -> Result<(), String> {
             }
         }
     }
+    let under_a_link = |key: &str| -> Option<String> {
+        let mut prefix = String::new();
+        for component in key.split('/') {
+            if !prefix.is_empty() && links.contains(&prefix) {
+                return Some(prefix);
+            }
+            if !prefix.is_empty() {
+                prefix.push('/');
+            }
+            prefix.push_str(component);
+        }
+        None
+    };
     for name in &names {
         let key = member_key(name);
         // A second entry of a link's name (a directory over it) would have `tar` reach through it.
@@ -605,15 +736,28 @@ fn check_members(names: &str, kinds: &str) -> Result<(), String> {
                 "entry {name:?} is a link's name and appears more than once"
             ));
         }
-        let mut prefix = String::new();
-        for component in key.split('/') {
-            if !prefix.is_empty() && links.contains(&prefix) {
-                return Err(format!("entry {name:?} lies under the link {prefix:?}"));
-            }
-            if !prefix.is_empty() {
-                prefix.push('/');
-            }
-            prefix.push_str(component);
+        if let Some(link) = under_a_link(&key) {
+            return Err(format!("entry {name:?} lies under the link {link:?}"));
+        }
+    }
+    // A hard link's target, by the same rules, and an entry of the archive: never a file of
+    // the machine's (`tar` would link it into the tree).
+    for (name, target) in hard_links {
+        let key = member_key(target);
+        if target.starts_with('/') || target.split('/').any(|c| c == "..") || key.is_empty() {
+            return Err(format!(
+                "entry {name:?} is a hard link to {target:?}, outside the archive"
+            ));
+        }
+        if let Some(link) = under_a_link(&key) {
+            return Err(format!(
+                "entry {name:?} is a hard link to {target:?}, under the link {link:?}"
+            ));
+        }
+        if !seen.contains_key(&key) {
+            return Err(format!(
+                "entry {name:?} is a hard link to {target:?}, which the archive does not hold"
+            ));
         }
     }
     Ok(())
@@ -1555,31 +1699,127 @@ mod tests {
         assert!(status.success(), "tar {args:?}");
     }
 
+    /// Generous caps, for a test about something else.
+    const LIMITS: UnpackLimits = UnpackLimits {
+        total: 1 << 30,
+        per_file: 1 << 30,
+    };
+
+    /// One listed entry: type, size, name, and a link's target.
+    type Listed<'a> = (char, u64, &'a str, Option<&'a str>);
+
+    /// The `tar -t` and `tar -tv` listings of `entries`, as GNU tar prints them.
+    fn listing(entries: &[Listed<'_>]) -> (String, String) {
+        let (mut names, mut verbose) = (String::new(), String::new());
+        for (kind, size, name, target) in entries {
+            names.push_str(&format!("{name}\n"));
+            let tail = match (kind, target) {
+                ('h', Some(t)) => format!(" link to {t}"),
+                ('l', Some(t)) => format!(" -> {t}"),
+                _ => String::new(),
+            };
+            verbose.push_str(&format!(
+                "{kind}rw-r--r-- u/g {size:>8} 2026-10-07 17:31 {name}{tail}\n"
+            ));
+        }
+        (names, verbose)
+    }
+
     #[test]
     fn the_member_listing_refuses_what_could_reach_outside_the_tree() {
-        let ok = "./\n./.zshrc\n./.config/\n./.config/nvim/init.lua\n./.vim\n./b\n";
-        let kinds = "d\n-\nd\n-\nl\nh\n";
-        assert_eq!(check_members(ok, kinds), Ok(()));
-        for (names, kinds, why) in [
-            ("/etc/profile\n", "-\n", "absolute path"),
-            ("./../.zshrc\n", "-\n", "`..`"),
-            ("a/../../x\n", "-\n", "`..`"),
+        let (names, verbose) = listing(&[
+            ('d', 0, "./", None),
+            ('-', 10, "./.zshrc", None),
+            ('d', 0, "./.config/", None),
+            ('-', 10, "./.config/nvim/init.lua", None),
+            ('l', 0, "./.vim", Some("/opt/vim")),
+            ('h', 0, "./b", Some("./.zshrc")),
+            ('h', 0, "./my file link to x", Some("./.zshrc")),
+        ]);
+        assert_eq!(check_members(&names, &verbose, &LIMITS), Ok(()));
+        let file = |name| ('-', 1, name, None);
+        let link = |name, to| ('l', 0, name, Some(to));
+        let hard = |name, to| ('h', 0, name, Some(to));
+        let cases: Vec<(Vec<Listed<'_>>, &str)> = vec![
+            (vec![file("/etc/profile")], "absolute path"),
+            (vec![file("./../.zshrc")], "`..`"),
+            (vec![file("a/../../x")], "`..`"),
             (
-                "./.config\n./.config/fish/config.fish\n",
-                "l\n-\n",
+                vec![
+                    link("./.config", "/home/b/.config"),
+                    file("./.config/fish/config.fish"),
+                ],
                 "under the link \".config\"",
             ),
-            ("x\nx/y\n", "h\n-\n", "under the link \"x\""),
-            ("./x\nx\n", "l\nl\n", "more than once"),
-            ("./x\n./x/\n", "l\nd\n", "more than once"),
-            ("./x/\n./x\n", "d\nl\n", "more than once"),
-            ("./dev\n", "c\n", "type 'c'"),
-            ("./fifo\n", "p\n", "type 'p'"),
-            ("./a\n./b\n", "-\n", "listings disagree"),
-        ] {
-            let err = check_members(names, kinds).expect_err(names);
+            (
+                vec![hard("x", "y"), file("y"), file("x/y")],
+                "under the link \"x\"",
+            ),
+            (vec![link("./x", "a"), link("x", "b")], "more than once"),
+            (
+                vec![link("./x", "a"), ('d', 0, "./x/", None)],
+                "more than once",
+            ),
+            (
+                vec![('d', 0, "./x/", None), link("./x", "a")],
+                "more than once",
+            ),
+            (vec![link(".", "/etc")], "at the archive's root"),
+            (vec![link("./", "/etc")], "at the archive's root"),
+            (vec![hard("./h", "/etc/shadow")], "outside the archive"),
+            (vec![hard("./h", "../../etc/shadow")], "outside the archive"),
+            (vec![hard("./h", ".")], "outside the archive"),
+            (
+                vec![link("./s", "/etc"), hard("./h", "./s/shadow")],
+                "under the link \"s\"",
+            ),
+            (vec![hard("./h", "./missing")], "does not hold"),
+            (vec![('c', 0, "./dev", None)], "type 'c'"),
+            (vec![('p', 0, "./fifo", None)], "type 'p'"),
+        ];
+        for (entries, why) in cases {
+            let (names, verbose) = listing(&entries);
+            let err = check_members(&names, &verbose, &LIMITS).expect_err(&names);
             assert!(err.contains(why), "{names:?}: {err}");
         }
+        let (names, _) = listing(&[file("./a"), file("./b")]);
+        let (_, verbose) = listing(&[file("./a")]);
+        let err = check_members(&names, &verbose, &LIMITS).expect_err("disagree");
+        assert!(err.contains("listings disagree"), "{err}");
+    }
+
+    #[test]
+    fn the_listing_s_sizes_are_capped_per_file_and_in_all() {
+        let limits = UnpackLimits {
+            total: 100,
+            per_file: 60,
+        };
+        let (names, verbose) = listing(&[('-', 60, "./a", None), ('-', 40, "./b", None)]);
+        assert_eq!(check_members(&names, &verbose, &limits), Ok(()));
+        let (names, verbose) = listing(&[('-', 61, "./a", None)]);
+        let err = check_members(&names, &verbose, &limits).expect_err("one file");
+        assert!(
+            err.contains("61 bytes") && err.contains(UnpackLimits::PER_FILE_ENV),
+            "{err}"
+        );
+        let (names, verbose) = listing(&[
+            ('-', 60, "./a", None),
+            ('-', 40, "./b", None),
+            ('-', 1, "./c", None),
+        ]);
+        let err = check_members(&names, &verbose, &limits).expect_err("in all");
+        assert!(
+            err.contains("more than 100") && err.contains(UnpackLimits::TOTAL_ENV),
+            "{err}"
+        );
+        let (names, _) = listing(&[('-', 1, "./a", None)]);
+        let err = check_members(&names, "-rw-r--r-- u/g\n", &limits).expect_err("no size");
+        assert!(err.contains("size cannot be read"), "{err}");
+    }
+
+    /// `unpack_checked` of `archive` into `into`, its copy beside the archive.
+    fn unpack(archive: &Path, into: &Path, limits: &UnpackLimits) -> Result<(), BootError> {
+        unpack_checked(archive, &archive.with_extension("copy"), into, limits)
     }
 
     /// A tree of the usual kinds, packed as the launching adapter packs one.
@@ -1600,6 +1840,8 @@ mod tests {
             .expect("chmod");
         std::os::unix::fs::symlink("/nonexistent/abs", src.join(".abs")).expect("symlink");
         std::os::unix::fs::symlink(".zshrc", src.join(".rel")).expect("symlink");
+        // A hard link `tar` lists as `link to ./.zshrc`.
+        std::fs::hard_link(src.join(".zshrc"), src.join(".zshrc-again")).expect("link");
         let archive = work.join("0.tar.gz");
         tar_in(
             work,
@@ -1619,7 +1861,7 @@ mod tests {
         let work = tempfile::tempdir().expect("tmp");
         let archive = pack_ordinary(work.path());
         let unpacked = work.path().join("unpacked");
-        unpack_checked(&archive, &unpacked).expect("unpack");
+        unpack(&archive, &unpacked, &LIMITS).expect("unpack");
 
         let fx = Fixture::new();
         let tree = fx.home.archive_staging_dir().join("0");
@@ -1644,6 +1886,10 @@ mod tests {
                 & 0o7777
         };
         assert_eq!(mode(".zshrc"), 0o600);
+        assert_eq!(
+            std::fs::read_to_string(tree.join(".zshrc-again")).expect("read"),
+            "export A=1\n"
+        );
         assert_eq!(mode("bin/hello"), 0o755);
         assert_eq!(mode("bin"), 0o750);
         assert_eq!(
@@ -1691,7 +1937,7 @@ mod tests {
         );
         for (archive, why) in [(absolute, "absolute path"), (dotdot, "`..`")] {
             let into = work.path().join("into");
-            let err = unpack_checked(&archive, &into).expect_err("refused");
+            let err = unpack(&archive, &into, &LIMITS).expect_err("refused");
             assert!(format!("{err}").contains(why), "{err}");
             assert!(!into.exists(), "nothing was unpacked");
         }
@@ -1724,7 +1970,7 @@ mod tests {
             .status()
             .expect("gzip");
         assert!(status.success());
-        let err = unpack_checked(&through, &work.path().join("into1")).expect_err("refused");
+        let err = unpack(&through, &work.path().join("into1"), &LIMITS).expect_err("refused");
         assert!(format!("{err}").contains("under the link \"dir\""), "{err}");
         assert!(!victim.join("planted").exists());
 
@@ -1746,8 +1992,28 @@ mod tests {
                 ".",
             ],
         );
-        let err = unpack_checked(&fifo, &work.path().join("into2")).expect_err("refused");
+        let err = unpack(&fifo, &work.path().join("into2"), &LIMITS).expect_err("refused");
         assert!(format!("{err}").contains("type 'p'"), "{err}");
+    }
+
+    #[test]
+    fn a_real_archive_over_a_cap_or_behind_a_link_is_refused_and_unpacks_nothing() {
+        let work = tempfile::tempdir().expect("tmp");
+        let archive = pack_ordinary(work.path());
+        let into = work.path().join("into");
+        let tight = UnpackLimits {
+            total: 1 << 20,
+            per_file: 8,
+        };
+        let err = unpack(&archive, &into, &tight).expect_err("over the cap");
+        assert!(format!("{err}").contains("a file may"), "{err}");
+        assert!(!into.exists());
+        // The archive is read through one descriptor that does not follow a link.
+        let link = work.path().join("link.tar.gz");
+        std::os::unix::fs::symlink(&archive, &link).expect("symlink");
+        let err = unpack(&link, &into, &LIMITS).expect_err("a link");
+        assert!(format!("{err}").contains("open"), "{err}");
+        assert!(!into.exists());
     }
 
     #[test]
@@ -1779,12 +2045,21 @@ mod tests {
             std::fs::metadata(&dir).expect("stat").permissions().mode() & 0o7777,
             0o700
         );
-        std::fs::create_dir_all(root.join("1-0/x")).expect("leftover");
+        // An earlier daemon of this pid left one; another daemon's is its own.
+        let earlier = root.join(format!("{}-0-0", std::process::id()));
+        let other = root.join(format!("{}-1-0", std::process::id() + 1));
+        for leftover in [&earlier, &other] {
+            std::fs::create_dir_all(leftover.join("x")).expect("leftover");
+        }
         drop(staging);
         assert!(!dir.exists());
         let again = RootStaging::create(&root).expect("staging");
-        assert!(!root.join("1-0").exists() || std::process::id() == 1);
-        drop(again);
+        assert!(!earlier.exists(), "this pid's earlier daemon is gone");
+        assert!(other.exists(), "another pid's staging is left alone");
+        // Two applies at once in this daemon: neither removes the other's.
+        let beside = RootStaging::create(&root).expect("staging");
+        assert!(again.dir.exists() && beside.dir.exists());
+        drop((again, beside));
     }
 
     // Real applies: archives packed with tar, applied through the manifest into a throwaway home,
