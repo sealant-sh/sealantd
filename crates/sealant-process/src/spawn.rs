@@ -99,11 +99,26 @@ impl Drop for SpawnedPid {
     }
 }
 
+/// No process starts from a thread acting with a person's filesystem identity
+/// ([`crate::identity::RunAs::as_fs_user`]): its child would run as root.
+fn refuse_on_fs_user_thread() -> io::Result<()> {
+    if crate::identity::on_fs_user_thread() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "a process may not start from a thread acting as a person's filesystem identity \
+             (it would run as root)",
+        ));
+    }
+    Ok(())
+}
+
 /// Spawn a [`std::process::Command`] under the gate.
 ///
 /// # Errors
-/// Returns whatever `Command::spawn` returns.
+/// Returns whatever `Command::spawn` returns; `PermissionDenied` from a thread acting with a
+/// person's filesystem identity.
 pub fn spawn_std(command: &mut Command) -> io::Result<(Child, SpawnedPid)> {
+    refuse_on_fs_user_thread()?;
     let mut gate = lock_gate();
     let child = command.spawn()?;
     let guard = SpawnedPid::register(&mut gate, child.id() as i32);
@@ -115,10 +130,12 @@ pub fn spawn_std(command: &mut Command) -> io::Result<(Child, SpawnedPid)> {
 /// child has been reaped (usually: move it into the task that awaits `child.wait()`).
 ///
 /// # Errors
-/// Returns whatever `tokio::process::Command::spawn` returns.
+/// Returns whatever `tokio::process::Command::spawn` returns; `PermissionDenied` from a thread
+/// acting with a person's filesystem identity.
 pub fn spawn_tokio(
     command: &mut tokio::process::Command,
 ) -> io::Result<(tokio::process::Child, SpawnedPid)> {
+    refuse_on_fs_user_thread()?;
     let mut gate = lock_gate();
     let child = command.spawn()?;
     let pid = child.id().map_or(-1, |p| p as i32);

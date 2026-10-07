@@ -111,6 +111,11 @@ The daemon runs as root, and so does every process it starts, unless the request
   write into the home (directories, files, links, modes) is made on a thread whose filesystem
   uid, gid and groups are the person's and that holds no capability, so the kernel checks it as
   theirs: a link they planted into another person's 0700 home fails the apply, naming the path.
+  Root reads each archive once, through a descriptor that does not follow a link, into its own
+  directory, and refuses it before extracting when a link sits at its root, a hard link points
+  outside it, or it unpacks to more than `SEALANT_DOTFILES_MAX_UNPACKED_BYTES` (256 MiB) in all
+  or `SEALANT_DOTFILES_MAX_FILE_BYTES` (64 MiB) in one file. No process may start from the
+  writer thread (it would run as root; the spawn gate refuses it).
 - `runtime.getCapabilities` names `exec.user`, `dotfiles.user` and `restore.owner_map` in
   `supports`. `sealantd capabilities --json` prints the same, with the version, without booting,
   for an image build to record.
