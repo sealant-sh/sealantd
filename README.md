@@ -96,6 +96,16 @@ The daemon runs as root, and so does every process it starts, unless the request
   could not read it).
 - Root, a user in root's group, or a user the passwd database does not have, is refused.
   `openSftp` takes no user yet: an SFTP bridge runs as root.
+- **Only the executor's people.** sealantd decides who a `user` may be from the passwd entry it
+  resolves, whatever the caller checked first (a person with `sudo` in the executor can edit
+  `/etc/passwd`, so a check made before asking proves nothing alone). With an owner map
+  (`SEALANT_CAPTURE_OWNER_MAP`), the uid must be one of the map's `people` or its `worktree`
+  uid, and its primary group the map's `gid`. Without one, the uid must be in Mend's reserved
+  range, 40001-49999 (`sealant_runtime_core::PERSON_UID_MIN`..=`PERSON_UID_MAX`), and its
+  primary group 40000 (`PERSON_GID`, Mend's `mend`). `exec`, `openSession` and `dotfiles.apply`
+  refuse anyone else with `invalid-argument` before anything starts, saying why
+  (`user "1000" is refused: uid 1000 is not one of this executor's people (owner map)`). A
+  request that names no user is unchanged.
 - The dotfiles applier runs as a user into their passwd home, its commands with a clean
   environment (`PATH`, the locale, `TERM` and the person's identity; nothing of the daemon's),
   through

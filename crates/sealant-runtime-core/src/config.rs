@@ -40,6 +40,76 @@ pub struct Bind {
     pub subpath: String,
 }
 
+/// The primary group of Mend's people (`mend`) where no owner map names one: the gid a user named
+/// to run as must have as its primary group under [`People::Reserved`].
+pub const PERSON_GID: u32 = 40_000;
+/// The lowest uid of Mend's reserved range for its people (Mend's ADR 0016).
+pub const PERSON_UID_MIN: u32 = 40_001;
+/// The highest uid of Mend's reserved range for its people.
+pub const PERSON_UID_MAX: u32 = 49_999;
+
+/// Which users a process may run as when a request names one (`exec`, `openSession` and
+/// `dotfiles.apply` take `user`). The daemon decides from the resolved passwd entry, never from
+/// what the caller checked: a person with `sudo` in the executor can edit `/etc/passwd`, so a
+/// check made before asking the daemon proves nothing on its own. Root and root's group are
+/// refused under either rule.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", tag = "kind")]
+pub enum People {
+    /// No owner map: a uid in Mend's reserved range ([`PERSON_UID_MIN`] to [`PERSON_UID_MAX`])
+    /// whose primary group is [`PERSON_GID`].
+    #[default]
+    Reserved,
+    /// The boot's owner map (`SEALANT_CAPTURE_OWNER_MAP`): one of its people's uids or its
+    /// change owner's (`worktree`), whose primary group is the map's `gid`.
+    Listed {
+        /// The map's shared group.
+        gid: u32,
+        /// The map's people's uids and its change owner's.
+        uids: Vec<u32>,
+    },
+}
+
+impl People {
+    /// Whether a user with `uid` and primary group `gid` may run a process here; `Err` says why
+    /// not, in plain words.
+    ///
+    /// # Errors
+    /// The uid or the primary group is not one this rule admits.
+    pub fn admit(&self, uid: u32, gid: u32) -> Result<(), String> {
+        match self {
+            Self::Reserved => {
+                if !(PERSON_UID_MIN..=PERSON_UID_MAX).contains(&uid) {
+                    return Err(format!(
+                        "uid {uid} is outside the range of Mend's people \
+                         ({PERSON_UID_MIN}-{PERSON_UID_MAX}; no owner map)"
+                    ));
+                }
+                if gid != PERSON_GID {
+                    return Err(format!(
+                        "uid {uid} has primary group {gid}, not the group of Mend's people \
+                         ({PERSON_GID}; no owner map)"
+                    ));
+                }
+            }
+            Self::Listed { gid: group, uids } => {
+                if !uids.contains(&uid) {
+                    return Err(format!(
+                        "uid {uid} is not one of this executor's people (owner map)"
+                    ));
+                }
+                if gid != *group {
+                    return Err(format!(
+                        "uid {uid} has primary group {gid}, not this executor's people's group \
+                         {group} (owner map)"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// All runtime configuration. Values are validated by [`RuntimeConfig::validate`] before the
 /// daemon reports healthy. Secrets are never emitted; [`RuntimeConfig::sanitized_summary`] exposes
 /// only allowlisted, non-secret fields.
@@ -74,6 +144,10 @@ pub struct RuntimeConfig {
     /// here: they reach every person.
     #[serde(default)]
     pub person_withheld: Vec<String>,
+    /// The users a request may name to run a process as ([`People`]): the boot's owner map's
+    /// people when it has one, else Mend's reserved range.
+    #[serde(default)]
+    pub people: People,
     /// Set `PR_SET_NO_NEW_PRIVS` on the daemon (plan §18), inherited by every child: no child
     /// gains privileges through a setuid binary or file capabilities. On by default. Off only in
     /// a per-person executor (a boot under an owner map, Mend's ADR 0016): every person there has
@@ -170,6 +244,7 @@ impl RuntimeConfig {
             child_env: Vec::new(),
             redact_literals: Vec::new(),
             person_withheld: Vec::new(),
+            people: People::Reserved,
             no_new_privileges: true,
             child_uid: None,
             child_gid: None,
@@ -296,6 +371,62 @@ mod tests {
     #[test]
     fn defaults_validate() {
         assert!(cfg().validate().is_ok());
+    }
+
+    #[test]
+    fn without_an_owner_map_only_mend_s_reserved_range_in_its_group_runs() {
+        let people = People::default();
+        assert_eq!(people, People::Reserved);
+        for uid in [PERSON_UID_MIN, 40_012, PERSON_UID_MAX] {
+            assert_eq!(people.admit(uid, PERSON_GID), Ok(()), "{uid}");
+        }
+        for uid in [0, 1000, PERSON_GID, PERSON_UID_MAX + 1, 65_534] {
+            let why = people.admit(uid, PERSON_GID).unwrap_err();
+            assert!(why.contains(&format!("uid {uid} is outside")), "{why}");
+            assert!(why.contains("no owner map"), "{why}");
+        }
+        for gid in [0, 1000, 40_970] {
+            let why = people.admit(40_012, gid).unwrap_err();
+            assert!(why.contains(&format!("primary group {gid}")), "{why}");
+        }
+    }
+
+    #[test]
+    fn with_an_owner_map_only_its_people_in_its_group_run() {
+        let people = People::Listed {
+            gid: 41_000,
+            uids: vec![40_012, 40_031],
+        };
+        assert_eq!(people.admit(40_012, 41_000), Ok(()));
+        assert_eq!(people.admit(40_031, 41_000), Ok(()));
+        // In Mend's reserved range and group, but not on the map.
+        let why = people.admit(40_013, PERSON_GID).unwrap_err();
+        assert_eq!(
+            why,
+            "uid 40013 is not one of this executor's people (owner map)"
+        );
+        // On the map, in another group.
+        let why = people.admit(40_012, PERSON_GID).unwrap_err();
+        assert!(why.contains("primary group 40000"), "{why}");
+        assert!(why.contains("owner map"), "{why}");
+        assert!(people.admit(0, 41_000).is_err());
+        assert!(people.admit(40_012, 0).is_err());
+        // A map lists whomever it lists, outside the reserved range too.
+        let listed = People::Listed {
+            gid: 1000,
+            uids: vec![1000],
+        };
+        assert_eq!(listed.admit(1000, 1000), Ok(()));
+    }
+
+    #[test]
+    fn a_config_without_people_reads_as_the_reserved_range() {
+        let json = serde_json::to_value(cfg()).unwrap();
+        assert_eq!(json["people"], serde_json::json!({"kind": "reserved"}));
+        let mut object = json.as_object().unwrap().clone();
+        object.remove("people");
+        let read: RuntimeConfig = serde_json::from_value(object.into()).unwrap();
+        assert_eq!(read.people, People::Reserved);
     }
 
     #[test]

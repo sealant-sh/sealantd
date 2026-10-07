@@ -164,12 +164,13 @@ impl ProcessRuntime {
             .clone()
             .map_or_else(|| self.config.workspace_root.clone(), Into::into);
 
-        // A named user: resolved here, its private directories made, its identity set in the
-        // child before exec ([`crate::identity`]).
+        // A named user: resolved here and admitted only if the runtime's people include it,
+        // its private directories made, its identity set in the child before exec
+        // ([`crate::identity`]).
         let run_as = args
             .user
             .as_deref()
-            .map(crate::identity::RunAs::resolve)
+            .map(|user| crate::identity::RunAs::resolve(user, &self.config.people))
             .transpose()
             .map_err(ControlError::invalid_argument)?;
         if let Some(user) = &run_as {

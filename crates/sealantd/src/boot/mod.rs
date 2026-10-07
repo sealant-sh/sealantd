@@ -442,6 +442,8 @@ fn into_runtime_config(config: &BootConfig, secret_env: &[(String, String)]) -> 
     // A process run as a person never gets the launcher's declared harness logins; the
     // project's secrets (the secret environment) reach every person.
     runtime_config.person_withheld = config.declared_harness_keys.clone();
+    // Who a request may name to run as: the owner map's people, else Mend's reserved range.
+    runtime_config.people = config::people(&config.source);
     runtime_config.no_new_privileges = config.no_new_privileges;
     runtime_config
 }
@@ -1278,5 +1280,32 @@ mod tests {
         let mut per_person = boot_config(&[]);
         per_person.no_new_privileges = false;
         assert!(!into_runtime_config(&per_person, &[]).no_new_privileges);
+
+        // Who a request may run as: the map's people and its change owner, in its group, even
+        // when it names nobody; without a map (or another source), Mend's reserved range.
+        assert_eq!(
+            into_runtime_config(&clone, &[]).people,
+            sealant_runtime_core::People::Reserved
+        );
+        assert_eq!(
+            config::people(&capture(None)),
+            sealant_runtime_core::People::Reserved
+        );
+        assert_eq!(
+            config::people(&capture(Some(map(&[])))),
+            sealant_runtime_core::People::Listed {
+                gid: 40000,
+                uids: vec![40012]
+            }
+        );
+        let mut mapped = boot_config(&[]);
+        mapped.source = capture(Some(map(&[("acct_a", 40012), ("acct_b", 40031)])));
+        assert_eq!(
+            into_runtime_config(&mapped, &[]).people,
+            sealant_runtime_core::People::Listed {
+                gid: 40000,
+                uids: vec![40012, 40031]
+            }
+        );
     }
 }

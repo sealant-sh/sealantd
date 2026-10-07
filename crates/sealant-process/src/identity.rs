@@ -12,6 +12,12 @@
 //! locks); the forked child only makes system calls, `setgroups`, `setgid`, `prctl`, `setuid`,
 //! `capset` and `umask`, before `exec`. A process for which no user is named runs
 //! as before.
+//!
+//! Only a user the runtime's [`People`] admits is run as, decided here from the passwd entry the
+//! daemon reads (a caller's own check proves nothing: a person with `sudo` can edit
+//! `/etc/passwd`): with the boot's owner map, one of its people or its change owner, in its
+//! group; without one, a uid in Mend's reserved range (40001-49999) whose primary group is
+//! 40000. Root and root's group are refused under either.
 #![allow(unsafe_code)]
 
 use std::ffi::CString;
@@ -21,6 +27,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 
 use nix::unistd::{Gid, Uid, User};
+pub use sealant_runtime_core::People;
 
 /// The umask a person's processes run with: what they create is the group's to write.
 pub const PERSON_UMASK: u32 = 0o002;
@@ -210,8 +217,10 @@ pub struct RunAs {
 
 impl RunAs {
     /// Look `user` up: a login name, or a decimal uid. Refused for root (a process names no user
-    /// to run as root) and for a user the passwd database does not have.
-    pub fn resolve(user: &str) -> Result<Self, String> {
+    /// to run as root), for a user the passwd database does not have, and for a user `people`
+    /// does not admit ([`People::admit`]: the boot's owner map's people, else Mend's reserved
+    /// range in its group), decided from the passwd entry as the daemon reads it.
+    pub fn resolve(user: &str, people: &People) -> Result<Self, String> {
         let user = user.trim();
         if user.is_empty() {
             return Err("the user to run as is empty".to_owned());
@@ -232,6 +241,9 @@ impl RunAs {
                 "user {user:?} has root's group as its primary group: a person never runs in it"
             ));
         }
+        people
+            .admit(entry.uid.as_raw(), entry.gid.as_raw())
+            .map_err(|why| format!("user {user:?} is refused: {why}"))?;
         let name = CString::new(entry.name.as_bytes())
             .map_err(|_| format!("user {user:?} has a name with a NUL in it"))?;
         let groups: Vec<u32> = nix::unistd::getgrouplist(&name, entry.gid)
@@ -674,11 +686,62 @@ mod tests {
 
     #[test]
     fn root_and_unknown_users_are_refused() {
-        assert!(RunAs::resolve("root").is_err());
-        assert!(RunAs::resolve("0").is_err());
-        assert!(RunAs::resolve("").is_err());
-        assert!(RunAs::resolve("no-such-user-sealantd-test").is_err());
-        assert!(RunAs::resolve("4294967000").is_err());
+        // Root stays refused even where a map would list uid and gid 0.
+        let root_listed = People::Listed {
+            gid: 0,
+            uids: vec![0],
+        };
+        for people in [People::Reserved, root_listed] {
+            assert!(
+                RunAs::resolve("root", &people)
+                    .unwrap_err()
+                    .contains("is root")
+            );
+            assert!(
+                RunAs::resolve("0", &people)
+                    .unwrap_err()
+                    .contains("is root")
+            );
+            assert!(RunAs::resolve("", &people).is_err());
+            assert!(RunAs::resolve("no-such-user-sealantd-test", &people).is_err());
+            assert!(RunAs::resolve("4294967000", &people).is_err());
+        }
+    }
+
+    /// A user the passwd database has but the rule does not admit is refused, after the lookup.
+    #[test]
+    fn a_user_outside_the_people_is_refused() {
+        let me = nix::unistd::getuid();
+        if me.is_root() {
+            return;
+        }
+        let entry = User::from_uid(me).unwrap().unwrap();
+        let (uid, gid) = (me.as_raw(), entry.gid.as_raw());
+        let me = uid.to_string();
+        let listed = People::Listed {
+            gid,
+            uids: vec![uid],
+        };
+        assert!(RunAs::resolve(&me, &listed).is_ok());
+        let others = People::Listed {
+            gid,
+            uids: vec![uid.wrapping_add(1)],
+        };
+        let why = RunAs::resolve(&me, &others).unwrap_err();
+        assert!(
+            why.contains(&format!("uid {uid} is not one of this executor's people")),
+            "{why}"
+        );
+        let other_group = People::Listed {
+            gid: gid.wrapping_add(1),
+            uids: vec![uid],
+        };
+        let why = RunAs::resolve(&me, &other_group).unwrap_err();
+        assert!(why.contains(&format!("primary group {gid}")), "{why}");
+        if !(40_001..=49_999).contains(&uid) {
+            let why = RunAs::resolve(&me, &People::Reserved).unwrap_err();
+            assert!(why.contains("no owner map"), "{why}");
+        }
     }
 
     #[test]
@@ -760,10 +823,14 @@ mod tests {
         if me.is_root() {
             return;
         }
-        let user = RunAs::resolve(&me.as_raw().to_string()).unwrap();
+        let people = People::Listed {
+            gid: User::from_uid(me).unwrap().unwrap().gid.as_raw(),
+            uids: vec![me.as_raw()],
+        };
+        let user = RunAs::resolve(&me.as_raw().to_string(), &people).unwrap();
         assert_eq!(user.uid, me.as_raw());
         assert!(user.groups.contains(&user.gid));
-        let by_name = RunAs::resolve(&user.name).unwrap();
+        let by_name = RunAs::resolve(&user.name, &people).unwrap();
         assert_eq!(by_name, user);
         let env = user.env();
         assert!(env.contains(&("USER".to_owned(), user.name.clone())));

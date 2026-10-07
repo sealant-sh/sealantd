@@ -4,9 +4,13 @@
 //! every child inherits it; `dotfiles.apply` writes a person's dotfiles into their home as them
 //! and answers before their `./install.sh` ends, which runs as them.
 //!
-//! These need root and real users: they add a group and two users to the passwd database, so
-//! they run only with `SEALANTD_REQUIRE_ROOT_TESTS=1`, as root (CI runs them under sudo; locally,
-//! in a container).
+//! A request names only a user the runtime's people admit: the owner map's people (most tests
+//! here run as a per-person executor whose map names Bob and Cat), or without a map Mend's
+//! reserved range in its group; anyone else is refused before anything starts.
+//!
+//! These need root and real users: they add groups and users to the passwd database, so they
+//! run only with `SEALANTD_REQUIRE_ROOT_TESTS=1`, as root (CI runs them under sudo; locally, in a
+//! container).
 
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -19,7 +23,7 @@ use sealant_protocol::{
     ClientMessage, Command, CommandResult, ControlRequest, ControlResponse, DotfilesApplyArgs,
     ExecArgs, OpenSessionArgs, RequestId, ResponseOutcome, ServerMessage, SessionMode,
 };
-use sealant_runtime_core::{RuntimeConfig, new_runtime_id};
+use sealant_runtime_core::{PERSON_GID, People, RuntimeConfig, new_runtime_id};
 use sealantd::Runtime;
 use sealantd::shutdown::ShutdownSignal;
 use tokio::io::{DuplexStream, ReadHalf, WriteHalf};
@@ -36,6 +40,19 @@ const BOB_UID: u32 = 40972;
 /// 0700 as Mend makes every home.
 const CAT: &str = "mtestcat";
 const CAT_UID: u32 = 40973;
+/// A person as Mend makes one without an owner map: a uid in its reserved range whose primary
+/// group is [`PERSON_GID`] (`mend`; made here as `mtestmend` when the database lacks it).
+const DAN: &str = "mtestdan";
+const DAN_UID: u32 = 40974;
+
+/// The people of the executor most tests here run as: an owner map naming Bob and Cat, in
+/// [`GROUP`].
+fn per_person() -> People {
+    People::Listed {
+        gid: GID,
+        uids: vec![BOB_UID, CAT_UID],
+    }
+}
 
 /// Whether these run here: as root with `SEALANTD_REQUIRE_ROOT_TESTS=1`. They make the test
 /// group and users once.
@@ -85,7 +102,25 @@ fn ready() -> bool {
             "/bin/sh",
             CAT,
         ]);
-        for user in [BOB, CAT] {
+        let has_group = Std::new("getent")
+            .args(["group", &PERSON_GID.to_string()])
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if !has_group {
+            run(&["groupadd", "-g", &PERSON_GID.to_string(), "mtestmend"]);
+        }
+        run(&[
+            "useradd",
+            "-m",
+            "-u",
+            &DAN_UID.to_string(),
+            "-g",
+            &PERSON_GID.to_string(),
+            "-s",
+            "/bin/sh",
+            DAN,
+        ]);
+        for user in [BOB, CAT, DAN] {
             std::fs::set_permissions(
                 format!("/home/{user}"),
                 std::os::unix::fs::PermissionsExt::from_mode(0o700),
@@ -122,22 +157,25 @@ impl Client {
         child_env: Vec<sealant_protocol::EnvVar>,
         person_withheld: Vec<String>,
     ) -> Self {
-        Self::start_posture(workspace, child_env, person_withheld, false)
+        Self::start_posture(workspace, child_env, person_withheld, false, per_person())
     }
 
     /// With the daemon's no-new-privileges posture given (`true`: every executor but a
-    /// per-person one). Setting it is irreversible on the calling thread.
+    /// per-person one), and the people a request may name. Setting no-new-privileges is
+    /// irreversible on the calling thread.
     fn start_posture(
         workspace: &Path,
         child_env: Vec<sealant_protocol::EnvVar>,
         person_withheld: Vec<String>,
         no_new_privileges: bool,
+        people: People,
     ) -> Self {
         let mut config = RuntimeConfig::new(new_runtime_id());
         config.workspace_root = workspace.to_path_buf();
         config.child_env = child_env;
         config.person_withheld = person_withheld;
         config.no_new_privileges = no_new_privileges;
+        config.people = people;
         let runtime = Runtime::new(config, Arc::new(ShutdownSignal::new(1000)));
         runtime.mark_healthy();
         let (_sd_tx, sd_rx) = watch::channel(false);
@@ -358,6 +396,184 @@ async fn a_session_runs_as_the_user_it_names() {
             assert_eq!(wait_for(&tty), format!("{BOB}\n"));
         }
     }
+}
+
+/// `user` named by `exec`, by `openSession` (pipe and PTY) and by `dotfiles.apply`, each answered
+/// with its refusal; `out` is what each would have written had it started.
+async fn refused_everywhere(client: &mut Client, user: &str, out: &Path) -> Vec<String> {
+    let script = format!("id -u > {0}.tmp && mv {0}.tmp {0}", out.display());
+    let mut commands = vec![Command::Exec(exec(script.clone(), Some(user)))];
+    for mode in [SessionMode::Pipe, SessionMode::Pty] {
+        commands.push(Command::OpenSession(OpenSessionArgs {
+            user: Some(user.to_owned()),
+            execution_id: None,
+            shell: Some("/bin/sh".to_owned()),
+            args: vec!["-c".to_owned(), script.clone()],
+            cwd: None,
+            env: vec![],
+            cols: 80,
+            rows: 24,
+            term: None,
+            mode,
+        }));
+    }
+    let archives = out.with_extension("archives");
+    std::fs::create_dir_all(&archives).unwrap();
+    commands.push(Command::DotfilesApply(Box::new(DotfilesApplyArgs {
+        user: user.to_owned(),
+        repository: None,
+        archive_dir: Some(archives.display().to_string()),
+        execution_id: None,
+    })));
+    let mut messages = Vec::new();
+    for command in commands {
+        match client.request(command).await.outcome {
+            ResponseOutcome::Error { error } => {
+                assert_eq!(
+                    error.code,
+                    sealant_protocol::ControlErrorCode::InvalidArgument,
+                    "{user}: {error:?}"
+                );
+                messages.push(error.message);
+            }
+            ResponseOutcome::Ok { result } => panic!("{user} ran: {result:?}"),
+        }
+    }
+    messages
+}
+
+/// Nothing of a refused request started: what it would have written is still not there.
+fn never_written(out: &Path) {
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(!out.exists(), "{} was written", out.display());
+    assert!(!out.with_extension("tmp").exists());
+}
+
+/// Under an owner map, a request may name only the map's people (and its change owner), in its
+/// group: a real user outside it, one of Mend's reserved range included, is refused by `exec`,
+/// `openSession` and `dotfiles.apply` alike, and nothing starts. Root stays refused.
+#[tokio::test]
+async fn under_an_owner_map_only_its_people_run() {
+    if !ready() {
+        return;
+    }
+    let dir = scratch();
+    let only_bob = People::Listed {
+        gid: GID,
+        uids: vec![BOB_UID],
+    };
+    let mut client = Client::start_posture(dir.path(), Vec::new(), Vec::new(), false, only_bob);
+    let out = dir.path().join("bob");
+    ok(client
+        .request(Command::Exec(exec(
+            format!("id -u > {0}.tmp && mv {0}.tmp {0}", out.display()),
+            Some(BOB),
+        )))
+        .await);
+    assert_eq!(wait_for(&out), format!("{BOB_UID}\n"));
+
+    for (user, uid) in [(CAT, CAT_UID), (DAN, DAN_UID)] {
+        let out = dir.path().join(user);
+        for message in refused_everywhere(&mut client, user, &out).await {
+            assert!(
+                message.contains(&format!("uid {uid} is not one of this executor's people")),
+                "{message}"
+            );
+        }
+        never_written(&out);
+    }
+    let out = dir.path().join("root");
+    for message in refused_everywhere(&mut client, "root", &out).await {
+        assert!(message.contains("is root"), "{message}");
+    }
+    never_written(&out);
+
+    // On the map, but its primary group is not the map's: refused.
+    let mut client = Client::start_posture(
+        dir.path(),
+        Vec::new(),
+        Vec::new(),
+        false,
+        People::Listed {
+            gid: PERSON_GID,
+            uids: vec![BOB_UID],
+        },
+    );
+    let out = dir.path().join("bob-other-group");
+    for message in refused_everywhere(&mut client, &BOB_UID.to_string(), &out).await {
+        assert!(
+            message.contains(&format!("has primary group {GID}")),
+            "{message}"
+        );
+    }
+    never_written(&out);
+}
+
+/// Without an owner map, a request may name only a user in Mend's reserved range (40001-49999)
+/// whose primary group is 40000: Dan runs; Bob (in the range, another primary group) and
+/// `nobody` (outside it) are refused, and nothing of theirs starts.
+#[tokio::test]
+async fn without_an_owner_map_only_mend_s_reserved_range_runs() {
+    if !ready() {
+        return;
+    }
+    let dir = scratch();
+    let mut client =
+        Client::start_posture(dir.path(), Vec::new(), Vec::new(), false, People::Reserved);
+    let out = dir.path().join("dan");
+    ok(client
+        .request(Command::Exec(exec(
+            format!("id -u > {0}.tmp && mv {0}.tmp {0}", out.display()),
+            Some(DAN),
+        )))
+        .await);
+    assert_eq!(wait_for(&out), format!("{DAN_UID}\n"));
+    let session = dir.path().join("dan-session");
+    ok(client
+        .request(Command::OpenSession(OpenSessionArgs {
+            user: Some(DAN_UID.to_string()),
+            execution_id: None,
+            shell: Some("/bin/sh".to_owned()),
+            args: vec![
+                "-c".to_owned(),
+                format!("id -u > {0}.tmp && mv {0}.tmp {0}", session.display()),
+            ],
+            cwd: None,
+            env: vec![],
+            cols: 80,
+            rows: 24,
+            term: None,
+            mode: SessionMode::Pty,
+        }))
+        .await);
+    assert_eq!(wait_for(&session), format!("{DAN_UID}\n"));
+
+    let out = dir.path().join("bob");
+    for message in refused_everywhere(&mut client, BOB, &out).await {
+        assert!(
+            message.contains(&format!(
+                "has primary group {GID}, not the group of Mend's people"
+            )),
+            "{message}"
+        );
+    }
+    never_written(&out);
+    let nobody = nix::unistd::User::from_name("nobody").unwrap();
+    if let Some(nobody) = nobody {
+        let out = dir.path().join("nobody");
+        for message in refused_everywhere(&mut client, "nobody", &out).await {
+            assert!(
+                message.contains(&format!("uid {} is outside the range", nobody.uid)),
+                "{message}"
+            );
+        }
+        never_written(&out);
+    }
+    let out = dir.path().join("root");
+    for message in refused_everywhere(&mut client, "0", &out).await {
+        assert!(message.contains("is root"), "{message}");
+    }
+    never_written(&out);
 }
 
 /// `dotfiles.apply` writes the files into the user's home as theirs, answers once they are
@@ -600,7 +816,7 @@ fn the_dotfiles_writer_thread_is_the_person_and_holds_nothing_of_root() {
     let roots = dir.path().join("roots-only");
     std::fs::write(&roots, "root's\n").unwrap();
     std::fs::set_permissions(&roots, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
-    let user = sealant_process::identity::RunAs::resolve(BOB).unwrap();
+    let user = sealant_process::identity::RunAs::resolve(BOB, &per_person()).unwrap();
     let dumpable = sealant_process::identity::process_dumpable();
     assert_eq!(dumpable, 1, "a root daemon starts dumpable");
     let (status, read, spawned) = user
@@ -1581,6 +1797,7 @@ fn sudo_as_person(no_new_privileges: bool) -> (String, sealant_protocol::Capabil
                 )],
                 Vec::new(),
                 no_new_privileges,
+                per_person(),
             );
             let caps = match ok(client.request(Command::RuntimeGetCapabilities).await) {
                 Some(CommandResult::Capabilities(c)) => c,

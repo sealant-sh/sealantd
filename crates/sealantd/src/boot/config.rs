@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-use sealant_runtime_core::config::{Bind, BindableMount};
+use sealant_runtime_core::config::{Bind, BindableMount, People};
 
 use crate::boot::error::BootError;
 
@@ -42,6 +42,23 @@ pub fn privilege_posture(source: &WorkspaceSource, is_root: bool) -> bool {
         WorkspaceSource::Capture(c) if c.owners.as_ref().is_some_and(|o| !o.people.is_empty())
     );
     !(per_person && is_root)
+}
+
+/// The users a request may name to run a process as ([`People`]): under a capture source's owner
+/// map, its people and its change owner, in its group; otherwise Mend's reserved range
+/// (`sealant_runtime_core::PERSON_UID_MIN`..=`PERSON_UID_MAX`, primary group `PERSON_GID`).
+#[must_use]
+pub fn people(source: &WorkspaceSource) -> People {
+    match source {
+        WorkspaceSource::Capture(c) => c.owners.as_ref().map_or(People::Reserved, |map| {
+            let mut uids: Vec<u32> = map.people.values().copied().collect();
+            uids.push(map.worktree);
+            uids.sort_unstable();
+            uids.dedup();
+            People::Listed { gid: map.gid, uids }
+        }),
+        _ => People::Reserved,
+    }
 }
 
 /// All `SEALANT_*` keys this loader consumes. Used to compute the harness passthrough environment
