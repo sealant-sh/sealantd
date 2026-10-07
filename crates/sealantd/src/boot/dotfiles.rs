@@ -179,6 +179,10 @@ impl Home {
             command.envs(sealant_process::identity::person_env(Some(&base_path)));
             command.envs(user.env());
             user.apply(command);
+            // Started in their home, not in the daemon's directory, which they may not be able
+            // to enter (stow then stops: "Your current directory ... seems to have vanished").
+            // A command that needs another directory sets it after this.
+            command.current_dir(&self.dir);
         }
         command
             .env("HOME", &self.dir)
