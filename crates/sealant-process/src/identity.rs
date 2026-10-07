@@ -341,6 +341,86 @@ impl RunAs {
             });
         }
     }
+
+    /// Run `work` on a thread of its own that reaches the filesystem as this user, and only as
+    /// them: the thread's supplementary groups, filesystem gid and filesystem uid become the
+    /// user's, and it gives up every capability, before `work` starts. The kernel then checks
+    /// every path `work` opens, makes, links, removes or changes the mode of as this user's: a
+    /// link they planted leads only where they could go themselves (never into another person's
+    /// 0700 home), and what `work` makes is theirs. The process umask is not changed.
+    ///
+    /// The calling thread and every other thread keep their identity: the kernel holds
+    /// credentials per thread, and these calls are the raw system calls (libc's `setgroups`
+    /// would change every thread's). The thread exits when `work` returns, so no other work
+    /// ever runs with what it gave up. A panic in `work` resumes on the caller.
+    ///
+    /// # Errors
+    /// The thread could not take the identity (a daemon without `CAP_SETUID` and `CAP_SETGID`):
+    /// `work` does not run.
+    pub fn as_fs_user<T: Send>(&self, work: impl FnOnce() -> T + Send) -> io::Result<T> {
+        let (groups, uid, gid) = (&self.groups, self.uid, self.gid);
+        std::thread::scope(|scope| {
+            let thread = scope.spawn(move || {
+                become_fs_user(groups, uid, gid)?;
+                Ok(work())
+            });
+            match thread.join() {
+                Ok(result) => result,
+                Err(panic) => std::panic::resume_unwind(panic),
+            }
+        })
+    }
+}
+
+/// On the calling thread only: the supplementary groups, filesystem gid and filesystem uid
+/// become the user's, then every capability set is emptied. With a filesystem uid other than 0
+/// the kernel already drops the filesystem capabilities (`CAP_DAC_OVERRIDE`, `CAP_FOWNER` and
+/// the rest) from the effective set; emptying every set leaves the thread nothing of root's.
+fn become_fs_user(groups: &[u32], uid: u32, gid: u32) -> io::Result<()> {
+    // SAFETY: raw system calls on integers and on a slice of `gid_t` that outlives the call; each
+    // changes the calling thread's credentials and nothing else.
+    unsafe {
+        if libc::syscall(libc::SYS_setgroups, groups.len(), groups.as_ptr()) == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        libc::syscall(libc::SYS_setfsgid, gid);
+        libc::syscall(libc::SYS_setfsuid, uid);
+    }
+    // `setfsuid` and `setfsgid` report no failure: an invalid id (-1) changes nothing and
+    // answers the current one, which must be the user's now.
+    // SAFETY: as above.
+    let (fsuid, fsgid) = unsafe {
+        (
+            libc::syscall(libc::SYS_setfsuid, u32::MAX),
+            libc::syscall(libc::SYS_setfsgid, u32::MAX),
+        )
+    };
+    if fsuid != libc::c_long::from(uid) || fsgid != libc::c_long::from(gid) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("the thread could not take uid {uid} and gid {gid} (it has {fsuid}:{fsgid})"),
+        ));
+    }
+    let none = CapData {
+        effective: 0,
+        permitted: 0,
+        inheritable: 0,
+    };
+    if capset([none, none]) == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+/// `capset` on the calling thread.
+fn capset(data: [CapData; 2]) -> libc::c_long {
+    let mut header = CapHeader {
+        version: CAPABILITY_VERSION_3,
+        pid: 0,
+    };
+    // SAFETY: capset reads the header and two data words from valid, live memory.
+    unsafe { libc::syscall(libc::SYS_capset, &raw mut header, data.as_ptr()) }
 }
 
 /// The one capability a person's process holds, ambient so every program it runs keeps it:
@@ -418,14 +498,7 @@ struct CapData {
 /// everything fails the start.
 fn keep_only_fowner() -> io::Result<()> {
     let bit = 1u32 << CAP_FOWNER;
-    let set = |data: [CapData; 2]| -> libc::c_long {
-        let mut header = CapHeader {
-            version: CAPABILITY_VERSION_3,
-            pid: 0,
-        };
-        // SAFETY: capset reads the header and two data words from valid, live memory.
-        unsafe { libc::syscall(libc::SYS_capset, &raw mut header, data.as_ptr()) }
-    };
+    let set = capset;
     let none = CapData {
         effective: 0,
         permitted: 0,
@@ -463,7 +536,10 @@ fn keep_only_fowner() -> io::Result<()> {
 /// place. The owner and mode are set through the opened directory, never through a path a
 /// symlink could replace in between; if something replaces it again, the open fails and so does
 /// the start, with the reason.
-fn private_dir(dir: &Path, uid: u32, gid: u32) -> io::Result<()> {
+///
+/// # Errors
+/// Whatever removing, making, opening or changing the directory answers.
+pub fn private_dir(dir: &Path, uid: u32, gid: u32) -> io::Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
     match std::fs::symlink_metadata(dir) {
         Ok(meta) if meta.is_dir() => {

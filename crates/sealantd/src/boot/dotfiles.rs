@@ -3,8 +3,12 @@
 //! command. Also applies caller-provided dotfiles archives (manifest.json + *.tar.gz staged by
 //! the launching adapter) through the same manager dispatch. Runs synchronously before the
 //! control socket binds so a failure aborts boot and nothing observes a half-applied home.
+//!
+//! A person's apply (`dotfiles.apply`, Mend's per-person layout) writes nothing into their home as
+//! root: root only unpacks their archives into a directory of its own outside every home, and
+//! every read and write inside the home runs as the person ([`Home::as_owner`]).
 
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -120,23 +124,20 @@ impl Home {
         &self.dir
     }
 
-    /// The owner of what the applier writes itself: the person's, or `None` for root.
-    fn owner(&self) -> Option<(u32, u32)> {
-        self.run_as.as_ref().map(|u| (u.uid, u.gid))
-    }
-
-    /// `mkdir -p path`, every directory it makes under the home given to the home's user.
-    fn mkdir(&self, path: &Path) -> Result<(), BootError> {
-        std::fs::create_dir_all(path).map_err(|e| BootError::io_path("mkdir -p", path, e))?;
-        if let Some(owner) = self.owner() {
-            for dir in path.ancestors() {
-                if dir == self.dir || !dir.starts_with(&self.dir) {
-                    break;
-                }
-                give(dir, Some(owner))?;
-            }
+    /// Run `work`, which reads or writes inside this home, as the home's user. For a person it
+    /// runs on a thread whose every filesystem access is theirs and nothing of root's
+    /// ([`RunAs::as_fs_user`]): a link they planted (`~/.config -> /home/other/.config`) leads
+    /// only where they could write themselves, and what it makes is theirs. For root, here.
+    fn as_owner<T: Send>(
+        &self,
+        work: impl FnOnce() -> Result<T, BootError> + Send,
+    ) -> Result<T, BootError> {
+        match &self.run_as {
+            None => work(),
+            Some(user) => user.as_fs_user(work).map_err(|e| {
+                BootError::Dotfiles(format!("could not act as {} in their home: {e}", user.name))
+            })?,
         }
-        Ok(())
     }
 
     /// Where the dotfiles repo is checked out.
@@ -201,13 +202,12 @@ pub(crate) fn apply_repository(
     mode: BootstrapMode,
 ) -> Result<Option<PendingBootstrap>, BootError> {
     let checkout = home.checkout_dir();
-    if let Some(parent) = checkout.parent() {
-        home.mkdir(parent)?;
-    }
-    if checkout.exists() {
-        std::fs::remove_dir_all(&checkout)
-            .map_err(|e| BootError::io_path("rm -rf", &checkout, e))?;
-    }
+    home.as_owner(|| {
+        if let Some(parent) = checkout.parent() {
+            mkdir_all(parent)?;
+        }
+        remove_tree(&checkout)
+    })?;
 
     let askpass_dir = match &home.run_as {
         Some(user) => {
@@ -217,10 +217,13 @@ pub(crate) fn apply_repository(
         }
         None => runtime_dir.to_path_buf(),
     };
-    let askpass = materialize_askpass(config, &askpass_dir, home.owner())?;
+    let askpass = home.as_owner(|| materialize_askpass(config, &askpass_dir))?;
     let clone_result = clone_dotfiles(config, &checkout, askpass.as_deref(), home);
     if let Some(path) = &askpass {
-        let _ = std::fs::remove_file(path);
+        let _ = home.as_owner(|| {
+            let _ = std::fs::remove_file(path);
+            Ok(())
+        });
     }
     clone_result?;
 
@@ -245,7 +248,7 @@ fn apply_tree(
     home: &Home,
     mode: BootstrapMode,
 ) -> Result<Option<PendingBootstrap>, BootError> {
-    let resolution = detect_manager(manager, checkout);
+    let resolution = home.as_owner(|| Ok(detect_manager(manager, checkout)))?;
     tracing::info!(
         requested = requested_name(manager),
         manager = resolution.manager.name(),
@@ -256,7 +259,10 @@ fn apply_tree(
     match resolution.manager {
         ResolvedManager::Chezmoi => apply_chezmoi(checkout, home)?,
         ResolvedManager::Stow => apply_stow(checkout, &target_dir, home)?,
-        ResolvedManager::Copy => apply_copy(checkout, &target_dir, home)?,
+        ResolvedManager::Copy => home.as_owner(|| {
+            mkdir_all(&target_dir)?;
+            copy_tree(checkout, &target_dir)
+        })?,
     }
 
     if !bootstrap {
@@ -267,8 +273,27 @@ fn apply_tree(
             run_bootstrap(checkout, bootstrap_command, home)?;
             Ok(None)
         }
-        BootstrapMode::Defer => Ok(pending_bootstrap(checkout, bootstrap_command)),
+        BootstrapMode::Defer => {
+            home.as_owner(|| Ok(pending_bootstrap(checkout, bootstrap_command)))
+        }
     }
+}
+
+/// `mkdir -p path`.
+fn mkdir_all(path: &Path) -> Result<(), BootError> {
+    std::fs::create_dir_all(path).map_err(|e| BootError::io_path("mkdir -p", path, e))
+}
+
+/// `rm -rf path`: a directory and what is in it, or the link or file standing there (std's
+/// `remove_dir_all` never follows a link out of the tree).
+fn remove_tree(path: &Path) -> Result<(), BootError> {
+    let removed = match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_dir() => std::fs::remove_dir_all(path),
+        Ok(_) => std::fs::remove_file(path),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    };
+    removed.map_err(|e| BootError::io_path("rm -rf", path, e))
 }
 
 /// The bootstrap `command` of the tree at `checkout`, when the script it names is there.
@@ -282,28 +307,6 @@ fn pending_bootstrap(checkout: &Path, command: &str) -> Option<PendingBootstrap>
         tracing::info!(command, "dotfiles bootstrap command absent; skipping");
         None
     }
-}
-
-/// Give `path` (not following a symlink) to `owner`, when there is one.
-fn give(path: &Path, owner: Option<(u32, u32)>) -> Result<(), BootError> {
-    if let Some((uid, gid)) = owner {
-        std::os::unix::fs::lchown(path, Some(uid), Some(gid))
-            .map_err(|e| BootError::io_path("chown", path, e))?;
-    }
-    Ok(())
-}
-
-/// Give everything under `dir`, and `dir`, to `owner`.
-fn give_tree(dir: &Path, owner: Option<(u32, u32)>) -> Result<(), BootError> {
-    if owner.is_none() {
-        return Ok(());
-    }
-    for entry in walkdir::WalkDir::new(dir) {
-        let entry =
-            entry.map_err(|e| BootError::Dotfiles(format!("walking {}: {e}", dir.display())))?;
-        give(entry.path(), owner)?;
-    }
-    Ok(())
 }
 
 /// The manifest describing caller-provided dotfiles archives (`manifest.json` beside them).
@@ -334,6 +337,11 @@ fn default_true() -> bool {
     true
 }
 
+/// Where a person's archives are unpacked, as root, before they reach the person's home: under
+/// the daemon's own runtime directory, outside every home and every capture root, root's only
+/// (0700). Each apply takes a directory of its own inside it and removes it when done.
+pub(crate) const ARCHIVE_STAGING_ROOT: &str = "/run/sealant/dotfiles-staging";
+
 /// Apply the archives in `dir` into `home`, in manifest order; with [`BootstrapMode::Defer`]
 /// every bootstrap is answered, in that order, instead of run.
 pub(crate) fn apply_archives_into(
@@ -341,12 +349,32 @@ pub(crate) fn apply_archives_into(
     home: &Home,
     mode: BootstrapMode,
 ) -> Result<Vec<PendingBootstrap>, BootError> {
+    apply_archives_staged_in(dir, home, mode, Path::new(ARCHIVE_STAGING_ROOT))
+}
+
+/// [`apply_archives_into`], a person's archives unpacked under `staging_root`.
+///
+/// Root's home (boot): each archive is extracted straight into its tree in the home, as root.
+/// A person's: each is unpacked as root into a directory of root's own outside the home
+/// ([`unpack_checked`], which refuses an entry that could reach outside it), and the person
+/// writes the tree into their home from there ([`mirror_into_home`]); everything after that
+/// (the manager, the copies, the bootstrap) reads and writes as the person.
+fn apply_archives_staged_in(
+    dir: &Path,
+    home: &Home,
+    mode: BootstrapMode,
+    staging_root: &Path,
+) -> Result<Vec<PendingBootstrap>, BootError> {
     let mut pending = Vec::new();
     let manifest_path = dir.join("manifest.json");
     let raw = std::fs::read_to_string(&manifest_path)
         .map_err(|e| BootError::io_path("read", &manifest_path, e))?;
     let manifest: ArchiveManifest = serde_json::from_str(&raw)
         .map_err(|e| BootError::Dotfiles(format!("invalid dotfiles archive manifest: {e}")))?;
+    let staging = match &home.run_as {
+        Some(_) if !manifest.archives.is_empty() => Some(RootStaging::create(staging_root)?),
+        _ => None,
+    };
 
     for (index, entry) in manifest.archives.iter().enumerate() {
         if entry.file.contains('/') || entry.file.contains("..") {
@@ -356,22 +384,30 @@ pub(crate) fn apply_archives_into(
             )));
         }
         let archive = dir.join(&entry.file);
-        let staging = home.archive_staging_dir().join(index.to_string());
-        if staging.exists() {
-            std::fs::remove_dir_all(&staging)
-                .map_err(|e| BootError::io_path("rm -rf", &staging, e))?;
+        let tree = home.archive_staging_dir().join(index.to_string());
+        match &staging {
+            None => {
+                if tree.exists() {
+                    std::fs::remove_dir_all(&tree)
+                        .map_err(|e| BootError::io_path("rm -rf", &tree, e))?;
+                }
+                if let Some(parent) = tree.parent() {
+                    mkdir_all(parent)?;
+                }
+                mkdir_all(&tree)?;
+                extract_archive(&archive, &tree)?;
+            }
+            Some(staging) => {
+                let unpacked = staging.dir.join(index.to_string());
+                unpack_checked(&archive, &unpacked)?;
+                mirror_into_home(&unpacked, &tree, home)?;
+                // Root's own directory: nothing of the person's is in it.
+                std::fs::remove_dir_all(&unpacked)
+                    .map_err(|e| BootError::io_path("rm -rf", &unpacked, e))?;
+            }
         }
-        // Extracted while the staging directory is still root's (tar restores times and modes,
-        // which takes `CAP_FOWNER` on a directory root does not own), then given to the person.
-        if let Some(parent) = staging.parent() {
-            home.mkdir(parent)?;
-        }
-        std::fs::create_dir_all(&staging)
-            .map_err(|e| BootError::io_path("mkdir -p", &staging, e))?;
-        extract_archive(&archive, &staging)?;
-        give_tree(&staging, home.owner())?;
         pending.extend(apply_tree(
-            &staging,
+            &tree,
             entry.manager.unwrap_or(DotfilesManager::Auto),
             entry.target.unwrap_or(DotfilesTarget::Home),
             entry.bootstrap,
@@ -397,11 +433,361 @@ fn extract_archive(archive: &Path, staging: &Path) -> Result<(), BootError> {
     )
 }
 
+/// One apply's directory under [`ARCHIVE_STAGING_ROOT`]: root's, 0700, and removed when dropped,
+/// the apply failed or not.
+#[derive(Debug)]
+struct RootStaging {
+    dir: PathBuf,
+}
+
+impl RootStaging {
+    /// Make `root` the daemon's own private directory (a link or file planted there is replaced,
+    /// a directory someone else made is removed), remove what a previous daemon left in it, and
+    /// make this apply's directory inside.
+    fn create(root: &Path) -> Result<Self, BootError> {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        if let Some(parent) = root.parent() {
+            mkdir_all(parent)?;
+        }
+        sealant_process::identity::private_dir(
+            root,
+            nix::unistd::geteuid().as_raw(),
+            nix::unistd::getegid().as_raw(),
+        )
+        .map_err(|e| BootError::io_path("make private directory", root, e))?;
+        let pid = std::process::id();
+        let ours = format!("{pid}-");
+        let entries =
+            std::fs::read_dir(root).map_err(|e| BootError::io_path("read_dir", root, e))?;
+        for entry in entries.flatten() {
+            if !entry.file_name().to_string_lossy().starts_with(&ours) {
+                let _ = remove_tree(&entry.path());
+            }
+        }
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = root.join(format!("{ours}{n}"));
+        // A daemon that is PID 1 again after a restart may meet its own leftover of this name.
+        remove_tree(&dir)?;
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&dir)
+            .map_err(|e| BootError::io_path("mkdir", &dir, e))?;
+        Ok(Self { dir })
+    }
+}
+
+impl Drop for RootStaging {
+    fn drop(&mut self) {
+        if let Err(e) = std::fs::remove_dir_all(&self.dir) {
+            tracing::warn!(dir = %self.dir.display(), error = %e, "dotfiles staging not removed");
+        }
+    }
+}
+
+/// Unpack `archive` as root into `into` (made here, 0700, inside root's own staging
+/// directory), refusing an archive that could reach outside it.
+///
+/// Before anything is written, every entry must be a file, a directory or a link, with a
+/// relative path free of `..`, that does not lie under a link the archive makes (where `tar`
+/// would write through it). `tar` then extracts without owners (`--no-same-owner`), and what it
+/// made is checked again: nothing but files, directories and links, and no file with a link
+/// outside the tree.
+fn unpack_checked(archive: &Path, into: &Path) -> Result<(), BootError> {
+    let refuse =
+        |why: String| BootError::Dotfiles(format!("dotfiles archive {}: {why}", archive.display()));
+    let meta =
+        std::fs::symlink_metadata(archive).map_err(|e| BootError::io_path("stat", archive, e))?;
+    if !meta.is_file() {
+        return Err(refuse("not a regular file".to_owned()));
+    }
+    // The two listings at once: each is a `tar` and a gunzip of the whole archive.
+    let (names, kinds) = std::thread::scope(|scope| {
+        let kinds = scope.spawn(|| list_archive(archive, true));
+        let names = list_archive(archive, false);
+        let kinds = kinds
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        (names, kinds)
+    });
+    check_members(&names?, &kinds?).map_err(refuse)?;
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(into)
+        .map_err(|e| BootError::io_path("mkdir", into, e))?;
+    run_checked(
+        Command::new("tar")
+            .arg("--no-same-owner")
+            .arg("-xzf")
+            .arg(archive)
+            .arg("-C")
+            .arg(into),
+        "tar -xzf",
+    )?;
+    check_unpacked(into).map_err(refuse)
+}
+
+/// `tar -tzf archive`, one member per line (`tar` escapes a newline in a name); with `verbose`,
+/// `tar -tvzf`, whose lines start with the member's type.
+fn list_archive(archive: &Path, verbose: bool) -> Result<String, BootError> {
+    let output = Command::new("tar")
+        .arg(if verbose { "-tvzf" } else { "-tzf" })
+        .arg(archive)
+        .env("LC_ALL", "C")
+        .stdin(std::process::Stdio::null())
+        .output_gated()
+        .map_err(|e| BootError::Dotfiles(format!("tar -tzf: could not spawn: {e}")))?;
+    if !output.status.success() {
+        return Err(BootError::Dotfiles(format!(
+            "tar -tzf {} exited with {}: {}",
+            archive.display(),
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// A member's path as a key: its components, without `.` and empty ones.
+fn member_key(name: &str) -> String {
+    name.split('/')
+        .filter(|c| !c.is_empty() && *c != ".")
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// The member listing's verdict: `Err` names the first entry refused, and why. `names` is
+/// `tar -t`'s listing and `kinds` `tar -tv`'s, line for line.
+fn check_members(names: &str, kinds: &str) -> Result<(), String> {
+    let names: Vec<&str> = names.lines().collect();
+    let kinds: Vec<char> = kinds
+        .lines()
+        .map(|l| l.chars().next().unwrap_or('?'))
+        .collect();
+    if names.len() != kinds.len() {
+        return Err(format!(
+            "its listings disagree ({} names, {} entries)",
+            names.len(),
+            kinds.len()
+        ));
+    }
+    let mut links = std::collections::HashSet::new();
+    let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for (name, kind) in names.iter().zip(&kinds) {
+        *seen.entry(member_key(name)).or_default() += 1;
+        if name.starts_with('/') {
+            return Err(format!("entry {name:?} has an absolute path"));
+        }
+        if name.split('/').any(|c| c == "..") {
+            return Err(format!("entry {name:?} has a `..` in its path"));
+        }
+        match kind {
+            '-' | 'd' => {}
+            'l' | 'h' => {
+                links.insert(member_key(name));
+            }
+            other => {
+                return Err(format!(
+                    "entry {name:?} is of type {other:?}: only files, directories and links are \
+                     applied"
+                ));
+            }
+        }
+    }
+    for name in &names {
+        let key = member_key(name);
+        // A second entry of a link's name (a directory over it) would have `tar` reach through it.
+        if links.contains(&key) && seen.get(&key).is_some_and(|count| *count > 1) {
+            return Err(format!(
+                "entry {name:?} is a link's name and appears more than once"
+            ));
+        }
+        let mut prefix = String::new();
+        for component in key.split('/') {
+            if !prefix.is_empty() && links.contains(&prefix) {
+                return Err(format!("entry {name:?} lies under the link {prefix:?}"));
+            }
+            if !prefix.is_empty() {
+                prefix.push('/');
+            }
+            prefix.push_str(component);
+        }
+    }
+    Ok(())
+}
+
+/// What `tar` made under `dir`: nothing but files, directories and symlinks, and no file with a
+/// hard link outside `dir`.
+fn check_unpacked(dir: &Path) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+    let mut linked: std::collections::HashMap<(u64, u64), (u64, u64, PathBuf)> =
+        std::collections::HashMap::new();
+    for entry in walkdir::WalkDir::new(dir) {
+        let entry = entry.map_err(|e| format!("walking what it unpacked: {e}"))?;
+        let kind = entry.file_type();
+        if kind.is_dir() || kind.is_symlink() {
+            continue;
+        }
+        let path = entry.path();
+        if !kind.is_file() {
+            return Err(format!(
+                "{} is not a file, a directory or a link",
+                path.display()
+            ));
+        }
+        let meta = entry
+            .metadata()
+            .map_err(|e| format!("stat {}: {e}", path.display()))?;
+        if meta.nlink() > 1 {
+            let seen = linked.entry((meta.dev(), meta.ino())).or_insert((
+                meta.nlink(),
+                0,
+                path.to_path_buf(),
+            ));
+            seen.1 += 1;
+        }
+    }
+    match linked.values().find(|(nlink, seen, _)| seen < nlink) {
+        Some((_, _, path)) => Err(format!(
+            "{} has a hard link outside the archive",
+            path.display()
+        )),
+        None => Ok(()),
+    }
+}
+
+/// One entry of an unpacked tree, as root reads it for the person to write.
+#[derive(Debug)]
+enum Staged {
+    /// A directory (the tree itself when `rel` is empty) and its mode.
+    Dir { rel: PathBuf, mode: u32 },
+    /// A file, opened by root, its mode and its modification time.
+    File {
+        rel: PathBuf,
+        file: std::fs::File,
+        mode: u32,
+        modified: Option<std::time::SystemTime>,
+    },
+    /// A symlink and its target, never followed.
+    Link { rel: PathBuf, target: PathBuf },
+}
+
+/// Write the tree unpacked at `unpacked` (root's) to `tree` in `home`, as the home's user: root
+/// reads, on a thread of its own, and hands each entry over (a file as the file it opened); the
+/// user removes what was at `tree` and writes every entry there. The tree is the same as `tar`
+/// made, with the user as owner: its files keep their bytes, mode (without set-id bits) and
+/// modification time, its directories their mode, its links their target.
+fn mirror_into_home(unpacked: &Path, tree: &Path, home: &Home) -> Result<(), BootError> {
+    let (send, receive) = std::sync::mpsc::sync_channel::<Result<Staged, BootError>>(64);
+    std::thread::scope(|scope| {
+        scope.spawn(move || read_staged(unpacked, &send));
+        home.as_owner(move || write_staged(tree, &receive))
+    })
+}
+
+/// Send every entry under `unpacked`, the directory itself first, a directory before what is in
+/// it; stop at the first error (sent) or once the writer has stopped listening.
+fn read_staged(unpacked: &Path, send: &std::sync::mpsc::SyncSender<Result<Staged, BootError>>) {
+    use std::os::unix::fs::OpenOptionsExt;
+    let walk = walkdir::WalkDir::new(unpacked).sort_by_file_name();
+    for entry in walk {
+        let staged = entry
+            .map_err(|e| BootError::Dotfiles(format!("walking {}: {e}", unpacked.display())))
+            .and_then(|entry| {
+                let path = entry.path();
+                let rel = path.strip_prefix(unpacked).unwrap_or(path).to_path_buf();
+                let kind = entry.file_type();
+                if kind.is_symlink() {
+                    let target = std::fs::read_link(path)
+                        .map_err(|e| BootError::io_path("readlink", path, e))?;
+                    return Ok(Staged::Link { rel, target });
+                }
+                let meta = entry
+                    .metadata()
+                    .map_err(|e| BootError::Dotfiles(format!("stat {}: {e}", path.display())))?;
+                if kind.is_dir() {
+                    return Ok(Staged::Dir {
+                        rel,
+                        mode: meta.permissions().mode() & 0o7777,
+                    });
+                }
+                let file = std::fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(nix::libc::O_NOFOLLOW)
+                    .open(path)
+                    .map_err(|e| BootError::io_path("open", path, e))?;
+                Ok(Staged::File {
+                    rel,
+                    file,
+                    mode: meta.permissions().mode() & 0o777,
+                    modified: meta.modified().ok(),
+                })
+            });
+        let failed = staged.is_err();
+        if send.send(staged).is_err() || failed {
+            return;
+        }
+    }
+}
+
+/// As the home's user: replace whatever is at `tree` with the entries received.
+fn write_staged(
+    tree: &Path,
+    receive: &std::sync::mpsc::Receiver<Result<Staged, BootError>>,
+) -> Result<(), BootError> {
+    use std::os::unix::fs::OpenOptionsExt;
+    remove_tree(tree)?;
+    if let Some(parent) = tree.parent() {
+        mkdir_all(parent)?;
+    }
+    // Modes go on the directories last, deepest first: one without write permission would
+    // refuse what goes in it.
+    let mut dirs = Vec::new();
+    for staged in receive {
+        match staged? {
+            Staged::Dir { rel, mode } => {
+                let path = tree.join(rel);
+                std::fs::create_dir(&path).map_err(|e| BootError::io_path("mkdir", &path, e))?;
+                dirs.push((path, mode));
+            }
+            Staged::Link { rel, target } => {
+                let path = tree.join(rel);
+                std::os::unix::fs::symlink(&target, &path)
+                    .map_err(|e| BootError::io_path("symlink", &path, e))?;
+            }
+            Staged::File {
+                rel,
+                mut file,
+                mode,
+                modified,
+            } => {
+                let path = tree.join(rel);
+                let mut out = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(&path)
+                    .map_err(|e| BootError::io_path("create", &path, e))?;
+                std::io::copy(&mut file, &mut out)
+                    .map_err(|e| BootError::io_path("write", &path, e))?;
+                out.set_permissions(std::fs::Permissions::from_mode(mode))
+                    .map_err(|e| BootError::io_path("chmod", &path, e))?;
+                if let Some(modified) = modified {
+                    let _ = out.set_modified(modified);
+                }
+            }
+        }
+    }
+    for (path, mode) in dirs.iter().rev() {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(*mode))
+            .map_err(|e| BootError::io_path("chmod", path, e))?;
+    }
+    Ok(())
+}
+
 /// Write the dotfiles HTTP askpass shim if a token is configured.
 fn materialize_askpass(
     config: &DotfilesConfig,
     runtime_dir: &Path,
-    owner: Option<(u32, u32)>,
 ) -> Result<Option<PathBuf>, BootError> {
     let Some(token) = &config.http_token else {
         return Ok(None);
@@ -415,7 +801,6 @@ fn materialize_askpass(
     std::fs::write(&path, script).map_err(|e| BootError::io_path("write", &path, e))?;
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
         .map_err(|e| BootError::io_path("chmod", &path, e))?;
-    give(&path, owner)?;
     Ok(Some(path))
 }
 
@@ -675,17 +1060,21 @@ fn apply_chezmoi(checkout: &Path, home: &Home) -> Result<(), BootError> {
 /// path both provide fails the apply with stow's own conflict error instead of one side winning
 /// quietly. Loose top-level files (`README.md`) are not packages and are left out, as stow does.
 fn apply_stow(checkout: &Path, target_dir: &Path, home: &Home) -> Result<(), BootError> {
-    home.mkdir(target_dir)?;
-    let top = TopLevel::scan(checkout).map_err(|e| BootError::io_path("read_dir", checkout, e))?;
-    if !top.home_entries.is_empty() {
-        tracing::info!(
-            entries = %name_list(&top.home_entries),
-            "stow: top-level dot entries are not packages; copying them into the target"
-        );
-        for name in &top.home_entries {
-            copy_entry(&checkout.join(name), &target_dir.join(name), home.owner())?;
+    let top = home.as_owner(|| {
+        mkdir_all(target_dir)?;
+        let top =
+            TopLevel::scan(checkout).map_err(|e| BootError::io_path("read_dir", checkout, e))?;
+        if !top.home_entries.is_empty() {
+            tracing::info!(
+                entries = %name_list(&top.home_entries),
+                "stow: top-level dot entries are not packages; copying them into the target"
+            );
+            for name in &top.home_entries {
+                copy_entry(&checkout.join(name), &target_dir.join(name))?;
+            }
         }
-    }
+        Ok(top)
+    })?;
     if !top.loose_files.is_empty() {
         tracing::info!(
             files = %name_list(&top.loose_files),
@@ -709,21 +1098,16 @@ fn apply_stow(checkout: &Path, target_dir: &Path, home: &Home) -> Result<(), Boo
     Ok(())
 }
 
-fn apply_copy(checkout: &Path, target_dir: &Path, home: &Home) -> Result<(), BootError> {
-    home.mkdir(target_dir)?;
-    copy_tree(checkout, target_dir, home.owner())
-}
-
-/// Recursively copy the dotfiles tree into the target, skipping the `.git` directory.
-/// Every entry it writes is given to `owner`, when there is one.
-fn copy_tree(src: &Path, dst: &Path, owner: Option<(u32, u32)>) -> Result<(), BootError> {
+/// Recursively copy the dotfiles tree into the target, skipping the `.git` directory. A
+/// person's copy runs as them ([`Home::as_owner`]), so everything it writes is theirs.
+fn copy_tree(src: &Path, dst: &Path) -> Result<(), BootError> {
     let entries = std::fs::read_dir(src).map_err(|e| BootError::io_path("read_dir", src, e))?;
     for entry in entries.flatten() {
         let name = entry.file_name();
         if name == ".git" {
             continue;
         }
-        copy_entry(&entry.path(), &dst.join(&name), owner)?;
+        copy_entry(&entry.path(), &dst.join(&name))?;
     }
     Ok(())
 }
@@ -734,15 +1118,22 @@ fn copy_tree(src: &Path, dst: &Path, owner: Option<(u32, u32)>) -> Result<(), Bo
 /// of a file or symlink is replaced rather than written through, so a later archive never edits
 /// the file an earlier one's link points at. A directory is merged into whatever directory is at
 /// its destination, including one reached through a symlink: a directory stow folded into an
-/// earlier archive's staging tree receives the later archive's files there.
-fn copy_entry(from: &Path, to: &Path, owner: Option<(u32, u32)>) -> Result<(), BootError> {
+/// earlier archive's staging tree receives the later archive's files there. For a person that
+/// is only a directory they can write themselves: a link of theirs into another person's home
+/// fails here, naming it.
+fn copy_entry(from: &Path, to: &Path) -> Result<(), BootError> {
     let file_type = std::fs::symlink_metadata(from)
         .map_err(|e| BootError::io_path("stat", from, e))?
         .file_type();
     if file_type.is_dir() {
-        std::fs::create_dir_all(to).map_err(|e| BootError::io_path("mkdir -p", to, e))?;
-        give(to, owner)?;
-        return copy_tree(from, to, owner);
+        match std::fs::metadata(to) {
+            Ok(meta) if meta.is_dir() => {}
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                return Err(BootError::io_path("reach directory", to, e));
+            }
+            _ => std::fs::create_dir_all(to).map_err(|e| BootError::io_path("mkdir -p", to, e))?,
+        }
+        return copy_tree(from, to);
     }
     remove_non_directory(to)?;
     if file_type.is_symlink() {
@@ -751,7 +1142,7 @@ fn copy_entry(from: &Path, to: &Path, owner: Option<(u32, u32)>) -> Result<(), B
     } else {
         std::fs::copy(from, to).map_err(|e| BootError::io_path("copy", to, e))?;
     }
-    give(to, owner)
+    Ok(())
 }
 
 /// Remove whatever non-directory sits at `path`. A directory is left for the caller's own
@@ -769,7 +1160,7 @@ fn remove_non_directory(path: &Path) -> Result<(), BootError> {
 
 fn run_bootstrap(checkout: &Path, command: &str, home: &Home) -> Result<(), BootError> {
     let bootstrap_path = checkout.join(command.trim_start_matches("./"));
-    if !bootstrap_path.exists() {
+    if !home.as_owner(|| Ok(bootstrap_path.exists()))? {
         tracing::info!(command, "dotfiles bootstrap command absent; skipping");
         return Ok(());
     }
@@ -1045,7 +1436,7 @@ mod tests {
         std::fs::create_dir_all(src.path().join("nested")).expect("nested");
         std::fs::write(src.path().join("nested/file"), b"hi").expect("write");
 
-        copy_tree(src.path(), dst.path(), None).expect("copy");
+        copy_tree(src.path(), dst.path()).expect("copy");
         assert!(dst.path().join(".vimrc").exists());
         assert!(dst.path().join("nested/file").exists());
         assert!(!dst.path().join(".git").exists());
@@ -1060,7 +1451,7 @@ mod tests {
         std::fs::write(src.path().join("real"), b"x").expect("write");
         std::os::unix::fs::symlink("real", src.path().join(".relative")).expect("symlink");
 
-        copy_tree(src.path(), dst.path(), None).expect("a dangling link does not fail the copy");
+        copy_tree(src.path(), dst.path()).expect("a dangling link does not fail the copy");
         assert_eq!(
             std::fs::read_link(dst.path().join(".dangling")).expect("link"),
             Path::new("/nonexistent/sealant/target")
@@ -1081,7 +1472,7 @@ mod tests {
         std::os::unix::fs::symlink(&outside, dst.path().join(".zshrc")).expect("symlink");
         std::fs::write(src.path().join(".zshrc"), b"later\n").expect("write");
 
-        copy_tree(src.path(), dst.path(), None).expect("copy");
+        copy_tree(src.path(), dst.path()).expect("copy");
         let written = dst.path().join(".zshrc");
         assert!(!written.symlink_metadata().expect("meta").is_symlink());
         assert_eq!(std::fs::read_to_string(written).expect("read"), "later\n");
@@ -1148,6 +1539,248 @@ mod tests {
         extract_archive(&archive, staging.path()).expect("extract");
         let content = std::fs::read_to_string(staging.path().join(".zshrc")).expect("read");
         assert_eq!(content, "export MARKER=1\n");
+    }
+
+    /// `tar` run in `dir` with `args`, which must succeed.
+    fn tar_in(dir: &Path, args: &[&str]) {
+        let status = Command::new("tar")
+            .args(args)
+            .current_dir(dir)
+            .status()
+            .expect("tar available");
+        assert!(status.success(), "tar {args:?}");
+    }
+
+    #[test]
+    fn the_member_listing_refuses_what_could_reach_outside_the_tree() {
+        let ok = "./\n./.zshrc\n./.config/\n./.config/nvim/init.lua\n./.vim\n./b\n";
+        let kinds = "d\n-\nd\n-\nl\nh\n";
+        assert_eq!(check_members(ok, kinds), Ok(()));
+        for (names, kinds, why) in [
+            ("/etc/profile\n", "-\n", "absolute path"),
+            ("./../.zshrc\n", "-\n", "`..`"),
+            ("a/../../x\n", "-\n", "`..`"),
+            (
+                "./.config\n./.config/fish/config.fish\n",
+                "l\n-\n",
+                "under the link \".config\"",
+            ),
+            ("x\nx/y\n", "h\n-\n", "under the link \"x\""),
+            ("./x\nx\n", "l\nl\n", "more than once"),
+            ("./x\n./x/\n", "l\nd\n", "more than once"),
+            ("./x/\n./x\n", "d\nl\n", "more than once"),
+            ("./dev\n", "c\n", "type 'c'"),
+            ("./fifo\n", "p\n", "type 'p'"),
+            ("./a\n./b\n", "-\n", "listings disagree"),
+        ] {
+            let err = check_members(names, kinds).expect_err(names);
+            assert!(err.contains(why), "{names:?}: {err}");
+        }
+    }
+
+    /// A tree of the usual kinds, packed as the launching adapter packs one.
+    fn pack_ordinary(work: &Path) -> PathBuf {
+        let src = work.join("src");
+        write_tree(
+            &src,
+            &[
+                (".zshrc", "export A=1\n"),
+                (".config/nvim/init.lua", "-- lua\n"),
+                ("bin/hello", "#!/bin/sh\necho hi\n"),
+            ],
+        );
+        make_executable(&src.join("bin/hello"));
+        std::fs::set_permissions(src.join(".zshrc"), std::fs::Permissions::from_mode(0o600))
+            .expect("chmod");
+        std::fs::set_permissions(src.join("bin"), std::fs::Permissions::from_mode(0o750))
+            .expect("chmod");
+        std::os::unix::fs::symlink("/nonexistent/abs", src.join(".abs")).expect("symlink");
+        std::os::unix::fs::symlink(".zshrc", src.join(".rel")).expect("symlink");
+        let archive = work.join("0.tar.gz");
+        tar_in(
+            work,
+            &[
+                "-czf",
+                &archive.to_string_lossy(),
+                "-C",
+                &src.to_string_lossy(),
+                ".",
+            ],
+        );
+        archive
+    }
+
+    #[test]
+    fn an_ordinary_archive_unpacks_and_mirrors_with_its_modes_and_links() {
+        let work = tempfile::tempdir().expect("tmp");
+        let archive = pack_ordinary(work.path());
+        let unpacked = work.path().join("unpacked");
+        unpack_checked(&archive, &unpacked).expect("unpack");
+
+        let fx = Fixture::new();
+        let tree = fx.home.archive_staging_dir().join("0");
+        // Whatever stood at the tree is replaced, a link there removed rather than followed.
+        let elsewhere = work.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).expect("mkdir");
+        std::fs::create_dir_all(tree.parent().expect("parent")).expect("mkdir");
+        std::os::unix::fs::symlink(&elsewhere, &tree).expect("symlink");
+        mirror_into_home(&unpacked, &tree, &fx.home).expect("mirror");
+
+        assert!(
+            std::fs::read_dir(&elsewhere)
+                .expect("read")
+                .next()
+                .is_none()
+        );
+        let mode = |p: &str| {
+            std::fs::symlink_metadata(tree.join(p))
+                .expect("stat")
+                .permissions()
+                .mode()
+                & 0o7777
+        };
+        assert_eq!(mode(".zshrc"), 0o600);
+        assert_eq!(mode("bin/hello"), 0o755);
+        assert_eq!(mode("bin"), 0o750);
+        assert_eq!(
+            std::fs::read_to_string(tree.join(".config/nvim/init.lua")).expect("read"),
+            "-- lua\n"
+        );
+        assert_eq!(
+            std::fs::read_link(tree.join(".abs")).expect("link"),
+            Path::new("/nonexistent/abs")
+        );
+        assert_eq!(
+            std::fs::read_link(tree.join(".rel")).expect("link"),
+            Path::new(".zshrc")
+        );
+        let modified = |root: &Path| {
+            std::fs::metadata(root.join(".config/nvim/init.lua"))
+                .expect("stat")
+                .modified()
+                .expect("mtime")
+        };
+        assert_eq!(modified(&tree), modified(&unpacked));
+    }
+
+    #[test]
+    fn absolute_and_dotdot_entries_are_refused_before_anything_is_written() {
+        let work = tempfile::tempdir().expect("tmp");
+        let outside = work.path().join("outside");
+        std::fs::write(&outside, "planted\n").expect("write");
+        let inner = work.path().join("a/b");
+        std::fs::create_dir_all(&inner).expect("mkdir");
+        // `-P` keeps the leading `/` and the `..` that tar would otherwise strip.
+        let absolute = work.path().join("absolute.tar.gz");
+        tar_in(
+            work.path(),
+            &[
+                "-czPf",
+                &absolute.to_string_lossy(),
+                &outside.to_string_lossy(),
+            ],
+        );
+        let dotdot = work.path().join("dotdot.tar.gz");
+        tar_in(
+            &inner,
+            &["-czPf", &dotdot.to_string_lossy(), "../../outside"],
+        );
+        for (archive, why) in [(absolute, "absolute path"), (dotdot, "`..`")] {
+            let into = work.path().join("into");
+            let err = unpack_checked(&archive, &into).expect_err("refused");
+            assert!(format!("{err}").contains(why), "{err}");
+            assert!(!into.exists(), "nothing was unpacked");
+        }
+        assert_eq!(
+            std::fs::read_to_string(&outside).expect("read"),
+            "planted\n"
+        );
+    }
+
+    #[test]
+    fn an_entry_under_a_link_and_a_special_file_are_refused() {
+        let work = tempfile::tempdir().expect("tmp");
+        let victim = work.path().join("victim");
+        std::fs::create_dir_all(&victim).expect("mkdir");
+        // A link to the victim directory, then a file appended under the link's name.
+        let first = work.path().join("first");
+        std::fs::create_dir_all(&first).expect("mkdir");
+        std::os::unix::fs::symlink(&victim, first.join("dir")).expect("symlink");
+        let second = work.path().join("second");
+        write_tree(&second, &[("dir/planted", "x\n")]);
+        let plain = work.path().join("through.tar");
+        tar_in(&first, &["-cf", &plain.to_string_lossy(), "dir"]);
+        tar_in(&second, &["-rf", &plain.to_string_lossy(), "dir/planted"]);
+        let through = work.path().join("through.tar.gz");
+        let gz = std::fs::File::create(&through).expect("create");
+        let status = Command::new("gzip")
+            .arg("-c")
+            .arg(&plain)
+            .stdout(gz)
+            .status()
+            .expect("gzip");
+        assert!(status.success());
+        let err = unpack_checked(&through, &work.path().join("into1")).expect_err("refused");
+        assert!(format!("{err}").contains("under the link \"dir\""), "{err}");
+        assert!(!victim.join("planted").exists());
+
+        let fifo_src = work.path().join("fifo");
+        std::fs::create_dir_all(&fifo_src).expect("mkdir");
+        let status = Command::new("mkfifo")
+            .arg(fifo_src.join("pipe"))
+            .status()
+            .expect("mkfifo");
+        assert!(status.success());
+        let fifo = work.path().join("fifo.tar.gz");
+        tar_in(
+            work.path(),
+            &[
+                "-czf",
+                &fifo.to_string_lossy(),
+                "-C",
+                &fifo_src.to_string_lossy(),
+                ".",
+            ],
+        );
+        let err = unpack_checked(&fifo, &work.path().join("into2")).expect_err("refused");
+        assert!(format!("{err}").contains("type 'p'"), "{err}");
+    }
+
+    #[test]
+    fn an_unpacked_file_with_a_hard_link_outside_the_tree_is_refused() {
+        let work = tempfile::tempdir().expect("tmp");
+        let tree = work.path().join("tree");
+        std::fs::create_dir_all(&tree).expect("mkdir");
+        std::fs::write(work.path().join("secret"), "s\n").expect("write");
+        std::fs::hard_link(work.path().join("secret"), tree.join("copy")).expect("link");
+        let err = check_unpacked(&tree).expect_err("refused");
+        assert!(err.contains("hard link outside"), "{err}");
+        std::fs::hard_link(tree.join("copy"), tree.join("again")).expect("link");
+        std::fs::remove_file(work.path().join("secret")).expect("rm");
+        assert_eq!(check_unpacked(&tree), Ok(()), "two links, both inside");
+    }
+
+    #[test]
+    fn a_person_s_staging_directory_is_root_s_own_and_removed_when_done() {
+        let work = tempfile::tempdir().expect("tmp");
+        let root = work.path().join("run/dotfiles-staging");
+        // A previous daemon's leftover goes; a link planted at the root is replaced.
+        std::fs::create_dir_all(root.parent().expect("parent")).expect("mkdir");
+        std::os::unix::fs::symlink(work.path(), &root).expect("symlink");
+        let staging = RootStaging::create(&root).expect("staging");
+        let meta = std::fs::symlink_metadata(&root).expect("stat");
+        assert!(meta.is_dir() && meta.permissions().mode() & 0o7777 == 0o700);
+        let dir = staging.dir.clone();
+        assert_eq!(
+            std::fs::metadata(&dir).expect("stat").permissions().mode() & 0o7777,
+            0o700
+        );
+        std::fs::create_dir_all(root.join("1-0/x")).expect("leftover");
+        drop(staging);
+        assert!(!dir.exists());
+        let again = RootStaging::create(&root).expect("staging");
+        assert!(!root.join("1-0").exists() || std::process::id() == 1);
+        drop(again);
     }
 
     // Real applies: archives packed with tar, applied through the manifest into a throwaway home,

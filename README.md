@@ -104,6 +104,13 @@ The daemon runs as root, and so does every process it starts, unless the request
   and runs `./install.sh` after them as a managed process of that user, named in the answer
   (`bootstrap`), so the caller can start the person's agent beside it. Boot applies root's
   dotfiles into `/root` as before; no user needs to exist at boot.
+- Nothing of a person's apply writes into their home as root. Root unpacks their archives into a
+  directory of its own outside every home (`/run/sealant/dotfiles-staging`, 0700, removed when
+  the apply ends), without owners, after refusing an archive with an entry that has an absolute
+  path, a `..`, lies under one of its own links, or is not a file, a directory or a link. Every
+  write into the home (directories, files, links, modes) is made on a thread whose filesystem
+  uid, gid and groups are the person's and that holds no capability, so the kernel checks it as
+  theirs: a link they planted into another person's 0700 home fails the apply, naming the path.
 - `runtime.getCapabilities` names `exec.user`, `dotfiles.user` and `restore.owner_map` in
   `supports`. `sealantd capabilities --json` prints the same, with the version, without booting,
   for an image build to record.
