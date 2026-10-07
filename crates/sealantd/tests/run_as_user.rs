@@ -32,6 +32,10 @@ const EXTRA_GROUP: &str = "mtestextra";
 const EXTRA_GID: u32 = 40971;
 const BOB: &str = "mtestbob";
 const BOB_UID: u32 = 40972;
+/// A second person, in the same primary group as Mend's people share (`mend`), whose home is
+/// 0700 as Mend makes every home.
+const CAT: &str = "mtestcat";
+const CAT_UID: u32 = 40973;
 
 /// Whether these run here: as root with `SEALANTD_REQUIRE_ROOT_TESTS=1`. They make the test
 /// group and users once.
@@ -70,6 +74,24 @@ fn ready() -> bool {
             "/bin/sh",
             BOB,
         ]);
+        run(&[
+            "useradd",
+            "-m",
+            "-u",
+            &CAT_UID.to_string(),
+            "-g",
+            GROUP,
+            "-s",
+            "/bin/sh",
+            CAT,
+        ]);
+        for user in [BOB, CAT] {
+            std::fs::set_permissions(
+                format!("/home/{user}"),
+                std::os::unix::fs::PermissionsExt::from_mode(0o700),
+            )
+            .unwrap();
+        }
     });
     true
 }
@@ -350,12 +372,30 @@ async fn dotfiles_apply_as_the_user_and_answer_before_install_sh_ends() {
     let _ = std::fs::remove_file(home.join(".mtest-zshrc"));
     let evidence = dir.path().join("install-ran");
     let gate = dir.path().join("install-may-finish");
-    // A dotfiles tree with a file, a nested file, a symlink and an install.sh that waits.
+    let _ = std::fs::remove_file(home.join(".mtest-private"));
+    let _ = std::fs::remove_dir_all(home.join(".mtest-bin"));
+    // A dotfiles tree with a file, a private file, a nested file, a symlink, a directory of its
+    // own mode and an install.sh that waits.
     let tree = dir.path().join("tree");
     std::fs::create_dir_all(tree.join(".config/mtest")).unwrap();
+    std::fs::create_dir_all(tree.join(".mtest-bin")).unwrap();
     std::fs::write(tree.join(".mtest-zshrc"), "export A=1\n").unwrap();
+    std::fs::write(tree.join(".mtest-private"), "secret\n").unwrap();
+    std::fs::write(tree.join(".mtest-bin/hello"), "#!/bin/sh\necho hi\n").unwrap();
     std::fs::write(tree.join(".config/mtest/conf"), "x\n").unwrap();
     std::os::unix::fs::symlink(".mtest-zshrc", tree.join(".mtest-link")).unwrap();
+    for (path, mode) in [
+        (".mtest-zshrc", 0o644),
+        (".mtest-private", 0o600),
+        (".mtest-bin/hello", 0o755),
+        (".mtest-bin", 0o750),
+    ] {
+        std::fs::set_permissions(
+            tree.join(path),
+            std::os::unix::fs::PermissionsExt::from_mode(mode),
+        )
+        .unwrap();
+    }
     std::fs::write(
         tree.join("install.sh"),
         format!(
@@ -421,6 +461,30 @@ async fn dotfiles_apply_as_the_user_and_answer_before_install_sh_ends() {
     }
     let staging = home.join(".local/share/sealant-dotfiles/0/install.sh");
     assert_eq!(std::fs::metadata(&staging).unwrap().uid(), BOB_UID);
+    // The modes the archive carries, on files and in the tree; directories the copy makes in the
+    // home take the daemon's umask, as they always have.
+    let umask = daemon_umask();
+    let mode = |path: &Path| std::fs::symlink_metadata(path).unwrap().mode() & 0o7777;
+    for (path, expected) in [
+        (".mtest-zshrc", 0o644),
+        (".mtest-private", 0o600),
+        (".mtest-bin/hello", 0o755),
+        (".mtest-bin", 0o777 & !umask),
+        (".config/mtest", 0o777 & !umask),
+        (".local/share/sealant-dotfiles/0/.mtest-bin", 0o750),
+        (".local/share/sealant-dotfiles/0/install.sh", 0o755),
+    ] {
+        assert_eq!(mode(&home.join(path)), expected, "{path}");
+    }
+    assert_eq!(
+        std::fs::read_link(home.join(".mtest-link")).unwrap(),
+        Path::new(".mtest-zshrc")
+    );
+    for path in [".local/share/sealant-dotfiles/0", ".mtest-bin/hello"] {
+        let meta = std::fs::symlink_metadata(home.join(path)).unwrap();
+        assert_eq!((meta.uid(), meta.gid()), (BOB_UID, GID), "{path}");
+    }
+    assert_staging_empty();
 
     std::fs::write(&gate, "").unwrap();
     assert_eq!(
@@ -452,6 +516,384 @@ async fn dotfiles_apply_as_the_user_and_answer_before_install_sh_ends() {
         let response = client.request(Command::DotfilesApply(Box::new(args))).await;
         assert!(matches!(response.outcome, ResponseOutcome::Error { .. }));
     }
+}
+
+/// The daemon's umask (read and put back; these tests run on one thread).
+fn daemon_umask() -> u32 {
+    let mask = nix::sys::stat::umask(nix::sys::stat::Mode::from_bits_truncate(0o022));
+    nix::sys::stat::umask(mask);
+    mask.bits()
+}
+
+/// Nothing is left under the daemon's dotfiles staging directory once an apply answers.
+fn assert_staging_empty() {
+    let root = Path::new("/run/sealant/dotfiles-staging");
+    let meta = std::fs::symlink_metadata(root).unwrap();
+    assert!(meta.is_dir(), "the staging directory is a directory");
+    assert_eq!((meta.uid(), meta.mode() & 0o7777), (0, 0o700));
+    let left: Vec<_> = std::fs::read_dir(root).unwrap().flatten().collect();
+    assert!(left.is_empty(), "staging left behind: {left:?}");
+}
+
+/// `tree` packed as `<archives>/0.tar.gz`, with a manifest applying it with `manager`, no
+/// bootstrap. `flags` go to tar (`-P` keeps an absolute or `..` path).
+fn pack_one(tree: &Path, archives: &Path, manager: &str, flags: &[&str], members: &[&str]) {
+    std::fs::create_dir_all(archives).unwrap();
+    assert!(
+        Std::new("tar")
+            .arg("-czf")
+            .arg(archives.join("0.tar.gz"))
+            .args(flags)
+            .arg("-C")
+            .arg(tree)
+            .args(members)
+            .status()
+            .unwrap()
+            .success()
+    );
+    std::fs::write(
+        archives.join("manifest.json"),
+        format!(
+            r#"{{"archives":[{{"file":"0.tar.gz","manager":"{manager}","bootstrap":false}}]}}"#
+        ),
+    )
+    .unwrap();
+}
+
+/// `dotfiles.apply` of `archives` for `user`, answered with its error.
+async fn apply_refused(client: &mut Client, user: &str, archives: &Path) -> String {
+    let response = client
+        .request(Command::DotfilesApply(Box::new(DotfilesApplyArgs {
+            user: user.to_owned(),
+            repository: None,
+            archive_dir: Some(archives.display().to_string()),
+            execution_id: None,
+        })))
+        .await;
+    match response.outcome {
+        ResponseOutcome::Error { error } => error.message,
+        ResponseOutcome::Ok { result } => panic!("applied: {result:?}"),
+    }
+}
+
+/// The thread a person's dotfiles are written on (`RunAs::as_fs_user`) reaches the filesystem as
+/// them, with their groups, and holds no capability; a file only root may read is out of its
+/// reach. The calling thread is root as before.
+#[test]
+fn the_dotfiles_writer_thread_is_the_person_and_holds_nothing_of_root() {
+    if !ready() {
+        return;
+    }
+    let field = |status: &str, key: &str| -> Vec<String> {
+        status
+            .lines()
+            .find(|l| l.starts_with(key))
+            .unwrap_or_else(|| panic!("{key} in {status}"))
+            .split_whitespace()
+            .skip(1)
+            .map(str::to_owned)
+            .collect()
+    };
+    let dir = scratch();
+    let roots = dir.path().join("roots-only");
+    std::fs::write(&roots, "root's\n").unwrap();
+    std::fs::set_permissions(&roots, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
+    let user = sealant_process::identity::RunAs::resolve(BOB).unwrap();
+    let (status, read) = user
+        .as_fs_user(|| {
+            (
+                std::fs::read_to_string("/proc/thread-self/status").unwrap(),
+                std::fs::read_to_string(&roots).map_err(|e| e.kind()),
+            )
+        })
+        .unwrap();
+    // Real, effective, saved and filesystem ids: only the filesystem ones are the person's.
+    assert_eq!(field(&status, "Uid:")[3], BOB_UID.to_string(), "{status}");
+    assert_eq!(field(&status, "Gid:")[3], GID.to_string(), "{status}");
+    let mut groups = field(&status, "Groups:");
+    groups.sort();
+    assert_eq!(groups, [GID.to_string(), EXTRA_GID.to_string()], "{status}");
+    for set in ["CapInh:", "CapPrm:", "CapEff:", "CapAmb:"] {
+        assert_eq!(field(&status, set), ["0000000000000000"], "{set} {status}");
+    }
+    assert_eq!(read, Err(std::io::ErrorKind::PermissionDenied));
+    let mine = std::fs::read_to_string("/proc/thread-self/status").unwrap();
+    assert_eq!(field(&mine, "Uid:")[3], "0", "{mine}");
+    assert_ne!(field(&mine, "CapEff:"), ["0000000000000000"], "{mine}");
+    assert_eq!(std::fs::read_to_string(&roots).unwrap(), "root's\n");
+}
+
+/// The review's attack (P2-1 on Core's #334): a person links a directory of their home into
+/// another person's and has their dotfiles applied, with the copy manager. Nothing lands in the
+/// other home, the apply names the path it could not reach, and the other person's files keep
+/// their bytes and owner. The same for a link where the archives are staged in the home.
+#[tokio::test]
+async fn a_person_s_link_into_another_home_takes_none_of_their_dotfiles() {
+    if !ready() {
+        return;
+    }
+    let dir = scratch();
+    let bob = PathBuf::from(format!("/home/{BOB}"));
+    let cat = PathBuf::from(format!("/home/{CAT}"));
+    // Cat's own files: a fish config and a staged tree of theirs.
+    let cat_fish = cat.join(".config/fish/config.fish");
+    let cat_staged = cat.join(".local/share/sealant-dotfiles/0/keep");
+    for path in [&cat_fish, &cat_staged] {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, "cat's own\n").unwrap();
+    }
+    assert!(
+        Std::new("chown")
+            .args(["-R", &format!("{CAT}:{GROUP}")])
+            .arg(cat.join(".config"))
+            .arg(cat.join(".local"))
+            .status()
+            .unwrap()
+            .success()
+    );
+    let link = |at: &Path, to: &Path| {
+        let _ = std::fs::remove_dir_all(at);
+        let _ = std::fs::remove_file(at);
+        std::fs::create_dir_all(at.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(to, at).unwrap();
+        std::os::unix::fs::lchown(at, Some(BOB_UID), Some(GID)).unwrap();
+    };
+    let tree = dir.path().join("tree");
+    std::fs::create_dir_all(tree.join(".config/fish")).unwrap();
+    std::fs::write(tree.join(".config/fish/config.fish"), "bob's code\n").unwrap();
+    let archives = dir.path().join("archives");
+    pack_one(&tree, &archives, "copy", &[], &["."]);
+    let mut client = Client::start(dir.path());
+
+    // 1. `~/.config` -> the other home's `.config`, then the copy manager.
+    link(&bob.join(".config"), &cat.join(".config"));
+    let refused = apply_refused(&mut client, BOB, &archives).await;
+    assert!(
+        refused.contains(&format!("{}/.config", bob.display()))
+            && refused.contains("Permission denied"),
+        "{refused}"
+    );
+    // 2. `~/.local/share/sealant-dotfiles` -> the other home's staged trees.
+    std::fs::remove_file(bob.join(".config")).unwrap();
+    link(
+        &bob.join(".local/share/sealant-dotfiles"),
+        &cat.join(".local/share/sealant-dotfiles"),
+    );
+    let refused = apply_refused(&mut client, BOB, &archives).await;
+    assert!(refused.contains("Permission denied"), "{refused}");
+    std::fs::remove_file(bob.join(".local/share/sealant-dotfiles")).unwrap();
+
+    for path in [&cat_fish, &cat_staged] {
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "cat's own\n");
+        let meta = std::fs::metadata(path).unwrap();
+        assert_eq!((meta.uid(), meta.mode() & 0o7777), (CAT_UID, 0o644));
+    }
+    let fish: Vec<_> = std::fs::read_dir(cat.join(".config/fish"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name())
+        .collect();
+    assert_eq!(fish, ["config.fish"]);
+    assert_staging_empty();
+
+    // Without the links, the same archive applies.
+    ok(client
+        .request(Command::DotfilesApply(Box::new(DotfilesApplyArgs {
+            user: BOB.to_owned(),
+            repository: None,
+            archive_dir: Some(archives.display().to_string()),
+            execution_id: None,
+        })))
+        .await);
+    assert_eq!(
+        std::fs::read_to_string(bob.join(".config/fish/config.fish")).unwrap(),
+        "bob's code\n"
+    );
+    assert_eq!(std::fs::read_to_string(&cat_fish).unwrap(), "cat's own\n");
+    let _ = std::fs::remove_dir_all(bob.join(".config/fish"));
+}
+
+/// A person's stow tree: the packages are linked into their home from their own tree under
+/// `~/.local/share/sealant-dotfiles`, and a top-level dot entry is copied, all theirs.
+#[tokio::test]
+async fn a_person_s_stow_tree_links_from_their_own_tree() {
+    if !ready() {
+        return;
+    }
+    let stow = Std::new("sh")
+        .args(["-c", "command -v stow"])
+        .output()
+        .unwrap();
+    if !stow.status.success() {
+        eprintln!("SKIPPED: stow is not on PATH");
+        return;
+    }
+    let dir = scratch();
+    let home = PathBuf::from(format!("/home/{BOB}"));
+    for path in [".mtest-stowed", ".mtest-dot"] {
+        let _ = std::fs::remove_file(home.join(path));
+    }
+    let tree = dir.path().join("tree");
+    std::fs::create_dir_all(tree.join("pkg")).unwrap();
+    std::fs::write(tree.join("pkg/.mtest-stowed"), "stowed\n").unwrap();
+    std::fs::write(tree.join(".mtest-dot"), "dot\n").unwrap();
+    let archives = dir.path().join("archives");
+    pack_one(&tree, &archives, "stow", &[], &["."]);
+    let mut client = Client::start(dir.path());
+    ok(client
+        .request(Command::DotfilesApply(Box::new(DotfilesApplyArgs {
+            user: BOB.to_owned(),
+            repository: None,
+            archive_dir: Some(archives.display().to_string()),
+            execution_id: None,
+        })))
+        .await);
+    let linked = home.join(".mtest-stowed");
+    let meta = std::fs::symlink_metadata(&linked).unwrap();
+    assert!(meta.is_symlink());
+    assert_eq!(meta.uid(), BOB_UID);
+    assert_eq!(std::fs::read_to_string(&linked).unwrap(), "stowed\n");
+    assert_eq!(
+        std::fs::canonicalize(&linked).unwrap(),
+        home.join(".local/share/sealant-dotfiles/0/pkg/.mtest-stowed")
+    );
+    let dot = std::fs::symlink_metadata(home.join(".mtest-dot")).unwrap();
+    assert!(dot.is_file());
+    assert_eq!(dot.uid(), BOB_UID);
+    assert_staging_empty();
+}
+
+/// A person's archive with an absolute entry or one with `..` is refused before anything of it
+/// is written, and the apply says which entry.
+#[tokio::test]
+async fn a_person_s_archive_with_an_absolute_or_dotdot_entry_is_refused() {
+    if !ready() {
+        return;
+    }
+    let dir = scratch();
+    let target = dir.path().join("target-file");
+    std::fs::write(&target, "from the archive\n").unwrap();
+    let inner = dir.path().join("a/b");
+    std::fs::create_dir_all(&inner).unwrap();
+    let absolute = dir.path().join("absolute");
+    pack_one(
+        &inner,
+        &absolute,
+        "copy",
+        &["-P"],
+        &[&target.display().to_string()],
+    );
+    let dotdot = dir.path().join("dotdot");
+    pack_one(&inner, &dotdot, "copy", &["-P"], &["../../target-file"]);
+    std::fs::write(&target, "untouched\n").unwrap();
+    let mut client = Client::start(dir.path());
+    for (archives, why) in [(&absolute, "absolute path"), (&dotdot, "`..`")] {
+        let refused = apply_refused(&mut client, BOB, archives).await;
+        assert!(refused.contains(why), "{refused}");
+    }
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "untouched\n");
+    assert_staging_empty();
+}
+
+/// `len` bytes of text that compresses about as well as configuration does (words drawn from a
+/// fixed pseudo-random sequence).
+fn text(len: usize) -> String {
+    const WORDS: &[&str] = &[
+        "set",
+        "export",
+        "alias",
+        "function",
+        "end",
+        "if",
+        "then",
+        "fi",
+        "local",
+        "return",
+        "vim.o.number",
+        "true",
+        "false",
+        "bind",
+        "key",
+        "color",
+        "path",
+        "~/.config",
+        "--",
+        "require",
+        "plugin",
+        "opts",
+        "theme",
+        "font",
+        "size",
+        "12",
+        "0x1e1e2e",
+        "mouse",
+    ];
+    let mut seed: u64 = len as u64 ^ 0x9e37_79b9_7f4a_7c15;
+    let mut out = String::with_capacity(len + 16);
+    while out.len() < len {
+        seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+        out.push_str(WORDS[(seed >> 33) as usize % WORDS.len()]);
+        out.push(if seed.is_multiple_of(7) { '\n' } else { ' ' });
+    }
+    out.truncate(len);
+    out
+}
+
+/// The cost of a person's apply of a typical dotfiles archive (the copy manager, no bootstrap):
+/// `dotfiles.apply` to its answer, 40 times. A measurement, run by hand:
+/// `SEALANTD_REQUIRE_ROOT_TESTS=1 run_as_user --ignored --nocapture dotfiles_apply_timing`.
+#[tokio::test]
+#[ignore = "a measurement"]
+async fn dotfiles_apply_timing() {
+    if !ready() {
+        return;
+    }
+    let dir = scratch();
+    let tree = dir.path().join("tree");
+    // About 150 files in 20 directories, 1 MB: shell, editor, git, terminal and a few scripts.
+    for (d, files, size) in [
+        (".config/nvim/lua/plugins", 40, 2_000),
+        (".config/nvim/after/ftplugin", 20, 500),
+        (".config/fish/functions", 30, 800),
+        (".config/fish/conf.d", 10, 400),
+        (".config/git", 3, 300),
+        (".config/alacritty", 2, 3_000),
+        (".config/tmux/plugins", 10, 5_000),
+        (".local/bin", 20, 1_500),
+        (".ssh", 1, 200),
+        (".config/zsh", 10, 2_000),
+        (".", 4, 4_000),
+    ] {
+        std::fs::create_dir_all(tree.join(d)).unwrap();
+        for i in 0..files {
+            std::fs::write(tree.join(d).join(format!(".mtest-{i}.conf")), text(size)).unwrap();
+        }
+    }
+    std::fs::write(tree.join(".config/mtest-blob"), text(600_000)).unwrap();
+    let archives = dir.path().join("archives");
+    pack_one(&tree, &archives, "copy", &[], &["."]);
+    let size = std::fs::metadata(archives.join("0.tar.gz")).unwrap().len();
+    let mut client = Client::start(dir.path());
+    let mut times = Vec::new();
+    for _ in 0..40 {
+        let started = Instant::now();
+        ok(client
+            .request(Command::DotfilesApply(Box::new(DotfilesApplyArgs {
+                user: BOB.to_owned(),
+                repository: None,
+                archive_dir: Some(archives.display().to_string()),
+                execution_id: None,
+            })))
+            .await);
+        times.push(started.elapsed().as_secs_f64() * 1000.0);
+    }
+    times.sort_by(f64::total_cmp);
+    eprintln!(
+        "dotfiles.apply ({size} B archive): median {:.2} ms, p90 {:.2} ms, min {:.2} ms",
+        times[times.len() / 2],
+        times[times.len() * 9 / 10],
+        times[0]
+    );
 }
 
 /// The spawn path's cost: `exec` of `/bin/true` to its `process.exited`, 300 times each, without
