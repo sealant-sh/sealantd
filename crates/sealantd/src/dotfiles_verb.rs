@@ -28,7 +28,8 @@ pub(crate) async fn apply(
     request_id: RequestId,
 ) -> Result<DotfilesApplied, ControlError> {
     let args = *args;
-    let run_as = RunAs::resolve(&args.user).map_err(ControlError::invalid_argument)?;
+    let run_as = RunAs::resolve(&args.user, &processes.config.people)
+        .map_err(ControlError::invalid_argument)?;
     let repository = args
         .repository
         .map(repository_config)

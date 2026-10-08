@@ -14,7 +14,9 @@ pub mod redact;
 pub mod status;
 
 pub use clock::Clock;
-pub use config::{Bind, BindableMount, RuntimeConfig};
+pub use config::{
+    Bind, BindableMount, PERSON_GID, PERSON_UID_MAX, PERSON_UID_MIN, People, RuntimeConfig,
+};
 pub use error::ConfigError;
 pub use idgen::{IdGenerator, new_runtime_id};
 pub use redact::Redactor;

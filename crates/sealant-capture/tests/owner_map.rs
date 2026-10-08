@@ -587,8 +587,12 @@ fn person_user() {
 fn bob_command(script: &str) -> Command {
     let mut c = Command::new("sh");
     c.arg("-c").arg(script);
-    sealant_process::identity::RunAs::resolve(&BOB.to_string())
-        .unwrap()
-        .apply(&mut c);
+    // Bob is in Mend's reserved range and group, as a person without an owner map is.
+    sealant_process::identity::RunAs::resolve(
+        &BOB.to_string(),
+        &sealant_process::identity::People::Reserved,
+    )
+    .unwrap()
+    .apply(&mut c);
     c
 }

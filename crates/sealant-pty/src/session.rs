@@ -323,12 +323,13 @@ impl SessionRuntime {
             .clone()
             .map_or_else(|| self.config.workspace_root.clone(), Into::into);
         let term = args.term.clone().unwrap_or_else(|| DEFAULT_TERM.to_owned());
-        // A named user: resolved here, its private directories made, its identity set in the
-        // leader before exec ([`sealant_process::identity`]).
+        // A named user: resolved here and admitted only if the runtime's people include it,
+        // its private directories made, its identity set in the leader before exec
+        // ([`sealant_process::identity`]).
         let run_as = args
             .user
             .as_deref()
-            .map(sealant_process::identity::RunAs::resolve)
+            .map(|user| sealant_process::identity::RunAs::resolve(user, &self.config.people))
             .transpose()
             .map_err(ControlError::invalid_argument)?;
         if let Some(user) = &run_as {
