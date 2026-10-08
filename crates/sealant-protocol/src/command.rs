@@ -168,9 +168,10 @@ pub struct ExecArgs {
     pub graceful_signal: Option<Signal>,
     /// Run as this user (a login name or a decimal uid, looked up in the passwd database): its
     /// uid, groups, `HOME`, `USER`, `LOGNAME` and `SHELL`, umask `0002`, and a private `TMPDIR`
-    /// and `XDG_RUNTIME_DIR`. Only one of the executor's people: the boot's owner map's, else a
-    /// uid in Mend's reserved range (40001-49999) whose primary group is 40000; anyone else is
-    /// refused (`invalid-argument`). Absent: as the daemon's child environment says (root).
+    /// and `XDG_RUNTIME_DIR`. Only one of the executor's people: a uid in Mend's reserved range
+    /// (40001-49999) whose primary group is 40000, or one of the boot's owner map's people in its
+    /// group; anyone else, root included, is refused (`invalid-argument`). Absent: as the
+    /// daemon's child environment says (root).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
 }

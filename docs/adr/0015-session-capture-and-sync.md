@@ -304,6 +304,11 @@ that names at least one person is a per-person executor, and does not set no-new
 design, not a sandbox). Without a map, or with one that names nobody, no-new-privileges is set as
 for every other executor. A launcher passes a map only for a per-person launch.
 
+The map does not limit who a process may run as on its own. A request that names a `user` is
+admitted when its uid is in Mend's reserved range (40001-49999) with primary group 40000, or is
+one of the map's people in the map's group; root, root's group and every other uid are refused.
+The map is read only at boot, so the range is what admits a person who joins the worktree later.
+
 ### Cadence and budgets
 
 Small class: 2 s of quiet after any change, at most every 10 s while the tree stays dirty, at every
