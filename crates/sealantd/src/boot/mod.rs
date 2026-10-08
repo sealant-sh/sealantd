@@ -442,7 +442,7 @@ fn into_runtime_config(config: &BootConfig, secret_env: &[(String, String)]) -> 
     // A process run as a person never gets the launcher's declared harness logins; the
     // project's secrets (the secret environment) reach every person.
     runtime_config.person_withheld = config.declared_harness_keys.clone();
-    // Who a request may name to run as: the owner map's people, else Mend's reserved range.
+    // Who a request may name to run as: Mend's reserved range, and the owner map's people.
     runtime_config.people = config::people(&config.source);
     runtime_config.no_new_privileges = config.no_new_privileges;
     runtime_config

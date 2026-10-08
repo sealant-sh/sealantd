@@ -98,14 +98,17 @@ The daemon runs as root, and so does every process it starts, unless the request
   `openSftp` takes no user yet: an SFTP bridge runs as root.
 - **Only the executor's people.** sealantd decides who a `user` may be from the passwd entry it
   resolves, whatever the caller checked first (a person with `sudo` in the executor can edit
-  `/etc/passwd`, so a check made before asking proves nothing alone). With an owner map
-  (`SEALANT_CAPTURE_OWNER_MAP`), the uid must be one of the map's `people` or its `worktree`
-  uid, and its primary group the map's `gid`. Without one, the uid must be in Mend's reserved
-  range, 40001-49999 (`sealant_runtime_core::PERSON_UID_MIN`..=`PERSON_UID_MAX`), and its
-  primary group 40000 (`PERSON_GID`, Mend's `mend`). `exec`, `openSession` and `dotfiles.apply`
-  refuse anyone else with `invalid-argument` before anything starts, saying why
-  (`user "1000" is refused: uid 1000 is not one of this executor's people (owner map)`). A
-  request that names no user is unchanged.
+  `/etc/passwd`, so a check made before asking proves nothing alone). A uid in Mend's reserved
+  range, 40001-49999 (`sealant_runtime_core::PERSON_UID_MIN`..=`PERSON_UID_MAX`), whose primary
+  group is 40000 (`PERSON_GID`, Mend's `mend`) is admitted, with an owner map or without one:
+  every uid there is one of Mend's people, and the map is read only at boot, so a person who
+  joins the worktree later is not on it. With an owner map (`SEALANT_CAPTURE_OWNER_MAP`), the
+  map's `people` and its `worktree` uid are admitted too, in the map's `gid`. `exec`,
+  `openSession` and `dotfiles.apply` refuse anyone else (root, root's group, a system or host
+  user, a reserved uid in another group) with `invalid-argument` before anything starts, saying
+  why (`user "1500" is refused: uid 1500 is not one of this executor's people (owner map) and is
+  outside the range of Mend's people (40001-49999)`). A request that names no user is
+  unchanged. The owner map still decides what a restore owns and the privilege posture.
 - The dotfiles applier runs as a user into their passwd home, its commands with a clean
   environment (`PATH`, the locale, `TERM` and the person's identity; nothing of the daemon's),
   through

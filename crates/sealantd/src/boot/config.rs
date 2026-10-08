@@ -44,9 +44,10 @@ pub fn privilege_posture(source: &WorkspaceSource, is_root: bool) -> bool {
     !(per_person && is_root)
 }
 
-/// The users a request may name to run a process as ([`People`]): under a capture source's owner
-/// map, its people and its change owner, in its group; otherwise Mend's reserved range
-/// (`sealant_runtime_core::PERSON_UID_MIN`..=`PERSON_UID_MAX`, primary group `PERSON_GID`).
+/// The users a request may name to run a process as ([`People`]): Mend's reserved range
+/// (`sealant_runtime_core::PERSON_UID_MIN`..=`PERSON_UID_MAX`, primary group `PERSON_GID`), and
+/// under a capture source's owner map also its people and its change owner, in its group. The
+/// map is read here once; the range is what admits a person who joins after boot.
 #[must_use]
 pub fn people(source: &WorkspaceSource) -> People {
     match source {

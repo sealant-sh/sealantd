@@ -52,7 +52,8 @@ pub const PERSON_UID_MAX: u32 = 49_999;
 /// `dotfiles.apply` take `user`). The daemon decides from the resolved passwd entry, never from
 /// what the caller checked: a person with `sudo` in the executor can edit `/etc/passwd`, so a
 /// check made before asking the daemon proves nothing on its own. Root and root's group are
-/// refused under either rule.
+/// refused under either rule, and so is every uid that is neither listed nor in Mend's reserved
+/// range: no request runs a process as root or as a system user.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", tag = "kind")]
 pub enum People {
@@ -61,7 +62,10 @@ pub enum People {
     #[default]
     Reserved,
     /// The boot's owner map (`SEALANT_CAPTURE_OWNER_MAP`): one of its people's uids or its
-    /// change owner's (`worktree`), whose primary group is the map's `gid`.
+    /// change owner's (`worktree`), whose primary group is the map's `gid`; or, as under
+    /// [`People::Reserved`], any uid in Mend's reserved range whose primary group is
+    /// [`PERSON_GID`]. The map is read once, at boot, and a person who joins the worktree after
+    /// it is not on it: the range admits them, and every uid in it is one of Mend's people.
     Listed {
         /// The map's shared group.
         gid: u32,
@@ -93,17 +97,26 @@ impl People {
                 }
             }
             Self::Listed { gid: group, uids } => {
-                if !uids.contains(&uid) {
-                    return Err(format!(
-                        "uid {uid} is not one of this executor's people (owner map)"
-                    ));
+                let listed = uids.contains(&uid);
+                if (listed && gid == *group) || Self::Reserved.admit(uid, gid).is_ok() {
+                    return Ok(());
                 }
-                if gid != *group {
+                if listed {
                     return Err(format!(
                         "uid {uid} has primary group {gid}, not this executor's people's group \
                          {group} (owner map)"
                     ));
                 }
+                if !(PERSON_UID_MIN..=PERSON_UID_MAX).contains(&uid) {
+                    return Err(format!(
+                        "uid {uid} is not one of this executor's people (owner map) and is \
+                         outside the range of Mend's people ({PERSON_UID_MIN}-{PERSON_UID_MAX})"
+                    ));
+                }
+                return Err(format!(
+                    "uid {uid} is not one of this executor's people (owner map) and has primary \
+                     group {gid}, not the group of Mend's people ({PERSON_GID})"
+                ));
             }
         }
         Ok(())
@@ -144,8 +157,8 @@ pub struct RuntimeConfig {
     /// here: they reach every person.
     #[serde(default)]
     pub person_withheld: Vec<String>,
-    /// The users a request may name to run a process as ([`People`]): the boot's owner map's
-    /// people when it has one, else Mend's reserved range.
+    /// The users a request may name to run a process as ([`People`]): Mend's reserved range,
+    /// and the boot's owner map's people when it has one.
     #[serde(default)]
     pub people: People,
     /// Set `PR_SET_NO_NEW_PRIVS` on the daemon (plan §18), inherited by every child: no child
@@ -392,31 +405,55 @@ mod tests {
     }
 
     #[test]
-    fn with_an_owner_map_only_its_people_in_its_group_run() {
+    fn with_an_owner_map_its_people_and_mend_s_reserved_range_run() {
         let people = People::Listed {
             gid: 41_000,
             uids: vec![40_012, 40_031],
         };
         assert_eq!(people.admit(40_012, 41_000), Ok(()));
         assert_eq!(people.admit(40_031, 41_000), Ok(()));
-        // In Mend's reserved range and group, but not on the map.
-        let why = people.admit(40_013, PERSON_GID).unwrap_err();
+        // Not on the map (a person who joined after boot), in Mend's reserved range and group.
+        for uid in [PERSON_UID_MIN, 40_013, PERSON_UID_MAX] {
+            assert_eq!(people.admit(uid, PERSON_GID), Ok(()), "{uid}");
+        }
+        // Not on the map, outside the range: a system or host user.
+        for uid in [1000, 1500, PERSON_GID, PERSON_UID_MAX + 1, 65_534] {
+            let why = people.admit(uid, PERSON_GID).unwrap_err();
+            assert_eq!(
+                why,
+                format!(
+                    "uid {uid} is not one of this executor's people (owner map) and is outside \
+                     the range of Mend's people (40001-49999)"
+                )
+            );
+        }
+        // Not on the map, in the range, in another group.
+        let why = people.admit(40_013, 1000).unwrap_err();
         assert_eq!(
             why,
-            "uid 40013 is not one of this executor's people (owner map)"
+            "uid 40013 is not one of this executor's people (owner map) and has primary group \
+             1000, not the group of Mend's people (40000)"
         );
-        // On the map, in another group.
-        let why = people.admit(40_012, PERSON_GID).unwrap_err();
-        assert!(why.contains("primary group 40000"), "{why}");
-        assert!(why.contains("owner map"), "{why}");
+        // On the map, in neither its group nor Mend's.
+        let why = people.admit(40_012, 1000).unwrap_err();
+        assert!(
+            why.contains("primary group 1000, not this executor's people's group 41000"),
+            "{why}"
+        );
+        // On the map, in Mend's group rather than the map's: the range admits it.
+        assert_eq!(people.admit(40_012, PERSON_GID), Ok(()));
+        // Root and root's group, listed or not.
         assert!(people.admit(0, 41_000).is_err());
+        assert!(people.admit(0, PERSON_GID).is_err());
         assert!(people.admit(40_012, 0).is_err());
+        assert!(people.admit(40_013, 0).is_err());
         // A map lists whomever it lists, outside the reserved range too.
         let listed = People::Listed {
             gid: 1000,
             uids: vec![1000],
         };
         assert_eq!(listed.admit(1000, 1000), Ok(()));
+        assert!(listed.admit(1500, 1000).is_err());
     }
 
     #[test]

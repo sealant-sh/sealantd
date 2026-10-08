@@ -15,9 +15,10 @@
 //!
 //! Only a user the runtime's [`People`] admits is run as, decided here from the passwd entry the
 //! daemon reads (a caller's own check proves nothing: a person with `sudo` can edit
-//! `/etc/passwd`): with the boot's owner map, one of its people or its change owner, in its
-//! group; without one, a uid in Mend's reserved range (40001-49999) whose primary group is
-//! 40000. Root and root's group are refused under either.
+//! `/etc/passwd`): a uid in Mend's reserved range (40001-49999) whose primary group is 40000,
+//! and with the boot's owner map also one of its people or its change owner, in its group. A
+//! person who joins after boot is not on the map; the range admits them. Root, root's group and
+//! any other uid (a system or host user) are refused under either.
 #![allow(unsafe_code)]
 
 use std::ffi::CString;
@@ -218,8 +219,8 @@ pub struct RunAs {
 impl RunAs {
     /// Look `user` up: a login name, or a decimal uid. Refused for root (a process names no user
     /// to run as root), for a user the passwd database does not have, and for a user `people`
-    /// does not admit ([`People::admit`]: the boot's owner map's people, else Mend's reserved
-    /// range in its group), decided from the passwd entry as the daemon reads it.
+    /// does not admit ([`People::admit`]: Mend's reserved range in its group, and the boot's
+    /// owner map's people), decided from the passwd entry as the daemon reads it.
     pub fn resolve(user: &str, people: &People) -> Result<Self, String> {
         let user = user.trim();
         if user.is_empty() {
@@ -717,6 +718,10 @@ mod tests {
         }
         let entry = User::from_uid(me).unwrap().unwrap();
         let (uid, gid) = (me.as_raw(), entry.gid.as_raw());
+        // One of Mend's people is admitted by the range whatever a map lists: nothing to refuse.
+        if People::Reserved.admit(uid, gid).is_ok() {
+            return;
+        }
         let me = uid.to_string();
         let listed = People::Listed {
             gid,
@@ -738,10 +743,8 @@ mod tests {
         };
         let why = RunAs::resolve(&me, &other_group).unwrap_err();
         assert!(why.contains(&format!("primary group {gid}")), "{why}");
-        if !(40_001..=49_999).contains(&uid) {
-            let why = RunAs::resolve(&me, &People::Reserved).unwrap_err();
-            assert!(why.contains("no owner map"), "{why}");
-        }
+        let why = RunAs::resolve(&me, &People::Reserved).unwrap_err();
+        assert!(why.contains("no owner map"), "{why}");
     }
 
     #[test]
