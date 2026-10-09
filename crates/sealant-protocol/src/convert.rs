@@ -935,6 +935,7 @@ impl From<OpenSftpArgs> for wire::OpenSftpArgs {
         Self {
             execution_id: opt_id(a.execution_id),
             cwd: a.cwd,
+            user: a.user,
         }
     }
 }
@@ -943,6 +944,7 @@ impl From<wire::OpenSftpArgs> for OpenSftpArgs {
         Self {
             execution_id: a.execution_id.map(ExecutionId::new),
             cwd: a.cwd,
+            user: a.user,
         }
     }
 }
@@ -2433,6 +2435,7 @@ mod tests {
             Command::OpenSftp(OpenSftpArgs {
                 execution_id: None,
                 cwd: Some("/work".to_owned()),
+                user: Some("mbob".to_owned()),
             }),
         ));
         let bytes = encode_client(&msg);

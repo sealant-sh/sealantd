@@ -333,6 +333,11 @@ pub struct OpenSftpArgs {
     /// Working directory for the sftp-server process.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+    /// Run the sftp-server as this user, admitted and set up as [`ExecArgs::user`] is: what it
+    /// reads and writes is that user's to read and write, and what it makes is theirs. Absent:
+    /// root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
 }
 
 /// Arguments to `dotfiles.apply`: apply a person's dotfiles into their home, as their user (Mend's
@@ -750,8 +755,9 @@ pub struct Capabilities {
     pub limits: Limits,
     /// What this daemon can do beyond the schema, by name: `restore.owner_map` (a capture
     /// restore takes an owner map), `exec.user` and `dotfiles.user` (an execution and the
-    /// dotfiles applier run as a given user). Mend's per-person layout runs on a daemon that
-    /// names all three. A daemon from before this list reports none.
+    /// dotfiles applier run as a given user), and `sftp.user` (an SFTP bridge runs as a given
+    /// user). Mend's per-person layout runs on a daemon that names the first three. A daemon
+    /// from before this list reports none.
     #[serde(default)]
     pub supports: Vec<String>,
     /// The capabilities a process run as a person holds in this daemon: `CAP_FOWNER`, or none.

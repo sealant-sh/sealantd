@@ -29,7 +29,7 @@ async fn the_offline_report_is_the_booted_one() {
         printed,
         format!(
             "{{\"schemaVersion\":{},\"daemonVersion\":\"{}\",\"os\":\"{}\",\"arch\":\"{}\",\
-             \"supports\":[\"dotfiles.user\",\"exec.user\",\"restore.owner_map\"]}}\n",
+             \"supports\":[\"dotfiles.user\",\"exec.user\",\"restore.owner_map\",\"sftp.user\"]}}\n",
             sealant_protocol::SCHEMA_VERSION,
             env!("CARGO_PKG_VERSION"),
             std::env::consts::OS,
@@ -72,7 +72,12 @@ async fn the_offline_report_is_the_booted_one() {
 
     let supports: Vec<String> = serde_json::from_value(offline["supports"].clone()).unwrap();
     assert_eq!(supports, booted.supports);
-    for name in ["exec.user", "dotfiles.user", "restore.owner_map"] {
+    for name in [
+        "exec.user",
+        "dotfiles.user",
+        "restore.owner_map",
+        "sftp.user",
+    ] {
         assert!(supports.iter().any(|s| s == name), "{name} missing");
     }
     assert_eq!(offline["daemonVersion"], booted.daemon_version);

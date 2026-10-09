@@ -35,12 +35,19 @@ pub const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
 ///   `dotfiles.apply`, which answers once the files are applied and runs `./install.sh` after
 ///   them as a managed process of that user.
 /// - `exec.user`: `exec` and `openSession` take a `user` ([`sealant_process::identity`]).
+/// - `sftp.user`: `openSftp` takes a `user` too: the `sftp-server` runs as them, admitted as for
+///   `exec`.
 /// - `restore.owner_map`: a capture restore takes an owner map (`SEALANT_CAPTURE_OWNER_MAP`),
 ///   gives each person's saved directory to their uid and the worktree to the group
 ///   ([`sealant_capture::owners`]), and sets the group's default ACLs at preparation.
 ///
 /// `sealantd capabilities --json` prints the same list without booting.
-pub const SUPPORTS: &[&str] = &["dotfiles.user", "exec.user", "restore.owner_map"];
+pub const SUPPORTS: &[&str] = &[
+    "dotfiles.user",
+    "exec.user",
+    "restore.owner_map",
+    "sftp.user",
+];
 
 /// The environment entry a test marks its processes with, to narrow a sweep to them.
 pub const SWEEP_MARK_ENV: &str = "SEALANTD_SWEEP_MARK";
@@ -1647,14 +1654,22 @@ impl Runtime {
 
             // §1.C — open an SFTP bridge (in-container sftp-server stdio).
             Command::OpenSftp(args) => {
+                // A named user is resolved and admitted as for an exec, before anything starts.
+                let as_user = match args.user.as_deref().map(|user| self.sftp_user(user)) {
+                    Some(Ok(as_user)) => Some(as_user),
+                    Some(Err(error)) => return ControlResponse::error(rid, error),
+                    None => None,
+                };
                 let cwd = args
                     .cwd
                     .map_or_else(|| self.config.workspace_root.clone(), Into::into);
                 let channel_id = self.idgen.channel_id();
-                match self
-                    .sftp
-                    .open(channel_id.clone(), &cwd, conn.out_tx.clone())
-                {
+                match self.sftp.open(
+                    channel_id.clone(),
+                    &cwd,
+                    as_user.as_ref().map(|(user, env)| (user, env.as_slice())),
+                    conn.out_tx.clone(),
+                ) {
                     Ok(inbound) => {
                         conn.register_channel(channel_id.clone(), inbound).await;
                         // Eager closer: on connection drop, abort all bridge tasks and reap the
@@ -1691,6 +1706,46 @@ impl Runtime {
                 )),
             ),
         }
+    }
+}
+
+impl Runtime {
+    /// The user an `sftp-server` runs as and its whole environment, as an exec as that user gets
+    /// it: the daemon's child environment less what a person never inherits, the image's person
+    /// environment, then the user's identity. Refused (`invalid-argument`) for a user the
+    /// runtime's people do not admit, root included.
+    fn sftp_user(
+        &self,
+        user: &str,
+    ) -> Result<(sealant_process::identity::RunAs, Vec<(String, String)>), ControlError> {
+        use sealant_process::identity;
+        let run_as = identity::RunAs::resolve(user, &self.config.people)
+            .map_err(ControlError::invalid_argument)?;
+        run_as.prepare_dirs().map_err(|e| {
+            ControlError::process_start_failed(format!(
+                "the private directories of user {}: {e}",
+                run_as.name
+            ))
+        })?;
+        let inherited = |key: &str| {
+            !(identity::withheld_from_person(key)
+                || self.config.person_withheld.iter().any(|k| k == key))
+        };
+        let mut env: Vec<(String, String)> = self
+            .config
+            .child_env
+            .iter()
+            .filter(|v| inherited(&v.key))
+            .map(|v| (v.key.clone(), v.value.clone()))
+            .collect();
+        let base_path = env
+            .iter()
+            .rev()
+            .find(|(key, _)| key == "PATH")
+            .map(|(_, value)| value.clone());
+        env.extend(identity::person_env(base_path.as_deref()));
+        env.extend(run_as.env());
+        Ok((run_as, env))
     }
 }
 

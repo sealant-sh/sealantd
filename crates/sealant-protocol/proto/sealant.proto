@@ -471,7 +471,12 @@ message ReadSessionOutputArgs {
 message DetachSessionArgs { string channel_id = 1; }
 message OpenForwardArgs { string host = 1; uint32 port = 2; optional string execution_id = 3; optional string protocol = 4; }
 message CloseForwardArgs { string channel_id = 1; }
-message OpenSftpArgs { optional string execution_id = 1; optional string cwd = 2; }
+message OpenSftpArgs {
+  optional string execution_id = 1;
+  optional string cwd = 2;
+  // Run the sftp-server as this user: a login name or a decimal uid, as ExecArgs.user.
+  optional string user = 3;
+}
 message CloseSftpArgs { string channel_id = 1; }
 
 message Command {
@@ -524,7 +529,7 @@ message Capabilities {
   FeatureMatrix features = 7;
   Limits limits = 8;
   // What this daemon can do beyond the schema, by name (`restore.owner_map`, `exec.user`,
-  // `dotfiles.user`).
+  // `dotfiles.user`, `sftp.user`).
   repeated string supports = 9;
   // The capabilities a process run as a person holds here: CAP_FOWNER, or none.
   repeated string person_capabilities = 10;
