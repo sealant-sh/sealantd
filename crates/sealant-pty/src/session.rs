@@ -488,15 +488,16 @@ impl SessionRuntime {
             &correlation,
             method,
             Confidence::Observed,
-            EventPayload::ProcessStarted(ProcessStarted {
+            // The arguments' count and lengths, never their text: they can carry secrets.
+            EventPayload::ProcessStarted(ProcessStarted::new(
                 pid,
-                pgid: pid,
-                pidfd: false,
-                executable: shell,
-                args: args.args.clone(),
-                cwd: cwd.display().to_string(),
-                started_at: self.clock.wall_now(),
-            }),
+                pid,
+                false,
+                shell,
+                &args.args,
+                cwd.display().to_string(),
+                self.clock.wall_now(),
+            )),
         );
 
         // Capture the leader's output until it closes or the leader exits. This is the SINGLE

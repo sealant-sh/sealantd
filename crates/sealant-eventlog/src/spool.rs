@@ -104,6 +104,30 @@ fn parse_segment_index(name: &str) -> Option<u64> {
         .ok()
 }
 
+/// The suffix of a segment being rewritten ([`Spool::rewrite`]): `seg-….log.rewrite`. Never read as
+/// a segment; one left by a crash mid-rewrite is removed on open.
+const REWRITE_SUFFIX: &str = ".rewrite";
+
+fn is_stale_rewrite(name: &str) -> bool {
+    name.strip_suffix(REWRITE_SUFFIX)
+        .is_some_and(|segment| parse_segment_index(segment).is_some())
+}
+
+/// Read every whole record of a segment, stopping at the first that is not (as replay does).
+fn read_segment(path: &Path, max_payload_bytes: u32) -> io::Result<Vec<Record>> {
+    let mut reader = BufReader::new(File::open(path)?);
+    let mut records = Vec::new();
+    while let Ok(Some(rec)) = record::read_record(&mut reader, max_payload_bytes) {
+        records.push(rec);
+    }
+    Ok(records)
+}
+
+/// fsync a directory, so a rename inside it survives a crash.
+fn sync_dir(dir: &Path) -> io::Result<()> {
+    File::open(dir)?.sync_all()
+}
+
 struct ScanResult {
     max_sequence: u64,
     records: u64,
@@ -159,10 +183,14 @@ impl Spool {
         let mut indices: Vec<u64> = Vec::new();
         for entry in fs::read_dir(&config.dir)? {
             let entry = entry?;
-            if let Some(name) = entry.file_name().to_str()
-                && let Some(index) = parse_segment_index(name)
-            {
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if let Some(index) = parse_segment_index(&name) {
                 indices.push(index);
+            } else if is_stale_rewrite(&name) {
+                // A rewrite that never reached its rename: the original segment is intact.
+                fs::remove_file(entry.path())?;
             }
         }
         indices.sort_unstable();
@@ -311,6 +339,80 @@ impl Spool {
             }
         }
         Ok(stats)
+    }
+
+    /// Rewrite stored records in place. `f` sees each whole record and returns a replacement payload,
+    /// or `None` to keep it. Sequence numbers and timestamps are kept. A segment with no replaced
+    /// record is not touched; one with any is written whole to `seg-….log.rewrite`, synced, and
+    /// renamed over the original (then the directory is synced), so a crash leaves either the old
+    /// segment or the new one, never a mix. Returns the number of records replaced.
+    ///
+    /// # Errors
+    /// Returns an I/O error if a segment cannot be read or written, and `InvalidData` if a
+    /// replacement exceeds the maximum record payload. Segments rewritten before the error stay
+    /// rewritten; the one that failed, and those after it, stay as they were.
+    pub fn rewrite<F: FnMut(&Record) -> Option<Vec<u8>>>(&mut self, mut f: F) -> io::Result<u64> {
+        let mut replaced = 0;
+        let last = self.segments.len().saturating_sub(1);
+        for position in 0..self.segments.len() {
+            let path = self.segments[position].path.clone();
+            let records = read_segment(&path, self.config.max_payload_bytes)?;
+            let mut changed = 0u64;
+            let mut out = Vec::new();
+            for rec in &records {
+                match f(rec) {
+                    Some(payload) => {
+                        let len = u32::try_from(payload.len()).unwrap_or(u32::MAX);
+                        if len > self.config.max_payload_bytes {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                SpoolError::PayloadTooLarge {
+                                    len,
+                                    max: self.config.max_payload_bytes,
+                                },
+                            ));
+                        }
+                        record::encode_into(&mut out, rec.sequence, rec.timestamp_micros, &payload);
+                        changed += 1;
+                    }
+                    None => {
+                        record::encode_into(
+                            &mut out,
+                            rec.sequence,
+                            rec.timestamp_micros,
+                            &rec.payload,
+                        );
+                    }
+                }
+            }
+            if changed == 0 {
+                continue;
+            }
+            let mut staged = path.clone().into_os_string();
+            staged.push(REWRITE_SUFFIX);
+            let staged = PathBuf::from(staged);
+            {
+                let mut file = OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(&staged)?;
+                file.write_all(&out)?;
+                file.sync_all()?;
+            }
+            fs::rename(&staged, &path)?;
+            sync_dir(&self.config.dir)?;
+            let new_bytes = out.len() as u64;
+            let segment = &mut self.segments[position];
+            self.total_bytes = self.total_bytes - segment.bytes + new_bytes;
+            segment.bytes = new_bytes;
+            if position == last {
+                // The append handle still points at the replaced file.
+                self.active = Some(OpenOptions::new().append(true).open(&path)?);
+            }
+            replaced += changed;
+        }
+        Ok(replaced)
     }
 
     /// Delete fully-acknowledged segments whose highest sequence is `<= up_to_sequence`. The active
@@ -517,6 +619,83 @@ mod tests {
             spool.append(1, 1, &big),
             Err(SpoolError::PayloadTooLarge { max: 1024, .. })
         ));
+    }
+
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    fn spool_bytes(dir: &Path) -> Vec<u8> {
+        let mut all = Vec::new();
+        for entry in fs::read_dir(dir).expect("dir") {
+            all.extend(fs::read(entry.expect("entry").path()).expect("read"));
+        }
+        all
+    }
+
+    #[test]
+    fn rewrite_replaces_records_in_every_segment_and_keeps_the_rest() {
+        let dir = tempfile::tempdir().expect("tmp");
+        // Tiny segments: the secret lands in an older segment and in the active one.
+        let mut spool = Spool::open(config(dir.path().into(), 60, 1 << 30)).expect("open");
+        spool.append(1, 1, b"keep-one").expect("1");
+        spool.append(2, 2, b"secret-a").expect("2");
+        spool.append(3, 3, b"keep-two").expect("3");
+        spool.append(4, 4, b"secret-b").expect("4");
+        assert!(spool.segment_count() > 1);
+        assert!(contains(&spool_bytes(dir.path()), b"secret"));
+
+        let replaced = spool
+            .rewrite(|r| r.payload.starts_with(b"secret").then(|| b"gone".to_vec()))
+            .expect("rewrite");
+        assert_eq!(replaced, 2);
+        assert!(!contains(&spool_bytes(dir.path()), b"secret"));
+        assert_eq!(
+            collect(&spool),
+            vec![
+                (1, b"keep-one".to_vec()),
+                (2, b"gone".to_vec()),
+                (3, b"keep-two".to_vec()),
+                (4, b"gone".to_vec()),
+            ]
+        );
+        let on_disk: u64 = fs::read_dir(dir.path())
+            .expect("dir")
+            .map(|e| e.expect("entry").metadata().expect("meta").len())
+            .sum();
+        assert_eq!(spool.total_bytes(), on_disk);
+
+        // The active segment's append handle follows the rename.
+        spool.append(5, 5, b"after").expect("5");
+        drop(spool);
+        let reopened = Spool::open(config(dir.path().into(), 60, 1 << 30)).expect("reopen");
+        let records = collect(&reopened);
+        assert_eq!(records.len(), 5);
+        assert_eq!(records[4], (5, b"after".to_vec()));
+    }
+
+    #[test]
+    fn rewrite_leaves_untouched_segments_alone_and_open_drops_a_stale_rewrite() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let mut spool = Spool::open(config(dir.path().into(), 1 << 20, 1 << 30)).expect("open");
+        spool.append(1, 1, b"a").expect("a");
+        let seg = dir.path().join(segment_name(0));
+        let before = fs::metadata(&seg).expect("meta").modified().expect("mtime");
+        assert_eq!(spool.rewrite(|_| None).expect("rewrite"), 0);
+        assert_eq!(
+            fs::metadata(&seg).expect("meta").modified().expect("mtime"),
+            before
+        );
+        drop(spool);
+
+        // A crash between writing the staged copy and renaming it.
+        let stale = dir
+            .path()
+            .join(format!("{}{REWRITE_SUFFIX}", segment_name(0)));
+        fs::write(&stale, b"half-written").expect("stale");
+        let spool = Spool::open(config(dir.path().into(), 1 << 20, 1 << 30)).expect("reopen");
+        assert!(!stale.exists());
+        assert_eq!(collect(&spool), vec![(1, b"a".to_vec())]);
     }
 
     #[test]

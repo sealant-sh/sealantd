@@ -204,13 +204,73 @@ pub struct ProcessStarted {
     pub pidfd: bool,
     /// Resolved executable.
     pub executable: String,
-    /// Argument vector (excluding argv0).
+    /// Always empty when published. Arguments can carry secrets (a token, a file's bytes in
+    /// base64), so their text never leaves the process that spawned them: [`Self::arg_count`] and
+    /// [`Self::arg_lengths`] describe them instead. Kept for wire compatibility; daemons before
+    /// this field's withholding filled it, and [`ProcessStarted::withhold_args`] empties such a
+    /// payload.
     #[serde(default)]
     pub args: Vec<String>,
     /// Working directory.
     pub cwd: String,
     /// When the process started.
     pub started_at: WallClockMicros,
+    /// How many arguments the process started with (excluding argv0).
+    #[serde(default)]
+    pub arg_count: u32,
+    /// Each argument's length in UTF-8 bytes, in order.
+    #[serde(default)]
+    pub arg_lengths: Vec<u32>,
+}
+
+impl ProcessStarted {
+    /// A `process.started` payload for a process spawned with `args`: their count and lengths, never
+    /// their text.
+    #[must_use]
+    pub fn new(
+        pid: i32,
+        pgid: i32,
+        pidfd: bool,
+        executable: String,
+        args: &[String],
+        cwd: String,
+        started_at: WallClockMicros,
+    ) -> Self {
+        let (arg_count, arg_lengths) = describe_args(args);
+        Self {
+            pid,
+            pgid,
+            pidfd,
+            executable,
+            args: Vec::new(),
+            cwd,
+            started_at,
+            arg_count,
+            arg_lengths,
+        }
+    }
+
+    /// Replace any argument text with its count and lengths. Returns whether anything changed: a
+    /// payload with no argument text (already withheld, or a process with no arguments) is left as
+    /// it is.
+    pub fn withhold_args(&mut self) -> bool {
+        if self.args.is_empty() {
+            return false;
+        }
+        let args = std::mem::take(&mut self.args);
+        (self.arg_count, self.arg_lengths) = describe_args(&args);
+        true
+    }
+}
+
+/// The count of `args` and each one's length in UTF-8 bytes (saturating at `u32::MAX`).
+fn describe_args(args: &[String]) -> (u32, Vec<u32>) {
+    let count = u32::try_from(args.len()).unwrap_or(u32::MAX);
+    let lengths = args
+        .iter()
+        .map(|arg| u32::try_from(arg.len()).unwrap_or(u32::MAX))
+        .collect();
+    (count, lengths)
 }
 
 /// Payload for `process.exited`.
@@ -511,6 +571,15 @@ impl EventPayload {
         }
     }
 
+    /// Withhold any argument text this payload carries (only `process.started` has any; see
+    /// [`ProcessStarted::withhold_args`]). Returns whether anything changed.
+    pub fn withhold_args(&mut self) -> bool {
+        match self {
+            Self::ProcessStarted(started) => started.withhold_args(),
+            _ => false,
+        }
+    }
+
     /// Default priority class for this payload (plan §15).
     #[must_use]
     pub fn priority(&self) -> EventPriority {
@@ -633,6 +702,85 @@ mod tests {
         assert_eq!(back, env);
         assert_eq!(back.event_type(), "io.chunk");
         assert_eq!(back.priority(), EventPriority::Normal);
+    }
+
+    fn marker_args() -> Vec<String> {
+        vec![
+            "withheld-marker-7f3a".to_owned(),
+            String::new(),
+            "  whitespace-led".to_owned(),
+            "multi\nline é".to_owned(),
+        ]
+    }
+
+    #[test]
+    fn process_started_carries_counts_never_argument_text() {
+        let started = ProcessStarted::new(
+            7,
+            7,
+            false,
+            "/bin/sh".to_owned(),
+            &marker_args(),
+            "/workspace".to_owned(),
+            WallClockMicros(1),
+        );
+        assert!(started.args.is_empty());
+        assert_eq!(started.arg_count, 4);
+        // UTF-8 bytes, not characters: "é" is two.
+        assert_eq!(started.arg_lengths, vec![20, 0, 16, 13]);
+    }
+
+    #[test]
+    fn withhold_args_empties_an_old_payload_and_is_idempotent() {
+        let mut payload = EventPayload::ProcessStarted(ProcessStarted {
+            pid: 7,
+            pgid: 7,
+            pidfd: false,
+            executable: "/bin/sh".to_owned(),
+            args: marker_args(),
+            cwd: "/workspace".to_owned(),
+            started_at: WallClockMicros(1),
+            arg_count: 0,
+            arg_lengths: vec![],
+        });
+        assert!(payload.withhold_args());
+        let EventPayload::ProcessStarted(started) = &payload else {
+            panic!("still process.started");
+        };
+        assert!(started.args.is_empty());
+        assert_eq!(started.arg_count, 4);
+        assert_eq!(started.arg_lengths, vec![20, 0, 16, 13]);
+        let once = payload.clone();
+        assert!(!payload.withhold_args(), "already withheld");
+        assert_eq!(payload, once);
+        let mut heartbeat = EventPayload::RuntimeHeartbeat(RuntimeHeartbeat {
+            state: crate::RuntimeState::Healthy,
+        });
+        assert!(!heartbeat.withhold_args());
+    }
+
+    #[test]
+    fn process_started_json_names_match_core() {
+        let started = ProcessStarted::new(
+            7,
+            7,
+            false,
+            "/bin/sh".to_owned(),
+            &marker_args(),
+            "/workspace".to_owned(),
+            WallClockMicros(1),
+        );
+        let json = serde_json::to_value(EventPayload::ProcessStarted(started)).expect("ser");
+        assert_eq!(json["argCount"], 4);
+        assert_eq!(json["argLengths"], serde_json::json!([20, 0, 16, 13]));
+        assert_eq!(json["args"], serde_json::json!([]));
+        assert!(!json.to_string().contains("withheld-marker-7f3a"));
+        // A payload from an older publisher, with neither field, still reads.
+        let old: ProcessStarted = serde_json::from_value(serde_json::json!({
+            "pid": 7, "pgid": 7, "executable": "/bin/sh", "args": ["x"], "cwd": "/", "startedAt": 1
+        }))
+        .expect("de");
+        assert_eq!((old.arg_count, old.arg_lengths.len()), (0, 0));
     }
 
     #[test]

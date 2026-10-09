@@ -24,6 +24,15 @@ use sealant_protocol::{
 use sealant_runtime_core::{Clock, IdGenerator};
 use tokio::sync::{broadcast, mpsc};
 
+/// The payload to store instead of a spooled event that carries process argument text, or `None`
+/// to keep the record as it is (no argument text, or bytes that do not decode as an event).
+fn withheld_record(payload: &[u8]) -> Option<Vec<u8>> {
+    let mut env = sealant_protocol::decode_event(payload).ok()?;
+    env.payload
+        .withhold_args()
+        .then(|| sealant_protocol::encode_event(&env))
+}
+
 /// Correlation ids attached to an event. Cheaply cloned; absent ids are omitted on the wire.
 #[derive(Debug, Clone, Default)]
 pub struct Correlation {
@@ -221,8 +230,26 @@ impl EventBus {
 
     fn replay_spool(&self, durable: &Durable) {
         let mut spool = durable.spool.lock().unwrap_or_else(|e| e.into_inner());
+        // A spool written by an older daemon can hold `process.started` events with their argument
+        // text. Rewrite them on disk before anything is replayed, so the text neither stays in the
+        // active segment (which an ack never deletes) nor reaches a subscriber.
+        match spool.rewrite(|record| withheld_record(&record.payload)) {
+            Ok(0) => {}
+            Ok(records) => tracing::info!(
+                records,
+                "withheld process arguments in spooled events written by an older daemon"
+            ),
+            Err(error) => tracing::warn!(
+                %error,
+                "spooled events from an older daemon could not be rewritten; their process \
+                 arguments are withheld on replay and stay on disk until their segment is \
+                 acknowledged and deleted"
+            ),
+        }
         let result = spool.replay(|record| {
-            if let Ok(env) = sealant_protocol::decode_event(&record.payload) {
+            if let Ok(mut env) = sealant_protocol::decode_event(&record.payload) {
+                // The rewrite above already did this, unless it failed.
+                env.payload.withhold_args();
                 durable
                     .high_water
                     .fetch_max(env.sequence.get(), Ordering::Relaxed);
@@ -277,8 +304,19 @@ impl EventBus {
         correlation: &Correlation,
         capture_method: CaptureMethod,
         confidence: Confidence,
-        payload: EventPayload,
+        mut payload: EventPayload,
     ) -> EventEnvelope {
+        // Publishers build `process.started` without argument text ([`ProcessStarted::new`]). This
+        // is the backstop for one that does not: the text is withheld before any subscriber or
+        // the spool sees the event.
+        //
+        // [`ProcessStarted::new`]: sealant_protocol::ProcessStarted::new
+        if payload.withhold_args() {
+            tracing::warn!(
+                event_type = payload.event_type(),
+                "a publisher passed process arguments; withheld"
+            );
+        }
         let sequence = Sequence(self.sequence.fetch_add(1, Ordering::Relaxed));
         EventEnvelope {
             schema_version: SCHEMA_VERSION,
@@ -414,7 +452,7 @@ impl EventBus {
 mod tests {
     use super::*;
     use sealant_eventlog::{FsyncPolicy, SpoolConfig};
-    use sealant_protocol::{RuntimeHeartbeat, RuntimeState};
+    use sealant_protocol::{ProcessStarted, RuntimeHeartbeat, RuntimeState};
     use sealant_runtime_core::new_runtime_id;
     use std::path::PathBuf;
 
@@ -537,6 +575,155 @@ mod tests {
             .expect("no timeout")
             .expect("event");
         assert_eq!(replayed.sequence, envelope.sequence);
+    }
+
+    const MARKER: &[u8] = b"withheld-marker-7f3a";
+
+    fn marker_args() -> Vec<String> {
+        vec![
+            "withheld-marker-7f3a".to_owned(),
+            String::new(),
+            "  whitespace-led".to_owned(),
+            "multi\nline".to_owned(),
+        ]
+    }
+
+    /// A `process.started` as a daemon before argument withholding published it.
+    fn old_style_started() -> EventPayload {
+        EventPayload::ProcessStarted(ProcessStarted {
+            pid: 7,
+            pgid: 7,
+            pidfd: false,
+            executable: "/bin/sh".to_owned(),
+            args: marker_args(),
+            cwd: "/workspace".to_owned(),
+            started_at: sealant_protocol::WallClockMicros(1),
+            arg_count: 0,
+            arg_lengths: vec![],
+        })
+    }
+
+    fn contains_marker(bytes: &[u8]) -> bool {
+        bytes.windows(MARKER.len()).any(|w| w == MARKER)
+    }
+
+    fn dir_bytes(dir: &std::path::Path) -> Vec<u8> {
+        let mut all = Vec::new();
+        for entry in std::fs::read_dir(dir).expect("dir") {
+            all.extend(std::fs::read(entry.expect("entry").path()).expect("read"));
+        }
+        all
+    }
+
+    fn assert_withheld(env: &EventEnvelope) {
+        let EventPayload::ProcessStarted(started) = &env.payload else {
+            panic!("expected process.started, got {:?}", env.payload);
+        };
+        assert!(started.args.is_empty());
+        assert_eq!(started.arg_count, 4);
+        assert_eq!(started.arg_lengths, vec![20, 0, 16, 10]);
+        assert!(!contains_marker(&sealant_protocol::encode_event(env)));
+    }
+
+    #[tokio::test]
+    async fn a_publisher_passing_arguments_is_withheld_before_subscribers_and_the_spool() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let rt = new_runtime_id();
+        let clock = Arc::new(Clock::new());
+        let idgen = Arc::new(IdGenerator::new(&rt));
+        let bus = Arc::new(EventBus::durable(
+            rt,
+            clock,
+            idgen,
+            64,
+            open_spool(dir.path().into()),
+            Duration::from_millis(50),
+        ));
+        let mut rx = bus.subscribe();
+        bus.start_delivery();
+        bus.publish(
+            &Correlation::new(),
+            CaptureMethod::Internal,
+            Confidence::Observed,
+            old_style_started(),
+        );
+        let env = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("no timeout")
+            .expect("event");
+        assert_withheld(&env);
+        // Spooled before it was broadcast: the bytes on disk are final.
+        let on_disk = dir_bytes(dir.path());
+        assert!(!on_disk.is_empty(), "the event was spooled");
+        assert!(!contains_marker(&on_disk));
+    }
+
+    #[tokio::test]
+    async fn an_older_daemons_spooled_arguments_are_rewritten_and_never_replayed() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let rt = new_runtime_id();
+        let clock = Arc::new(Clock::new());
+        let idgen = Arc::new(IdGenerator::new(&rt));
+        let seed = EventBus::new(rt.clone(), clock.clone(), idgen.clone(), 8);
+        // Two segments, as an older daemon left them: the argument text in the older one (which an
+        // ack deletes) and in the active one (which an ack never deletes).
+        let tiny = |dir: PathBuf| {
+            Spool::open(SpoolConfig {
+                dir,
+                segment_bytes: 64,
+                disk_limit_bytes: 1 << 30,
+                max_payload_bytes: 1 << 20,
+                fsync: FsyncPolicy::Never,
+            })
+            .expect("spool")
+        };
+        let mut seeded = Vec::new();
+        {
+            let mut spool = tiny(dir.path().into());
+            for _ in 0..2 {
+                let mut envelope = seed.build_envelope(
+                    &Correlation::new(),
+                    CaptureMethod::Internal,
+                    Confidence::Observed,
+                    heartbeat(),
+                );
+                // Past `build_envelope`, as an older daemon wrote it.
+                envelope.payload = old_style_started();
+                let bytes = sealant_protocol::encode_event(&envelope);
+                assert!(contains_marker(&bytes));
+                spool
+                    .append(envelope.sequence.get(), 0, &bytes)
+                    .expect("append");
+                seeded.push(envelope);
+            }
+            spool.flush().expect("flush");
+            assert_eq!(spool.segment_count(), 2);
+        }
+        assert!(contains_marker(&dir_bytes(dir.path())));
+
+        let bus = Arc::new(EventBus::durable(
+            rt,
+            clock,
+            idgen,
+            64,
+            tiny(dir.path().into()),
+            Duration::from_millis(50),
+        ));
+        let mut rx = bus.subscribe();
+        bus.start_delivery();
+        for envelope in &seeded {
+            let replayed = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("no timeout")
+                .expect("event");
+            assert_eq!(replayed.sequence, envelope.sequence);
+            assert_eq!(replayed.event_id, envelope.event_id);
+            assert_withheld(&replayed);
+        }
+        // The rewrite precedes the replay, so it is done once the events arrived.
+        let on_disk = dir_bytes(dir.path());
+        assert!(!on_disk.is_empty(), "the active segment stays");
+        assert!(!contains_marker(&on_disk));
     }
 
     #[tokio::test]
