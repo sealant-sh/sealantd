@@ -1,5 +1,213 @@
 # @sealant/runtime-protocol
 
+## 0.20.0
+
+### Minor Changes
+
+- c52f585: Upload URLs bound to their bytes. The executor lists `sha256` in `plan.get`'s `upload_answers`: it
+  sends `x-amz-checksum-sha256` (the SHA-256 of the bytes, base64) on every PUT whose URL signs it,
+  and declares in `upload.urls` the SHA-256 of each pack index, the one key whose name does not say
+  it. A registrar on a store that cannot refuse an overwrite but checks a signed checksum (Garage) can
+  then mint URLs that write those bytes or nothing: no write authority, and no seal waits for them to
+  expire. An older registrar ignores both, and nothing changes for a URL that does not sign it.
+- 49972eb: Processes as a person's user (Mend's per-person layout). `exec` and `openSession` take `user`, a
+  login name or a decimal uid: the process starts as exactly that passwd entry (uid, primary and
+  supplementary groups, `HOME`, `USER`, `LOGNAME`, `SHELL`, umask `0002`, a private `TMPDIR` and
+  `XDG_RUNTIME_DIR`), and every child inherits it; a PTY leader owns its terminal. Where the daemon
+  has no no-new-privileges (so `sudo` works), the process also holds `CAP_FOWNER`, ambient, which
+  amounts to root; `runtime.getCapabilities` reports `personCapabilities` and, when withheld, why.
+  Such a process inherits no harness or provider login, no declared harness key and no `SEALANT_*`
+  key from the daemon's environment; the project's secrets reach it. The dotfiles commands run with
+  a clean, explicit environment. The image's `/etc/sealant/person-env` (first line
+  `# person-env 1`, then literal `KEY=VALUE` lines, `PATH_PREPEND` in front of `PATH`) applies to
+  every process run as a person, never to root, under the caller's explicit variables.
+
+  The dotfiles applier runs as a user into their home through the new `dotfiles.apply` command,
+  which answers once the files are applied and runs `./install.sh` after them as a managed process
+  of that user. It is used once the user exists, the launcher included; boot still applies root's
+  dotfiles into `/root`, and no user needs to exist at boot.
+
+  `supports` names `exec.user` and `dotfiles.user` beside `restore.owner_map`, and
+  `sealantd capabilities --json` prints them without booting.
+
+- 5480f46: A per-person executor (a root daemon whose capture source carries an owner map naming at least one
+  person, Mend's ADR 0016) no longer
+  sets no-new-privileges on the daemon: every person there has passwordless `sudo`, which
+  no-new-privileges breaks, so the executor is root by design, not a sandbox, and its persons hold
+  `CAP_FOWNER` (pnpm relinks bins). Every other executor keeps no-new-privileges, as before (plan §18,
+  amended). The posture is decided once (`BootConfig::no_new_privileges`) and read by boot's
+  preparation and the runtime alike. Boot logs the posture and the state it found, and
+  `runtime.getCapabilities` reports `noNewPrivileges` (optional: absent is unknown).
+- 8aee6ed: `process.started` never carries a process's arguments. They can carry secrets (a token a script
+  writes, a file's bytes in base64), and the daemon published them as text to every event subscriber
+  and to the durable spool on disk (`--spool-dir` / `SEALANT_SPOOL_DIR`). The event now names the
+  executable and carries `argCount` and `argLengths` (each argument's length in UTF-8 bytes, in
+  order), the shape Sealant Core already stores; `args` stays in the schema for wire compatibility and
+  is always empty.
+
+  Exec and session open build the event without the text, and the event bus withholds any text a
+  publisher passes before a subscriber or the spool sees it. On start, a daemon rewrites spool
+  segments an older daemon left with argument text (each segment to a synced copy renamed over the
+  original) before it replays them, and withholds the text from every replayed event even if the
+  rewrite fails.
+
+  A rewrite replaces a segment only after reading it completely: a read error or a record that no
+  longer decodes leaves the segment as it was. The active segment's append handle is the rewritten
+  file's own, installed with the rename, so no append can go to the replaced file; a failed directory
+  sync after the rename is synced again by the next flush. A failed lifecycle step is logged by its
+  phase and index (`setup[0]`), its program and its arguments' count and lengths, never its script,
+  and the workspace clone URL is logged without credentials.
+
+- 674837c: A capture restore takes an owner map (`SEALANT_CAPTURE_OWNER_MAP`, Mend's per-person layout):
+  each person's saved directory (`people/<account id>/` in the harness home) is restored owned by
+  their uid and the shared group, the directory itself 0710 and the rest at its recorded mode. The
+  worktree, its git directory and the shared conversations (`people/<id>/conversations/`) get the
+  owner's read, write and execute bits copied to the group (a 0600 file comes back 0660) and setgid
+  on directories, in the `chmod` the restore already makes, so a capture root made with 0644/0755 comes
+  back editable by every person at no extra syscalls. At boot the worktree root goes to the change's
+  owner and the group, and the group's default ACL is set on it and on `/opt` and `/var/cache`.
+  Captures still record no owner; without a map nothing changes.
+
+  `Capabilities` gains `supports`, the names of what the daemon can do beyond the schema; this
+  daemon names `restore.owner_map`.
+
+- 1a148ff: An SFTP bridge runs as a person's user. `openSftp` takes `user`, a login name or a decimal uid,
+  admitted exactly as for `exec` (one of the executor's people, never root): the `sftp-server` starts
+  as that user with the environment an exec as them gets (the daemon's child environment less every
+  login and `SEALANT_*` key, the image's person environment, then `HOME`, `USER`, `LOGNAME`,
+  `SHELL`, `TMPDIR` and `XDG_RUNTIME_DIR` from their passwd entry), so what it reads and writes is
+  theirs to read and write, and what it makes is theirs. Without `user` nothing changes: root, with
+  the daemon's environment. `supports` names `sftp.user`, which an SSH gateway reads before it sends
+  a user, since an older daemon ignores the field and would run the bridge as root.
+- 5116abf: sealantd runs a process only as one of the executor's people. When `exec`, `openSession` or
+  `dotfiles.apply` names a `user`, the daemon checks the passwd entry it resolves: the uid must be in
+  Mend's reserved range (40001-49999) with primary group 40000, or, under an owner map
+  (`SEALANT_CAPTURE_OWNER_MAP`), one of the map's `people` or its `worktree` uid in the map's `gid`.
+  The range applies under a map too, because the map is read only at boot and a person who joins the
+  worktree later is not on it. Anyone else is refused with `invalid-argument` before anything
+  starts, and the message says why (`uid 1500 is not one of this executor's people (owner map) and
+is outside the range of Mend's people (40001-49999)`). Root and root's group stay refused. A
+  caller's own check is not enough here, since a person with `sudo` in the executor can edit
+  `/etc/passwd`. Requests that name no user are unchanged.
+
+### Patch Changes
+
+- 9a7fa5b: A pack index's SHA-256 is declared on a multipart mint too, so a registrar that answers it as a
+  single PUT can bind that URL to its bytes (before, it went unbound and the seal waited for it).
+- 7379a34: Two capture timing bugs, found while fixing flaky tests:
+
+  - A change signalled while a class loop was between reading its clock and going to sleep woke
+    nobody, and the loop slept until the old due time: a watched class's reconcile interval, a
+    minute for the small class and ten for the bulk class. An overflow at startup went unhandled
+    that long. The loop now checks the state again under the lock it sleeps on.
+  - A flush beside a bulk upload waited for the ship worker to let go of the pass, and the worker,
+    having yielded to it, took the pass straight back, over and over. On arm64 a suspend flush
+    beside a 5 s bulk upload took 5 to 19 s, the worker giving way 8,575 times in one of them. The
+    worker now waits until the flush holds the pass.
+
+- 0a4278e: `dotfiles.apply` no longer writes into a person's home as root. Their archives are unpacked by root
+  into a directory of its own outside every home (`/run/sealant/dotfiles-staging`, 0700, removed once
+  the apply ends, failed or not), without owners, and an archive is refused before anything is
+  written when an entry has an absolute path, a `..`, lies under a link the archive makes, or is not
+  a file, a directory or a link. Every write into the home (directories, files, links, modes, the
+  trees under `~/.local/share/sealant-dotfiles`, the repository checkout's removal and the askpass
+  shim) is made as the person: on a thread whose filesystem uid, gid and groups are theirs and that
+  holds no capability. A link a person planted into another person's home now fails the apply,
+  naming the path, instead of letting root write through it. Root's own dotfiles at boot are applied
+  as before.
+- 2d3ba7e: A person's `dotfiles.apply` hardened further (review of #149):
+
+  - **Sizes:** an archive is refused before anything is extracted when its listing unpacks to more
+    than `SEALANT_DOTFILES_MAX_UNPACKED_BYTES` (default 256 MiB) in all, or more than
+    `SEALANT_DOTFILES_MAX_FILE_BYTES` (default 64 MiB) in one file.
+  - **Links:** an archive is refused when a link sits at its root (`.`), or when a hard link's
+    target is absolute, has a `..`, lies under one of the archive's links, or is not an entry of
+    the archive. These no longer rely on GNU tar's own protections.
+  - **One read:** the archive is read once, through a descriptor that does not follow a link, into
+    root's staging, and every listing and the extraction read that copy.
+  - **No process from the writer thread:** the process gate refuses a spawn from a thread acting
+    with a person's filesystem identity, whose child would run as root.
+  - **Dumpable:** the daemon is dumpable again after an apply, as it was before it.
+  - **Staging sweep:** only this pid's leftovers from an earlier daemon are removed; another
+    daemon's are left alone.
+  - **Tree mode:** the person's tree under `~/.local/share/sealant-dotfiles/<i>` takes the mode it
+    had before #149 (the daemon's umask) instead of 0700.
+
+- 231691f: `@sealant/runtime-client` depends on the exact `@sealant/runtime-protocol` version it was published
+  with, not a caret range. The two are versioned together, and a caret on a prerelease
+  (`^0.20.0-next.7`) would accept any later prerelease of the protocol.
+- 26ce30d: A final capture flush uses every core. On a 140,548-file, 2.3 GB dependency tree the snapshot
+  took 28.9 s and now takes 2.9 s on a Ryzen 9950X3D. In a session on an i9-9900K, which has no SHA
+  extensions, it took 69 s and now takes 9 to 10 s.
+
+  - Small files are read, hashed and compressed on reader threads, in the order the build takes them.
+  - A file too large to read ahead whole is still read in order, and its parts are hashed and
+    compressed on those threads. 24 such files were 923 MB of that tree.
+  - A pack's digest is computed on a thread of its own, and the pack is synced and named while the
+    next one is written.
+  - SHA-256 comes from `ring`, about twice as fast as before on a CPU without SHA extensions.
+  - Objects of 16 MiB and more upload four at a time. They went up one at a time.
+  - A single PUT may run for as long as its size needs at 512 KiB/s. It was cut at 10 minutes.
+
+  The output is the same bytes: the same chunks, packs and tree as a build on one thread.
+
+- 07ada50: Capture leaves every harness credential out of the harness home, after an audit of Claude Code
+  2.1.289, Codex 0.160.0, opencode 1.18.34 and pi 1.0.2 in a workspace-like container with no OS
+  keyring, after a clean exit and killed in the middle of a turn. Newly left out, and never restored from an earlier capture:
+
+  - Codex: `.codex/.credentials.json`, where Codex keeps MCP server OAuth tokens when no keyring is
+    available (every workspace), `.codex/shell_snapshots/` (every exported environment variable with
+    its value, present while a session runs and left behind when it is killed), and `.codex/secrets/`.
+  - Claude Code: `.claude/.device-keys.json`, `.claude/remote-settings.json`, and the directories
+    `.claude/backups/` (copies of `~/.claude.json`, with a Console API key and MCP server headers),
+    `.claude/file-history/` (a copy of every file it edits), `.claude/shell-snapshots/`,
+    `.claude/sessions/`, `.claude/session-env/` and `.claude/ide/`.
+  - opencode: `.local/share/opencode/repos/` and `.local/share/opencode/log/`, where a clone URL's
+    credentials land.
+  - pi: `.pi/agent/mcp-auth.json` (pi's own MCP server OAuth tokens), `.pi/agent/oauth.json`, `.pi/agent/mcp-oauth/` and `.pi/agent/mcp-oauth-encrypted/`,
+    `.pi/agent/mcp.json`, `.pi/agent/tmp/` (clones a launch loads, a source URL's credentials in
+    their git config), `.pi/agent/crashes.json`, and the copy Mend delivers from a person's pi profile
+    (`.pi/agent/mend/profile/root/mcp.json`, `.mend/pi-profile-kept/`).
+
+  Codex's machine state is left out too, in a list of its own since none of it is a credential:
+  `.codex/packages/` (the runtime a `codex` typed by hand unpacks, about 427 MB),
+  `.codex/app-server-daemon/` and `.codex/app-server-control/` (a daemon's state and control socket).
+
+  A login or token one person made in a session no longer reaches the next session in the worktree.
+  The list can now name a directory as well as a file, and a file covers its suffixed siblings (a
+  lock, a write's temporary, a backup copy). ADR-0015 lists every entry.
+
+- 07ada50: Capture leaves opencode's MCP server logins out of the harness home:
+  `.local/share/opencode/mcp-auth.json` (the OAuth tokens and client secrets of the MCP servers
+  opencode signs in to), as it does opencode's own `auth.json`. A sign-in made inside one person's
+  session is no longer saved, and no longer reaches the next session in the worktree, anyone's.
+
+  A restore never writes a harness credential file back either: a capture made before a file joined
+  the list (opencode's `mcp-auth.json` until now) still holds it, and materialize now skips every
+  harness credential under the harness home instead of restoring it.
+
+- dbefd1f: Capture applies the harness credential and machine-state tables under every person's saved
+  directory (`people/<account id>/` in the harness home, Mend's per-person layout) as it does at the
+  root, the sibling rule included: a login a link-breaking write leaves in a person's saved directory
+  is never captured, and a capture that holds one never restores it. The tables apply under every
+  shared conversation (`people/<id>/conversations/<session>/`) too, and a shared conversation never
+  saves `file-history/`: Claude Code's file history is never saved anywhere.
+
+  Codex's logs database (`codex-db/logs_*`) and every SQLite `-shm` file in `codex-db/` are machine
+  state, never saved; Codex's thread index and memory database are saved with their WAL. ADR-0015
+  lists both entries, and a new kind of entry, a pattern with one `*` in its last component.
+
+- 15c33aa: Capture leaves pi's and opencode's own login files out of the harness home, as it does Claude
+  Code's and Codex's: `.pi/agent/auth.json` and `.local/share/opencode/auth.json`. A login made inside
+  a session with either harness is never captured; their settings and sessions still are.
+- 05ce137: A restore writes files on every core, up to 16. The walk of a capture's tree still makes every
+  directory in order. The files are then written on threads, each one staged beside its path and
+  renamed into place, as before. On the Docker box a boot restoring the mend project, 127,000 files
+  and 2.48 GB of them dependencies, spent 31-40 s in `capture head materialized`, writing those files
+  one after another. Copying the same tree there takes 14.8 s on one thread and 2.1 s on twelve. On a
+  32-core workstation the whole restore of 146,469 files went from 8.0 s to 5.0 s, and the restored
+  tree's `git status` is identical. `capture head materialized` now logs `elapsed_ms`.
+
 ## 0.19.0
 
 ### Minor Changes
@@ -95,11 +303,11 @@ rev-list --stdin` got their whole input before their answer was read: once the a
 standby no session claimed (…)` on stderr, which Core's recovery sweep already releases on
     (`nothing-to-save`). Once any claim or writer was admitted none of this applies again.
 
-    Before, a claimed standby whose re-plan failed kept its placeholder captures queued forever
-    (`lease-lost`). Its final flush never completed, and the launch waited 12 minutes, failed and
-    needed a discard. Mend binds a `complete` answer to the lease epoch its claim took, so to act
-    on the answer itself it must read a claimed standby's answer under the placeholder's epoch and
-    its `standby:<id>` launch as nothing to save. Until then it sees the executor end.
+        Before, a claimed standby whose re-plan failed kept its placeholder captures queued forever
+        (`lease-lost`). Its final flush never completed, and the launch waited 12 minutes, failed and
+        needed a discard. Mend binds a `complete` answer to the lease epoch its claim took, so to act
+        on the answer itself it must read a claimed standby's answer under the placeholder's epoch and
+        its `standby:<id>` launch as nothing to save. Until then it sees the executor end.
 
   - **A base restores in its own formats (F4b).** When the plan's workspace class carries no
     `.git/config` or reftable tables (Mend's capture 0), the workspace sweep now leaves the ones
