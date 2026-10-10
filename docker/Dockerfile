@@ -15,12 +15,29 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY . .
-RUN set -eux; \
+# Cargo's registry, its git checkouts and the target directory are BuildKit cache mounts, one of each
+# per platform, so two platforms built on one builder never wait on each other's lock: a rebuild on
+# the same builder after an edit compiles what changed, not the whole tree (Mend's verify stack
+# rebuilds sealantd in a session after each fix; a cold build takes about 1.5 min at 12 CPUs). A
+# release builder starts empty, so a release build is unchanged. The binaries are copied out of the
+# mount, which the image never contains.
+#
+# Cargo decides a crate is fresh by file mtimes. The target directory outlives the tree it was built
+# from, and `COPY` keeps whatever mtimes the context carries, so a source older than the cached
+# artifacts (another checkout, a restored tree) would ship the cached binary. Every source file is
+# stamped with the build's time first: the workspace's own crates always rebuild, and only the
+# dependencies come from the cache.
+ARG TARGETPLATFORM
+RUN --mount=type=cache,id=sealantd-cargo-registry-${TARGETPLATFORM},target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=sealantd-cargo-git-${TARGETPLATFORM},target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=sealantd-target-${TARGETPLATFORM},target=/src/target,sharing=locked \
+    set -eux; \
     case "$(uname -m)" in \
       x86_64)  target=x86_64-unknown-linux-musl ;; \
       aarch64) target=aarch64-unknown-linux-musl ;; \
       *) echo "unsupported arch $(uname -m)" >&2; exit 1 ;; \
     esac; \
+    find /src -path /src/target -prune -o -type f -exec touch -c {} +; \
     rustup target add "$target"; \
     cargo build --locked --release --bin sealantd --bin sealantctl --target "$target"; \
     cp "target/$target/release/sealantd" /sealantd; \
