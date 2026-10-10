@@ -195,9 +195,16 @@ message ProcessStarted {
   int32 pgid = 2;
   bool pidfd = 3;
   string executable = 4;
+  // Always empty. Arguments can carry secrets (a token, a file's bytes in base64), so the daemon
+  // never publishes their text: `arg_count` and `arg_lengths` describe them instead. The field
+  // stays for wire compatibility; older daemons filled it.
   repeated string args = 5;
   string cwd = 6;
   int64 started_at = 7;
+  // How many arguments the process started with (excluding argv0).
+  uint32 arg_count = 8;
+  // Each argument's length in UTF-8 bytes, in order.
+  repeated uint32 arg_lengths = 9;
 }
 
 message ProcessExited {

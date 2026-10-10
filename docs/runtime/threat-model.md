@@ -71,6 +71,16 @@ and "Daemon secrets do not leak through env or inherited descriptors" gates):
    *that* an env var existed (by allowlisted name), never an unredacted secret value.
 5. **close-on-exec on every daemon-only descriptor** (control socket, spool fds, log sink) so no daemon
    resource is inherited across the child's `exec` (plan §18 design goals).
+6. **Never publish a process's arguments.** They can carry secrets (a token a script writes, a file's
+   bytes in base64). `process.started` names the executable and carries `argCount` and `argLengths`
+   (UTF-8 bytes per argument); its `args` is always empty. The publishers build it that way, the event
+   bus withholds any text a publisher passes before a subscriber or the spool sees it, and on start
+   the daemon rewrites spool segments an older daemon left with argument text before replaying them.
+   No log line prints an argument: a failed lifecycle step is named by its phase and index
+   (`setup[0]`, `startup[1]`) with its program and its arguments' count and UTF-8 lengths, never its
+   script, and the workspace clone's URL is logged without any `user:password@`. The daemon's own
+   git helpers are named by their subcommand and first argument, which the daemon chooses (a flag,
+   a ref or a path).
 
 ## 4. Logging vs. telemetry separation (plan §18)
 

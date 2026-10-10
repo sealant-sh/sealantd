@@ -11,11 +11,15 @@ import { rmSync } from "node:fs";
 import { Buffer } from "node:buffer";
 import type { ChildProcess } from "node:child_process";
 
+import { toJson } from "@bufbuild/protobuf";
+
 import { SealantClient, SealantError } from "@sealant/runtime-client";
 import {
   ControlErrorCode,
+  EventEnvelopeSchema,
   RuntimeState,
   StreamKind,
+  type ProcessStarted,
 } from "@sealant/runtime-protocol";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -85,6 +89,39 @@ test("starts daemon, execs, streams typed events, gets the result, and shuts dow
     }
     assert.equal(stdout.toString("utf8"), "hello\n");
     assert.equal(exitCode, 0);
+
+    await client.shutdown(200);
+  } finally {
+    client.close();
+    await waitExit(child);
+    rmSync(socketPath, { force: true });
+  }
+});
+
+test("process.started describes the arguments and never carries their text", async () => {
+  const socketPath = uniqueSocket();
+  const { client, child } = await SealantClient.spawn({ binPath, socketPath, workspace: tmpdir() });
+  try {
+    const marker = "withheld-marker-7f3a";
+    const args = ["-c", "exit 0", "sh", marker, "", "  whitespace-led", "multi\nline é"];
+    const events = client.events();
+    await client.exec({ executable: "/bin/sh", args });
+
+    let started: ProcessStarted | undefined;
+    for await (const event of events) {
+      const json = JSON.stringify(toJson(EventEnvelopeSchema, event));
+      assert.ok(!json.includes(marker), `an event carried argument text: ${json}`);
+      if (event.payload.case === "processStarted") started = event.payload.value;
+      if (event.payload.case === "processExited") break;
+    }
+    assert.ok(started, "process.started arrived");
+    assert.deepEqual(started.args, []);
+    assert.equal(started.argCount, args.length);
+    assert.deepEqual(
+      started.argLengths,
+      args.map((a) => Buffer.byteLength(a, "utf8")),
+    );
+    assert.deepEqual(started.argLengths, [2, 6, 2, 20, 0, 16, 13]);
 
     await client.shutdown(200);
   } finally {

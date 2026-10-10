@@ -277,15 +277,16 @@ impl ProcessRuntime {
             &correlation,
             CaptureMethod::Internal,
             Confidence::Observed,
-            EventPayload::ProcessStarted(ProcessStarted {
+            // The arguments' count and lengths, never their text: they can carry secrets.
+            EventPayload::ProcessStarted(ProcessStarted::new(
                 pid,
                 pgid,
-                pidfd: false,
-                executable: args.executable.clone(),
-                args: args.args.clone(),
-                cwd: cwd.display().to_string(),
-                started_at: self.clock.wall_now(),
-            }),
+                false,
+                args.executable.clone(),
+                &args.args,
+                cwd.display().to_string(),
+                self.clock.wall_now(),
+            )),
         );
 
         let chunk_size = self.config.io_chunk_bytes;

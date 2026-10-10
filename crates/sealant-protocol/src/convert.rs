@@ -421,6 +421,8 @@ impl From<ProcessStarted> for wire::ProcessStarted {
             args: p.args,
             cwd: p.cwd,
             started_at: p.started_at.get(),
+            arg_count: p.arg_count,
+            arg_lengths: p.arg_lengths,
         }
     }
 }
@@ -434,6 +436,8 @@ impl From<wire::ProcessStarted> for ProcessStarted {
             args: p.args,
             cwd: p.cwd,
             started_at: WallClockMicros(p.started_at),
+            arg_count: p.arg_count,
+            arg_lengths: p.arg_lengths,
         }
     }
 }
@@ -2036,6 +2040,48 @@ mod tests {
         assert_eq!(wire_summary.mode, wire::SessionMode::Pipe as i32);
         let back = SessionSummary::try_from(wire_summary).expect("decode");
         assert_eq!(back, summary);
+    }
+
+    #[test]
+    fn process_started_counts_round_trip_and_old_args_decode() {
+        let started = ProcessStarted::new(
+            7,
+            7,
+            false,
+            "/bin/sh".to_owned(),
+            &["withheld-marker-7f3a".to_owned(), String::new()],
+            "/workspace".to_owned(),
+            WallClockMicros(1),
+        );
+        let wire_started = wire::ProcessStarted::from(started.clone());
+        assert!(wire_started.args.is_empty());
+        assert_eq!(wire_started.arg_count, 2);
+        assert_eq!(wire_started.arg_lengths, vec![20, 0]);
+        let bytes = wire_started.encode_to_vec();
+        assert!(
+            !bytes
+                .windows(b"withheld-marker-7f3a".len())
+                .any(|w| w == b"withheld-marker-7f3a")
+        );
+        let back = ProcessStarted::from(wire::ProcessStarted::decode(bytes.as_slice()).expect("d"));
+        assert_eq!(back, started);
+
+        // An older daemon's message: argument text, no counts. It decodes as it was written, and
+        // withholding gives the counts the new fields carry.
+        let old = wire::ProcessStarted {
+            pid: 7,
+            pgid: 7,
+            pidfd: false,
+            executable: "/bin/sh".to_owned(),
+            args: vec!["withheld-marker-7f3a".to_owned(), String::new()],
+            cwd: "/workspace".to_owned(),
+            started_at: 1,
+            arg_count: 0,
+            arg_lengths: vec![],
+        };
+        let mut decoded = ProcessStarted::from(old);
+        assert!(decoded.withhold_args());
+        assert_eq!(decoded, started);
     }
 
     #[test]
