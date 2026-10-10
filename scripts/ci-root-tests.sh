@@ -5,6 +5,11 @@
 set -euo pipefail
 
 command -v setfacl >/dev/null || sudo apt-get install -y --no-install-recommends acl
+# `run_as_user` opens a real SFTP bridge as a person (required: a missing binary fails the test).
+if [ ! -x /usr/lib/openssh/sftp-server ] && [ ! -x /usr/libexec/openssh/sftp-server ]; then
+  sudo apt-get update -q
+  sudo apt-get install -y --no-install-recommends openssh-sftp-server
+fi
 # `run_as_user` runs pnpm as a person in a restored worktree (it needs the registry too).
 command -v pnpm >/dev/null || sudo npm install -g pnpm@9
 

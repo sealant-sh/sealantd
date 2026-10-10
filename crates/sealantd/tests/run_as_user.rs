@@ -416,16 +416,18 @@ async fn sftp_round_trip(
 }
 
 /// An SFTP bridge with a user runs its `sftp-server` as that user: a directory it makes is
-/// theirs, and one in a home they cannot enter is refused. Needs the image's `sftp-server`.
+/// theirs, and one in a home they cannot enter is refused. Needs the `sftp-server` (required).
 #[tokio::test]
 async fn an_sftp_bridge_runs_as_the_user_it_names() {
     if !ready() {
         return;
     }
-    if sealant_process::sftp::resolve_sftp_server().is_none() {
-        eprintln!("no sftp-server here: the SFTP-as-a-user test is skipped");
-        return;
-    }
+    // `ready()` holds only with SEALANTD_REQUIRE_ROOT_TESTS=1, where a skip would pass a security
+    // test that never ran: the image must carry the sftp-server (CI installs it).
+    assert!(
+        sealant_process::sftp::resolve_sftp_server().is_some(),
+        "SEALANTD_REQUIRE_ROOT_TESTS=1 but no sftp-server here: install openssh-sftp-server"
+    );
     let dir = scratch();
     let mut client = Client::start(dir.path());
     let Some(CommandResult::SftpOpened(opened)) = ok(client
