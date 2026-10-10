@@ -15,3 +15,10 @@ publisher passes before a subscriber or the spool sees it. On start, a daemon re
 segments an older daemon left with argument text (each segment to a synced copy renamed over the
 original) before it replays them, and withholds the text from every replayed event even if the
 rewrite fails.
+
+A rewrite replaces a segment only after reading it completely: a read error or a record that no
+longer decodes leaves the segment as it was. The active segment's append handle is the rewritten
+file's own, installed with the rename, so no append can go to the replaced file; a failed directory
+sync after the rename is synced again by the next flush. A failed lifecycle step is logged by its
+phase and index (`setup[0]`), its program and its arguments' count and lengths, never its script,
+and the workspace clone URL is logged without credentials.

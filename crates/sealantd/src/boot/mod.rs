@@ -654,15 +654,26 @@ async fn boot_serve(
     tracing::info!(banner = %config.banner, "{}", config.banner);
 
     // Step 14: lifecycle setup then startup, each awaited to completion (set -e parity).
-    let steps: Vec<&LifecycleStep> = config
+    // A step is named by its phase and index, never by its script: the script is a shell argument
+    // and can carry secrets.
+    let steps: Vec<(String, &LifecycleStep)> = config
         .lifecycle
         .setup
         .iter()
-        .chain(config.lifecycle.startup.iter())
+        .enumerate()
+        .map(|(index, step)| (format!("setup[{index}]"), step))
+        .chain(
+            config
+                .lifecycle
+                .startup
+                .iter()
+                .enumerate()
+                .map(|(index, step)| (format!("startup[{index}]"), step)),
+        )
         .collect();
-    for step in steps {
-        if let Err(code) = run_lifecycle_step(&runtime, &config, step).await {
-            tracing::error!(run = %step.run, "lifecycle step failed; aborting boot");
+    for (label, step) in steps {
+        if let Err(code) = run_lifecycle_step(&runtime, &config, &label, step).await {
+            tracing::error!(step = %label, "lifecycle step failed; aborting boot");
             let code = final_capture(&runtime, code).await;
             return shutdown_with(&runtime, &serve_tx, control_handle, code).await;
         }
@@ -868,9 +879,13 @@ async fn final_capture(runtime: &Arc<Runtime>, code: ExitCode) -> ExitCode {
 }
 
 /// Run one lifecycle step as a managed process and await its exit. `Err(code)` on non-zero exit.
+///
+/// A failure is logged with the step's `label`, its program, and its arguments' count and UTF-8
+/// lengths; never the script, which is a shell argument and can carry secrets.
 async fn run_lifecycle_step(
     runtime: &Arc<Runtime>,
     config: &BootConfig,
+    label: &str,
     step: &LifecycleStep,
 ) -> Result<(), ExitCode> {
     let (executable, flag) = shell_invocation(config, step.shell);
@@ -893,19 +908,49 @@ async fn run_lifecycle_step(
         capture: Some(CapturePolicy::default()),
         graceful_signal: None,
     };
+    let program = args.executable.clone();
+    let arg_count = args.args.len();
+    let arg_lengths: Vec<usize> = args.args.iter().map(String::len).collect();
     // Subscribe before spawning so a fast-exiting step's `process.exited` is not missed.
     let mut events = runtime.event_subscriber();
     let accepted = match runtime.spawn_managed(args) {
         Ok(accepted) => accepted,
         Err(error) => {
-            tracing::error!(%error, run = %step.run, "lifecycle step failed to spawn");
+            tracing::error!(
+                %error,
+                step = label,
+                %program,
+                arg_count,
+                ?arg_lengths,
+                "lifecycle step failed to spawn"
+            );
             return Err(ExitCode::FAILURE);
         }
     };
+    let failed = |status: &str| {
+        tracing::error!(
+            step = label,
+            %program,
+            arg_count,
+            ?arg_lengths,
+            status,
+            "lifecycle step failed"
+        );
+    };
     match await_exit_on(&mut events, &accepted.process_id).await {
         ExitStatus::Code(0) => Ok(()),
-        ExitStatus::Code(code) => Err(exit_code_from(code)),
-        ExitStatus::Signal(_) | ExitStatus::Lost => Err(ExitCode::FAILURE),
+        ExitStatus::Code(code) => {
+            failed(&format!("exited with {code}"));
+            Err(exit_code_from(code))
+        }
+        ExitStatus::Signal(signal) => {
+            failed(&format!("killed by signal {signal}"));
+            Err(ExitCode::FAILURE)
+        }
+        ExitStatus::Lost => {
+            failed("exit not observed");
+            Err(ExitCode::FAILURE)
+        }
     }
 }
 
@@ -1093,6 +1138,86 @@ mod tests {
         assert_eq!(prepare_exit_code(&other, false), 1);
     }
     use config::MapEnv;
+
+    const MARKER: &str = "withheld-marker-7f3a";
+
+    /// A writer that keeps every formatted log line, for asserting what a log never says.
+    #[derive(Clone, Default)]
+    struct CapturedLog(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl CapturedLog {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap_or_else(|e| e.into_inner())).into_owned()
+        }
+    }
+
+    /// Run one lifecycle step whose script carries the marker (also registered as a secret, as a
+    /// launcher's token would be) and return what was logged at every level.
+    async fn lifecycle_step_log(shell: Shell, missing_shell: bool) -> (bool, String) {
+        let log = CapturedLog::default();
+        let writer = log.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let tmp = tempfile::tempdir().expect("tmp");
+        let mut config = boot_config(&[]);
+        config.workspace.workspace_root = tmp.path().to_owned();
+        config.workspace.working_directory = tmp.path().to_owned();
+        config.control.session_journal_dir = tmp.path().join("journals");
+        config.control.socket = tmp.path().join("control.sock");
+        if missing_shell {
+            config.shells.bash = tmp.path().join("missing-shell");
+        }
+        let runtime = Runtime::new(
+            into_runtime_config(&config, &[("TOKEN".to_owned(), MARKER.to_owned())]),
+            Arc::new(ShutdownSignal::new(100)),
+        );
+        let step = LifecycleStep {
+            run: format!("exit 3 # {MARKER}"),
+            shell,
+            working_directory: Some(tmp.path().to_owned()),
+        };
+        let failed = run_lifecycle_step(&runtime, &config, "setup[0]", &step)
+            .await
+            .is_err();
+        (failed, log.text())
+    }
+
+    #[tokio::test]
+    async fn a_lifecycle_step_that_cannot_spawn_is_logged_without_its_script() {
+        let (failed, text) = lifecycle_step_log(Shell::LoginBash, true).await;
+        assert!(failed);
+        assert!(text.contains("lifecycle step failed to spawn"), "{text}");
+        assert!(text.contains("setup[0]"), "{text}");
+        assert!(text.contains("arg_count=2"), "{text}");
+        assert!(!text.contains(MARKER), "the script was logged: {text}");
+    }
+
+    #[tokio::test]
+    async fn a_lifecycle_step_that_fails_is_logged_without_its_script() {
+        let (failed, text) = lifecycle_step_log(Shell::Sh, false).await;
+        assert!(failed);
+        assert!(text.contains("lifecycle step failed"), "{text}");
+        assert!(text.contains("exited with 3"), "{text}");
+        assert!(text.contains("setup[0]"), "{text}");
+        assert!(!text.contains(MARKER), "the script was logged: {text}");
+    }
 
     fn boot_config(pairs: &[(&str, &str)]) -> BootConfig {
         let mut all = vec![

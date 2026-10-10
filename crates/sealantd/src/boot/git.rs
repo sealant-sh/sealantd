@@ -102,6 +102,21 @@ fn write_secret_file(path: &Path, contents: &[u8], mode: u32) -> Result<(), Boot
     Ok(())
 }
 
+/// `url` with any `user:password@` removed from its authority, for logs. A URL that does not look
+/// like `scheme://authority/…` comes back unchanged (an scp-style `git@host:path` names only a
+/// user).
+fn url_without_userinfo(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_owned();
+    };
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, path) = rest.split_at(authority_end);
+    match authority.rfind('@') {
+        Some(at) => format!("{scheme}://{}{path}", &authority[at + 1..]),
+        None => url.to_owned(),
+    }
+}
+
 /// Clone the workspace repository if it is not already present (E9).
 ///
 /// Returns `Ok(false)` if the working directory already contains a checkout (no-op), `Ok(true)` if
@@ -150,8 +165,9 @@ pub(crate) fn clone_repo_if_absent(
     command.arg(&repo.url).arg(working_directory);
     auth.apply(&mut command);
 
+    // The URL is an argument to git: named without any credentials it may carry.
     tracing::info!(
-        url = %repo.url,
+        url = %url_without_userinfo(&repo.url),
         reference = repo.reference.as_deref().unwrap_or("(remote default)"),
         "cloning workspace repository"
     );
@@ -167,6 +183,26 @@ pub(crate) fn clone_repo_if_absent(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_clone_url_is_logged_without_credentials() {
+        assert_eq!(
+            url_without_userinfo("https://x-access-token:ghs_secret@github.com/o/r.git"),
+            "https://github.com/o/r.git"
+        );
+        assert_eq!(
+            url_without_userinfo("https://ghs_secret@github.com"),
+            "https://github.com"
+        );
+        assert_eq!(
+            url_without_userinfo("https://github.com/o/r.git?a=b@c"),
+            "https://github.com/o/r.git?a=b@c"
+        );
+        assert_eq!(
+            url_without_userinfo("git@github.com:o/r.git"),
+            "git@github.com:o/r.git"
+        );
+    }
 
     #[test]
     fn askpass_emits_username_then_token() {
