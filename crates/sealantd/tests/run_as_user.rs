@@ -21,7 +21,8 @@ use std::time::{Duration, Instant};
 use sealant_control::{handle_connection, read_frame, write_frame};
 use sealant_protocol::{
     ClientMessage, Command, CommandResult, ControlRequest, ControlResponse, DotfilesApplyArgs,
-    ExecArgs, OpenSessionArgs, RequestId, ResponseOutcome, ServerMessage, SessionMode,
+    ExecArgs, OpenSessionArgs, OpenSftpArgs, RequestId, ResponseOutcome, ServerMessage,
+    SessionMode, StreamFrame, StreamPayload,
 };
 use sealant_runtime_core::{PERSON_GID, People, RuntimeConfig, new_runtime_id};
 use sealantd::Runtime;
@@ -363,6 +364,127 @@ async fn an_execution_runs_as_the_user_it_names() {
     }
 }
 
+/// One SFTP packet: its length, its type, then its body.
+fn sftp_packet(kind: u8, body: &[u8]) -> Vec<u8> {
+    let mut packet = u32::try_from(body.len() + 1)
+        .unwrap()
+        .to_be_bytes()
+        .to_vec();
+    packet.push(kind);
+    packet.extend_from_slice(body);
+    packet
+}
+
+/// Send `bytes` on `channel` and answer the first SFTP packet the bridge sends back: its type and
+/// its body.
+async fn sftp_round_trip(
+    client: &mut Client,
+    channel: &sealant_protocol::ChannelId,
+    seq: u64,
+    bytes: Vec<u8>,
+) -> (u8, Vec<u8>) {
+    let body = sealant_protocol::encode_client(&ClientMessage::Stream(StreamFrame::data(
+        channel.clone(),
+        seq,
+        bytes,
+    )));
+    write_frame(&mut client.writer, &body, MAX).await.unwrap();
+    let mut got = Vec::new();
+    let read = async {
+        loop {
+            let body = read_frame(&mut client.reader, MAX).await.unwrap().unwrap();
+            if let ServerMessage::Stream(frame) = sealant_protocol::decode_server(&body).unwrap()
+                && &frame.channel_id == channel
+            {
+                match frame.payload {
+                    StreamPayload::Data { data } => got.extend_from_slice(data.as_slice()),
+                    StreamPayload::End(end) => panic!("the sftp-server ended: {end:?}"),
+                    StreamPayload::WindowUpdate { .. } => {}
+                }
+            }
+            if got.len() >= 4 {
+                let len = u32::from_be_bytes(got[..4].try_into().unwrap()) as usize;
+                if got.len() >= 4 + len {
+                    return (got[4], got[5..4 + len].to_vec());
+                }
+            }
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(20), read)
+        .await
+        .expect("an SFTP answer")
+}
+
+/// An SFTP bridge with a user runs its `sftp-server` as that user: a directory it makes is
+/// theirs, and one in a home they cannot enter is refused. Needs the `sftp-server` (required).
+#[tokio::test]
+async fn an_sftp_bridge_runs_as_the_user_it_names() {
+    if !ready() {
+        return;
+    }
+    // `ready()` holds only with SEALANTD_REQUIRE_ROOT_TESTS=1, where a skip would pass a security
+    // test that never ran: the image must carry the sftp-server (CI installs it).
+    assert!(
+        sealant_process::sftp::resolve_sftp_server().is_some(),
+        "SEALANTD_REQUIRE_ROOT_TESTS=1 but no sftp-server here: install openssh-sftp-server"
+    );
+    let dir = scratch();
+    let mut client = Client::start(dir.path());
+    let Some(CommandResult::SftpOpened(opened)) = ok(client
+        .request(Command::OpenSftp(OpenSftpArgs {
+            execution_id: None,
+            cwd: None,
+            user: Some(BOB.to_owned()),
+        }))
+        .await)
+    else {
+        panic!("no SFTP channel");
+    };
+    let channel = opened.channel_id;
+    // SSH_FXP_INIT, version 3: answered with SSH_FXP_VERSION.
+    let (kind, _) = sftp_round_trip(
+        &mut client,
+        &channel,
+        0,
+        sftp_packet(1, &3u32.to_be_bytes()),
+    )
+    .await;
+    assert_eq!(kind, 2, "no SSH_FXP_VERSION");
+    // SSH_FXP_MKDIR: request id, path, attributes with no flags; answered with SSH_FXP_STATUS.
+    let mkdir = |id: u32, path: &Path| {
+        let path = path.display().to_string();
+        let mut body = id.to_be_bytes().to_vec();
+        body.extend_from_slice(&u32::try_from(path.len()).unwrap().to_be_bytes());
+        body.extend_from_slice(path.as_bytes());
+        body.extend_from_slice(&0u32.to_be_bytes());
+        sftp_packet(14, &body)
+    };
+    let made = dir.path().join("made-over-sftp");
+    let (kind, body) = sftp_round_trip(&mut client, &channel, 1, mkdir(7, &made)).await;
+    assert_eq!(kind, 101, "no SSH_FXP_STATUS");
+    assert_eq!(
+        &body[4..8],
+        &0u32.to_be_bytes(),
+        "the mkdir failed: {body:?}"
+    );
+    let meta = std::fs::metadata(&made).unwrap();
+    assert_eq!((meta.uid(), meta.gid()), (BOB_UID, GID), "not Bob's");
+    // Cat's home is 0700 and Cat's: Bob's sftp-server cannot make anything in it.
+    let (kind, body) = sftp_round_trip(
+        &mut client,
+        &channel,
+        2,
+        mkdir(8, &Path::new(&format!("/home/{CAT}")).join("from-bob")),
+    )
+    .await;
+    assert_eq!(kind, 101, "no SSH_FXP_STATUS");
+    assert_ne!(
+        &body[4..8],
+        &0u32.to_be_bytes(),
+        "Bob made a directory in Cat's home"
+    );
+}
+
 /// A session's leader runs as its user too, in both shapes; a PTY leader owns its terminal.
 #[tokio::test]
 async fn a_session_runs_as_the_user_it_names() {
@@ -403,7 +525,7 @@ async fn a_session_runs_as_the_user_it_names() {
     }
 }
 
-/// `user` named by `exec`, by `openSession` (pipe and PTY) and by `dotfiles.apply`, each answered
+/// `user` named by `exec`, by `openSession` (pipe and PTY), by `dotfiles.apply` and by `openSftp`, each answered
 /// with its refusal; `out` is what each would have written had it started.
 async fn refused_everywhere(client: &mut Client, user: &str, out: &Path) -> Vec<String> {
     let script = format!("id -u > {0}.tmp && mv {0}.tmp {0}", out.display());
@@ -430,6 +552,11 @@ async fn refused_everywhere(client: &mut Client, user: &str, out: &Path) -> Vec<
         archive_dir: Some(archives.display().to_string()),
         execution_id: None,
     })));
+    commands.push(Command::OpenSftp(OpenSftpArgs {
+        execution_id: None,
+        cwd: None,
+        user: Some(user.to_owned()),
+    }));
     let mut messages = Vec::new();
     for command in commands {
         match client.request(command).await.outcome {

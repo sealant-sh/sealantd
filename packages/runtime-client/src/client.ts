@@ -539,8 +539,11 @@ export class SealantClient {
     this.#channels.get(channelId)?.destroy();
   }
 
-  /** Open an SFTP subsystem channel as a multiplexed byte channel. */
-  async openSftp(options: { executionId?: string; cwd?: string } = {}): Promise<{
+  /**
+   * Open an SFTP subsystem channel as a multiplexed byte channel. With `user`, the sftp-server runs
+   * as that user (a daemon whose capabilities name `sftp.user`; an older one ignores it).
+   */
+  async openSftp(options: { executionId?: string; cwd?: string; user?: string } = {}): Promise<{
     result: SftpOpened;
     channel: Channel;
   }> {
@@ -548,7 +551,7 @@ export class SealantClient {
       okResult(
         await this.request({
           case: "openSftp",
-          value: { executionId: options.executionId, cwd: options.cwd },
+          value: { executionId: options.executionId, cwd: options.cwd, user: options.user },
         }),
       ),
       "sftpOpened",

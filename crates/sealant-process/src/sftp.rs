@@ -22,6 +22,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tokio::sync::mpsc;
 
+use crate::identity::RunAs;
 use crate::spawn::spawn_tokio;
 
 /// Read-buffer size for the stdout→gateway pump.
@@ -90,7 +91,9 @@ impl SftpRuntime {
         resolve_sftp_server().is_some()
     }
 
-    /// Open an SFTP bridge bound to `channel_id`, spawning `sftp-server` in `cwd`.
+    /// Open an SFTP bridge bound to `channel_id`, spawning `sftp-server` in `cwd`: as root with
+    /// the daemon's environment, or, with `as_user`, as that user with exactly the environment it
+    /// names (the caller resolved and admitted the user, and made their private directories).
     ///
     /// Returns the inbound sink (gateway → child stdin) the caller registers in the connection's
     /// channel registry.
@@ -102,6 +105,7 @@ impl SftpRuntime {
         &self,
         channel_id: ChannelId,
         cwd: &Path,
+        as_user: Option<(&RunAs, &[(String, String)])>,
         out_tx: mpsc::Sender<ServerMessage>,
     ) -> Result<mpsc::Sender<StreamPayload>, ControlError> {
         let binary = resolve_sftp_server().ok_or_else(|| {
@@ -118,6 +122,11 @@ impl SftpRuntime {
         command.stdout(Stdio::piped());
         command.stderr(Stdio::null());
         command.kill_on_drop(true);
+        if let Some((user, env)) = as_user {
+            command.env_clear();
+            command.envs(env.iter().map(|(key, value)| (key, value)));
+            user.apply(command.as_std_mut());
+        }
         // Spawn under the reap gate so the orphan reaper can never peek this child before its pid
         // is registered as one we spawned (see `crate::spawn`).
         let (mut child, spawned_pid) = spawn_tokio(&mut command).map_err(|e| {
@@ -266,7 +275,7 @@ mod tests {
             let rt = SftpRuntime::new();
             let channel = ChannelId::new("chan_sftp");
             let inbound = rt
-                .open(channel.clone(), Path::new("/tmp"), out_tx)
+                .open(channel.clone(), Path::new("/tmp"), None, out_tx)
                 .expect("sftp-server present: open should succeed");
             // Closing inbound (End) makes sftp-server exit; we should observe an End frame.
             inbound
@@ -294,7 +303,7 @@ mod tests {
         let (out_tx, _rx) = mpsc::channel::<ServerMessage>(8);
         let rt = SftpRuntime::new();
         let err = rt
-            .open(ChannelId::new("chan_sftp"), Path::new("/tmp"), out_tx)
+            .open(ChannelId::new("chan_sftp"), Path::new("/tmp"), None, out_tx)
             .expect_err("should be unavailable");
         assert_eq!(err.code, ControlErrorCode::FeatureUnavailable);
     }
@@ -311,7 +320,7 @@ mod tests {
         let rt = SftpRuntime::new();
         let channel = ChannelId::new("chan_sftp_init");
         let inbound = rt
-            .open(channel.clone(), Path::new("/tmp"), out_tx)
+            .open(channel.clone(), Path::new("/tmp"), None, out_tx)
             .expect("open sftp bridge");
 
         // SSH_FXP_INIT: u32 length=5, u8 type=1 (INIT), u32 version=3.
