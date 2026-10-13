@@ -20,7 +20,7 @@ concurrency:
 jobs:
   version:
     if: github.repository == 'sealant-sh/sealantd'
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: [self-hosted, box, linux, x64]
     timeout-minutes: 15
     permissions:
       contents: write # commit the version bump to the changeset-release branch

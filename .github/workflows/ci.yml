@@ -24,13 +24,13 @@ concurrency:
 
 jobs:
   rust:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: [self-hosted, box, linux, x64]
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false # don't leave the git token in .git for later steps
-      - uses: dtolnay/rust-toolchain@stable # Blacksmith runners don't preinstall Rust like github-hosted
+      - uses: dtolnay/rust-toolchain@stable # the same stable toolchain on every runner
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2 # cache ~/.cargo + target so deps aren't recompiled each run
@@ -53,7 +53,7 @@ jobs:
   # The released daemon runs on arm64 too (Graviton MicroVMs), so the same tests run natively
   # there. fmt is architecture-independent and stays on the job above.
   rust-arm64:
-    runs-on: blacksmith-4vcpu-ubuntu-2404-arm
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -73,7 +73,7 @@ jobs:
           SEALANTD_REQUIRE_NNP_FREE: "1"
 
   node:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: [self-hosted, box, linux, x64]
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -90,6 +90,6 @@ jobs:
       # The prerelease version next.yml publishes; the same script lives in Core and Mend.
       - run: node --test scripts/next-version.test.mjs scripts/check-tarball.test.mjs scripts/republish.test.mjs
       - run: pnpm -r build
-      - uses: dtolnay/rust-toolchain@stable # Blacksmith runners don't preinstall Rust
+      - uses: dtolnay/rust-toolchain@stable
       - run: cargo build --locked -p sealantd # the TypeScript e2e spawns the daemon binary
       - run: pnpm -r test
