@@ -51,7 +51,7 @@ jobs:
       github.repository == 'sealant-sh/sealantd' && github.event.workflow_run.conclusion == 'success'
       && github.event.workflow_run.event == 'push' &&
       github.event.workflow_run.head_repository.full_name == github.repository
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: [self-hosted, box, linux, x64]
     timeout-minutes: 10
     outputs:
       version: ${{ steps.plan.outputs.version }}
@@ -116,8 +116,8 @@ jobs:
     strategy:
       matrix:
         platform:
-          - { arch: amd64, runner: blacksmith-4vcpu-ubuntu-2404 }
-          - { arch: arm64, runner: blacksmith-4vcpu-ubuntu-2404-arm }
+          - { arch: amd64, runner: [self-hosted, box, linux, x64] }
+          - { arch: arm64, runner: ubuntu-24.04-arm }
     runs-on: ${{ matrix.platform.runner }}
     timeout-minutes: 60
     permissions:
@@ -165,7 +165,7 @@ jobs:
 
   image-tag:
     needs: [plan, image]
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: [self-hosted, box, linux, x64]
     timeout-minutes: 10
     permissions:
       contents: read
@@ -206,7 +206,7 @@ jobs:
   # build tools included, can reach the npm credential.
   pack:
     needs: [plan, image-tag]
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: [self-hosted, box, linux, x64]
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -262,7 +262,7 @@ jobs:
   # tarball is ours, this version and this commit, that `next` would move forward, and publishes.
   publish:
     needs: [plan, image-tag, pack]
-    # npm trusted publishing (OIDC) needs a GitHub-hosted runner: this job stays off Blacksmith.
+    # npm trusted publishing (OIDC) needs a GitHub-hosted runner: this job stays off the self-hosted runners.
     runs-on: ubuntu-latest
     timeout-minutes: 10
     environment: next

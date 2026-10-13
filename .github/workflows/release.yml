@@ -16,7 +16,7 @@ jobs:
   # but hold more. Main is frozen from the Version Packages merge to this tag (sealant-sh/mend
   # docs/operations/next-channel.md); a merge during the freeze is what produces one.
   stable-tag:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: [self-hosted, box, linux, x64]
     timeout-minutes: 5
     permissions:
       contents: read
@@ -64,9 +64,10 @@ jobs:
 
   image:
     needs: stable-tag
-    # Blacksmith runner, but no Blacksmith layer cache: other jobs write it, and this job pushes.
+    # Self-hosted, but no shared layer cache: other jobs write it, and this job pushes. The buildx
+    # builder below is created fresh for this job.
     # (The npm job stays on ubuntu-latest — github-hosted — to keep OIDC trusted publishing safe.)
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: [self-hosted, box, linux, x64]
     permissions:
       contents: read
       packages: write
@@ -74,7 +75,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # QEMU emulates arm64 on this amd64 runner, with no layer cache (other jobs would write it).
-      # Real arm64 speedup later = native arm64 Blacksmith runners + a per-arch matrix
+      # Real arm64 speedup later = native arm64 runners (ubuntu-24.04-arm) + a per-arch matrix
       # (drops QEMU).
       # binfmt at a fixed digest: it runs privileged and emulates every arm64 RUN.
       - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
@@ -112,7 +113,7 @@ jobs:
 
   npm:
     needs: stable-tag
-    # npm trusted publishing (OIDC) needs a GitHub-hosted runner: this job stays off Blacksmith.
+    # npm trusted publishing (OIDC) needs a GitHub-hosted runner: this job stays off the self-hosted runners.
     runs-on: ubuntu-latest
     # Gate every publish behind a protected environment: add required reviewers + restrict deployment
     # to protected tags in repo Settings -> Environments -> release. This means a compromised PR,
