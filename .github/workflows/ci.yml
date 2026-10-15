@@ -23,7 +23,29 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # A pull request that changes documentation only runs nothing below (scripts/ci-docs-only.sh).
+  # A job its `if` skips reports success, so the required rust and node checks still pass; if this
+  # job fails, `code` is empty and every job runs.
+  changes:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 5
+    outputs:
+      code: ${{ steps.scope.outputs.code }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0 # the diff against the pull request's base
+      - id: scope
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: scripts/ci-docs-only.sh >>"$GITHUB_OUTPUT"
+
   rust:
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: [self-hosted, box, linux, x64]
     timeout-minutes: 30
     steps:
@@ -60,6 +82,8 @@ jobs:
   # The released daemon runs on arm64 too (Graviton MicroVMs), so the same tests run natively
   # there. fmt is architecture-independent and stays on the job above.
   rust-arm64:
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 30
     steps:
@@ -86,6 +110,8 @@ jobs:
       - run: cargo test --workspace --doc
 
   node:
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: [self-hosted, box, linux, x64]
     timeout-minutes: 20
     steps:
