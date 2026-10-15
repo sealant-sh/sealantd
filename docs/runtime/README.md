@@ -8,3 +8,4 @@
 - [known-limitations.md](known-limitations.md) — honest observability and packaging limits.
 
 See [../adr/](../adr/) for decision records.
+
