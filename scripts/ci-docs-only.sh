@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Prints code=false when a pull request changes documentation only, so ci.yml skips its Rust and
 # Node jobs, and code=true otherwise. Whatever it cannot prove runs everything: a push, a git
-# failure, any other path, or a document under docs/ that code names (a test checks ADR 0015's
+# failure (git grep included), any other path, or a document under docs/ that code names (a test checks ADR 0015's
 # tables against the capture index). A push to main always runs everything.
 set -uo pipefail
 
@@ -14,10 +14,19 @@ docs_only() {
 		case $path in
 		README.md | AGENTS.md | CLAUDE.md | .changeset/*.md) ;;
 		docs/*)
-			if git grep -qF -e "$path" -- crates packages scripts fuzz ':!*.md'; then
+			# 0: code names the document; 1: nothing does; anything else: git grep failed.
+			git grep -qF -e "$path" -- crates packages scripts fuzz ':!*.md'
+			case $? in
+			0)
 				echo "$path is read by code" >&2
 				return 1
-			fi
+				;;
+			1) ;;
+			*)
+				echo "git grep failed for $path" >&2
+				return 1
+				;;
+			esac
 			;;
 		*) return 1 ;;
 		esac
