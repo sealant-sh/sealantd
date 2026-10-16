@@ -126,6 +126,11 @@ jobs:
       contents: read
       packages: write
     steps:
+      # Disk use on / and /mnt every 5 s, so the step summary shows this job's peak on a hosted runner.
+      - name: Start the disk sampler
+        run: >-
+          nohup bash -c 'while :; do df -B1 --output=used / /mnt 2>/dev/null | tail -n +2 | paste -sd" ";
+          sleep 5; done' >"$RUNNER_TEMP/disk-used.log" 2>&1 &
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.plan.outputs.sha }}
@@ -164,6 +169,13 @@ jobs:
           path: /tmp/digests/*
           if-no-files-found: error
           retention-days: 1
+      - name: Report peak disk use
+        if: always()
+        run: |
+          df -h / /mnt 2>/dev/null || df -h /
+          awk '{ if ($1 > r) r = $1; if ($2 > m) m = $2 } END {
+            printf "Peak disk used: / %d MiB, /mnt %d MiB\n", r / 1048576, m / 1048576 }' \
+            "$RUNNER_TEMP/disk-used.log" | tee -a "$GITHUB_STEP_SUMMARY"
 
   image-tag:
     needs: [plan, image]
