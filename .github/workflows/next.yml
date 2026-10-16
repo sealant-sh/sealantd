@@ -209,6 +209,12 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      # A version is tagged once, with this run's index. The tag is read before it is written, and
+      # the read after the write decides (sealant-sh/mend release-cli.yml, finalize-images): absent
+      # creates it, this run's digest is done, any other digest is refused, and a read that failed
+      # fails the job. Re-running the failed npm job keeps the image Core may already have pulled;
+      # re-running all jobs rebuilds the images, and their new index is refused: the version is spent.
+      # scripts/next-tag.test.mjs runs this step as written, against a stand-in docker.
       - name: Tag the multi-arch image
         id: tag
         working-directory: /tmp/digests
@@ -217,16 +223,85 @@ jobs:
           VERSION: ${{ needs.plan.outputs.version }}
         run: |
           set -euo pipefail
-          # A version is tagged once. A re-run after a failed npm job keeps the image Core may
-          # already have pulled.
-          if ! docker buildx imagetools inspect "$REPOSITORY:$VERSION" >/dev/null 2>&1; then
-            sources=()
-            for digest in *; do sources+=("$REPOSITORY@sha256:$digest"); done
-            docker buildx imagetools create --tag "$REPOSITORY:$VERSION" "${sources[@]}"
+          shopt -s inherit_errexit
+          ref=$REPOSITORY:$VERSION
+          sources=()
+          for digest in *; do sources+=("$REPOSITORY@sha256:$digest"); done
+          # This run's index digest, known before anything is written: --dry-run prints the exact
+          # bytes create pushes, plus one newline, and the index digest is theirs.
+          docker buildx imagetools create --dry-run --tag "$ref" "${sources[@]}" >"$RUNNER_TEMP/index.json"
+          if [[ ! -s $RUNNER_TEMP/index.json || -n $(tail -c 1 "$RUNNER_TEMP/index.json") ]]; then
+            echo "::error::imagetools create --dry-run printed no index."
+            exit 1
           fi
-          docker buildx imagetools inspect "$REPOSITORY:$VERSION"
-          digest=$(docker buildx imagetools inspect "$REPOSITORY:$VERSION" --format '{{json .Manifest}}' | jq -r .digest)
-          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          cat "$RUNNER_TEMP/index.json"
+          index=sha256:$(head -c -1 "$RUNNER_TEMP/index.json" | sha256sum | cut -d ' ' -f 1)
+          echo "This run's index is $index."
+          # The digest <ref> names, `absent` when the registry says it does not exist, and a
+          # failure for anything else: a read that failed is never taken for an absent tag. Absent
+          # is buildx's not-found line and nothing else: all of stderr, its trailing newlines
+          # aside, is exactly `ERROR: <ref>: not found`, and stdout is empty.
+          read_tag() {
+            local out err status=0 digest
+            out=$(docker buildx imagetools inspect "$1" --format '{{json .Manifest}}' \
+              2>"$RUNNER_TEMP/inspect.err") || status=$?
+            if ((status == 0)); then
+              digest=$(jq -r '.digest // ""' <<<"$out" 2>/dev/null) || digest=
+              if [[ $digest =~ ^sha256:[0-9a-f]{64}$ ]]; then
+                printf '%s\n' "$digest"
+                return 0
+              fi
+              echo "::error::$1 answered without a digest." >&2
+              return 1
+            fi
+            err=$(<"$RUNNER_TEMP/inspect.err")
+            if [[ -z $out && $err == "ERROR: $1: not found" ]]; then
+              echo absent
+              return 0
+            fi
+            cat "$RUNNER_TEMP/inspect.err" >&2
+            echo "::error::Could not read $1." >&2
+            return 1
+          }
+          if ! current=$(read_tag "$ref"); then
+            echo "::error::$ref is unreadable; nothing was written."
+            exit 1
+          fi
+          if [[ $current == "$index" ]]; then
+            echo "$ref is already this run's $index."
+          elif [[ $current != absent ]]; then
+            echo "::error::$ref exists at $current, not $index, the index this run built. Version $VERSION is spent: nothing was written."
+            exit 1
+          else
+            status=0
+            docker buildx imagetools create --metadata-file "$RUNNER_TEMP/create.json" \
+              --tag "$ref" "${sources[@]}" || status=$?
+            if ((status == 0)); then
+              created=$(jq -r '."containerimage.digest" // ."containerimage.descriptor".digest // ""' \
+                "$RUNNER_TEMP/create.json" 2>/dev/null) || created=
+              if [[ $created != "$index" ]]; then
+                echo "::error::imagetools create reported '$created', not $index, the index its dry run printed."
+                exit 1
+              fi
+            fi
+            if ! after=$(read_tag "$ref"); then
+              echo "::error::$ref is unreadable after the create (exit $status)."
+              exit 1
+            fi
+            if [[ $after == "$index" ]]; then
+              if ((status != 0)); then
+                echo "::warning::The create reported exit $status, but $ref resolves to $index, the index this run built."
+              fi
+              echo "$ref is $index."
+            elif [[ $after == absent ]]; then
+              echo "::error::$ref does not exist after the create (exit $status)."
+              exit 1
+            else
+              echo "::error::$ref resolves to $after after the create, not $index. Version $VERSION is spent."
+              exit 1
+            fi
+          fi
+          echo "digest=$index" >>"$GITHUB_OUTPUT"
 
   # Builds and packs the two packages. No id-token here: nothing this job runs, the dependencies'
   # build tools included, can reach the npm credential.
