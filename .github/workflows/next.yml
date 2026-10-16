@@ -11,7 +11,9 @@
 # @sealant/runtime-* or move their `latest`. Images have no such boundary: the token the image jobs
 # hold (`packages: write`) can push ghcr.io/sealant-sh/sealantd too, GHCR cannot scope it per image,
 # and any writer can run a branch workflow that requests it, code-owner review or not. Every action
-# and BuildKit image in those jobs is pinned and no cache other jobs write is restored; Core pins
+# and BuildKit image in those jobs is pinned and no cache other jobs write is restored. Every job runs
+# on a GitHub-hosted runner, a fresh VM: the box's runner VMs keep state between jobs, so code from an
+# earlier pull request could change what a job there builds or pushes. Core pins
 # sealantd as `tag@sha256:…`, which keeps out a tag moved after the pin (ADR 0015, Known gaps).
 #
 # SECURITY: `workflow_run` runs this file as it is on main, never a pull request's copy, and the
@@ -51,7 +53,7 @@ jobs:
       github.repository == 'sealant-sh/sealantd' && github.event.workflow_run.conclusion == 'success'
       && github.event.workflow_run.event == 'push' &&
       github.event.workflow_run.head_repository.full_name == github.repository
-    runs-on: [self-hosted, box, linux, x64]
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     outputs:
       version: ${{ steps.plan.outputs.version }}
@@ -116,7 +118,7 @@ jobs:
     strategy:
       matrix:
         platform:
-          - { arch: amd64, runner: [self-hosted, box, linux, x64] }
+          - { arch: amd64, runner: ubuntu-24.04 }
           - { arch: arm64, runner: ubuntu-24.04-arm }
     runs-on: ${{ matrix.platform.runner }}
     timeout-minutes: 60
@@ -124,6 +126,11 @@ jobs:
       contents: read
       packages: write
     steps:
+      # Disk use on / and /mnt every 5 s, so the step summary shows this job's peak on a hosted runner.
+      - name: Start the disk sampler
+        run: >-
+          nohup bash -c 'while :; do df -B1 --output=used / /mnt 2>/dev/null | tail -n +2 | paste -sd" ";
+          sleep 5; done' >"$RUNNER_TEMP/disk-used.log" 2>&1 &
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.plan.outputs.sha }}
@@ -162,10 +169,29 @@ jobs:
           path: /tmp/digests/*
           if-no-files-found: error
           retention-days: 1
+      # Telemetry only: it never turns the job's result red, and says so when it has nothing.
+      - name: Report peak disk use
+        if: always()
+        continue-on-error: true
+        run: |
+          df -h / /mnt 2>/dev/null || df -h / || true
+          log=$RUNNER_TEMP/disk-used.log
+          if [ -s "$log" ]; then
+            report=$(awk '$1 ~ /^[0-9]+$/ { n++; if ($1 > r) r = $1; if ($2 ~ /^[0-9]+$/) { two = 1; if ($2 > m) m = $2 } }
+              END { if (!n) { print "Disk use unavailable: no samples"; exit }
+                printf "Sampled peak disk used (every 5 s, %d samples): / %d MiB", n, r / 1048576
+                if (two) printf ", /mnt %d MiB\n", m / 1048576; else print ", /mnt not present" }' \
+              "$log") || report="Disk use unavailable: the samples could not be read"
+          else
+            report="Disk use unavailable: the sampler wrote no samples"
+          fi
+          echo "$report"
+          echo "$report" >>"$GITHUB_STEP_SUMMARY" ||
+            echo "::warning::Could not write the disk report to the step summary"
 
   image-tag:
     needs: [plan, image]
-    runs-on: [self-hosted, box, linux, x64]
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
       contents: read
@@ -206,7 +232,7 @@ jobs:
   # build tools included, can reach the npm credential.
   pack:
     needs: [plan, image-tag]
-    runs-on: [self-hosted, box, linux, x64]
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

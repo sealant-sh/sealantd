@@ -16,7 +16,7 @@ jobs:
   # but hold more. Main is frozen from the Version Packages merge to this tag (sealant-sh/mend
   # docs/operations/next-channel.md); a merge during the freeze is what produces one.
   stable-tag:
-    runs-on: [self-hosted, box, linux, x64]
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
       contents: read
@@ -64,10 +64,10 @@ jobs:
 
   image:
     needs: stable-tag
-    # Self-hosted, but no shared layer cache: other jobs write it, and this job pushes. The buildx
+    # No shared layer cache: other jobs write it, and this job pushes. The buildx
     # builder below is created fresh for this job.
     # (The npm job stays on ubuntu-latest — github-hosted — to keep OIDC trusted publishing safe.)
-    runs-on: [self-hosted, box, linux, x64]
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       packages: write
