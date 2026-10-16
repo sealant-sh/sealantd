@@ -111,6 +111,18 @@ commit's published is refused.
   `next` dist-tag; the client depends on the protocol through an exact alias,
   `"@sealant/runtime-protocol": "npm:@sealant/runtime-protocol-next@<version>"`.
 
+The image tag is written once, from the index this run built. `image-tag` takes that index's digest
+from `imagetools create --dry-run`, which prints the exact bytes the create pushes, before it writes
+anything. It then reads the version tag. The tag is absent only when the registry answers exactly
+`ERROR: <ref>: not found` and prints nothing else. Any other failed read fails the job. A tag
+already at this run's digest is left alone, and a tag at any other digest is refused, because that
+version is spent. After a create, the job reads the tag again and that read decides. A create that
+reported an error but left this run's digest passes with a warning. A create that exits 0 but
+reports a digest other than this run's fails at once, before the re-read. Re-run only the failed
+jobs, while the run's artifacts are still kept: a full re-run rebuilds the images, and their index
+is refused if the rebuilt bytes differ (identical bytes are a no-op). Manual or external writes to
+the tag are outside this check (`scripts/next-tag.test.mjs`).
+
 The `next` trusted publisher is registered only on the two `-next` packages, so nothing in that
 workflow can publish `@sealant/runtime-*`. Images have no such boundary: a job with
 `packages: write` can push `ghcr.io/sealant-sh/sealantd` too (GHCR cannot scope it), and any of the
@@ -132,3 +144,7 @@ that commit's next build; then tag that same commit. Core refuses to cut a stabl
 pins a prerelease, so this tag comes first. The whole order is in sealant-sh/mend
 `docs/operations/next-channel.md`. The release refuses while an npm prerelease of the version came
 from a commit the tag leaves out, which is what a merge during the freeze produces.
+
+**Never re-run an old stable release run.** sealantd's stable pipeline writes `:<version>`,
+major.minor and `latest` with no lock or floor, so re-running an older run can move `latest`
+backwards or replace a version's digest. Cut a new version instead.
