@@ -117,8 +117,11 @@ anything. It then reads the version tag. The tag is absent only when the registr
 `ERROR: <ref>: not found` and prints nothing else. Any other failed read fails the job. A tag
 already at this run's digest is left alone, and a tag at any other digest is refused, because that
 version is spent. After a create, the job reads the tag again and that read decides. A create that
-reported an error but left this run's digest passes with a warning. Re-run only the failed jobs: a
-full re-run rebuilds the images, and their new index is refused (`scripts/next-tag.test.mjs`).
+reported an error but left this run's digest passes with a warning. A create that exits 0 but
+reports a digest other than this run's fails at once, before the re-read. Re-run only the failed
+jobs, while the run's artifacts are still kept: a full re-run rebuilds the images, and their index
+is refused if the rebuilt bytes differ (identical bytes are a no-op). Manual or external writes to
+the tag are outside this check (`scripts/next-tag.test.mjs`).
 
 The `next` trusted publisher is registered only on the two `-next` packages, so nothing in that
 workflow can publish `@sealant/runtime-*`. Images have no such boundary: a job with
