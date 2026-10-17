@@ -4,9 +4,12 @@
 // npm integrity read-back, and REPUBLISH_TEST_PACOTE swaps the pacote a publishing job's tarball
 // check loads, in next.yml's publish and release.yml's npm job, both holding an id-token: set by a
 // workflow, it would run code of the setter's choosing beside the npm credential. Only the tests may
-// set them. The guard is a plain text scan of the
-// workflow files with no shell parser: it refuses text, so it never has to work out what Bash would
-// make of a script, and it cannot hang.
+// set them. NORMALIZE_PACOTE, the same swap for scripts/normalize-npm-tarball.mjs, is left out on
+// purpose: only release.yml's pack job runs that script, and pack holds no credential (contents:
+// read, no id-token, no packages: write); the npm job carries the check written out and reads
+// REPUBLISH_TEST_PACOTE instead. The guard is a plain text scan of the workflow files with no shell
+// parser: it refuses text, so it never has to work out what Bash would make of a script, and it
+// cannot hang.
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { readFileSync, readdirSync } from "node:fs";

@@ -1175,26 +1175,785 @@ test("only finalize writes :<version> to GHCR, and nothing writes :latest or :X.
   assert.doesNotMatch(code, /:latest\b|type=raw,value=latest|major\}\}\.\{\{minor|pattern=\{\{/);
 });
 
-test("every image a job starts or builds with is pinned by digest", () => {
-  const PINNED = /^[a-z0-9][a-z0-9./-]*(:[\w.-]+)?@sha256:[0-9a-f]{64}$/;
-  const started = [];
-  for (const [name, definition] of Object.entries(releaseJobs))
-    for (const entry of definition.steps ?? []) {
-      for (const line of (entry.run ?? "").replace(/\\\n\s*/g, " ").split("\n")) {
-        const run = /\bdocker run\b(.*)$/.exec(line);
-        if (run) started.push({ at: name, image: run[1].trim().split(/\s+/).at(-1) });
-      }
-      const driver = /(?:^|,)image=([^,\s]+)/.exec(entry.with?.["driver-opts"] ?? "");
-      if (entry.uses?.startsWith("docker/setup-buildx-action@"))
-        started.push({ at: name, image: driver?.[1] ?? "<the action's unpinned default>" });
+// --- every image a publishing workflow runs, by digest ---
+
+/** A reference pinned by its sha256 digest, with or without a tag (a registry port is allowed). */
+const PINNED = /^[a-z0-9][a-z0-9._/:-]*@sha256:[0-9a-f]{64}$/;
+/** A word shaped like an image reference that names a registry path or a tag (so `:` or `/`). */
+const IMAGE_LIKE =
+  /^(?=.*[:/])[a-z0-9][a-z0-9._-]*(:[0-9]+)?(\/[a-z0-9][a-z0-9._-]*)*(:[A-Za-z0-9_][A-Za-z0-9_.-]{0,127})?$/;
+
+// docker's options, from the Docker CLI's own help, client 29.8.1 (API 1.56): `docker --help`
+// (Global Options), `docker run --help`, `docker create --help` and `docker pull --help`; `docker
+// container run`, `docker container create` and `docker image pull` are their aliases and print the
+// same options (https://docs.docker.com/reference/cli/docker/container/run/,
+// …/container/create/, …/image/pull/). An option shown with a type (`--stop-timeout int`) takes a
+// value; one without is a flag. Options the help hides (`--net`, deprecated ones) are not here, so
+// they fail the scan as unknown rather than be guessed at. Regenerate from a newer CLI's help.
+const DOCKER_OPTIONS = {
+  global: {
+    flags: new Set(["-D", "--debug", "--tls", "--tlsverify", "-v", "--version"]),
+    values: new Set([
+      "--config",
+      "-c",
+      "--context",
+      "-H",
+      "--host",
+      "-l",
+      "--log-level",
+      "--tlscacert",
+      "--tlscert",
+      "--tlskey",
+    ]),
+  },
+  run: {
+    flags: new Set([
+      "-d",
+      "--detach",
+      "--help",
+      "--init",
+      "-i",
+      "--interactive",
+      "--no-healthcheck",
+      "--oom-kill-disable",
+      "--privileged",
+      "-P",
+      "--publish-all",
+      "-q",
+      "--quiet",
+      "--read-only",
+      "--rm",
+      "--sig-proxy",
+      "-t",
+      "--tty",
+      "--use-api-socket",
+    ]),
+    values: new Set([
+      "--add-host",
+      "--annotation",
+      "-a",
+      "--attach",
+      "--blkio-weight",
+      "--blkio-weight-device",
+      "--cap-add",
+      "--cap-drop",
+      "--cgroup-parent",
+      "--cgroupns",
+      "--cidfile",
+      "--cpu-period",
+      "--cpu-quota",
+      "--cpu-rt-period",
+      "--cpu-rt-runtime",
+      "-c",
+      "--cpu-shares",
+      "--cpus",
+      "--cpuset-cpus",
+      "--cpuset-mems",
+      "--detach-keys",
+      "--device",
+      "--device-cgroup-rule",
+      "--device-read-bps",
+      "--device-read-iops",
+      "--device-write-bps",
+      "--device-write-iops",
+      "--dns",
+      "--dns-option",
+      "--dns-search",
+      "--domainname",
+      "--entrypoint",
+      "-e",
+      "--env",
+      "--env-file",
+      "--expose",
+      "--gpus",
+      "--group-add",
+      "--health-cmd",
+      "--health-interval",
+      "--health-retries",
+      "--health-start-interval",
+      "--health-start-period",
+      "--health-timeout",
+      "-h",
+      "--hostname",
+      "--ip",
+      "--ip6",
+      "--ipc",
+      "--isolation",
+      "-l",
+      "--label",
+      "--label-file",
+      "--link",
+      "--link-local-ip",
+      "--log-driver",
+      "--log-opt",
+      "--mac-address",
+      "-m",
+      "--memory",
+      "--memory-reservation",
+      "--memory-swap",
+      "--memory-swappiness",
+      "--mount",
+      "--name",
+      "--network",
+      "--network-alias",
+      "--oom-score-adj",
+      "--pid",
+      "--pids-limit",
+      "--platform",
+      "-p",
+      "--publish",
+      "--pull",
+      "--restart",
+      "--runtime",
+      "--security-opt",
+      "--shm-size",
+      "--stop-signal",
+      "--stop-timeout",
+      "--storage-opt",
+      "--sysctl",
+      "--tmpfs",
+      "--ulimit",
+      "--umask",
+      "-u",
+      "--user",
+      "--userns",
+      "--uts",
+      "-v",
+      "--volume",
+      "--volume-driver",
+      "--volumes-from",
+      "-w",
+      "--workdir",
+    ]),
+  },
+  create: {
+    flags: new Set([
+      "--help",
+      "--init",
+      "-i",
+      "--interactive",
+      "--no-healthcheck",
+      "--oom-kill-disable",
+      "--privileged",
+      "-P",
+      "--publish-all",
+      "-q",
+      "--quiet",
+      "--read-only",
+      "--rm",
+      "-t",
+      "--tty",
+      "--use-api-socket",
+    ]),
+    values: new Set([
+      "--add-host",
+      "--annotation",
+      "-a",
+      "--attach",
+      "--blkio-weight",
+      "--blkio-weight-device",
+      "--cap-add",
+      "--cap-drop",
+      "--cgroup-parent",
+      "--cgroupns",
+      "--cidfile",
+      "--cpu-period",
+      "--cpu-quota",
+      "--cpu-rt-period",
+      "--cpu-rt-runtime",
+      "-c",
+      "--cpu-shares",
+      "--cpus",
+      "--cpuset-cpus",
+      "--cpuset-mems",
+      "--device",
+      "--device-cgroup-rule",
+      "--device-read-bps",
+      "--device-read-iops",
+      "--device-write-bps",
+      "--device-write-iops",
+      "--dns",
+      "--dns-option",
+      "--dns-search",
+      "--domainname",
+      "--entrypoint",
+      "-e",
+      "--env",
+      "--env-file",
+      "--expose",
+      "--gpus",
+      "--group-add",
+      "--health-cmd",
+      "--health-interval",
+      "--health-retries",
+      "--health-start-interval",
+      "--health-start-period",
+      "--health-timeout",
+      "-h",
+      "--hostname",
+      "--ip",
+      "--ip6",
+      "--ipc",
+      "--isolation",
+      "-l",
+      "--label",
+      "--label-file",
+      "--link",
+      "--link-local-ip",
+      "--log-driver",
+      "--log-opt",
+      "--mac-address",
+      "-m",
+      "--memory",
+      "--memory-reservation",
+      "--memory-swap",
+      "--memory-swappiness",
+      "--mount",
+      "--name",
+      "--network",
+      "--network-alias",
+      "--oom-score-adj",
+      "--pid",
+      "--pids-limit",
+      "--platform",
+      "-p",
+      "--publish",
+      "--pull",
+      "--restart",
+      "--runtime",
+      "--security-opt",
+      "--shm-size",
+      "--stop-signal",
+      "--stop-timeout",
+      "--storage-opt",
+      "--sysctl",
+      "--tmpfs",
+      "--ulimit",
+      "--umask",
+      "-u",
+      "--user",
+      "--userns",
+      "--uts",
+      "-v",
+      "--volume",
+      "--volume-driver",
+      "--volumes-from",
+      "-w",
+      "--workdir",
+    ]),
+  },
+  pull: { flags: new Set(["-a", "--all-tags", "-q", "--quiet"]), values: new Set(["--platform"]) },
+};
+/** The docker subcommands that start or fetch an image, by the words that name them. */
+const IMAGE_COMMANDS = [
+  [["container", "run"], "run"],
+  [["container", "create"], "create"],
+  [["image", "pull"], "pull"],
+  [["run"], "run"],
+  [["create"], "create"],
+  [["pull"], "pull"],
+];
+
+/**
+ * A run: block lexed as Bash would split it into commands of words, enough to find docker's
+ * arguments: single quotes, double quotes (a `$VAR` inside stays part of its word) and backslash
+ * escapes never split a word; a backslash-newline joins lines; `#` at a word's start comments to the
+ * line's end; newlines, `;`, `&`, `|`, `(`, `)`, `<` and `>` end a command. Each word is {text,
+ * dynamic}: dynamic when the shell expands something in it (`$`, `$(…)`, backticks). The body of each
+ * command substitution is lexed too, as its own commands.
+ */
+const lexShell = (source) => {
+  const commands = [[]];
+  let word = null;
+  const add = (text, dynamic = false) => {
+    word ??= { text: "", dynamic: false };
+    word.text += text;
+    word.dynamic ||= dynamic;
+  };
+  const endWord = () => {
+    if (word !== null) commands.at(-1).push(word);
+    word = null;
+  };
+  const endCommand = () => {
+    endWord();
+    if (commands.at(-1).length > 0) commands.push([]);
+  };
+  /** The body of the `$(` whose body starts at `from`, and the index past its `)`. */
+  const substitution = (from) => {
+    let depth = 1;
+    let quote = null;
+    for (let at = from; at < source.length; at += 1) {
+      const c = source[at];
+      if (quote === "'") {
+        if (c === "'") quote = null;
+      } else if (c === "\\") at += 1;
+      else if (quote === '"') {
+        if (c === '"') quote = null;
+      } else if (c === "'" || c === '"') quote = c;
+      else if (c === "(") depth += 1;
+      else if (c === ")" && (depth -= 1) === 0) return [source.slice(from, at), at + 1];
     }
-  for (const { at, image } of started) assert.match(image, PINNED, `${at} starts ${image}`);
-  // The dry run's loopback registry is one of them.
+    throw new Error(`an unclosed $( in: ${source.slice(from - 2, from + 60)}`);
+  };
+  const nested = [];
+  /** Reads an expansion at `at` (`$(…)`, `` `…` `` or `$`) into the word; the index past it. */
+  const expansion = (at) => {
+    if (source.startsWith("$(", at)) {
+      const [body, next] = substitution(at + 2);
+      nested.push(body);
+      add("$(…)", true);
+      return next;
+    }
+    if (source[at] === "`") {
+      const close = source.indexOf("`", at + 1);
+      if (close < 0) throw new Error("an unclosed backtick");
+      nested.push(source.slice(at + 1, close));
+      add("`…`", true);
+      return close + 1;
+    }
+    add("$", true);
+    return at + 1;
+  };
+  let at = 0;
+  while (at < source.length) {
+    const c = source[at];
+    if (c === "\\") {
+      if (source[at + 1] !== "\n") add(source[at + 1] ?? "");
+      at += 2;
+    } else if (c === "'") {
+      const close = source.indexOf("'", at + 1);
+      if (close < 0) throw new Error(`an unclosed ' in: ${source.slice(at, at + 60)}`);
+      add(source.slice(at + 1, close));
+      at = close + 1;
+    } else if (c === '"') {
+      add("");
+      at += 1;
+      while (source[at] !== '"') {
+        if (at >= source.length) throw new Error('an unclosed "');
+        if (source[at] === "\\" && '$`"\\\n'.includes(source[at + 1])) {
+          if (source[at + 1] !== "\n") add(source[at + 1]);
+          at += 2;
+        } else if (source[at] === "$" || source[at] === "`") at = expansion(at);
+        else add(source[at++]);
+      }
+      at += 1;
+    } else if (c === "$" || c === "`") at = expansion(at);
+    else if (c === "#" && word === null) {
+      const newline = source.indexOf("\n", at);
+      at = newline < 0 ? source.length : newline;
+    } else if (c === "\n" || ";&|()<>".includes(c)) {
+      endCommand();
+      at += 1;
+    } else if (/\s/.test(c)) {
+      endWord();
+      at += 1;
+    } else add(source[at++]);
+  }
+  endCommand();
+  return [...commands.filter((command) => command.length > 0), ...nested.flatMap(lexShell)];
+};
+
+/**
+ * Moves past the options at `words[at]` by `table` (getopt-style: `--name value`, `--name=value`,
+ * `-e value`, `-evalue`, and flag clusters such as `-dit`); the index of the first operand, or -1
+ * after reporting an option the table does not know, or one the shell builds, in `problems`.
+ */
+const pastOptions = (words, at, table, what, problems) => {
+  while (at < words.length && words[at].text.startsWith("-") && words[at].text !== "-") {
+    const { text, dynamic } = words[at];
+    if (text === "--") return at + 1;
+    if (text.startsWith("--")) {
+      const [name] = text.split("=", 1);
+      const inline = text.includes("=");
+      if (!inline && dynamic) {
+        problems.push(`${what} ${text}: an option the shell builds`);
+        return -1;
+      }
+      if (table.values.has(name)) at += inline ? 1 : 2;
+      else if (table.flags.has(name) && !inline) at += 1;
+      else {
+        problems.push(`${what} ${name}: an option this scan does not know`);
+        return -1;
+      }
+      continue;
+    }
+    let consumed = 1;
+    for (let k = 1; k < text.length; k += 1) {
+      const option = `-${text[k]}`;
+      if (table.flags.has(option)) continue;
+      if (table.values.has(option)) {
+        if (k === text.length - 1) consumed = 2;
+        break;
+      }
+      problems.push(`${what} ${text}: an option this scan does not know`);
+      return -1;
+    }
+    at += consumed;
+  }
+  return at;
+};
+
+/**
+ * Every image a run: block hands docker to start or fetch. Each command's `docker` word (or
+ * `…/docker`) is read past docker's global options to its subcommand; for run, create, pull,
+ * container run/create and image pull, past that subcommand's options to the first operand, the
+ * image. Returns {command, image, literal} for each, and {problem} for what the scan refuses to
+ * guess at: an option the tables do not know or the shell builds, a subcommand with no image, and a
+ * literal image-like word (a `:` or a `/`, not an option, no digest) anywhere after an image the
+ * shell builds, so an ordinary option value the tables missed can never pass as the image and
+ * exempt the real one.
+ *
+ * What it cannot check: an image name the shell builds from variables at run time (literal false:
+ * a release job pulls one by the digest its run's release manifest records, which other tests hold);
+ * an image a script or an action the job calls starts; docker reached under another name (an
+ * alias, a function, a variable holding its path); and options a newer CLI adds until the tables
+ * are regenerated, which fail the scan instead.
+ */
+const dockerImages = (run) => {
+  const found = [];
+  const problems = [];
+  for (const words of lexShell(run))
+    for (let start = 0; start < words.length; start += 1) {
+      if (words[start].dynamic || !/(^|\/)docker$/.test(words[start].text)) continue;
+      let at = pastOptions(words, start + 1, DOCKER_OPTIONS.global, "docker", problems);
+      if (at < 0) continue;
+      const match = IMAGE_COMMANDS.find(([names]) =>
+        names.every((name, k) => words[at + k]?.text === name && !words[at + k].dynamic),
+      );
+      if (match === undefined) continue;
+      const [names, options] = match;
+      const command = `docker ${names.join(" ")}`;
+      at = pastOptions(words, at + names.length, DOCKER_OPTIONS[options], command, problems);
+      if (at < 0) continue;
+      const operand = words[at];
+      if (operand === undefined) {
+        problems.push(`${command} names no image`);
+        continue;
+      }
+      found.push({ command, image: operand.text, literal: !operand.dynamic });
+      if (!operand.dynamic) continue;
+      for (const later of words.slice(at + 1))
+        if (
+          !later.dynamic &&
+          !later.text.startsWith("-") &&
+          IMAGE_LIKE.test(later.text) &&
+          !later.text.includes("@sha256:")
+        )
+          problems.push(
+            `${command}: ${later.text} follows the image the shell builds (${operand.text}) and is not pinned by digest`,
+          );
+    }
+  return [...found, ...problems.map((problem) => ({ problem }))];
+};
+
+/** Every image a workflow names in YAML: a step's `uses: docker://…`, a job's container, its services. */
+const yamlImages = (document) => {
+  const found = [];
+  for (const [name, job] of Object.entries(document.jobs ?? {})) {
+    if (job.container !== undefined)
+      found.push({
+        at: `${name} container`,
+        image: typeof job.container === "string" ? job.container : job.container?.image,
+      });
+    for (const [service, definition] of Object.entries(job.services ?? {}))
+      found.push({
+        at: `${name} services.${service}`,
+        image: typeof definition === "string" ? definition : definition?.image,
+      });
+    for (const step of job.steps ?? [])
+      if (String(step.uses ?? "").startsWith("docker://"))
+        found.push({
+          at: `${name} ${step.name ?? step.uses}`,
+          image: step.uses.slice("docker://".length),
+        });
+  }
+  return found;
+};
+
+/** release.yml, every workflow it calls through `uses: ./.github/workflows/…`, and next.yml. */
+const publishingWorkflows = () => {
+  const files = new Set();
+  for (const pending = ["release.yml", "next.yml"]; pending.length > 0;) {
+    const file = pending.pop();
+    if (files.has(file)) continue;
+    files.add(file);
+    for (const job of Object.values(workflow(file).jobs ?? {})) {
+      const called = /^\.\/\.github\/workflows\/([^/]+)$/.exec(job?.uses ?? "");
+      if (called) pending.push(called[1]);
+    }
+  }
+  return [...files].toSorted();
+};
+
+/** Every image `document` (a parsed workflow) runs, starts or pulls, and every problem reading it. */
+const workflowImages = (document) => {
+  const images = [];
+  const problems = [];
+  for (const [name, job] of Object.entries(document.jobs ?? {}))
+    for (const step of job.steps ?? []) {
+      const where = `${name} ${step.name ?? step.uses ?? step.run?.slice(0, 40)}`;
+      for (const found of dockerImages(step.run ?? ""))
+        if (found.problem !== undefined) problems.push(`${where}: ${found.problem}`);
+        else images.push({ at: where, ...found });
+      // BuildKit runs privileged, and performs the push.
+      if (String(step.uses ?? "").startsWith("docker/setup-buildx-action@")) {
+        const driver = /(?:^|,)image=([^,\s]+)/.exec(step.with?.["driver-opts"] ?? "");
+        images.push({
+          at: where,
+          image: driver?.[1] ?? "<the action's default BuildKit>",
+          literal: true,
+        });
+      }
+    }
+  for (const found of yamlImages(document))
+    images.push({ ...found, image: String(found.image), literal: true });
+  return { images, problems };
+};
+/** The images a workflow names that are not pinned by digest, and its reading problems. */
+const unpinned = (document) => {
+  const { images, problems } = workflowImages(document);
+  return [
+    ...problems,
+    ...images
+      .filter(({ image, literal }) => literal && !PINNED.test(image))
+      .map(({ at, image }) => `${at}: ${image} is not pinned by digest`),
+  ];
+};
+
+test("every image a publishing workflow starts, pulls or runs as a container is pinned by digest", () => {
+  const files = publishingWorkflows();
+  assert.deepEqual(files, ["next.yml", "release.yml"]);
+  for (const file of files) assert.deepEqual(unpinned(workflow(file)), [], file);
+  // The lexer reads every run: block of every workflow without refusing one.
+  for (const file of workflowFiles())
+    for (const job of Object.values(workflow(file).jobs ?? {}))
+      for (const step of job.steps ?? []) assert.doesNotThrow(() => lexShell(step.run ?? ""), file);
+});
+
+// A new image in the release, pinned or built at run time, fails here until someone has looked.
+test("the images release.yml starts today, by name or as the shell builds them", () => {
+  // The dry run's loopback registry is the one image started by name; the identity check's pull
+  // and create name the image the shell built from the manifest.
+  const { images } = workflowImages(workflow("release.yml"));
   assert.deepEqual(
-    started.filter(({ image }) => image.startsWith("registry:")).map(({ at }) => at),
-    ["archive-merge"],
+    images
+      .filter(({ at }) => !/setup-buildx/.test(at))
+      .map(({ at, command, image, literal }) => [at.split(" ")[0], command, image, literal]),
+    [
+      [
+        "archive-merge",
+        "docker run",
+        "registry:2@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373",
+        true,
+      ],
+      ["identity", "docker pull", "$REPOSITORY@$digest", false],
+      ["identity", "docker create", "$id", false],
+    ],
   );
-  // The guard refuses what was there before, and a tag-only or digest-less reference.
+});
+
+test("the shell lexer keeps quoted words whole and finds commands inside substitutions", () => {
+  const words = (source) =>
+    lexShell(source).map((command) =>
+      command.map(({ text, dynamic }) => (dynamic ? `${text}*` : text)),
+    );
+  assert.deepEqual(words(`docker run --env "BANNER=hello $BUILD_LABEL" -e FOO="a b" x`), [
+    ["docker", "run", "--env", "BANNER=hello $BUILD_LABEL*", "-e", "FOO=a b", "x"],
+  ]);
+  assert.deepEqual(words("a 'x=y z' b\\ c \\\n  d # e f\ng;h|i&&j"), [
+    ["a", "x=y z", "b c", "d"],
+    ["g"],
+    ["h"],
+    ["i"],
+    ["j"],
+  ]);
+  assert.deepEqual(words('out="$(docker run "a b" "$(echo c)")"; `docker pull d`'), [
+    ["out=$(…)*"],
+    ["`…`*"],
+    ["docker", "run", "a b", "$(…)*"],
+    ["echo", "c"],
+    ["docker", "pull", "d"],
+  ]);
+  assert.deepEqual(words(`x=\${y:-$(npm root -g)/p} '$(not run)' "\\$z"`), [
+    ["x=${y:-$(…)/p}*", "$(not run)", "$z"],
+    ["npm", "root", "-g"],
+  ]);
+});
+
+test("the image scan reads docker's options, quotes, continuations and subcommand forms", () => {
+  const PIN = `@sha256:${"a".repeat(64)}`;
+  const images = (run) =>
+    dockerImages(run).map((found) => found.problem ?? [found.command, found.image, found.literal]);
+  const unpinnedAlpine = [["docker run", "alpine:3.22", true]];
+  for (const [label, run, expected] of [
+    ["plain", "docker run --rm alpine:3.22 true", unpinnedAlpine],
+    [
+      "a global option with a value",
+      "docker --context default run --rm alpine:3.22 true",
+      unpinnedAlpine,
+    ],
+    [
+      "global options in every form",
+      "docker -H unix:///x --config=/c --debug -l info run -d --name x -p 1:1 alpine:3.22",
+      unpinnedAlpine,
+    ],
+    [
+      "a continuation that leaves two spaces",
+      "docker \\\n  run --rm alpine:3.22 true",
+      unpinnedAlpine,
+    ],
+    [
+      "a continuation between options",
+      "docker run --rm \\\n    --name x \\\n    alpine:3.22 true",
+      unpinnedAlpine,
+    ],
+    // Astra's round 2: an option value the scan took for a dynamic image.
+    [
+      "a value option an old table lacked",
+      'docker run --rm --stop-timeout "$STOP_TIMEOUT" alpine:3.22 true',
+      unpinnedAlpine,
+    ],
+    [
+      "a quoted value with a space and a variable",
+      'docker run --rm --env "BANNER=hello $BUILD_LABEL" alpine:3.22 true',
+      unpinnedAlpine,
+    ],
+    ["a value quoted mid-word", 'docker run -e FOO="a b" alpine:3.22', unpinnedAlpine],
+    [
+      "a single-quoted value",
+      "docker run --label 'x=y z' alpine",
+      [["docker run", "alpine", true]],
+    ],
+    [
+      "a value attached to its short option",
+      "docker run -eFOO=1 -p8080:80 alpine:3.22",
+      unpinnedAlpine,
+    ],
+    ["a flag cluster", "docker run -dit alpine:3.22 sh", unpinnedAlpine],
+    [
+      "a flag cluster ending in a value option",
+      "docker run -ite FOO=1 alpine:3.22",
+      unpinnedAlpine,
+    ],
+    [
+      "docker container run",
+      "docker container run alpine:3.22",
+      [["docker container run", "alpine:3.22", true]],
+    ],
+    [
+      "docker container create",
+      "docker container create --stop-timeout 5 alpine:3.22",
+      [["docker container create", "alpine:3.22", true]],
+    ],
+    [
+      "docker create, inside a quoted $()",
+      'id="$(docker create "alpine:3.22" --version)"',
+      [["docker create", "alpine:3.22", true]],
+    ],
+    [
+      "docker pull with a platform",
+      "docker pull --platform linux/arm64 alpine:3.22",
+      [["docker pull", "alpine:3.22", true]],
+    ],
+    [
+      "docker image pull",
+      "docker image pull -q alpine:3.22",
+      [["docker image pull", "alpine:3.22", true]],
+    ],
+    ["an option=value", "docker run --name=x alpine:3.22", unpinnedAlpine],
+    ["after a pipe", "true | docker run -i alpine:3.22 cat", [["docker run", "alpine:3.22", true]]],
+    ["by path", "/usr/bin/docker run alpine:3.22", unpinnedAlpine],
+    [
+      "pinned",
+      `docker run --rm alpine:3.22${PIN} true`,
+      [["docker run", `alpine:3.22${PIN}`, true]],
+    ],
+    // An image the shell builds is exempt only with nothing image-like after it.
+    ["built at run time", 'docker run --rm "$IMAGE" true', [["docker run", "$IMAGE", false]]],
+    [
+      "a real dynamic pull",
+      'docker pull "$X/$y@$digest"',
+      [["docker pull", "$X/$y@$digest", false]],
+    ],
+    [
+      "a literal image after one the shell builds",
+      'docker run --rm "$IMAGE" alpine:3.22 true',
+      [
+        ["docker run", "$IMAGE", false],
+        "docker run: alpine:3.22 follows the image the shell builds ($IMAGE) and is not pinned by digest",
+      ],
+    ],
+    [
+      "a pinned word after one the shell builds",
+      `docker run --rm "$IMAGE" alpine${PIN}`,
+      [["docker run", "$IMAGE", false]],
+    ],
+    [
+      "an option the scan does not know, then a variable",
+      "docker run --frobnicate $X alpine:3.22",
+      ["docker run --frobnicate: an option this scan does not know"],
+    ],
+    [
+      "a hidden alias the help does not list",
+      "docker run --net host alpine:3.22",
+      ["docker run --net: an option this scan does not know"],
+    ],
+    [
+      "a global option the scan does not know",
+      "docker -Z run alpine:3.22",
+      ["docker -Z: an option this scan does not know"],
+    ],
+    [
+      "an option the shell builds",
+      'docker run "$FLAGS" alpine:3.22',
+      [
+        ["docker run", "$FLAGS", false],
+        "docker run: alpine:3.22 follows the image the shell builds ($FLAGS) and is not pinned by digest",
+      ],
+    ],
+    [
+      "a long option the shell builds",
+      "docker run --$OPT alpine:3.22",
+      ["docker run --$OPT: an option the shell builds"],
+    ],
+    ["no image", "docker run --rm", ["docker run names no image"]],
+    ["a comment", "# docker run alpine:3.22", []],
+    ["a quoted mention", 'echo "docker run alpine:3.22"', []],
+    [
+      "commands that start nothing",
+      'docker buildx imagetools create --tag x y\ndocker image inspect "$id"',
+      [],
+    ],
+  ])
+    assert.deepEqual(images(run), expected, label);
+  // The YAML forms.
+  const yaml = (jobs) => unpinned({ jobs });
+  assert.deepEqual(yaml({ a: { container: "alpine:3.22", steps: [] } }), [
+    "a container: alpine:3.22 is not pinned by digest",
+  ]);
+  assert.deepEqual(yaml({ a: { container: { image: "alpine:3.22" }, steps: [] } }), [
+    "a container: alpine:3.22 is not pinned by digest",
+  ]);
+  assert.deepEqual(yaml({ a: { services: { cache: { image: "redis:7" } }, steps: [] } }), [
+    "a services.cache: redis:7 is not pinned by digest",
+  ]);
+  assert.deepEqual(yaml({ a: { steps: [{ name: "s", uses: "docker://alpine:3.22" }] } }), [
+    "a s: alpine:3.22 is not pinned by digest",
+  ]);
+  // An expression is not a pin either.
+  assert.deepEqual(yaml({ a: { container: "${{ matrix.image }}", steps: [] } }), [
+    "a container: ${{ matrix.image }} is not pinned by digest",
+  ]);
+  assert.deepEqual(
+    yaml({
+      a: {
+        container: `alpine:3.22${PIN}`,
+        services: { cache: `redis:7${PIN}` },
+        steps: [{ name: "s", uses: `docker://alpine${PIN}` }, { run: `docker run alpine${PIN}` }],
+      },
+    }),
+    [],
+  );
   for (const image of ["registry:2", "registry", "registry:2@sha256:abc", "moby/buildkit:v0.33.1"])
     assert.doesNotMatch(image, PINNED, image);
 });
