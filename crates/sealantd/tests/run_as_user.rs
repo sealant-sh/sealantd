@@ -876,17 +876,20 @@ async fn dotfiles_apply_as_the_user_and_answer_before_install_sh_ends() {
     }
     let staging = home.join(".local/share/sealant-dotfiles/0/install.sh");
     assert_eq!(std::fs::metadata(&staging).unwrap().uid(), BOB_UID);
-    // The modes the archive carries, on files and in the tree; directories the copy makes in the
-    // home take the daemon's umask, as they always have.
-    let umask = daemon_umask();
+    // The modes the archive carries, on files, on its directories in the staged tree and on the
+    // tree itself (the archive's `./`); the directories the copy makes in the home take what a
+    // new directory there takes, as they always have: the daemon's umask, under whatever default
+    // ACL the home carries ([`made_dir_mode`]).
     let mode = |path: &Path| std::fs::symlink_metadata(path).unwrap().mode() & 0o7777;
+    let made = made_dir_mode(&home);
+    let tree_mode = mode(&tree);
     for (path, expected) in [
         (".mtest-zshrc", 0o644),
         (".mtest-private", 0o600),
         (".mtest-bin/hello", 0o755),
-        (".mtest-bin", 0o777 & !umask),
-        (".config/mtest", 0o777 & !umask),
-        (".local/share/sealant-dotfiles/0", 0o777 & !umask),
+        (".mtest-bin", made),
+        (".config/mtest", made),
+        (".local/share/sealant-dotfiles/0", tree_mode),
         (".local/share/sealant-dotfiles/0/.mtest-bin", 0o750),
         (".local/share/sealant-dotfiles/0/install.sh", 0o755),
     ] {
@@ -934,11 +937,18 @@ async fn dotfiles_apply_as_the_user_and_answer_before_install_sh_ends() {
     }
 }
 
-/// The daemon's umask (read and put back; these tests run on one thread).
-fn daemon_umask() -> u32 {
-    let mask = nix::sys::stat::umask(nix::sys::stat::Mode::from_bits_truncate(0o022));
-    nix::sys::stat::umask(mask);
-    mask.bits()
+/// The mode a directory made in `home` by the daemon's process takes: `0o777` under the
+/// process umask, or under the home's default ACL where it has one (a host's `setfacl -d` on
+/// `/home` gives every new directory the group's write bit whatever the umask; the test homes
+/// on GitHub's hosted Ubuntu runner carry one, sealantd#181). Measured on a directory made and
+/// removed here, in the same process.
+fn made_dir_mode(home: &Path) -> u32 {
+    let probe = home.join(".mtest-mode-probe");
+    let _ = std::fs::remove_dir(&probe);
+    std::fs::create_dir(&probe).unwrap();
+    let mode = std::fs::symlink_metadata(&probe).unwrap().mode() & 0o7777;
+    std::fs::remove_dir(&probe).unwrap();
+    mode
 }
 
 /// Nothing is left under the daemon's dotfiles staging directory once an apply answers.
@@ -1066,6 +1076,10 @@ async fn a_person_s_link_into_another_home_takes_none_of_their_dotfiles() {
     for path in [&cat_fish, &cat_staged] {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, "cat's own\n").unwrap();
+        // Pinned: the check below is that the apply left the file as it was, not what the
+        // home's umask or default ACL gave a new file.
+        std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o644))
+            .unwrap();
     }
     assert!(
         Std::new("chown")
