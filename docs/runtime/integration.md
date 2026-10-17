@@ -6,9 +6,9 @@ the orchestrator that drives workspaces over the control socket.
 
 ## 1. The daemon binary → multi-arch image (GHCR)
 
-A `vX.Y.Z` tag triggers `.github/workflows/release.yml`, which builds and pushes a static,
-multi-arch image to `ghcr.io/sealant-sh/sealantd`. The runtime layer is `scratch` + one static
-binary.
+A `vX.Y.Z` tag triggers `.github/workflows/release.yml`, which builds a static, multi-arch image
+and publishes it once, as `ghcr.io/sealant-sh/sealantd:X.Y.Z` (see [Stable releases](#stable-releases)).
+The runtime layer is `scratch` + one static binary.
 
 Bake it into the workspace image with a single `COPY --from` — buildx selects the matching arch
 automatically for each target platform:
@@ -18,8 +18,9 @@ automatically for each target platform:
 COPY --from=ghcr.io/sealant-sh/sealantd:X.Y.Z /usr/local/bin/sealantd /usr/local/bin/sealantd
 ```
 
-Pin by version (or by `@sha256:` digest for full reproducibility). Launch it in the workspace with a
-socket on a shared path, e.g.:
+Pin by version (or by `@sha256:` digest for full reproducibility). `:latest` and `:0.19` are frozen
+at 0.19.0 and are not a supported way to consume sealantd: no release moves them. Launch it in the
+workspace with a socket on a shared path, e.g.:
 
 ```sh
 sealantd --socket /run/sealantd.sock --workspace /workspace --watch-filesystem --network-proxy
@@ -145,6 +146,76 @@ pins a prerelease, so this tag comes first. The whole order is in sealant-sh/men
 `docs/operations/next-channel.md`. The release refuses while an npm prerelease of the version came
 from a commit the tag leaves out, which is what a merge during the freeze produces.
 
-**Never re-run an old stable release run.** sealantd's stable pipeline writes `:<version>`,
-major.minor and `latest` with no lock or floor, so re-running an older run can move `latest`
-backwards or replace a version's digest. Cut a new version instead.
+## Stable releases
+
+A `vX.Y.Z` tag runs `.github/workflows/release.yml` on GitHub-hosted runners:
+
+1. `stable-tag` refuses anything but a plain `vX.Y.Z` tag, an alias dependency in the published
+   packages, a next build of the version from a commit the tag leaves out, and a commit whose `ci`
+   push run on main did not pass (below).
+2. `build` builds each platform on its own native runner and pushes it by digest, with no tag.
+   `merge` stages the two as one index under this run's own tag, `staging-<run>-<attempt>`, and
+   checks the index holds exactly the two platforms it was given. `release-manifest` records the
+   version, the commit, the index digest and both platform digests, and is kept for 90 days.
+3. `identity` runs on each arch: it pulls that platform by the digest the manifest records, and
+   checks that a container of it runs exactly the image ID the pull gave, that its labels carry
+   this version, commit and repository, and that `sealantd --version` reports what the tagged
+   commit's `Cargo.toml` says. The workspace version there is `0.0.0`, which the release flow does
+   not stamp, so today the daemon reports `sealantd 0.0.0` and the version label is what names the
+   release; a `Cargo.toml` that says any version but `0.0.0` or this release's is refused.
+4. `finalize-images` writes `:X.Y.Z` from the checked index, under the lock below. It reads the tag
+   first: absent only when the registry answers exactly `ERROR: <ref>: not found`, already this
+   run's index is done, any other digest is refused because the version is spent. After a create
+   it reads the tag again, and that read decides.
+5. `npm` publishes the two runtime packages, after `finalize-images`, so every stable runtime
+   package has its daemon at `:X.Y.Z`.
+
+`finalize-images` and `npm` are the only jobs that write a stable channel, and each queues on the
+job-level lock `sealantd-release-channel` (`cancel-in-progress: false`, `queue: max`), never
+cancelled. The lock is held per job, not across a whole release.
+
+**Identity checks, not acceptance.** The identity checks prove the staged index is the build this
+tag describes and that its daemon starts on both arches. They do not exercise the runtime contract.
+A sealantd image is accepted through Core's pin: Core resolves `ghcr.io/sealant-sh/sealantd:X.Y.Z`
+to its digest (`tooling/scripts/pin-sealantd.mjs`), its release refuses any sealantd that is not
+pinned as `X.Y.Z@sha256:…`, and its CI and release `workspace-e2e` run against exactly that pinned
+digest (since sealant#368) before Core ships. A sealantd release Core cannot accept is fixed by a new
+sealantd version.
+
+**The `ci` gate.** `stable-tag` lists the `ci` workflow's runs of the tagged commit and requires one
+that is a push to this repository's main and concluded `success`, the signal Next trusts through
+its `workflow_run` trigger. It covers the Rust daemon tests and the Node package tests, which the
+release does not run. A failed read is retried, then fails the release; it is never taken for "no
+run". The signal is only as trustworthy as the runners `ci` uses: today its `rust` and `node` jobs
+run on the box's persistent runner VMs, which keep state between jobs, so a job from an earlier pull
+request could make a later run report success without running the tests honestly. That is decision
+D1/D2 in the CI plan. Once D1 (per-job rollback to a clean golden image) is live, the `ci` signal
+comes from a VM that starts clean for every job, and this section should say so.
+
+**Tags that never move.** No job writes `:latest` or `:X.Y`. They stay at 0.19.0, where the old
+pipeline left them, and nothing in Core, Mend or sealantd reads them: every consumer pins a version
+or a digest, and Core's release guard refuses anything else. They cannot be deleted without
+deleting the GHCR package version that also carries `:0.19.0`, which Core pins by digest.
+
+**No GitHub release.** sealantd publishes none, and nothing installs sealantd from one.
+
+**Re-running a release run.** Re-run failed jobs, while the run's artifacts are kept (the platform
+and index digests for a day, the release manifest for 90 days):
+
+| What happened | What re-running the failed jobs does |
+| --- | --- |
+| `stable-tag` refused a commit whose `ci` had not passed yet | Re-run it once `ci` has passed; nothing was built. |
+| `build`, `merge`, `release-manifest` or `identity` failed | Nothing final was written. The re-run stages a new `staging-<run>-<attempt>`. |
+| `finalize-images` failed after its create | The read finds this run's index and passes, with a warning if the create had reported an error. Absent, unreadable or another digest fails. |
+| `:X.Y.Z` exists at this run's index; `npm` failed | `finalize-images` does nothing; `npm` publishes. |
+
+Re-running **all** jobs after `:X.Y.Z` exists builds another index, which `finalize-images` refuses:
+the version is spent, so cut a new one. `npm` has no stable floor yet, so **never re-run the `npm`
+job of a release older than npm's `latest`**: it would move `latest` backwards. Manual writes to
+`:X.Y.Z` are outside these checks. Staging tags are not cleaned up yet.
+
+**What stays unproven until a watched stable release.** The jobs above are tested against stand-in
+`docker` commands and a stub GitHub API (`scripts/release-publication.test.mjs`,
+`scripts/release-manifest.test.mjs`). A real release is the first run of the push by digest and the
+staging index on GHCR, the anonymous pull of staged digests, the `ci` check against GitHub's API
+with the job's token, the finalize write, and the lock's queueing in this repository.

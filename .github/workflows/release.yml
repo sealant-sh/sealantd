@@ -1,5 +1,20 @@
-# Release pipeline: on a vX.Y.Z tag, build and push a multi-arch (amd64 + arm64) static sealantd
-# image to GHCR. The workspace image consumes it via `COPY --from` (see docs/runtime/integration.md).
+# Release: a vX.Y.Z tag releases sealantd: the image ghcr.io/sealant-sh/sealantd:<version>, amd64
+# and arm64, and @sealant/runtime-protocol and @sealant/runtime-client on npm. In order:
+#
+# 1. stable-tag refuses anything but a stable tag of a commit whose `ci` push run on main passed.
+# 2. build pushes each platform by digest, untagged; merge stages the index under this run's own
+#    tag, staging-<run>-<attempt>; release-manifest records every digest.
+# 3. identity pulls each platform by digest on its own arch and checks it is this release's build:
+#    the image ID it runs, its labels, and `sealantd --version`. Identity checks, not acceptance:
+#    a sealantd image is accepted by Core, which pins it by digest and runs its workspace e2e
+#    against exactly that digest before Core releases (docs/runtime/integration.md, Stable releases).
+# 4. finalize-images writes :<version>, once, from the checked index; npm publishes after it.
+#
+# Only finalize-images writes :<version>, and nothing writes :X.Y or :latest: those stay at 0.19.0,
+# where the old pipeline left them, and are not a supported way to consume sealantd. There is no
+# GitHub release. finalize-images and npm queue on one lock, sealantd-release-channel. Re-running
+# failed jobs is safe: every write first reads what is there.
+# Every job runs on a GitHub-hosted runner, a fresh VM: the box's runner VMs keep state between jobs.
 name: release
 
 on:
@@ -10,23 +25,29 @@ permissions:
   contents: read
 
 jobs:
-  # A prerelease tag (vX.Y.Z-anything) would publish to npm `latest` and tag the image `latest`.
-  # Prereleases publish from main in next.yml (ADR 0015 in sealant-sh/mend), never from a tag.
-  # And no next build of X.Y.Z may come from a commit this tag leaves out: it would sort below X.Y.Z
-  # but hold more. Main is frozen from the Version Packages merge to this tag (sealant-sh/mend
-  # docs/operations/next-channel.md); a merge during the freeze is what produces one.
+  # A prerelease tag (vX.Y.Z-anything) would publish to npm `latest`. Prereleases publish from main
+  # in next.yml (ADR 0015 in sealant-sh/mend), never from a tag. And no next build of X.Y.Z may come
+  # from a commit this tag leaves out: it would sort below X.Y.Z but hold more. Main is frozen from
+  # the Version Packages merge to this tag (sealant-sh/mend docs/operations/next-channel.md); a
+  # merge during the freeze is what produces one.
   stable-tag:
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 10
     permissions:
       contents: read
+      actions: read # the ci check below lists this commit's ci runs
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     steps:
       - name: Refuse a prerelease tag
+        id: version
         run: |
-          [[ $GITHUB_REF_NAME =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+          plain='^v(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})$'
+          [[ $GITHUB_REF_NAME =~ $plain ]] || {
             echo "::error::$GITHUB_REF_NAME is not a stable vX.Y.Z tag. Prereleases publish from main."
             exit 1
           }
+          echo "version=${GITHUB_REF_NAME#v}" >>"$GITHUB_OUTPUT"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
@@ -61,60 +82,481 @@ jobs:
         run: >-
           node scripts/next-version.mjs --stray "$GITHUB_REF_NAME" --npm
           @sealant/runtime-client-next HEAD
+      # Next publishes a main commit only after its `ci` push run passed (next.yml's workflow_run
+      # trigger); a stable release asks the same of its commit. That covers the Rust daemon tests and
+      # the Node package tests, which this workflow does not run. A run that is missing, failed, still
+      # running, from a pull request, from another branch or from a fork is refused, and a read that
+      # fails is retried, then fails: never read as no run. How much the signal is worth depends on
+      # the box runners `ci` uses (docs/runtime/integration.md, Stable releases).
+      # scripts/release-publication.test.mjs runs this step as written, against a stub GitHub API.
+      - name: Refuse a commit whose ci did not pass on main
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Retried reads wait 1500 ms × attempt (the ci runs read). Only a test sets
+          # RELEASE_TEST_RETRY_MS, never a workflow; the log says which delays this run used.
+          if [[ -z ${RELEASE_TEST_RETRY_MS:-} ]]; then
+            echo "retry backoff: production (1500 ms × attempt)"
+          elif [[ $RELEASE_TEST_RETRY_MS =~ ^(0|[1-9][0-9]{0,5})$ ]]; then
+            echo "retry backoff: overridden to $RELEASE_TEST_RETRY_MS ms × attempt"
+          else
+            echo "::error::RELEASE_TEST_RETRY_MS is not a whole number of milliseconds."
+            exit 1
+          fi
+          # shellcheck disable=SC2016 # JavaScript template literals, not shell expansions
+          node -e '
+            const [api, repository, sha, token] = process.argv.slice(1);
+            const query = new URLSearchParams({ head_sha: sha, event: "push", branch: "main", per_page: "100" });
+            const url = `${api}/repos/${repository}/actions/workflows/ci.yml/runs?${query}`;
+            const headers = { accept: "application/vnd.github+json", "x-github-api-version": "2022-11-28" };
+            if (token) headers.authorization = `Bearer ${token}`;
+            const refuse = (why) => {
+              console.error(`::error::${why}`);
+              process.exit(1);
+            };
+            const describe = (run) => `${run?.id} (${run?.event} on ${run?.head_branch}, ${run?.status}/${run?.conclusion})`;
+            const run = async () => {
+              for (let attempt = 1; attempt <= 4; attempt += 1) {
+                let response;
+                try {
+                  response = await fetch(url, { headers });
+                } catch (error) {
+                  if (attempt === 4) refuse(`GitHub could not be read for the ci runs of ${sha}: ${error.message}`);
+                }
+                if (response?.ok) {
+                  let body;
+                  try {
+                    body = await response.json();
+                  } catch {
+                    refuse(`GitHub answered the ci runs of ${sha} with something that is not JSON`);
+                  }
+                  if (!Array.isArray(body?.workflow_runs)) refuse(`GitHub answered no workflow_runs list for the ci runs of ${sha}`);
+                  const passed = body.workflow_runs.find(
+                    (entry) =>
+                      entry?.head_sha === sha && entry.event === "push" && entry.head_branch === "main" &&
+                      entry.path === ".github/workflows/ci.yml" && entry.repository?.full_name === repository &&
+                      entry.head_repository?.full_name === repository && entry.status === "completed" &&
+                      entry.conclusion === "success",
+                  );
+                  if (passed !== undefined) return console.log(`ci run ${passed.id} passed on main for ${sha}.`);
+                  const listed = body.workflow_runs.map(describe).join(", ") || "none";
+                  refuse(`No ci push run on main passed for ${sha} (GitHub lists: ${listed}). A stable release takes only a commit whose ci passed on main.`);
+                }
+                if (response !== undefined && attempt === 4) refuse(`GitHub answered ${response.status} for the ci runs of ${sha}`);
+                await new Promise((resolve) => setTimeout(resolve, attempt * Number(process.env.RELEASE_TEST_RETRY_MS || 1500)));
+              }
+            };
+            run();
+          ' -- "${GITHUB_API_URL:-https://api.github.com}" "$GITHUB_REPOSITORY" "$GITHUB_SHA" "${GH_TOKEN:-}"
 
-  image:
+  # Each platform on its own native runner, pushed by digest with no tag at all: nothing pulls it
+  # until the identity check names it by that digest.
+  build:
+    name: Image (${{ matrix.platform.arch }})
     needs: stable-tag
-    # No shared layer cache: other jobs write it, and this job pushes. The buildx
-    # builder below is created fresh for this job.
-    # (The npm job stays on ubuntu-latest — github-hosted — to keep OIDC trusted publishing safe.)
-    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - { arch: amd64, runner: ubuntu-24.04 }
+          - { arch: arm64, runner: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.platform.runner }}
+    timeout-minutes: 60
     permissions:
       contents: read
       packages: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      # QEMU emulates arm64 on this amd64 runner, with no layer cache (other jobs would write it).
-      # Real arm64 speedup later = native arm64 runners (ubuntu-24.04-arm) + a per-arch matrix
-      # (drops QEMU).
-      # binfmt at a fixed digest: it runs privileged and emulates every arm64 RUN.
-      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
         with:
-          image: tonistiigi/binfmt:qemu-v10.2.3-68@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0
-      # BuildKit at a fixed digest: it runs privileged and performs the push.
+          persist-credentials: false
+      # BuildKit at a fixed digest: it runs privileged and performs the push. No layer cache: other
+      # jobs would write it.
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
         with:
           driver-opts: image=moby/buildkit:v0.33.1@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea
-
       - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
-      - id: meta
-        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
-        with:
-          images: ghcr.io/${{ github.repository }}
-          tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest
-
-      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+      - id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: .
           file: docker/Dockerfile
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          platforms: linux/${{ matrix.platform.arch }}
           provenance: false
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ needs.stable-tag.outputs.version }}
+          outputs:
+            type=image,name=ghcr.io/${{ github.repository }},push-by-digest=true,name-canonical=true,push=true
+      - name: Export digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p /tmp/digests
+          touch "/tmp/digests/${DIGEST#sha256:}"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: digests-sealantd--${{ matrix.platform.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
 
+  # Both platforms as one index, under this run's own tag. :<version> is what every consumer of the
+  # version pulls, so only finalize-images writes it, after the identity checks.
+  merge:
+    name: Stage the index
+    needs: [stable-tag, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      # Only the index check, scripts/release-manifest.mjs.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: scripts/release-manifest.mjs
+          sparse-checkout-cone-mode: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          # setup-node v6 restores a package-manager cache by itself when packageManager names npm.
+          package-manager-cache: false
+          node-version: 24
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: /tmp/digests
+          pattern: digests-sealantd--*
+          merge-multiple: true
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # scripts/release-publication.test.mjs runs this step as written, against a stand-in docker.
+      - name: Stage the multi-arch index under this run's tag
+        working-directory: /tmp/digests
+        env:
+          REPOSITORY: ghcr.io/${{ github.repository }}
+        run: |
+          set -euo pipefail
+          tag=staging-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT
+          sources=()
+          for digest in *; do
+            if [[ ! $digest =~ ^[0-9a-f]{64}$ ]]; then
+              echo "::error::\"$digest\" in the digests artifact is not an image digest."
+              exit 1
+            fi
+            sources+=("$REPOSITORY@sha256:$digest")
+          done
+          mkdir -p "$RUNNER_TEMP/index"
+          docker buildx imagetools create --metadata-file "$RUNNER_TEMP/index/create.json" \
+            --tag "$REPOSITORY:$tag" "${sources[@]}"
+          docker buildx imagetools inspect "$REPOSITORY:$tag"
+      # The index digest goes in the release manifest: the one create reported, never the tag's,
+      # which another writer can move. That index and each source are read by digest, and the index
+      # must hold exactly the sources, for amd64 and arm64.
+      # scripts/release-manifest.test.mjs runs this step as written, against a stand-in docker.
+      - name: Check and record the index digest
+        working-directory: ${{ runner.temp }}/index
+        env:
+          REPOSITORY: ghcr.io/${{ github.repository }}
+        run: |
+          set -euo pipefail
+          digest=$(jq -r '."containerimage.digest" // ."containerimage.descriptor".digest // ""' create.json)
+          if [[ ! $digest =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::imagetools create reported no index digest."
+            exit 1
+          fi
+          docker buildx imagetools inspect "$REPOSITORY@$digest" --raw >index.json
+          sources=()
+          for file in /tmp/digests/*; do
+            source=${file##*/}
+            docker buildx imagetools inspect "$REPOSITORY@sha256:$source" --raw >"source-$source.json"
+            sources+=("sha256:$source=source-$source.json")
+          done
+          node "$GITHUB_WORKSPACE/scripts/release-manifest.mjs" check-index create.json \
+            index.json "${sources[@]}" >digest
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: index-sealantd
+          path: ${{ runner.temp }}/index/digest
+          if-no-files-found: error
+          retention-days: 1
+
+  # One record of what this run built: the image by its index and platform digests. Every later job
+  # reads it from this run and nowhere else. Kept 90 days, so failed jobs can be re-run.
+  release-manifest:
+    name: Write the release manifest
+    needs: [stable-tag, merge]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: scripts/release-manifest.mjs
+          sparse-checkout-cone-mode: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          # setup-node v6 restores a package-manager cache by itself when packageManager names npm.
+          package-manager-cache: false
+          node-version: 24
+      # One directory per artifact, named for its image and arch.
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: ${{ runner.temp }}/records/digests
+          pattern: digests-*
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: ${{ runner.temp }}/records/indexes
+          pattern: index-*
+      - name: Write release-manifest.json
+        env:
+          VERSION: ${{ needs.stable-tag.outputs.version }}
+          COMMIT: ${{ github.sha }}
+          DIGESTS: ${{ runner.temp }}/records/digests
+          INDEXES: ${{ runner.temp }}/records/indexes
+        run: |
+          mkdir -p "$RUNNER_TEMP/manifest"
+          node scripts/release-manifest.mjs write "$RUNNER_TEMP/manifest/release-manifest.json"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-manifest
+          path: ${{ runner.temp }}/manifest/release-manifest.json
+          if-no-files-found: error
+          retention-days: 90
+
+  # Identity checks, not acceptance: each arch's platform, pulled by the digest the manifest
+  # records, must be this release's build. It must run as the image ID it was pulled as, carry this
+  # version, commit and source as labels, and its daemon must report the version the tagged
+  # commit's Cargo.toml gives. A mislabelled or broken index stops here, before :<version> exists.
+  identity:
+    name: Identity check (${{ matrix.platform.arch }})
+    needs: [stable-tag, release-manifest]
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - { arch: amd64, runner: ubuntu-24.04 }
+          - { arch: arm64, runner: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.platform.runner }}
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      # The workspace version the daemon reports, and the manifest reader.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            Cargo.toml
+            scripts/release-manifest.mjs
+          sparse-checkout-cone-mode: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          # setup-node v6 restores a package-manager cache by itself when packageManager names npm.
+          package-manager-cache: false
+          node-version: 24
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-manifest
+          path: ${{ runner.temp }}/release
+      # Pulled anonymously, as a consumer pulls it. sealantd reports Cargo's workspace version, which
+      # the release flow does not stamp: while Cargo.toml says 0.0.0 the daemon reports 0.0.0, and
+      # the version label is what names the release. Cargo.toml saying any version but 0.0.0 or this
+      # release's is refused.
+      # scripts/release-publication.test.mjs runs this step as written, against a stand-in docker.
+      - name: Check this arch's image is this release's
+        env:
+          REPOSITORY: ghcr.io/${{ github.repository }}
+          MANIFEST: ${{ runner.temp }}/release/release-manifest.json
+          VERSION: ${{ needs.stable-tag.outputs.version }}
+          ARCH: ${{ matrix.platform.arch }}
+        run: |
+          set -euo pipefail
+          shopt -s inherit_errexit
+          case $RUNNER_ARCH in
+            X64) arch=amd64 ;;
+            ARM64) arch=arm64 ;;
+            *) echo "::error::No image is built for $RUNNER_ARCH."; exit 1 ;;
+          esac
+          if [[ $arch != "$ARCH" ]]; then
+            echo "::error::This $arch runner was asked to check $ARCH."
+            exit 1
+          fi
+          cargo=$(sed -n '/^\[workspace\.package\]$/,/^\[/s/^version = "\([^"]*\)"$/\1/p' Cargo.toml)
+          if [[ $cargo != 0.0.0 && $cargo != "$VERSION" ]]; then
+            echo "::error::Cargo.toml's workspace version is '$cargo', neither 0.0.0 nor $VERSION."
+            exit 1
+          fi
+          digest=$(node scripts/release-manifest.mjs digest "$MANIFEST" sealantd "$ARCH")
+          docker pull "$REPOSITORY@$digest"
+          id=$(docker image inspect "$REPOSITORY@$digest" --format '{{.Id}}')
+          if [[ ! $id =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::$REPOSITORY@$digest pulled as '$id', not an image ID."
+            exit 1
+          fi
+          # Every read from here names the ID the pull gave, never a reference that can move.
+          platform=$(docker image inspect "$id" --format '{{.Os}}/{{.Architecture}}')
+          labels=$(docker image inspect "$id" --format '{{json .Config.Labels}}')
+          label() { jq -r --arg key "org.opencontainers.image.$1" '.[$key] // ""' <<<"$labels"; }
+          problems=()
+          if [[ $platform != "linux/$ARCH" ]]; then problems+=("it is built for $platform, not linux/$ARCH"); fi
+          if [[ $(label version) != "$VERSION" ]]; then problems+=("its version label is '$(label version)', not $VERSION"); fi
+          if [[ $(label revision) != "$GITHUB_SHA" ]]; then problems+=("its revision label is '$(label revision)', not $GITHUB_SHA"); fi
+          if [[ $(label source) != "https://github.com/$GITHUB_REPOSITORY" ]]; then
+            problems+=("its source label is '$(label source)', not https://github.com/$GITHUB_REPOSITORY")
+          fi
+          if ((${#problems[@]} > 0)); then
+            printf -v joined '%s; ' "${problems[@]}"
+            echo "::error::$REPOSITORY@$digest ($id) is not this release's: ${joined%; }. Nothing was published."
+            exit 1
+          fi
+          # The daemon itself, in a container of exactly that ID.
+          container=$(docker create "$id" --version)
+          running=$(docker inspect "$container" --format '{{.Image}}')
+          status=0
+          reported=$(docker start --attach "$container") || status=$?
+          docker rm "$container" >/dev/null
+          if [[ $running != "$id" ]]; then
+            echo "::error::The container runs $running, not $id, the image pulled by digest."
+            exit 1
+          fi
+          if ((status != 0)) || [[ $reported != "sealantd $cargo" ]]; then
+            echo "::error::sealantd --version exited $status and reported '$reported', not 'sealantd $cargo'."
+            exit 1
+          fi
+          echo "$ARCH: $id is $VERSION from $GITHUB_SHA, and its daemon reports '$reported'."
+
+  # Writes :<version>, once, from the index digest this run checked. A version is spent once its tag
+  # exists: re-running failed jobs finds it at this run's digest and is done, re-running all jobs
+  # builds another index and is refused.
+  finalize-images:
+    name: Publish the checked image under its version
+    needs: [stable-tag, identity]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    # The release channel's lock: this job queues behind any other run's finalize or npm, never
+    # cancelled. Each job is serialized on its own; the lock is not held across a whole release.
+    # Job-level `queue: max` holds every pending job instead of only the newest (proven in
+    # sealant-sh/mend runs 38897026470, 38897041709 and 38897056028). actionlint does not know
+    # `queue` yet; .github/actionlint.yaml ignores it here.
+    concurrency:
+      group: sealantd-release-channel
+      cancel-in-progress: false
+      queue: max
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-manifest
+          path: release
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # The tag is read before it is written, and the read after the write decides: a create that
+      # reports an error but left this run's digest is done, any other digest is refused, and a tag
+      # still unreadable fails.
+      # scripts/release-publication.test.mjs runs this step as written, against a stand-in docker.
+      - name: Publish the checked index as its version
+        env:
+          REPOSITORY: ghcr.io/${{ github.repository }}
+          MANIFEST: ${{ github.workspace }}/release/release-manifest.json
+          VERSION: ${{ needs.stable-tag.outputs.version }}
+        run: |
+          set -euo pipefail
+          if ! jq -e --arg version "$VERSION" --arg commit "$GITHUB_SHA" \
+            '.version == $version and .commit == $commit' "$MANIFEST" >/dev/null; then
+            echo "::error::The release manifest is not this release's ($VERSION from $GITHUB_SHA)."
+            exit 1
+          fi
+          # The digest <ref> names, `absent` when the registry says it does not exist, and a
+          # failure for anything else: a read that failed is never taken for an absent tag. Absent
+          # is buildx's not-found line and nothing else: all of stderr, its trailing newlines aside,
+          # is exactly `ERROR: <ref>: not found`, and stdout is empty.
+          read_tag() {
+            local out err status=0 digest
+            out=$(docker buildx imagetools inspect "$1" --format '{{json .Manifest}}' \
+              2>"$RUNNER_TEMP/inspect.err") || status=$?
+            if ((status == 0)); then
+              digest=$(jq -r '.digest // ""' <<<"$out" 2>/dev/null) || digest=
+              if [[ $digest =~ ^sha256:[0-9a-f]{64}$ ]]; then
+                printf '%s\n' "$digest"
+                return 0
+              fi
+              echo "::error::$1 answered without a digest." >&2
+              return 1
+            fi
+            err=$(<"$RUNNER_TEMP/inspect.err")
+            if [[ -z $out && $err == "ERROR: $1: not found" ]]; then
+              echo absent
+              return 0
+            fi
+            cat "$RUNNER_TEMP/inspect.err" >&2
+            echo "::error::Could not read $1; nothing was written." >&2
+            return 1
+          }
+          ref=$REPOSITORY:$VERSION
+          index=$(jq -r '.images.sealantd.index // ""' "$MANIFEST")
+          if [[ ! $index =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::The release manifest records no index digest for sealantd."
+            exit 1
+          fi
+          current=$(read_tag "$ref")
+          if [[ $current == "$index" ]]; then
+            echo "$ref is already this run's $index."
+          elif [[ $current != absent ]]; then
+            echo "::error::$ref exists at $current, not $index, the index this run checked. Version $VERSION is spent: cut a new one."
+            exit 1
+          else
+            status=0
+            docker buildx imagetools create --tag "$ref" "$REPOSITORY@$index" || status=$?
+            if ! after=$(read_tag "$ref"); then
+              echo "::error::$ref is unreadable after the create (exit $status)."
+              exit 1
+            fi
+            if [[ $after == "$index" ]]; then
+              if ((status != 0)); then
+                echo "::warning::The create reported exit $status, but $ref resolves to $index, the index this run checked."
+              fi
+              echo "$ref is $index."
+            elif [[ $after == absent ]]; then
+              echo "::error::$ref does not exist after the create (exit $status)."
+              exit 1
+            else
+              echo "::error::$ref resolves to $after after the create, not $index. Version $VERSION is spent: cut a new one."
+              exit 1
+            fi
+          fi
+          {
+            echo "## sealantd $VERSION"
+            echo
+            echo "- \`$ref\` (\`$index\`)"
+          } >>"$GITHUB_STEP_SUMMARY"
+
+  # After the image exists, so every stable runtime package has its daemon at :<version>.
   npm:
-    needs: stable-tag
+    needs: [stable-tag, finalize-images]
+    # The release channel's lock, as finalize-images holds it.
+    concurrency:
+      group: sealantd-release-channel
+      cancel-in-progress: false
+      queue: max
     # npm trusted publishing (OIDC) needs a GitHub-hosted runner: this job stays off the self-hosted runners.
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     # Gate every publish behind a protected environment: add required reviewers + restrict deployment
     # to protected tags in repo Settings -> Environments -> release. This means a compromised PR,
     # dependency, or fork cannot trigger a publish without human approval.
