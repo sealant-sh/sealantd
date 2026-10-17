@@ -3236,10 +3236,29 @@ mod tests {
     /// final flush asked again, while the watcher has seen no change, snaps nothing: it answers
     /// in milliseconds and `capture.status` reads `complete` throughout. A change the watcher
     /// sees makes the next one snap again.
+    ///
+    /// On a manual clock: the store refuses every PUT until 5 s, so the first final flush, given
+    /// a 3 s deadline, snaps everything and returns at it, and the one asked next (no deadline)
+    /// snaps nothing and completes once the store opens. The repeat flushes take none of the
+    /// clock.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_final_flush_after_a_complete_one_snaps_nothing_and_stays_complete() {
         let tmp = tempfile::tempdir().unwrap();
-        let (boot, registrar) = boot(tmp.path());
+        let manual = ManualClock::new();
+        let opens = manual.now() + Duration::from_secs(5);
+        let clock = manual.clock();
+        let (boot, registrar) = boot_on_clock(
+            tmp.path(),
+            &manual,
+            |inner| {
+                Arc::new(Gate {
+                    inner,
+                    opens,
+                    clock,
+                })
+            },
+            |_| {},
+        );
         let ws = boot.layout.working_directory.clone();
         std::fs::write(ws.join(".gitignore"), "node_modules/\n").unwrap();
         for p in 0..100 {
@@ -3269,16 +3288,31 @@ mod tests {
             "both classes are watched"
         );
 
-        let first = runtime.final_flush(None, Some(3_000)).await.unwrap();
+        let bounded = {
+            let runtime = Arc::clone(&runtime);
+            async move { runtime.final_flush(Some(3_000), Some(3_000)).await.unwrap() }
+        };
+        let (refused, took) = on_clock(&manual, bounded).await;
+        assert!(!refused.complete, "{refused:?}");
+        assert_eq!(refused.incomplete_reason.as_deref(), Some("ship-failed"));
+        assert_eq!(took, Duration::from_secs(3), "the deadline, exactly");
+        assert!(manual.now() < opens, "the store still refuses");
+        let snapped = capture.runner().snapshot();
+        let (first, _) = on_clock(&manual, final_flush(&runtime, 3_000)).await;
         assert!(first.complete, "{first:?}");
+        assert!(manual.now() >= opens, "complete once the store took it");
+        let resumed = capture.runner().snapshot();
+        assert_eq!(
+            (resumed.small_snaps, resumed.bulk_snaps),
+            (snapped.small_snaps, snapped.bulk_snaps),
+            "the flush after the refused one snaps nothing"
+        );
         let registered = registrar.chain().len();
 
         for _ in 0..3 {
             let (stop, watcher) = watch_status(&capture);
             let before = capture.runner().snapshot();
-            let start = Instant::now();
-            let again = runtime.final_flush(None, Some(3_000)).await.unwrap();
-            let took = start.elapsed();
+            let (again, took) = on_clock(&manual, final_flush(&runtime, 3_000)).await;
             let after = capture.runner().snapshot();
             stop.store(true, Ordering::SeqCst);
             let seen = watcher.join().unwrap();
@@ -3299,6 +3333,7 @@ mod tests {
                 (before.small_snaps, before.bulk_snaps),
                 "a repeat final flush snaps nothing (it took {took:?})"
             );
+            assert_eq!(took, Duration::ZERO, "a repeat final flush answers at once");
         }
         assert_eq!(
             registrar.chain().len(),
@@ -3318,13 +3353,50 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        let report = runtime.final_flush(None, Some(3_000)).await.unwrap();
+        let (report, _) = on_clock(&manual, final_flush(&runtime, 3_000)).await;
         assert!(report.complete, "{report:?}");
         assert_eq!(registrar.chain().len(), registered + 1);
         let fresh = restore_head(tmp.path(), &registrar, "fresh");
         assert_eq!(
             std::fs::read_to_string(fresh.join("node_modules/pkg0/late.js")).unwrap(),
             "late\n"
+        );
+    }
+
+    /// sealantd#195: `capture.status` read `changed` after a complete final flush while anything
+    /// else held the engine (a repeat final flush's read of it), and a final flush asked then
+    /// read the disk as changed and snapped again. Whether a bulk build is paused is read from
+    /// the engine's flag, never by trying the engine's lock.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn status_stays_complete_while_the_engine_is_held() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (boot, _registrar) = boot(tmp.path());
+        let mut config = RuntimeConfig::new(new_runtime_id());
+        config.workspace_root = boot.layout.working_directory.clone();
+        let runtime = Runtime::new(config, Arc::new(ShutdownSignal::new(3_000)));
+        runtime.mark_healthy();
+        let capture = CaptureRuntime::new(boot);
+        assert!(runtime.install_capture(capture.clone()));
+        capture.start_without_harness(runtime.clone());
+        let first = runtime.final_flush(None, Some(3_000)).await.unwrap();
+        assert!(first.complete, "{first:?}");
+
+        let runner = capture.runner();
+        let before = (capture.status(), runner.final_is_current());
+        let during = runner.with_engine(|_| (capture.status(), runner.final_is_current()));
+        let after = (capture.status(), runner.final_is_current());
+        assert!(
+            before.0.complete && before.1 && after.0.complete && after.1,
+            "{before:?} {after:?}"
+        );
+        assert!(
+            during.0.complete,
+            "complete while the engine is held: {:?}",
+            during.0.incomplete_reason
+        );
+        assert!(
+            during.1,
+            "a final flush asked while the engine is held reads the disk as unchanged"
         );
     }
 
