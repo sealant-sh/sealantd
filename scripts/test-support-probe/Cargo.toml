@@ -1,0 +1,24 @@
+# A crate outside the workspace that depends on sealant-capture as the daemon does, without its
+# `test-support` feature (scripts/ci-test-support-gate.sh): neither binary may compile. With the
+# `control` feature, which turns test support on, both must.
+[package]
+name = "test-support-probe"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[features]
+control = ["sealant-capture/test-support"]
+
+[dependencies]
+sealant-capture = { path = "../../crates/sealant-capture" }
+
+[[bin]]
+name = "names-the-manual-clock"
+path = "names_the_manual_clock.rs"
+
+[[bin]]
+name = "injects-a-clock"
+path = "injects_a_clock.rs"

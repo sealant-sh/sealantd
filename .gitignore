@@ -10,3 +10,6 @@ dist
 
 # Built TS package artifacts
 packages/*/dist
+
+# The test-support probe copies the workspace lockfile in (scripts/ci-test-support-gate.sh).
+scripts/test-support-probe/Cargo.lock

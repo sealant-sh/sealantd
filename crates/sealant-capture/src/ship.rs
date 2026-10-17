@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
+use crate::clock::Clock;
 use crate::cpu::thread_cpu;
 use crate::engine::Class;
 use crate::io_at::IoAt;
@@ -2509,45 +2510,43 @@ impl Shipper {
 pub struct ShipWorker {
     stop: Arc<AtomicBool>,
     wake: Arc<(Mutex<bool>, std::sync::Condvar)>,
+    clock: Clock,
     handle: Option<thread::JoinHandle<()>>,
 }
 
 impl ShipWorker {
-    /// Spawn a worker polling every `tick`.
-    pub fn spawn(shipper: Arc<Shipper>, tick: Duration) -> io::Result<Self> {
+    /// Spawn a worker polling every `tick` of `clock`.
+    pub fn spawn(shipper: Arc<Shipper>, tick: Duration, clock: &Clock) -> io::Result<Self> {
         let stop = Arc::new(AtomicBool::new(false));
         let wake = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
-        let (stop2, wake2) = (Arc::clone(&stop), Arc::clone(&wake));
-        let handle = thread::Builder::new()
-            .name("capture-ship".into())
-            .spawn(move || {
-                while !stop2.load(Ordering::Relaxed) {
-                    match shipper.pass(Scope::All, None, false) {
-                        // A flush took the pass; the bulk upload resumes once it is done (the
-                        // next pass waits for the lock).
-                        Ok(pass) if pass.yielded => {
-                            thread::yield_now();
-                            continue;
-                        }
-                        Ok(_) => {}
-                        Err(e) => tracing::warn!(error = %e, "ship pass failed"),
+        let (stop2, wake2, clock2) = (Arc::clone(&stop), Arc::clone(&wake), clock.clone());
+        let handle = clock.spawn("capture-ship", move || {
+            while !stop2.load(Ordering::Relaxed) {
+                match shipper.pass(Scope::All, None, false) {
+                    // A flush took the pass; the bulk upload resumes once it is done (the
+                    // next pass waits for the lock).
+                    Ok(pass) if pass.yielded => {
+                        thread::yield_now();
+                        continue;
                     }
-                    let (lock, cv) = &*wake2;
-                    let mut woken = lock
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    if !*woken {
-                        let (guard, _) = cv
-                            .wait_timeout(woken, tick)
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        woken = guard;
-                    }
-                    *woken = false;
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(error = %e, "ship pass failed"),
                 }
-            })?;
+                let (lock, cv) = &*wake2;
+                let mut woken = lock
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let at = clock2.now() + tick;
+                while !*woken && clock2.now() < at {
+                    woken = clock2.wait_until(cv, woken, Some(at));
+                }
+                *woken = false;
+            }
+        })?;
         Ok(Self {
             stop,
             wake,
+            clock: clock.clone(),
             handle: Some(handle),
         })
     }
@@ -2558,7 +2557,7 @@ impl ShipWorker {
         *lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
-        cv.notify_one();
+        self.clock.notify_all(cv);
     }
 
     /// Stop and join.
