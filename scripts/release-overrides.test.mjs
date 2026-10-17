@@ -31,7 +31,7 @@ const REFUSED_IN_RELEASE = [
 ];
 
 // Rule 2. The only lines, trimmed and whole, that may name an override, by workflow: release.yml's
-// reads and each retrying step's preamble as they stand, and next.yml's pacote read. Any other line
+// reads and each retrying step's preamble as they stand, and each workflow's pacote read. Any other line
 // naming one fails, so `: "${NAME:=0}"`, `export NAME=0`, `NAME=0 cmd`, `read NAME`, `printf -v
 // NAME`, `declare NAME` and a `NAME<<EOF` record all do.
 const RELEASE_LINES = new Map([
@@ -56,6 +56,25 @@ const RELEASE_LINES = new Map([
     "await new Promise((resolve) => setTimeout(resolve, attempt * Number(process.env.RELEASE_TEST_RETRY_MS || 1500)));",
     "a retry wait, a read with the production default",
   ],
+  ["# REPUBLISH_TEST_WAIT, never a workflow.", "the comment over the integrity wait preamble"],
+  ["if [[ -z ${REPUBLISH_TEST_WAIT:-} ]]; then", "the preamble's unset test, a read"],
+  [
+    "elif [[ $REPUBLISH_TEST_WAIT =~ ^(0|[1-9][0-9]{0,3})$ ]]; then",
+    "the preamble's validation, a read",
+  ],
+  [
+    'echo "integrity read-back wait: overridden to $REPUBLISH_TEST_WAIT s × attempt"',
+    "the log line, reached only with a validated value",
+  ],
+  [
+    'echo "::error::REPUBLISH_TEST_WAIT is not a whole number of seconds."',
+    "the refusal, which names the variable and not its value",
+  ],
+  ["sleep $((attempt * ${REPUBLISH_TEST_WAIT:-5}))", "the integrity wait, a read with the default"],
+  [
+    "pacote=${REPUBLISH_TEST_PACOTE:-$(npm root -g)/npm/node_modules/pacote}",
+    "the npm job's pacote, a read with npm's own as the default",
+  ],
 ]);
 const OVERRIDE_LINES = {
   [RELEASE]: RELEASE_LINES,
@@ -72,9 +91,10 @@ const OVERRIDE_LINES = {
 const NAMING_FILES = [
   ".github/workflows/next.yml",
   ".github/workflows/release.yml",
-  "scripts/republish.test.mjs",
+  "scripts/release-npm.test.mjs",
   "scripts/release-overrides.test.mjs",
   "scripts/release-publication.test.mjs",
+  "scripts/republish.test.mjs",
 ];
 
 const workflowTexts = () => {

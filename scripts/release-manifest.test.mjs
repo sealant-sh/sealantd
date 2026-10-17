@@ -1,10 +1,18 @@
 // The release manifest release.yml writes, and the jobs that write and read it: run as written where
 // they are shell, against stand-in commands. Ported from sealant-sh/sealant
-// tooling/scripts/release-manifest.test.mjs, for sealantd's one image.
+// tooling/scripts/release-manifest.test.mjs, for sealantd's one image and two packages.
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -15,11 +23,16 @@ import { parse } from "yaml";
 import {
   ARCHES,
   IMAGES,
+  PACKAGES,
+  archiveIdentity,
   buildManifest,
+  checkArchive,
   checkIndex,
   selectPlatform,
   validateManifest,
 } from "./release-manifest.mjs";
+
+const [PROTOCOL, CLIENT] = PACKAGES;
 
 const root = execFileSync("git", ["rev-parse", "--show-toplevel"], { encoding: "utf8" }).trim();
 const script = fileURLToPath(new URL("./release-manifest.mjs", import.meta.url));
@@ -52,12 +65,32 @@ const records = (directory) => {
     mkdirSync(path.join(indexes, `index-${name}`), { recursive: true });
     writeFileSync(path.join(indexes, `index-${name}`, "digest"), `sha256:${hex(name)}\n`);
   }
-  return { digests, indexes };
+  return { digests, indexes, packages: packageRecords("1.2.3") };
 };
 
-test("the manifest holds the image's index and platform digests, and the run's identity", (t) => {
+/** What the pack job records for each tarball: its file name, sha512 and integrity. */
+const packageRecords = (version) =>
+  Object.fromEntries(
+    PACKAGES.map((name) => {
+      const digest = createHash("sha512").update(`${name} tarball`).digest();
+      return [
+        name,
+        {
+          file: `${name.slice(1).replace("/", "-")}-${version}.tgz`,
+          sha512: digest.toString("hex"),
+          integrity: `sha512-${digest.toString("base64")}`,
+        },
+      ];
+    }),
+  );
+
+test("the manifest holds the image's digests, each tarball's sha512, and the run's identity", (t) => {
   const manifest = buildManifest({ version: "1.2.3", commit: COMMIT, ...records(scratch(t)) });
-  assert.deepEqual(manifest, {
+  const { packages, ...rest } = manifest;
+  assert.deepEqual(Object.keys(packages), ["@sealant/runtime-protocol", "@sealant/runtime-client"]);
+  assert.deepEqual(packages, packageRecords("1.2.3"));
+  assert.equal(packages["@sealant/runtime-client"].file, "sealant-runtime-client-1.2.3.tgz");
+  assert.deepEqual(rest, {
     version: "1.2.3",
     commit: COMMIT,
     images: {
@@ -74,8 +107,8 @@ test("the manifest holds the image's index and platform digests, and the run's i
 
 test("a run missing a record, or holding a stray one, writes no manifest", (t) => {
   const directory = scratch(t);
-  const { digests, indexes } = records(directory);
-  const base = { version: "1.2.3", commit: COMMIT, digests, indexes };
+  const { digests, indexes, packages } = records(directory);
+  const base = { version: "1.2.3", commit: COMMIT, digests, indexes, packages };
   writeFileSync(path.join(digests, "digests-sealantd--arm64", hex("second")), "");
   assert.throws(() => buildManifest(base), /exactly one file/);
   rmSync(path.join(digests, "digests-sealantd--arm64"), { recursive: true });
@@ -91,8 +124,44 @@ test("a run missing a record, or holding a stray one, writes no manifest", (t) =
     { ...valid, images: { sealantd: { ...entry, platforms: { amd64: entry.platforms.amd64 } } } },
     { ...valid, images: { ...valid.images, "sealantd-next": entry } },
     { ...valid, images: {} },
+    { ...valid, version: "1.2.3-dryrun.0.1" },
+    { ...valid, packages: undefined },
+    { ...valid, packages: { [CLIENT]: valid.packages[CLIENT] } },
+    {
+      ...valid,
+      packages: { [CLIENT]: valid.packages[CLIENT], [PROTOCOL]: valid.packages[PROTOCOL] },
+    },
+    { ...valid, packages: { ...valid.packages, "@sealant/extra": valid.packages[CLIENT] } },
+    {
+      ...valid,
+      packages: {
+        ...valid.packages,
+        [CLIENT]: { ...valid.packages[CLIENT], integrity: "sha512-x" },
+      },
+    },
+    {
+      ...valid,
+      packages: {
+        ...valid.packages,
+        [CLIENT]: { ...valid.packages[CLIENT], file: "sealant-runtime-client-1.2.2.tgz" },
+      },
+    },
   ])
     assert.throws(() => validateManifest(broken));
+});
+
+test("a dry run's version is recorded as it is, beside its archives' digests", (t) => {
+  const { digests, indexes } = records(scratch(t));
+  const version = "1.2.3-dryrun.38700000001.2";
+  const manifest = buildManifest({
+    version,
+    commit: COMMIT,
+    digests,
+    indexes,
+    packages: packageRecords(version),
+  });
+  assert.equal(manifest.version, version);
+  assert.equal(manifest.packages[CLIENT].file, `sealant-runtime-client-${version}.tgz`);
 });
 
 test("digest prints the image's platform digest for one arch, and nothing else", (t) => {
@@ -114,13 +183,16 @@ test("digest prints the image's platform digest for one arch, and nothing else",
   }
 });
 
-test("the manifest job writes from this run's records and keeps them 90 days", (t) => {
+test("the manifest job writes from this run's records, whichever merge ran, and keeps them 90 days", (t) => {
   const job = jobs["release-manifest"];
-  assert.ok(job.needs.includes("merge"));
+  assert.ok(job.needs.includes("merge") && job.needs.includes("archive-merge"));
+  assert.match(job.if, /^\$\{\{ !cancelled\(\) && /);
   const write = step("release-manifest", "Write release-manifest.json");
   assert.equal(write.env.COMMIT, "${{ github.sha }}");
+  assert.equal(write.env.PACKAGES, "${{ needs.pack.outputs.records }}");
+  assert.ok(job.needs.includes("pack"));
   const directory = scratch(t);
-  const { digests, indexes } = records(directory);
+  const { digests, indexes, packages } = records(directory);
   const run = spawnSync("bash", ["--noprofile", "--norc", "-e", "-c", write.run], {
     cwd: root,
     encoding: "utf8",
@@ -131,6 +203,7 @@ test("the manifest job writes from this run's records and keeps them 90 days", (
       COMMIT,
       DIGESTS: digests,
       INDEXES: indexes,
+      PACKAGES: JSON.stringify(packages),
     },
   });
   assert.equal(run.status, 0, run.stderr);
@@ -138,6 +211,7 @@ test("the manifest job writes from this run's records and keeps them 90 days", (
     readFileSync(path.join(directory, "manifest/release-manifest.json"), "utf8"),
   );
   assert.equal(written.images.sealantd.index, `sha256:${hex("sealantd")}`);
+  assert.deepEqual(written.packages, packages);
   const upload = job.steps.find((entry) => entry.with?.name === "release-manifest");
   assert.equal(upload.with["retention-days"], 90);
 });
@@ -413,12 +487,13 @@ process.stdout.write(readFileSync(${JSON.stringify(documents)} + "/" + args[3].s
 `,
   );
   chmodSync(path.join(directory, "bin", "docker"), 0o755);
-  const run = (create) => {
+  const run = (create, job = "merge") => {
     writeFileSync(path.join(work, "create.json"), JSON.stringify(create));
     rmSync(path.join(work, "digest"), { force: true });
+    const script = step(job, "Check and record the index digest").run;
     return spawnSync(
       "bash",
-      ["--noprofile", "--norc", "-e", "-c", record.run.replaceAll("/tmp/digests", digests)],
+      ["--noprofile", "--norc", "-e", "-c", script.replaceAll("/tmp/digests", digests)],
       {
         cwd: work,
         encoding: "utf8",
@@ -433,6 +508,17 @@ process.stdout.write(readFileSync(${JSON.stringify(documents)} + "/" + args[3].s
   const recorded = run(created(index));
   assert.equal(recorded.status, 0, recorded.stderr);
   assert.equal(readFileSync(path.join(work, "digest"), "utf8"), `${index.digest}\n`);
+  // The dry run's archive-merge records its index the same way, each arch bound to its archive.
+  assert.match(
+    step("archive-merge", "Check and record the index digest").run,
+    /sources\+=\("\$arch=sha256:\$source=source-\$source\.json"\)/,
+  );
+  const archived = run(created(index), "archive-merge");
+  assert.equal(archived.status, 0, archived.stderr);
+  assert.equal(readFileSync(path.join(work, "digest"), "utf8"), `${index.digest}\n`);
+  const archivedSwap = run(created(swapped), "archive-merge");
+  assert.equal(archivedSwap.status, 1);
+  assert.match(archivedSwap.stderr, /maps linux\/amd64 to .*, the amd64 build/);
   const lone = run(created(indexOf([plainChildren[1]])));
   assert.equal(lone.status, 1);
   assert.match(lone.stderr, /0 linux\/amd64 entries/);
@@ -462,4 +548,235 @@ process.stdout.write(readFileSync(${JSON.stringify(documents)} + "/" + args[3].s
   );
   assert.equal(unnamed.status, 1);
   assert.match(unnamed.stderr, /is not <arch>=<digest>=<file>/);
+});
+
+// --- a dry run's archives ---
+
+/**
+ * An image archive as BuildKit's docker exporter writes one: oci-layout, index.json naming one
+ * manifest, the manifest and config blobs, and manifest.json; packed by tar with `./` names.
+ * `index` rewrites index.json's manifests, to forge a digest.
+ */
+const archive = (directory, { arch = "amd64", index } = {}) => {
+  const layout = path.join(directory, `layout-${Math.random()}`);
+  mkdirSync(path.join(layout, "blobs/sha256"), { recursive: true });
+  const blob = (bytes) => {
+    const digest = sha256(bytes);
+    writeFileSync(path.join(layout, "blobs/sha256", digest.slice(7)), bytes);
+    return digest;
+  };
+  // A nonce in the config, so two fixture archives are two images.
+  const config = Buffer.from(
+    JSON.stringify({ architecture: arch, os: "linux", nonce: Math.random() }),
+  );
+  const configDigest = blob(config);
+  const manifest = Buffer.from(
+    JSON.stringify({
+      schemaVersion: 2,
+      mediaType: "application/vnd.docker.distribution.manifest.v2+json",
+      config: { digest: configDigest, size: config.length },
+      layers: [],
+    }),
+  );
+  const manifestDigest = blob(manifest);
+  const descriptor = {
+    mediaType: "application/vnd.docker.distribution.manifest.v2+json",
+    digest: manifestDigest,
+    size: manifest.length,
+  };
+  writeFileSync(path.join(layout, "oci-layout"), '{"imageLayoutVersion":"1.0.0"}');
+  writeFileSync(
+    path.join(layout, "index.json"),
+    JSON.stringify({ schemaVersion: 2, manifests: index?.(descriptor) ?? [descriptor] }),
+  );
+  writeFileSync(path.join(layout, "manifest.json"), "[]");
+  const file = path.join(directory, `${Math.random()}.tar`);
+  execFileSync("tar", ["-cf", file, "-C", layout, "."]);
+  return { file, platform: manifestDigest, config: configDigest };
+};
+/** A manifest whose sealantd on `arch` records `platform`. */
+const manifestWith = (directory, arch, platform) => {
+  const manifest = buildManifest({ version: "1.2.3", commit: COMMIT, ...records(directory) });
+  manifest.images.sealantd.platforms[arch] = platform;
+  return manifest;
+};
+
+test("an archive's platform digest is computed from the archive, and must be the manifest's", (t) => {
+  const directory = scratch(t);
+  const built = archive(directory);
+  assert.deepEqual(archiveIdentity(built.file), {
+    platform: built.platform,
+    config: built.config,
+    architecture: "amd64",
+  });
+  const manifest = manifestWith(directory, "amd64", built.platform);
+  // The image IDs it may load as: the config digest, or on the containerd store the manifest's.
+  assert.deepEqual(checkArchive(manifest, "sealantd", "amd64", built.file), [
+    built.config,
+    built.platform,
+  ]);
+  // Another build's archive is not this run's.
+  const other = archive(directory);
+  assert.throws(
+    () => checkArchive(manifest, "sealantd", "amd64", other.file),
+    /the release manifest records/,
+  );
+  // The right digest, built for the other arch.
+  const arm = archive(directory, { arch: "arm64" });
+  const armManifest = manifestWith(scratch(t), "amd64", arm.platform);
+  assert.throws(() => checkArchive(armManifest, "sealantd", "amd64", arm.file), /built for arm64/);
+});
+
+test("an index.json whose digest is not its manifest's, or that names an index or two manifests, is refused", (t) => {
+  const directory = scratch(t);
+  const recorded = `sha256:${hex("recorded")}`;
+  const forged = archive(directory, {
+    index: (descriptor) => [{ ...descriptor, digest: recorded }],
+  });
+  const manifest = manifestWith(directory, "amd64", recorded);
+  assert.throws(
+    () => checkArchive(manifest, "sealantd", "amd64", forged.file),
+    /lacks the manifest/,
+  );
+  // The blob is present under the claimed name, but its bytes are another manifest's.
+  const layout = path.join(directory, "swapped");
+  mkdirSync(layout);
+  execFileSync("tar", ["-xf", forged.file, "-C", layout]);
+  writeFileSync(
+    path.join(layout, "blobs/sha256", recorded.slice(7)),
+    readFileSync(path.join(layout, "blobs/sha256", forged.platform.slice(7))),
+  );
+  const swapped = path.join(directory, "swapped.tar");
+  execFileSync("tar", ["-cf", swapped, "-C", layout, "."]);
+  assert.throws(
+    () => checkArchive(manifest, "sealantd", "amd64", swapped),
+    /does not hash to the digest index\.json gives it/,
+  );
+  const file = path.join(directory, "release-manifest.json");
+  writeFileSync(file, JSON.stringify(manifest));
+  const result = spawnSync(
+    process.execPath,
+    [script, "check-archive", file, "sealantd", "amd64", swapped],
+    { encoding: "utf8" },
+  );
+  assert.equal(result.status, 1);
+  assert.equal(result.stdout, "");
+  const list = archive(directory, {
+    index: (descriptor) => [
+      { ...descriptor, mediaType: "application/vnd.oci.image.index.v1+json" },
+    ],
+  });
+  assert.throws(() => archiveIdentity(list.file), /not one image manifest/);
+  const two = archive(directory, { index: (descriptor) => [descriptor, descriptor] });
+  assert.throws(() => archiveIdentity(two.file), /one platform manifest/);
+});
+
+test("the dry run's identity check loads only its arch's checked archive, and records the ID it loads as", (t) => {
+  const download = jobs.identity.steps.find((entry) => entry.with?.pattern?.startsWith("archive-"));
+  assert.equal(download.if, "needs.stable-tag.outputs.target == 'archive'");
+  assert.equal(download.with.pattern, "archive-sealantd--${{ matrix.platform.arch }}");
+  const load = step("identity", "Load this run's image from its archive");
+  assert.equal(load.if, "needs.stable-tag.outputs.target == 'archive'");
+  assert.equal(
+    step("identity", "Pull this run's image by digest").if,
+    "needs.stable-tag.outputs.target == 'ghcr'",
+  );
+  // The check that follows runs on both targets.
+  assert.equal(step("identity", "Check this arch's image is this release's").if, undefined);
+  const directory = scratch(t);
+  const bin = path.join(directory, "bin");
+  mkdirSync(bin);
+  const calls = path.join(directory, "calls.jsonl");
+  writeFileSync(
+    path.join(bin, "docker"),
+    `#!${process.execPath}
+const { appendFileSync } = require("node:fs");
+const args = process.argv.slice(2);
+appendFileSync(${JSON.stringify(calls)}, JSON.stringify(args) + "\\n");
+if (args[0] === "image" && args[1] === "inspect") {
+  if (process.env.FIXTURE_ONLY && process.env.FIXTURE_ONLY !== args[2]) process.exit(1);
+  console.log(process.env.FIXTURE_ID ?? args[2]);
+}
+`,
+  );
+  chmodSync(path.join(bin, "docker"), 0o755);
+  const built = archive(directory);
+  const dir = path.join(directory, "archives", "archive-sealantd--amd64");
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(path.join(dir, "sealantd.tar"), readFileSync(built.file));
+  const file = path.join(directory, "release-manifest.json");
+  writeFileSync(file, JSON.stringify(manifestWith(directory, "amd64", built.platform)));
+  const recorded = path.join(directory, "image-id");
+  const run = (extra = {}) => {
+    writeFileSync(calls, "");
+    rmSync(recorded, { force: true });
+    return spawnSync("bash", ["--noprofile", "--norc", "-e", "-c", load.run], {
+      cwd: root,
+      encoding: "utf8",
+      env: {
+        PATH: `${bin}:${process.env.PATH}`,
+        RUNNER_TEMP: directory,
+        MANIFEST: file,
+        ARCH: "amd64",
+        ...extra,
+      },
+    });
+  };
+  const calledWith = () =>
+    readFileSync(calls, "utf8")
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line));
+  const loaded = run();
+  assert.equal(loaded.status, 0, loaded.stderr);
+  assert.deepEqual(calledWith(), [
+    ["load", "--input", path.join(dir, "sealantd.tar")],
+    ["image", "inspect", built.config, "--format", "{{.Id}}"],
+  ]);
+  assert.equal(readFileSync(recorded, "utf8"), `${built.config}\n`);
+  // Docker's containerd image store IDs an image by its manifest digest.
+  const containerd = run({ FIXTURE_ONLY: built.platform });
+  assert.equal(containerd.status, 0, containerd.stderr);
+  assert.equal(readFileSync(recorded, "utf8"), `${built.platform}\n`);
+  // An image that loads as anything else is never recorded.
+  const elsewhere = run({ FIXTURE_ID: `sha256:${"e".repeat(64)}` });
+  assert.equal(elsewhere.status, 1);
+  assert.match(
+    elsewhere.stdout + elsewhere.stderr,
+    /did not load as its config digest or its manifest digest/,
+  );
+  assert.equal(readdirSync(directory).includes("image-id"), false);
+  // A swapped archive is refused before Docker sees it.
+  writeFileSync(path.join(dir, "sealantd.tar"), readFileSync(archive(directory).file));
+  const swapped = run();
+  assert.equal(swapped.status, 1);
+  assert.match(swapped.stderr, /the release manifest records/);
+  assert.ok(calledWith().every(([command]) => command !== "load"));
+});
+
+test("archive-build records the digest it computes from its archive, and only if BuildKit agrees", (t) => {
+  const record = step("archive-build", "Record the platform digest from the archive");
+  const directory = scratch(t);
+  const built = archive(directory);
+  const run = (DIGEST) =>
+    spawnSync(
+      "bash",
+      [
+        "--noprofile",
+        "--norc",
+        "-e",
+        "-c",
+        record.run.replaceAll("/tmp/digests", path.join(directory, "digests")),
+      ],
+      {
+        cwd: root,
+        encoding: "utf8",
+        env: { PATH: process.env.PATH, ARCHIVE: built.file, DIGEST },
+      },
+    );
+  assert.equal(run(built.platform).status, 0);
+  assert.deepEqual(readdirSync(path.join(directory, "digests")), [built.platform.slice(7)]);
+  const disagree = run(`sha256:${"0".repeat(64)}`);
+  assert.equal(disagree.status, 1);
+  assert.match(disagree.stdout, /The archive holds sha256:[0-9a-f]{64}; BuildKit reported/);
 });

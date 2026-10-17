@@ -3,29 +3,47 @@
 #
 # 1. stable-tag refuses anything but a stable tag of a commit whose `ci` push run on main passed.
 # 2. build pushes each platform by digest, untagged; merge stages the index under this run's own
-#    tag, staging-<run>-<attempt>; release-manifest records every digest.
+#    tag, staging-<run>-<attempt>. pack builds and packs the two npm packages with no credential.
+#    release-manifest records every digest and each tarball's sha512.
 # 3. identity resolves each platform through the staged index on its own arch, requires the index to
 #    map it to that arch's build, pulls it and checks it is this release's build: the image ID it
 #    runs, its labels, and `sealantd --version`. Identity checks, not acceptance:
 #    a sealantd image is accepted by Core, which pins it by digest and runs its workspace e2e
 #    against exactly that digest before Core releases (docs/runtime/integration.md, Stable releases).
-# 4. finalize-images writes :<version>, once, from the checked index; npm publishes after it.
+# 4. finalize-images writes :<version>, once, from the checked index; then npm publishes exactly the
+#    packed tarballs, under the stable floor.
 #
 # Only finalize-images writes :<version>, and nothing writes :X.Y or :latest: those stay at 0.19.0,
 # where the old pipeline left them, and are not a supported way to consume sealantd. There is no
 # GitHub release. finalize-images and npm queue on one lock, sealantd-release-channel. Re-running
 # failed jobs is safe: every write first reads what is there.
+# A dispatch with dry_run is a dry run: version <packages/runtime-client version>-dryrun.<run
+# id>.<attempt>, the image built to archives and checked from them (target archive), nothing pushed
+# to any registry outside the run (archive-merge pushes only to a registry inside its own job), and
+# no job that publishes runs: none holds packages: write or an id-token. Only a
+# tag push publishes, and every job that publishes refuses any version but its tag's plain X.Y.Z.
 # Every job runs on a GitHub-hosted runner, a fresh VM: the box's runner VMs keep state between jobs.
 name: release
 
 on:
   push:
     tags: ["v*.*.*"]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Build, check and pack a release without publishing anything"
+        required: true
+        type: boolean
 
 permissions:
   contents: read
 
 jobs:
+  # The run's one version and where its image goes. A tag push releases its tag to GHCR; a dispatch
+  # is refused unless it is a dry run, whose version is derived here, never given: no input or branch
+  # can name a real version's build. A dry run's target is archive: its image is built and checked
+  # from files, nothing is pushed to any registry outside the job that assembles its index, and no
+  # job that publishes runs.
   # A prerelease tag (vX.Y.Z-anything) would publish to npm `latest`. Prereleases publish from main
   # in next.yml (ADR 0015 in sealant-sh/mend), never from a tag. And no next build of X.Y.Z may come
   # from a commit this tag leaves out: it would sort below X.Y.Z but hold more. Main is frozen from
@@ -38,21 +56,69 @@ jobs:
       contents: read
       actions: read # the ci check below lists this commit's ci runs
     outputs:
-      version: ${{ steps.version.outputs.version }}
+      version: ${{ steps.resolve.outputs.version }}
+      target: ${{ steps.resolve.outputs.target }}
     steps:
-      - name: Refuse a prerelease tag
-        id: version
-        run: |
-          plain='^v(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})$'
-          [[ $GITHUB_REF_NAME =~ $plain ]] || {
-            echo "::error::$GITHUB_REF_NAME is not a stable vX.Y.Z tag. Prereleases publish from main."
-            exit 1
-          }
-          echo "version=${GITHUB_REF_NAME#v}" >>"$GITHUB_OUTPUT"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
+      # scripts/release-publication.test.mjs runs this step as written.
+      - name: Refuse anything but a stable tag push or a dry run, and choose the version
+        id: resolve
+        env:
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          plain='^(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})$'
+          case $GITHUB_EVENT_NAME in
+            push)
+              if [[ $GITHUB_REF != refs/tags/v* ]]; then
+                echo "::error::A release publishes from a vX.Y.Z tag push, not $GITHUB_REF."
+                exit 1
+              fi
+              version=${GITHUB_REF_NAME#v}
+              # The dry-run version is a dispatch's alone: as a tag it would build and push to GHCR.
+              if [[ $version == *dryrun* ]]; then
+                echo "::error::$GITHUB_REF_NAME is a dry-run version; a dry run is a dispatch, never a tag."
+                exit 1
+              fi
+              if [[ ! $version =~ $plain ]]; then
+                echo "::error::$GITHUB_REF_NAME is not a stable vX.Y.Z tag. Prereleases publish from main."
+                exit 1
+              fi
+              target=ghcr
+              ;;
+            workflow_dispatch)
+              if [[ $DRY_RUN != true ]]; then
+                echo "::error::A dispatch only dry-runs a release: set dry_run. A release publishes from a tag push."
+                exit 1
+              fi
+              # The runtime packages' committed version, which the next release takes once the Version
+              # Packages pull request has merged, stamped with this run. Derived here, never an input.
+              base=$(jq -r '.version // ""' packages/runtime-client/package.json)
+              if [[ ! $base =~ $plain ]]; then
+                echo "::error::packages/runtime-client/package.json gives '$base', not X.Y.Z; a dry run has no version."
+                exit 1
+              fi
+              version=$base-dryrun.$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT
+              target=archive
+              ;;
+            *)
+              echo "::error::$GITHUB_EVENT_NAME does not run a release."
+              exit 1
+              ;;
+          esac
+          case $GITHUB_EVENT_NAME/$target in
+            push/ghcr | workflow_dispatch/archive) ;;
+            *)
+              echo "::error::A $GITHUB_EVENT_NAME never builds for $target."
+              exit 1
+              ;;
+          esac
+          echo "version=$version" >>"$GITHUB_OUTPUT"
+          echo "target=$target" >>"$GITHUB_OUTPUT"
+          echo "Release $version, image to $target."
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           # setup-node v6 restores a package-manager cache by itself when packageManager names npm.
@@ -79,20 +145,27 @@ jobs:
               process.exit(1);
             }
           '
+      # A dry run checks the X.Y.Z it stamps, as that release would be checked.
       - name: Refuse a release that leaves out one of its next builds
+        env:
+          VERSION: ${{ steps.resolve.outputs.version }}
         run: >-
-          node scripts/next-version.mjs --stray "$GITHUB_REF_NAME" --npm
+          node scripts/next-version.mjs --stray "v${VERSION%%-*}" --npm
           @sealant/runtime-client-next HEAD
       # Next publishes a main commit only after its `ci` push run passed (next.yml's workflow_run
       # trigger); a stable release asks the same of its commit. That covers the Rust daemon tests and
       # the Node package tests, which this workflow does not run. A run that is missing, failed, still
       # running, from a pull request, from another branch or from a fork is refused, and a read that
       # fails is retried, then fails: never read as no run. How much the signal is worth depends on
-      # the box runners `ci` uses (docs/runtime/integration.md, Stable releases).
+      # the box runners `ci` uses (docs/runtime/integration.md, Stable releases). A dry run, only a
+      # dispatch building to archives with the version resolve derived, reports a commit without a
+      # passed ci run as a warning and in the run summary instead; a read that fails still fails it.
       # scripts/release-publication.test.mjs runs this step as written, against a stub GitHub API.
       - name: Refuse a commit whose ci did not pass on main
         env:
           GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.resolve.outputs.version }}
+          TARGET: ${{ steps.resolve.outputs.target }}
         run: |
           set -euo pipefail
           # Retried reads wait 1500 ms × attempt (the ci runs read). Only a test sets
@@ -105,9 +178,18 @@ jobs:
             echo "::error::RELEASE_TEST_RETRY_MS is not a whole number of milliseconds."
             exit 1
           fi
+          verdict=refuse
+          if [[ $GITHUB_EVENT_NAME == workflow_dispatch ]]; then
+            dryrun='^(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})-dryrun\.[1-9][0-9]*\.[1-9][0-9]*$'
+            if [[ $TARGET != archive || ! $VERSION =~ $dryrun ]]; then
+              echo "::error::A dispatch is a dry run: it builds to archives with a derived X.Y.Z-dryrun.<run>.<attempt>, not '$VERSION' to $TARGET."
+              exit 1
+            fi
+            verdict=report
+          fi
           # shellcheck disable=SC2016 # JavaScript template literals, not shell expansions
           node -e '
-            const [api, repository, sha, token] = process.argv.slice(1);
+            const [api, repository, sha, token, verdict] = process.argv.slice(1);
             const query = new URLSearchParams({ head_sha: sha, event: "push", branch: "main", per_page: "100" });
             const url = `${api}/repos/${repository}/actions/workflows/ci.yml/runs?${query}`;
             const headers = { accept: "application/vnd.github+json", "x-github-api-version": "2022-11-28" };
@@ -142,20 +224,25 @@ jobs:
                   );
                   if (passed !== undefined) return console.log(`ci run ${passed.id} passed on main for ${sha}.`);
                   const listed = body.workflow_runs.map(describe).join(", ") || "none";
-                  refuse(`No ci push run on main passed for ${sha} (GitHub lists: ${listed}). A stable release takes only a commit whose ci passed on main.`);
+                  const why = `No ci push run on main passed for ${sha} (GitHub lists: ${listed}). A stable release takes only a commit whose ci passed on main.`;
+                  if (verdict !== "report") refuse(why);
+                  console.log(`::warning::${why}`);
+                  require("node:fs").appendFileSync(process.env.GITHUB_STEP_SUMMARY, `A release would refuse:\n\n- ${why}\n`);
+                  return;
                 }
                 if (response !== undefined && attempt === 4) refuse(`GitHub answered ${response.status} for the ci runs of ${sha}`);
                 await new Promise((resolve) => setTimeout(resolve, attempt * Number(process.env.RELEASE_TEST_RETRY_MS || 1500)));
               }
             };
             run();
-          ' -- "${GITHUB_API_URL:-https://api.github.com}" "$GITHUB_REPOSITORY" "$GITHUB_SHA" "${GH_TOKEN:-}"
+          ' -- "${GITHUB_API_URL:-https://api.github.com}" "$GITHUB_REPOSITORY" "$GITHUB_SHA" "${GH_TOKEN:-}" "$verdict"
 
   # Each platform on its own native runner, pushed by digest with no tag at all: nothing pulls it
   # until the identity check names it by that digest.
   build:
     name: Image (${{ matrix.platform.arch }})
     needs: stable-tag
+    if: needs.stable-tag.outputs.target == 'ghcr'
     strategy:
       fail-fast: false
       matrix:
@@ -168,6 +255,18 @@ jobs:
       contents: read
       packages: write
     steps:
+      # This job publishes, so it refuses anything but a plain X.Y.Z that is its own tag's, however
+      # the version arrived: a dry run never publishes (sealant-sh/mend #1028: check the resolved
+      # version, not the input). scripts/release-publication.test.mjs runs this step.
+      - name: Refuse a version that is not this tag's release
+        env:
+          VERSION: ${{ needs.stable-tag.outputs.version }}
+        run: |
+          plain='^(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})$'
+          if [[ $GITHUB_EVENT_NAME != push || ! $VERSION =~ $plain || $GITHUB_REF_NAME != "v$VERSION" ]]; then
+            echo "::error::'$VERSION' on a $GITHUB_EVENT_NAME of $GITHUB_REF_NAME is not a plain X.Y.Z release of its own tag. This job publishes; a dry run never does."
+            exit 1
+          fi
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -207,17 +306,106 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+  # A dry run's image, built as build builds it but exported to a file, never pushed. The docker
+  # exporter, not oci: it writes the same OCI index.json and blobs and adds the manifest.json that
+  # Docker's classic image store needs to load an archive. No attestations, so index.json names the
+  # platform manifest itself, the digest the identity check checks.
+  archive-build:
+    name: Image archive (${{ matrix.platform.arch }})
+    needs: stable-tag
+    if: needs.stable-tag.outputs.target == 'archive'
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - { arch: amd64, runner: ubuntu-24.04 }
+          - { arch: arm64, runner: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.platform.runner }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          # setup-node v6 restores a package-manager cache by itself when packageManager names npm.
+          package-manager-cache: false
+          node-version: 24
+      # BuildKit at a fixed digest: it runs privileged.
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+        with:
+          driver-opts: image=moby/buildkit:v0.33.1@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea
+      - run: mkdir -p "$RUNNER_TEMP/archive"
+      - id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: linux/${{ matrix.platform.arch }}
+          provenance: false
+          sbom: false
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ needs.stable-tag.outputs.version }}
+          outputs: type=docker,dest=${{ runner.temp }}/archive/sealantd.tar
+      # The digest is computed from the archive itself and must be the one BuildKit reports, so the
+      # manifest records what the file holds.
+      # scripts/release-manifest.test.mjs runs this step as written.
+      - name: Record the platform digest from the archive
+        env:
+          ARCHIVE: ${{ runner.temp }}/archive/sealantd.tar
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          platform=$(node scripts/release-manifest.mjs archive-digest "$ARCHIVE")
+          if [[ $platform != "$DIGEST" ]]; then
+            echo "::error::The archive holds $platform; BuildKit reported '$DIGEST'."
+            exit 1
+          fi
+          mkdir -p /tmp/digests
+          touch "/tmp/digests/${platform#sha256:}"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: digests-sealantd--${{ matrix.platform.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+      # Layers are compressed already. They expire after a day.
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: archive-sealantd--${{ matrix.platform.arch }}
+          path: ${{ runner.temp }}/archive/sealantd.tar
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
   # Both platforms as one index, under this run's own tag. :<version> is what every consumer of the
   # version pulls, so only finalize-images writes it, after the identity checks.
   merge:
     name: Stage the index
     needs: [stable-tag, build]
+    if: needs.stable-tag.outputs.target == 'ghcr'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
       contents: read
       packages: write
     steps:
+      # This job publishes, so it refuses anything but a plain X.Y.Z that is its own tag's, however
+      # the version arrived: a dry run never publishes (sealant-sh/mend #1028: check the resolved
+      # version, not the input). scripts/release-publication.test.mjs runs this step.
+      - name: Refuse a version that is not this tag's release
+        env:
+          VERSION: ${{ needs.stable-tag.outputs.version }}
+        run: |
+          plain='^(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})$'
+          if [[ $GITHUB_EVENT_NAME != push || ! $VERSION =~ $plain || $GITHUB_REF_NAME != "v$VERSION" ]]; then
+            echo "::error::'$VERSION' on a $GITHUB_EVENT_NAME of $GITHUB_REF_NAME is not a plain X.Y.Z release of its own tag. This job publishes; a dry run never does."
+            exit 1
+          fi
       # Only the index check, scripts/release-manifest.mjs.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -291,11 +479,203 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-  # One record of what this run built: the image by its index and platform digests. Every later job
-  # reads it from this run and nowhere else. Kept 90 days, so failed jobs can be re-run.
+  # The index merge makes, assembled in a registry that lives and dies with this job on loopback:
+  # it proves both arches' archives make one index, and gives the manifest that index's digest.
+  # Nothing leaves the runner.
+  archive-merge:
+    name: Assemble the index
+    needs: [stable-tag, archive-build]
+    if: needs.stable-tag.outputs.target == 'archive'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      # Only the index check, scripts/release-manifest.mjs.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: scripts/release-manifest.mjs
+          sparse-checkout-cone-mode: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          # setup-node v6 restores a package-manager cache by itself when packageManager names npm.
+          package-manager-cache: false
+          node-version: 24
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: /tmp/archives
+          pattern: archive-sealantd--*
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: /tmp/digests
+          pattern: digests-sealantd--*
+      - name: Start a registry on loopback inside this job
+        run: docker run --detach --name registry --publish 127.0.0.1:5000:5000 registry:2
+      # The registry speaks plain HTTP on loopback; imagetools reads the builder's registry config.
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+        with:
+          driver-opts: image=moby/buildkit:v0.33.1@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea
+          buildkitd-config-inline: |
+            [registry."127.0.0.1:5000"]
+              http = true
+      # skopeo keeps each manifest's bytes (--preserve-digests), so the registry holds the digest the
+      # archive was recorded under; the inspect proves it.
+      - name: Push both arches' archives to it
+        env:
+          REPOSITORY: 127.0.0.1:5000/sealantd
+        run: |
+          set -euo pipefail
+          command -v skopeo >/dev/null || {
+            echo "::error::skopeo is missing from this runner image."
+            exit 1
+          }
+          for arch in amd64 arm64; do
+            digest=$(cd "/tmp/digests/digests-sealantd--$arch" && ls)
+            skopeo copy --preserve-digests --dest-tls-verify=false \
+              "oci-archive:/tmp/archives/archive-sealantd--$arch/sealantd.tar" "docker://$REPOSITORY:$arch"
+            docker buildx imagetools inspect "$REPOSITORY@sha256:$digest" >/dev/null
+          done
+      - name: Create and inspect the multi-arch index in the job's registry
+        env:
+          REPOSITORY: 127.0.0.1:5000/sealantd
+          VERSION: ${{ needs.stable-tag.outputs.version }}
+        run: |
+          set -euo pipefail
+          sources=()
+          for arch in amd64 arm64; do
+            sources+=("$REPOSITORY@sha256:$(cd "/tmp/digests/digests-sealantd--$arch" && ls)")
+          done
+          mkdir -p "$RUNNER_TEMP/index"
+          docker buildx imagetools create --metadata-file "$RUNNER_TEMP/index/create.json" \
+            --tag "$REPOSITORY:$VERSION" "${sources[@]}"
+          docker buildx imagetools inspect "$REPOSITORY:$VERSION"
+      # As merge records it: the digest create reported, each arch's platform bound to the archive
+      # that arch's build exported, checked against the sources by digest.
+      - name: Check and record the index digest
+        working-directory: ${{ runner.temp }}/index
+        env:
+          REPOSITORY: 127.0.0.1:5000/sealantd
+        run: |
+          set -euo pipefail
+          digest=$(jq -r '."containerimage.digest" // ."containerimage.descriptor".digest // ""' create.json)
+          if [[ ! $digest =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::imagetools create reported no index digest."
+            exit 1
+          fi
+          docker buildx imagetools inspect "$REPOSITORY@$digest" --raw >index.json
+          sources=()
+          for arch in amd64 arm64; do
+            source=$(cd "/tmp/digests/digests-sealantd--$arch" && ls)
+            docker buildx imagetools inspect "$REPOSITORY@sha256:$source" --raw >"source-$source.json"
+            sources+=("$arch=sha256:$source=source-$source.json")
+          done
+          node "$GITHUB_WORKSPACE/scripts/release-manifest.mjs" check-index create.json \
+            index.json "${sources[@]}" >digest
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: index-sealantd
+          path: ${{ runner.temp }}/index/digest
+          if-no-files-found: error
+          retention-days: 1
+
+  # Builds and packs the two packages with no credential: nothing this job runs, the dependencies'
+  # build tools included, can reach the npm token. Each tarball is normalized once, checked as the
+  # publisher will check it, and recorded in the release manifest by sha512; npm publishes exactly
+  # these bytes. Kept 90 days, as the manifest is.
+  pack:
+    name: Pack the npm packages
+    needs: stable-tag
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    outputs:
+      records: ${{ steps.pack.outputs.records }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Corepack puts pnpm (package.json#packageManager) on PATH. No pnpm store cache: jobs running
+      # unowned code write it. Node 24 for the bundled npm's pacote, which the normalizer uses.
+      - run: corepack enable
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          # setup-node v6 restores a package-manager cache by itself when packageManager names npm.
+          package-manager-cache: false
+          node-version: 24
+      # --ignore-scripts: never run dependency lifecycle scripts.
+      - run: pnpm install --frozen-lockfile --ignore-scripts
+      # The git tag is the single version authority: both package.json versions come from it, and
+      # the commit goes in as gitHead, which npm records and the publisher compares on a re-run.
+      - name: Set the version and commit
+        env:
+          VERSION: ${{ needs.stable-tag.outputs.version }}
+        run: |
+          set -euo pipefail
+          for package in packages/runtime-protocol packages/runtime-client; do
+            (cd "$package" && npm version "$VERSION" --no-git-tag-version --allow-same-version \
+              && npm pkg set "gitHead=$GITHUB_SHA")
+          done
+      # `pnpm pack` does not run prepublishOnly, where both packages build: build first.
+      - name: Build
+        run: pnpm --filter "@sealant/runtime-protocol" --filter "@sealant/runtime-client" run build
+      # pnpm pack turns the client's workspace:* dependency into this exact version. The normalized
+      # tarball is checked again as the publisher checks it: already normalized, never repacked.
+      # A dry run's version is no release's: its tarballs are checked without the channel's shape.
+      - name: Pack, normalize and record the tarballs
+        id: pack
+        env:
+          VERSION: ${{ needs.stable-tag.outputs.version }}
+          TARGET: ${{ needs.stable-tag.outputs.target }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/packed" "$RUNNER_TEMP/npm"
+          for package in packages/runtime-protocol packages/runtime-client; do
+            (cd "$package" && pnpm pack --pack-destination "$RUNNER_TEMP/packed")
+          done
+          # Every file each manifest exports is in its tarball, and nothing sits outside package/.
+          node scripts/check-tarball.mjs "$RUNNER_TEMP"/packed/*.tgz
+          records='{}'
+          for name in @sealant/runtime-protocol @sealant/runtime-client; do
+            file=${name#@}
+            file="${file//\//-}-$VERSION.tgz"
+            expected=(--name "$name" --version "$VERSION" --commit "$GITHUB_SHA")
+            if [[ $TARGET == ghcr ]]; then expected+=(--channel latest); fi
+            record=$(node scripts/normalize-npm-tarball.mjs "$RUNNER_TEMP/packed/$file" \
+              --out "$RUNNER_TEMP/npm" "${expected[@]}")
+            if [[ $(jq -r .file <<<"$record") != "$file" ]]; then
+              echo "::error::$name packed as $(jq -r .file <<<"$record"), not $file."
+              exit 1
+            fi
+            checked=$(node scripts/normalize-npm-tarball.mjs --check "$RUNNER_TEMP/npm/$file" \
+              "${expected[@]}")
+            if [[ $checked != "$record" ]]; then
+              echo "::error::The normalized $file does not check as it was recorded."
+              exit 1
+            fi
+            records=$(jq -c --arg name "$name" --argjson record "$record" '.[$name] = $record' <<<"$records")
+          done
+          node scripts/check-tarball.mjs "$RUNNER_TEMP"/npm/*.tgz
+          echo "records=$records" >>"$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: npm-tarballs
+          path: ${{ runner.temp }}/npm/*.tgz
+          if-no-files-found: error
+          retention-days: 90
+
+  # One record of what this run built: the image by its index and platform digests, and each npm
+  # tarball by its sha512. Every later job reads it from this run and nowhere else. Kept 90 days, so
+  # failed jobs can be re-run.
   release-manifest:
     name: Write the release manifest
-    needs: [stable-tag, merge]
+    needs: [stable-tag, merge, archive-merge, pack]
+    # merge or archive-merge, by target; the other one is skipped.
+    if: >-
+      ${{ !cancelled() && needs.stable-tag.result == 'success' && needs.pack.result == 'success' &&
+      ((needs.stable-tag.outputs.target == 'ghcr' && needs.merge.result == 'success') ||
+      (needs.stable-tag.outputs.target == 'archive' && needs.archive-merge.result == 'success')) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -326,6 +706,7 @@ jobs:
           COMMIT: ${{ github.sha }}
           DIGESTS: ${{ runner.temp }}/records/digests
           INDEXES: ${{ runner.temp }}/records/indexes
+          PACKAGES: ${{ needs.pack.outputs.records }}
         run: |
           mkdir -p "$RUNNER_TEMP/manifest"
           node scripts/release-manifest.mjs write "$RUNNER_TEMP/manifest/release-manifest.json"
@@ -337,13 +718,19 @@ jobs:
           retention-days: 90
 
   # Identity checks, not acceptance: each arch's platform, as the index the manifest records maps
-  # it, must be this arch's build, and that build must be this release's. It must run as the image
-  # ID it was pulled as, carry this version, commit and source as labels, and its daemon must report
-  # the version the tagged commit's Cargo.toml gives. A mislabelled, swapped or broken index stops
-  # here, before :<version> exists.
+  # it, must be this arch's build, and that build must be this release's. In a dry run, whose index
+  # never leaves archive-merge's job, the arch's archive is loaded after it is checked against the
+  # manifest. It must run as the image ID it was pulled or loaded as, carry this version, commit and
+  # source as labels, and its daemon must report the version the tagged commit's Cargo.toml gives.
+  # A mislabelled, swapped or broken index stops here, before :<version> exists.
   identity:
     name: Identity check (${{ matrix.platform.arch }})
     needs: [stable-tag, release-manifest]
+    # A job whose if names no status function also needs every job above it to have succeeded, and
+    # the other target's jobs above release-manifest are skipped: so the needs are checked by hand.
+    if: >-
+      ${{ !cancelled() && needs.stable-tag.result == 'success' && needs.release-manifest.result ==
+      'success' }}
     strategy:
       fail-fast: false
       matrix:
@@ -374,41 +761,24 @@ jobs:
           path: ${{ runner.temp }}/release
       # This arch's build digest, as its build job recorded it.
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        if: needs.stable-tag.outputs.target == 'ghcr'
         with:
           name: digests-sealantd--${{ matrix.platform.arch }}
           path: ${{ runner.temp }}/built
       # The platform is resolved through the index, as a consumer of :<version> resolves it: the
       # index is read by the digest the manifest records, and the digest it maps this arch's platform
       # to must be this arch's build, as its build job and the manifest both record it. Then that
-      # digest is pulled anonymously, as a consumer pulls it. sealantd reports Cargo's workspace version, which
-      # the release flow does not stamp: while Cargo.toml says 0.0.0 the daemon reports 0.0.0, and
-      # the version label is what names the release. Cargo.toml saying any version but 0.0.0 or this
-      # release's is refused.
+      # digest is pulled anonymously, as a consumer pulls it, and recorded as the ID the pull gave.
       # scripts/release-publication.test.mjs runs this step as written, against a stand-in docker.
-      - name: Check this arch's image is this release's
+      - name: Pull this run's image by digest
+        if: needs.stable-tag.outputs.target == 'ghcr'
         env:
           REPOSITORY: ghcr.io/${{ github.repository }}
           MANIFEST: ${{ runner.temp }}/release/release-manifest.json
           BUILT: ${{ runner.temp }}/built
-          VERSION: ${{ needs.stable-tag.outputs.version }}
           ARCH: ${{ matrix.platform.arch }}
         run: |
           set -euo pipefail
-          shopt -s inherit_errexit
-          case $RUNNER_ARCH in
-            X64) arch=amd64 ;;
-            ARM64) arch=arm64 ;;
-            *) echo "::error::No image is built for $RUNNER_ARCH."; exit 1 ;;
-          esac
-          if [[ $arch != "$ARCH" ]]; then
-            echo "::error::This $arch runner was asked to check $ARCH."
-            exit 1
-          fi
-          cargo=$(sed -n '/^\[workspace\.package\]$/,/^\[/s/^version = "\([^"]*\)"$/\1/p' Cargo.toml)
-          if [[ $cargo != 0.0.0 && $cargo != "$VERSION" ]]; then
-            echo "::error::Cargo.toml's workspace version is '$cargo', neither 0.0.0 nor $VERSION."
-            exit 1
-          fi
           receipt=$(node scripts/release-manifest.mjs digest "$MANIFEST" sealantd "$ARCH")
           index=$(jq -r '.images.sealantd.index' "$MANIFEST")
           built=("$BUILT"/*)
@@ -424,12 +794,71 @@ jobs:
             exit 1
           fi
           docker pull "$REPOSITORY@$digest"
-          id=$(docker image inspect "$REPOSITORY@$digest" --format '{{.Id}}')
-          if [[ ! $id =~ ^sha256:[0-9a-f]{64}$ ]]; then
-            echo "::error::$REPOSITORY@$digest pulled as '$id', not an image ID."
+          docker image inspect "$REPOSITORY@$digest" --format '{{.Id}}' >"$RUNNER_TEMP/image-id"
+      # A dry run's archive of this arch, checked against the manifest before Docker sees it. The
+      # image ID is then the config digest of that manifest (the manifest digest itself on Docker's
+      # containerd image store); the loaded image must be one of them. The dry run's index lived
+      # only in archive-merge's loopback registry, where check-index bound each platform to its build.
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        if: needs.stable-tag.outputs.target == 'archive'
+        with:
+          path: ${{ runner.temp }}/archives
+          pattern: archive-sealantd--${{ matrix.platform.arch }}
+      # scripts/release-manifest.test.mjs runs this step as written, against a stand-in docker.
+      - name: Load this run's image from its archive
+        if: needs.stable-tag.outputs.target == 'archive'
+        env:
+          MANIFEST: ${{ runner.temp }}/release/release-manifest.json
+          ARCH: ${{ matrix.platform.arch }}
+        run: |
+          set -euo pipefail
+          archive=$RUNNER_TEMP/archives/archive-sealantd--$ARCH/sealantd.tar
+          ids=$(node scripts/release-manifest.mjs check-archive "$MANIFEST" sealantd "$ARCH" "$archive")
+          docker load --input "$archive"
+          id=
+          for candidate in $ids; do
+            if [[ $(docker image inspect "$candidate" --format '{{.Id}}' 2>/dev/null) == "$candidate" ]]; then
+              id=$candidate
+              break
+            fi
+          done
+          if [[ -z $id ]]; then
+            echo "::error::sealantd did not load as its config digest or its manifest digest ($ids)."
             exit 1
           fi
-          # Every read from here names the ID the pull gave, never a reference that can move.
+          printf '%s\n' "$id" >"$RUNNER_TEMP/image-id"
+      # sealantd reports Cargo's workspace version, which the release flow does not stamp: while
+      # Cargo.toml says 0.0.0 the daemon reports 0.0.0, and the version label is what names the
+      # release. Cargo.toml saying any version but 0.0.0 or this release's X.Y.Z is refused.
+      # scripts/release-publication.test.mjs runs this step as written, against a stand-in docker.
+      - name: Check this arch's image is this release's
+        env:
+          VERSION: ${{ needs.stable-tag.outputs.version }}
+          ARCH: ${{ matrix.platform.arch }}
+        run: |
+          set -euo pipefail
+          shopt -s inherit_errexit
+          case $RUNNER_ARCH in
+            X64) arch=amd64 ;;
+            ARM64) arch=arm64 ;;
+            *) echo "::error::No image is built for $RUNNER_ARCH."; exit 1 ;;
+          esac
+          if [[ $arch != "$ARCH" ]]; then
+            echo "::error::This $arch runner was asked to check $ARCH."
+            exit 1
+          fi
+          release=${VERSION%%-*}
+          cargo=$(sed -n '/^\[workspace\.package\]$/,/^\[/s/^version = "\([^"]*\)"$/\1/p' Cargo.toml)
+          if [[ $cargo != 0.0.0 && $cargo != "$release" ]]; then
+            echo "::error::Cargo.toml's workspace version is '$cargo', neither 0.0.0 nor $release."
+            exit 1
+          fi
+          id=$(<"$RUNNER_TEMP/image-id")
+          if [[ ! $id =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::This job pulled or loaded '$id', not an image ID."
+            exit 1
+          fi
+          # Every read from here names that ID, never a reference that can move.
           platform=$(docker image inspect "$id" --format '{{.Os}}/{{.Architecture}}')
           labels=$(docker image inspect "$id" --format '{{json .Config.Labels}}')
           label() { jq -r --arg key "org.opencontainers.image.$1" '.[$key] // ""' <<<"$labels"; }
@@ -442,7 +871,7 @@ jobs:
           fi
           if ((${#problems[@]} > 0)); then
             printf -v joined '%s; ' "${problems[@]}"
-            echo "::error::$REPOSITORY@$digest ($id) is not this release's: ${joined%; }. Nothing was published."
+            echo "::error::The $ARCH image $id is not this release's: ${joined%; }. Nothing was published."
             exit 1
           fi
           # The daemon itself, in a container of exactly that ID.
@@ -452,7 +881,7 @@ jobs:
           reported=$(docker start --attach "$container") || status=$?
           docker rm "$container" >/dev/null
           if [[ $running != "$id" ]]; then
-            echo "::error::The container runs $running, not $id, the image pulled by digest."
+            echo "::error::The container runs $running, not $id, the image pulled or loaded."
             exit 1
           fi
           if ((status != 0)) || [[ $reported != "sealantd $cargo" ]]; then
@@ -467,6 +896,9 @@ jobs:
   finalize-images:
     name: Publish the checked image under its version
     needs: [stable-tag, identity]
+    if: >-
+      ${{ !cancelled() && github.event_name == 'push' && needs.stable-tag.result == 'success' &&
+      needs.identity.result == 'success' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -482,6 +914,18 @@ jobs:
       cancel-in-progress: false
       queue: max
     steps:
+      # This job publishes, so it refuses anything but a plain X.Y.Z that is its own tag's, however
+      # the version arrived: a dry run never publishes (sealant-sh/mend #1028: check the resolved
+      # version, not the input). scripts/release-publication.test.mjs runs this step.
+      - name: Refuse a version that is not this tag's release
+        env:
+          VERSION: ${{ needs.stable-tag.outputs.version }}
+        run: |
+          plain='^(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})$'
+          if [[ $GITHUB_EVENT_NAME != push || ! $VERSION =~ $plain || $GITHUB_REF_NAME != "v$VERSION" ]]; then
+            echo "::error::'$VERSION' on a $GITHUB_EVENT_NAME of $GITHUB_REF_NAME is not a plain X.Y.Z release of its own tag. This job publishes; a dry run never does."
+            exit 1
+          fi
       # Only the manifest reader, which binds the index's platforms (scripts/release-manifest.mjs).
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -596,46 +1040,461 @@ jobs:
             echo "- \`$ref\` (\`$index\`)"
           } >>"$GITHUB_STEP_SUMMARY"
 
-  # After the image exists, so every stable runtime package has its daemon at :<version>.
+  # Holds the npm credential and runs nothing from the repository: no checkout, no install, no
+  # build. It publishes exactly the tarballs the pack job made and the release manifest records,
+  # after :<version> exists, so every stable runtime package has its daemon.
   npm:
-    needs: [stable-tag, finalize-images]
-    # The release channel's lock, as finalize-images holds it.
+    name: Publish npm packages
+    needs: [stable-tag, pack, finalize-images]
+    # A tag push only: on a dry run this job is skipped, so it asks for no environment and no id-token.
+    if: >-
+      ${{ !cancelled() && github.event_name == 'push' && needs.stable-tag.result == 'success' &&
+      needs.pack.result == 'success' && needs.finalize-images.result == 'success' }}
+    # The release channel's lock, as finalize-images holds it. The floor is read inside it.
     concurrency:
       group: sealantd-release-channel
       cancel-in-progress: false
       queue: max
-    # npm trusted publishing (OIDC) needs a GitHub-hosted runner: this job stays off the self-hosted runners.
+    # npm trusted publishing (OIDC) needs a GitHub-hosted runner, where GitHub mints the id-token.
     runs-on: ubuntu-latest
     timeout-minutes: 15
     # Gate every publish behind a protected environment: add required reviewers + restrict deployment
-    # to protected tags in repo Settings -> Environments -> release. This means a compromised PR,
-    # dependency, or fork cannot trigger a publish without human approval.
+    # to protected tags in repo Settings -> Environments -> release. The trusted publishers of both
+    # packages are registered against sealant-sh/sealantd, release.yml and this environment.
     environment: release
     permissions:
-      contents: read
       id-token: write # OIDC: lets npm Trusted Publishing authenticate with no stored token
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      # Enable Corepack before setup-node, so pnpm (package.json#packageManager, pnpm@11.1.0) is on
-      # PATH for the install below. Corepack ships with Node.
-      - run: corepack enable
+      # This job publishes, so it refuses anything but a plain X.Y.Z that is its own tag's, however
+      # the version arrived: a dry run never publishes (sealant-sh/mend #1028: check the resolved
+      # version, not the input). scripts/release-publication.test.mjs runs this step.
+      - name: Refuse a version that is not this tag's release
+        env:
+          VERSION: ${{ needs.stable-tag.outputs.version }}
+        run: |
+          plain='^(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})$'
+          if [[ $GITHUB_EVENT_NAME != push || ! $VERSION =~ $plain || $GITHUB_REF_NAME != "v$VERSION" ]]; then
+            echo "::error::'$VERSION' on a $GITHUB_EVENT_NAME of $GITHUB_REF_NAME is not a plain X.Y.Z release of its own tag. This job publishes; a dry run never does."
+            exit 1
+          fi
+      # Node 24: trusted publishing needs the bundled npm >= 11.5, whose pacote the check uses.
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           # setup-node v6 restores a package-manager cache by itself when packageManager names npm.
           package-manager-cache: false
           node-version: 24
           registry-url: "https://registry.npmjs.org"
-      # --ignore-scripts: never run dependency lifecycle scripts in the publish job. The build below
-      # needs none (codegen is committed; build is just tsc).
-      - run: pnpm install --frozen-lockfile --ignore-scripts
-      # Sync the SDK package versions to the git tag (tag is the single source of truth).
-      - run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          pnpm --filter "@sealant/runtime-protocol" --filter "@sealant/runtime-client" \
-            exec npm version "$VERSION" --no-git-tag-version --allow-same-version
-      - run: pnpm -r build
-      # Tokenless publish via npm Trusted Publishing: the OIDC id-token (permissions above)
-      # authenticates the publish — no stored credential. --provenance attaches a public build
-      # attestation (the source repo is public). Configure the matching trusted publisher on
-      # npmjs.com for BOTH packages: repo sealant-sh/sealantd, workflow release.yml, env release.
-      - run: pnpm -r publish --access public --no-git-checks --provenance
+      # Both from this run: the tarballs the pack job made, and the manifest that records them.
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: npm-tarballs
+          path: npm
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-manifest
+          path: release
+      # The floor is read here, inside the lock: a newer release may have published while this run
+      # waited. Above it both packages publish; at it (a retry) nothing is republished and no
+      # dist-tag moves; below it nothing publishes.
+      # scripts/release-npm.test.mjs runs this step as written, against a stub npm registry.
+      - name: Publish to npm
+        env:
+          VERSION: ${{ needs.stable-tag.outputs.version }}
+        run: |
+          set -euo pipefail
+          # Retried reads wait 1500 ms × attempt (registry_get). Only a test sets
+          # RELEASE_TEST_RETRY_MS, never a workflow; the log says which delays this run used.
+          if [[ -z ${RELEASE_TEST_RETRY_MS:-} ]]; then
+            echo "retry backoff: production (1500 ms × attempt)"
+          elif [[ $RELEASE_TEST_RETRY_MS =~ ^(0|[1-9][0-9]{0,5})$ ]]; then
+            echo "retry backoff: overridden to $RELEASE_TEST_RETRY_MS ms × attempt"
+          else
+            echo "::error::RELEASE_TEST_RETRY_MS is not a whole number of milliseconds."
+            exit 1
+          fi
+          # The integrity read-back waits 5 s × attempt (published_integrity). Only a test sets
+          # REPUBLISH_TEST_WAIT, never a workflow.
+          if [[ -z ${REPUBLISH_TEST_WAIT:-} ]]; then
+            echo "integrity read-back wait: production (5 s × attempt)"
+          elif [[ $REPUBLISH_TEST_WAIT =~ ^(0|[1-9][0-9]{0,3})$ ]]; then
+            echo "integrity read-back wait: overridden to $REPUBLISH_TEST_WAIT s × attempt"
+          else
+            echo "::error::REPUBLISH_TEST_WAIT is not a whole number of seconds."
+            exit 1
+          fi
+          # --- floor ---
+          # release-npm.test.mjs runs this block as written, against a stub npm registry. A stable
+          # release's floor is the highest of its markers, compared as numbers X.Y.Z: npm's `latest` for
+          # each of FLOOR_PACKAGES. sealantd has no GitHub release, and its image :latest is frozen at
+          # 0.19.0 and moves with no release, so neither is a marker. A marker that does not exist adds
+          # nothing; one that cannot be read, or is present but not a plain X.Y.Z, fails the job: never
+          # read as no floor. Each reader validates the whole value it read before it is compared or joined
+          # to its source. A part of X.Y.Z has at most 9 digits, so Bash's 64-bit arithmetic compares every
+          # version this accepts; a longer part fails as not plain.
+          shopt -s inherit_errexit
+          PLAIN_VERSION='^(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})$'
+          FLOOR_PACKAGES=(@sealant/runtime-protocol @sealant/runtime-client)
+
+          # GET <path> from the registry, retried; a failure or a 404 stops the job: never guessed.
+          registry_get() {
+            # shellcheck disable=SC2016 # JavaScript template literals, not shell expansions
+            node -e '
+              const [where, registry] = process.argv.slice(1);
+              const url = new URL(where, registry.endsWith("/") ? registry : `${registry}/`);
+              const run = async () => {
+                for (let attempt = 1; attempt <= 4; attempt += 1) {
+                  try {
+                    const response = await fetch(url, { headers: { accept: "application/json" } });
+                    if (response.ok) return process.stdout.write(JSON.stringify(await response.json()));
+                    if (attempt === 4) throw new Error(`the registry answered ${response.status} for ${where}`);
+                  } catch (error) {
+                    if (attempt === 4) {
+                      console.error(`::error::${error.message}`);
+                      process.exit(1);
+                    }
+                  }
+                  await new Promise((resolve) => setTimeout(resolve, attempt * Number(process.env.RELEASE_TEST_RETRY_MS || 1500)));
+                }
+              };
+              run();
+            ' -- "$1" "$(npm config get registry)"
+          }
+
+          # <value> is a plain X.Y.Z (each part at most 9 digits), or the job fails naming <marker>.
+          plain_version() {
+            if [[ ! $1 =~ $PLAIN_VERSION ]]; then
+              echo "::error::$2 is '$1', not a plain X.Y.Z release; the floor cannot be read." >&2
+              return 1
+            fi
+          }
+
+          # npm's `latest` for <package>, validated, or nothing when the package has no `latest` dist-tag. The
+          # answer must be a JSON object; a `latest` that is null, empty, not a string or not a plain X.Y.Z fails.
+          npm_latest() {
+            local tags
+            tags=$(registry_get "-/package/${1/\//%2f}/dist-tags")
+            # shellcheck disable=SC2016 # JavaScript template literals, not shell expansions
+            node -e '
+              const [plain, what] = process.argv.slice(1);
+              const fail = (why) => {
+                console.error(`::error::${what} ${why}; the floor cannot be read.`);
+                process.exit(1);
+              };
+              let tags;
+              try {
+                tags = JSON.parse(require("node:fs").readFileSync(0, "utf8"));
+              } catch {
+                fail("is not JSON");
+              }
+              if (tags === null || typeof tags !== "object" || Array.isArray(tags)) fail("is not a JSON object");
+              if (!Object.hasOwn(tags, "latest")) process.exit(0);
+              if (typeof tags.latest !== "string" || !new RegExp(plain).test(tags.latest))
+                fail(`latest is ${JSON.stringify(tags.latest)}, not a plain X.Y.Z release`);
+              process.stdout.write(tags.latest);
+            ' "$PLAIN_VERSION" "npm:$1 dist-tags" <<<"$tags"
+          }
+
+          # -1, 0 or 1 as plain X.Y.Z <a> is below, equal to or above <b>.
+          version_order() {
+            local a b i
+            IFS=. read -r -a a <<<"$1"
+            IFS=. read -r -a b <<<"$2"
+            for i in 0 1 2; do
+              if ((10#${a[i]} < 10#${b[i]})); then echo -1 && return; fi
+              if ((10#${a[i]} > 10#${b[i]})); then echo 1 && return; fi
+            done
+            echo 0
+          }
+
+          # The floor of a stable release: `<version> <marker>` of the highest marker, or nothing when none
+          # exists. Every version here was validated by its reader; versions and markers are kept apart
+          # until the result is printed.
+          stable_floor() {
+            local value package i best=-1
+            local -a versions=() sources=()
+            for package in "${FLOOR_PACKAGES[@]}"; do
+              value=$(npm_latest "$package")
+              if [[ -n $value ]]; then versions+=("$value") && sources+=("npm:$package@latest"); fi
+            done
+            for i in "${!versions[@]}"; do
+              plain_version "${versions[i]}" "${sources[i]}"
+              if ((best < 0)) || [[ $(version_order "${versions[i]}" "${versions[best]}") == 1 ]]; then best=$i; fi
+            done
+            if ((best >= 0)); then printf '%s %s\n' "${versions[best]}" "${sources[best]}"; fi
+          }
+
+          # What a stable <version> may do against the floor line `<floor> <marker>` (empty: no floor):
+          # `publish` above it, `retry` at it, and a refusal below it.
+          stable_guard() {
+            local version=$1 floor=${2%% *} marker=${2#* }
+            plain_version "$version" "the release"
+            if [[ -z $2 ]]; then
+              echo publish
+              return
+            fi
+            plain_version "$floor" "$marker"
+            case $(version_order "$version" "$floor") in
+              1) echo publish ;;
+              0) echo retry ;;
+              *)
+                echo "::error::$version is below the stable floor $floor ($marker). A stable release never moves npm latest backwards, so a backport such as 0.38.2 after 0.39.0 is refused on purpose: publishing one under its own dist-tag is a decision not yet made. Nothing was published." >&2
+                return 1
+                ;;
+            esac
+          }
+          # --- end floor ---
+          # --- republish ---
+          # release-npm.test.mjs runs this block as written, against a stub registry. publish_release checks
+          # the downloaded artifact directories first (check_artifacts), then runs every npm command from a
+          # fresh empty directory, so no .npmrc in or near an artifact can configure npm. What publishes is the
+          # run's own tarballs, byte for byte: the pack job packed and normalized them once, and the run's
+          # release manifest records each one's sha512 and integrity. Nothing repacks them. Each is refused
+          # unless the manifest is this release's and its sha512 is the file's, and unless npm's own copy of
+          # pacote (no install, nothing unpinned loads), extracting it, finds it already normalized: only
+          # allowlisted manifest fields (no `tag`, no scripts, no publishConfig but `access`), the expected
+          # name, version, channel and commit, no alias dependency, a sibling at exactly this version, no root
+          # binding.gyp (npm would add an install script for it) and no .npmrc. That is
+          # scripts/normalize-npm-tarball.mjs --check, written out here because this job runs no repository
+          # file; release-npm.test.mjs holds the two to the same answers. Both tarballs are checked before
+          # either is published. The registry's dist.integrity must then be the manifest's.
+          # Failures inside $(...) stop the job too. Registry and npm JSON reaches node on stdin, never as an
+          # argument: Linux refuses one argument over 128 KB, and a package document outgrows that.
+          shopt -s inherit_errexit
+          KEEP_FIELDS='["name","version","description","license","repository","homepage","bugs","keywords","type","main","module","types","typings","exports","files","bin","man","directories","engines","dependencies","peerDependencies","peerDependenciesMeta","optionalDependencies","gitHead"]'
+
+          # The artifact directory <dir> holds exactly the expected files (regular files), nothing else.
+          check_artifacts() {
+            local dir=$1 extra expected
+            shift
+            extra=$(cd "$dir" && find . -mindepth 1 | sed 's|^\./||' | grep -vxF -f <(printf '%s\n' "$@") || true)
+            if [[ -n $extra ]]; then
+              echo "::error::The artifact holds more than the expected tarballs: $(tr '\n' ' ' <<<"$extra")"
+              return 1
+            fi
+            for expected in "$@"; do
+              if [[ ! -f $dir/$expected || -L $dir/$expected ]]; then
+                echo "::error::$expected is missing from the artifact, or is not a regular file."
+                return 1
+              fi
+            done
+          }
+
+          # registry_get comes from the floor block above.
+
+          # The commit a published version came from ("unknown" without gitHead), or nothing if unpublished.
+          published_from() {
+            local record
+            record=$(registry_get "${1/\//%2f}")
+            node -e '
+              const found = JSON.parse(require("node:fs").readFileSync(0, "utf8")).versions?.[process.argv[1]];
+              process.stdout.write(found === undefined ? "" : String(found.gitHead ?? "unknown"));
+            ' "$2" <<<"$record"
+          }
+
+          # The integrity the release manifest <manifest> records for <tarball> of <name>, once the manifest is
+          # this release's (<version>, <commit>), names the tarball's file, and records its sha512 and integrity.
+          recorded_integrity() {
+            # shellcheck disable=SC2016 # JavaScript template literals, not shell expansions
+            node -e '
+              const fs = require("node:fs");
+              const path = require("node:path");
+              const [tarball, file, name, version, commit] = process.argv.slice(1);
+              const manifest = JSON.parse(fs.readFileSync(file, "utf8"));
+              const entry = manifest.packages?.[name] ?? {};
+              const digest = require("node:crypto").createHash("sha512").update(fs.readFileSync(tarball)).digest();
+              const integrity = `sha512-${digest.toString("base64")}`;
+              const problems = [
+                manifest.version !== version && `the release manifest is for ${manifest.version}, not ${version}`,
+                manifest.commit !== commit && `the release manifest is from ${manifest.commit}, not ${commit}`,
+                entry.file !== path.basename(tarball) && `the release manifest names ${entry.file} for ${name}, not ${path.basename(tarball)}`,
+                entry.sha512 !== digest.toString("hex") && `${path.basename(tarball)} has another sha512 than the release manifest records`,
+                entry.integrity !== integrity && `the release manifest records integrity ${entry.integrity}, not ${integrity}`,
+              ].filter(Boolean);
+              if (problems.length > 0) {
+                console.error(`::error::${problems.join("; ")}. Nothing was published.`);
+                process.exit(1);
+              }
+              process.stdout.write(integrity);
+            ' "$1" "$2" "$3" "$4" "$5"
+          }
+
+          # Refuses <tarball> unless pacote, extracting it, finds it already published-ready as <name>@<version>
+          # from <commit> under <channel>. It never rewrites or repacks it.
+          check_tarball() {
+            local tarball=$1 name=$2 version=$3 commit=$4 channel=$5 work pacote status=0
+            pacote=${REPUBLISH_TEST_PACOTE:-$(npm root -g)/npm/node_modules/pacote}
+            work=$(mktemp -d)
+            # shellcheck disable=SC2016 # JavaScript template literals, not shell expansions
+            node -e '
+              const fs = require("node:fs");
+              const path = require("node:path");
+              const { isDeepStrictEqual } = require("node:util");
+              const [pacotePath, tarball, dir, name, version, commit, channel, keepText] = process.argv.slice(1);
+              const pacote = require(pacotePath);
+              const releasedTogether = ["@sealant/runtime-protocol", "@sealant/runtime-client"];
+              const run = async () => {
+                await pacote.extract(`file:${path.resolve(tarball)}`, dir);
+                const read = JSON.parse(fs.readFileSync(path.join(dir, "package.json"), "utf8"));
+                const normalized = {};
+                for (const field of JSON.parse(keepText)) if (field in read) normalized[field] = read[field];
+                if (read.publishConfig?.access !== undefined) normalized.publishConfig = { access: read.publishConfig.access };
+                const shape = channel === "next" ? /^\d+\.\d+\.\d+-next\.\d+$/ : /^\d+\.\d+\.\d+$/;
+                // A -next package depends on its siblings only as `npm:@sealant/<sibling>-next@<this version>`;
+                // anything else (and any alias at all outside the -next packages) is refused. Outside them, a
+                // package released together with this one is depended on at exactly this version.
+                const isNextPackage = /^@sealant\/[a-z0-9-]+-next$/.test(String(read.name));
+                const dependencyProblems = ["dependencies", "peerDependencies", "optionalDependencies"].flatMap(
+                  (field) =>
+                    Object.entries(read[field] ?? {}).flatMap(([dependency, spec]) => {
+                      const alias = String(spec).startsWith("npm:");
+                      if (!dependency.startsWith("@sealant/")) {
+                        return alias ? [`${dependency} is an alias (${spec})`] : [];
+                      }
+                      const expected = `npm:${dependency}-next@${version}`;
+                      if (isNextPackage) return spec === expected ? [] : [`${dependency}@${spec}, not ${expected}`];
+                      if (alias) return [`${dependency} is an alias (${spec})`];
+                      return releasedTogether.includes(dependency) && spec !== version ? [`${dependency}@${spec}, not ${version}`] : [];
+                    }),
+                );
+                const extra = Object.keys(read).filter((field) => !(field in normalized));
+                const npmrc = fs
+                  .readdirSync(dir, { recursive: true, withFileTypes: true })
+                  .filter((entry) => entry.name === ".npmrc")
+                  .map((entry) => path.relative(dir, path.join(entry.parentPath, entry.name)));
+                const problems = [
+                  channel === "next" && !isNextPackage && `${read.name} is not a -next package`,
+                  ...dependencyProblems,
+                  read.name !== name && `name ${read.name}, not ${name}`,
+                  read.version !== version && `version ${read.version}, not ${version}`,
+                  !shape.test(String(read.version)) && `${read.version} is not a ${channel} version`,
+                  read.gitHead !== commit && `gitHead ${read.gitHead}, not ${commit}`,
+                  fs.existsSync(path.join(dir, "binding.gyp")) && "a binding.gyp, which npm turns into an install script",
+                  extra.length > 0 && `not normalized: it keeps ${extra.join(", ")}`,
+                  extra.length === 0 && !isDeepStrictEqual(read.publishConfig, normalized.publishConfig) &&
+                    "not normalized: publishConfig holds more than access",
+                  npmrc.length > 0 && `not normalized: it holds ${npmrc.join(", ")}`,
+                ].filter(Boolean);
+                if (problems.length > 0) {
+                  console.error(`::error::${name}: ${problems.join("; ")}`);
+                  process.exit(1);
+                }
+              };
+              run().catch((error) => {
+                console.error(`::error::${name}: ${error.message}`);
+                process.exit(1);
+              });
+            ' "$pacote" "$tarball" "$work/package" "$name" "$version" "$commit" "$channel" "$KEEP_FIELDS" >&2 || status=$?
+            rm -rf "$work"
+            return "$status"
+          }
+
+          # The dist.integrity the registry serves for <name>@<version>, retried: a version just published can
+          # take a moment to read back. Nothing after the last try fails, never passes.
+          published_integrity() {
+            local attempt integrity
+            for attempt in 1 2 3 4 5 6; do
+              integrity=$(npm view "$1@$2" dist.integrity 2>/dev/null || true)
+              if [[ -n $integrity ]]; then
+                printf '%s\n' "$integrity"
+                return 0
+              fi
+              sleep $((attempt * ${REPUBLISH_TEST_WAIT:-5}))
+            done
+            echo "::error::The registry serves no dist.integrity for $1@$2." >&2
+            return 1
+          }
+
+          # <name>@<version> must be published with <integrity>, the tarball this run packed. Anything else
+          # is an incident: never republish over it.
+          verify_integrity() {
+            local served
+            served=$(published_integrity "$1" "$2")
+            if [[ $served != "$3" ]]; then
+              echo "::error::INCIDENT: $1@$2 is published with integrity $served, not $3, the tarball this run packed. Do not republish: deprecate $1@$2 and cut a new version (docs/runtime/integration.md, Stable releases)."
+              return 1
+            fi
+            echo "$1@$2 is published with the integrity this run packed."
+          }
+
+          # Publishes <tarball> as it is, as <name>@<version> from <commit> under `latest` with <integrity>;
+          # extra npm flags follow. A version already published from this commit is done once its integrity is
+          # checked; from another commit, refused.
+          publish_exact() {
+            local tarball=$1 name=$2 version=$3 commit=$4 integrity=$5 from
+            shift 5
+            from=$(published_from "$name" "$version")
+            if [[ -n $from ]]; then
+              if [[ $from != "$commit" ]]; then
+                echo "::error::$name@$version was published from $from, not $commit."
+                return 1
+              fi
+              echo "$name@$version is already published from this commit."
+              verify_integrity "$name" "$version" "$integrity"
+              return
+            fi
+            npm publish "$tarball" --tag latest --access public --ignore-scripts "$@"
+            verify_integrity "$name" "$version" "$integrity"
+          }
+
+          # The release: <tarballs> holds exactly the run's two tarballs of <version>, <release> exactly its
+          # release-manifest.json. Checks both, and both tarballs, moves to an empty directory, and publishes
+          # @sealant/runtime-protocol, then @sealant/runtime-client, which depends on it, from <commit>; extra
+          # npm flags follow. With --verify-only first (the version is the stable floor: a retry), nothing is
+          # republished and no dist-tag moves: each package npm holds must hold exactly this run's tarball. A
+          # package npm does not hold yet publishes only after an earlier one verified as this run's, which
+          # is what an attempt that stopped between the two packages leaves; npm holding neither means a
+          # marker was moved by hand, and nothing publishes.
+          publish_release() {
+            local mode=publish
+            if [[ $1 == --verify-only ]]; then
+              mode=verify
+              shift
+            fi
+            local tarballs=$1 release=$2 version=$3 commit=$4 name file integrity i held=0
+            shift 4
+            local -a names=(@sealant/runtime-protocol @sealant/runtime-client) files=() integrities=()
+            for name in "${names[@]}"; do
+              file=${name#@}
+              files+=("${file//\//-}-$version.tgz")
+            done
+            check_artifacts "$tarballs" "${files[@]}"
+            check_artifacts "$release" release-manifest.json
+            # Every npm command runs from an empty directory: no project .npmrc can reach it.
+            cd "$(mktemp -d)"
+            for i in "${!names[@]}"; do
+              integrity=$(recorded_integrity "$tarballs/${files[i]}" "$release/release-manifest.json" "${names[i]}" "$version" "$commit")
+              integrities+=("$integrity")
+              check_tarball "$tarballs/${files[i]}" "${names[i]}" "$version" "$commit" latest
+            done
+            for i in "${!names[@]}"; do
+              if [[ $mode == verify ]]; then
+                if [[ -n $(published_from "${names[i]}" "$version") ]]; then
+                  echo "${names[i]}@$version is the stable floor; a same-version retry publishes nothing."
+                  publish_exact "$tarballs/${files[i]}" "${names[i]}" "$version" "$commit" "${integrities[i]}"
+                  held=1
+                  continue
+                fi
+                if ((held == 0)); then
+                  echo "::error::$version is the stable floor, but npm does not hold ${names[i]}@$version: a marker was moved by hand. Nothing was published."
+                  return 1
+                fi
+                echo "${names[i]}@$version is not published yet: an earlier attempt stopped after the packages before it, so it publishes now."
+              fi
+              publish_exact "$tarballs/${files[i]}" "${names[i]}" "$version" "$commit" "${integrities[i]}" "$@"
+            done
+          }
+          # --- end republish ---
+
+          # Every marker is read before anything is published.
+          floor=$(stable_floor)
+          guard=$(stable_guard "$VERSION" "$floor")
+          echo "Stable floor: ${floor:-none}; $VERSION may $guard."
+          flags=()
+          if [[ $guard == retry ]]; then flags+=(--verify-only); fi
+          publish_release "${flags[@]}" "$GITHUB_WORKSPACE/npm" "$GITHUB_WORKSPACE/release" \
+            "$VERSION" "$GITHUB_SHA" --provenance
+          {
+            echo "## sealantd $VERSION on npm"
+            echo
+            echo "\`@sealant/runtime-protocol@$VERSION\`, \`@sealant/runtime-client@$VERSION\` on npm \`latest\`, from \`$GITHUB_SHA\`."
+          } >>"$GITHUB_STEP_SUMMARY"
