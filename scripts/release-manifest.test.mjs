@@ -187,6 +187,30 @@ const amd64 = imageManifest("amd64");
 const arm64 = imageManifest("arm64");
 const plainChildren = [childOf(amd64, "linux", "amd64"), childOf(arm64, "linux", "arm64")];
 
+/** `descriptor` annotated as BuildKit annotates an attestation, whatever its platform says. */
+const annotated = (descriptor) => ({
+  ...descriptor,
+  annotations: {
+    "vnd.docker.reference.digest": descriptor.digest,
+    "vnd.docker.reference.type": "attestation-manifest",
+  },
+});
+/** Astra's round 2: an attestation-annotated linux/amd64 descriptor of the arm64 build. */
+const ANNOTATED_AMD64 = annotated(childOf(arm64, "linux", "amd64"));
+/** Each way an annotated descriptor can claim a runnable platform, and where it sits. */
+const annotatedRunnable = () => [
+  ["Astra's annotated amd64 descriptor first", [ANNOTATED_AMD64, ...plainChildren]],
+  ["the same descriptor last", [...plainChildren, ANNOTATED_AMD64]],
+  [
+    "an annotated descriptor of a runnable variant",
+    [...plainChildren, annotated(childOf(imageManifest("arm64 v8"), "linux", "arm64", "v8"))],
+  ],
+  [
+    "an annotated descriptor of another digest",
+    [annotated(childOf(imageManifest("other amd64"), "linux", "amd64")), ...plainChildren],
+  ],
+];
+
 /** A source as merge names it: the build job's arch, and its manifest (or attested index). */
 const built = (arch, document) => ({ arch, ...document });
 const builds = [built("amd64", amd64), built("arm64", arm64)];
@@ -254,8 +278,13 @@ test("each arch's platform must name that arch's build: a swap, a duplicate, a w
     /has 2 linux\/amd64 entries/,
   );
   refused(
-    [...plainChildren, { ...plainChildren[1], digest: amd64.digest }],
+    [...plainChildren, childOf(imageManifest("another arm64"), "linux", "arm64")],
     /has 2 linux\/arm64 entries/,
+  );
+  // Counted per descriptor, never through a set: a digest listed twice is refused.
+  refused(
+    [...plainChildren, { ...plainChildren[1], digest: amd64.digest }],
+    new RegExp(`lists ${amd64.digest} 2 times`),
   );
   refused([plainChildren[0]], /has 0 linux\/arm64 entries \(none\), not one/);
   refused(
@@ -265,6 +294,20 @@ test("each arch's platform must name that arch's build: a swap, a duplicate, a w
   refused([childOf(amd64, "linux", "amd64", "v2"), plainChildren[1]], /holds linux\/amd64\/v2 /);
   refused([childOf(amd64, "windows", "amd64"), plainChildren[1]], /holds windows\/amd64 /);
   refused([{ ...plainChildren[0], platform: undefined }, plainChildren[1]], /holds no platform /);
+  // An attestation annotation never takes a descriptor out of its runnable platform: containerd
+  // ignores the annotation and selects the first match.
+  for (const [label, children] of annotatedRunnable())
+    refused(
+      children,
+      /annotated as an attestation for linux\/(amd64|arm64\/v8), a platform a consumer can select/,
+    );
+  // A real attestation, annotated and for unknown/unknown, is still one.
+  const attested = indexOf([...plainChildren, attestationOf(amd64), attestationOf(arm64)]);
+  assert.throws(
+    () => checkIndex(created(attested), attested.bytes, builds),
+    /from no source/,
+    "excluded from the platforms, the attestations are only children no plain source names",
+  );
   // One source per arch, no more and no fewer.
   for (const sources of [[builds[0]], [builds[0], built("amd64", arm64)], [...builds, builds[1]]])
     refused(plainChildren, /exactly one source per arch/, sources);
@@ -308,6 +351,16 @@ test("select resolves an arch through the index as a consumer would, and refuses
   ]) {
     const bad = indexOf(children);
     assert.throws(() => selectPlatform(bad.bytes, bad.digest, "amd64"), problem);
+  }
+  // An annotated runnable descriptor, first or last, is refused rather than skipped or selected.
+  for (const [label, children] of annotatedRunnable()) {
+    const bad = indexOf(children);
+    for (const arch of ARCHES)
+      assert.throws(
+        () => selectPlatform(bad.bytes, bad.digest, arch),
+        /annotated as an attestation/,
+        `${label} ${arch}`,
+      );
   }
   assert.throws(() => selectPlatform(index.bytes, swapped.digest, "amd64"), /does not hash to/);
   assert.throws(() => selectPlatform(amd64.bytes, amd64.digest, "amd64"), /not a multi-arch index/);

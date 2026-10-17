@@ -482,6 +482,17 @@ jobs:
       cancel-in-progress: false
       queue: max
     steps:
+      # Only the manifest reader, which binds the index's platforms (scripts/release-manifest.mjs).
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: scripts/release-manifest.mjs
+          sparse-checkout-cone-mode: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          # setup-node v6 restores a package-manager cache by itself when packageManager names npm.
+          package-manager-cache: false
+          node-version: 24
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: release-manifest
@@ -491,6 +502,7 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      # The platforms are bound again on the exact index this job tags, before anything is written.
       # The tag is read before it is written, and the read after the write decides: a create that
       # reports an error but left this run's digest is done, any other digest is refused, and a tag
       # still unreadable fails.
@@ -539,6 +551,19 @@ jobs:
             echo "::error::The release manifest records no index digest for sealantd."
             exit 1
           fi
+          # The index read by that digest must map each arch's platform, once and in a variant that
+          # arch's build has, to the build digest the manifest records for it: the digest identity
+          # required each arch's build artifact to be. The manifest outlives the one-day artifacts,
+          # so a re-run of this job can still check it.
+          docker buildx imagetools inspect "$REPOSITORY@$index" --raw >"$RUNNER_TEMP/index.json"
+          for arch in amd64 arm64; do
+            build=$(node "$GITHUB_WORKSPACE/scripts/release-manifest.mjs" digest "$MANIFEST" sealantd "$arch")
+            mapped=$(node "$GITHUB_WORKSPACE/scripts/release-manifest.mjs" select "$RUNNER_TEMP/index.json" "$index" "$arch")
+            if [[ $mapped != "$build" ]]; then
+              echo "::error::The index $index maps linux/$arch to $mapped, not $build, the $arch build. Nothing was written."
+              exit 1
+            fi
+          done
           current=$(read_tag "$ref")
           if [[ $current == "$index" ]]; then
             echo "$ref is already this run's $index."

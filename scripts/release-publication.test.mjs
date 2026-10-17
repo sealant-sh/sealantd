@@ -70,6 +70,36 @@ const indexDocument = (children) => {
   );
   return { bytes, digest: `sha256:${createHash("sha256").update(bytes).digest("hex")}` };
 };
+/** `descriptor` annotated as BuildKit annotates an attestation, whatever its platform says. */
+const annotated = (descriptor) => ({
+  ...descriptor,
+  annotations: {
+    "vnd.docker.reference.digest": descriptor.digest,
+    "vnd.docker.reference.type": "attestation-manifest",
+  },
+});
+/** A real BuildKit attestation of `digest`: annotated, and for unknown/unknown. */
+const attestation = (digest) =>
+  annotated({
+    ...child(
+      `sha256:${createHash("sha256").update(`attestation of ${digest}`).digest("hex")}`,
+      "unknown",
+    ),
+    platform: { os: "unknown", architecture: "unknown" },
+  });
+/** Astra's round 2, and its variants: an attestation annotation on a runnable platform. */
+const annotatedRunnable = () => {
+  const astra = annotated(child(PLATFORMS.arm64, "amd64"));
+  const plain = [child(PLATFORMS.amd64, "amd64"), child(PLATFORMS.arm64, "arm64")];
+  return [
+    ["Astra's annotated amd64 descriptor first", indexDocument([astra, ...plain])],
+    ["the same descriptor last", indexDocument([...plain, astra])],
+    [
+      "an annotated descriptor of a runnable variant",
+      indexDocument([...plain, annotated(child(`sha256:${"7".repeat(64)}`, "arm64", "v8"))]),
+    ],
+  ];
+};
 /** The index merge staged: each arch's platform names that arch's build. */
 const STAGED = indexDocument([child(PLATFORMS.amd64, "amd64"), child(PLATFORMS.arm64, "arm64")]);
 const INDEX = STAGED.digest;
@@ -179,13 +209,15 @@ process.exit(args[2] === "inspect" && process.env.FAIL_INSPECT ? 74 : 0);
  * reason other than not found, and `onCreate` says what a create does: `land` (the tag gets the
  * source's digest), `other` (another digest lands), `vanish` (the tag becomes unreadable), with an
  * optional exit code. `answers` replaces a reference's read with exact stdout, stderr and exit
- * (only its first read, with `once`).
+ * (only its first read, with `once`). The registry serves `index` (the staged index by default)
+ * by its digest, which the manifest records as the run's index.
  */
 const finalize = (
   t,
-  { tags = {}, unreadable = [], onCreate, manifest = {}, answers = {} } = {},
+  { tags = {}, unreadable = [], onCreate, manifest = {}, answers = {}, index = STAGED } = {},
 ) => {
   const directory = scratch(t, "sealantd-finalize-");
+  writeFileSync(path.join(directory, "staged-index"), index.bytes);
   const bin = path.join(directory, "bin");
   mkdirSync(bin);
   const calls = path.join(directory, "calls.jsonl");
@@ -203,6 +235,11 @@ const args = process.argv.slice(2);
 appendFileSync(${JSON.stringify(calls)}, JSON.stringify(args) + "\\n");
 const registry = JSON.parse(readFileSync(${JSON.stringify(state)}, "utf8"));
 const save = () => writeFileSync(${JSON.stringify(state)}, JSON.stringify(registry));
+if (args.slice(0, 3).join(" ") === "buildx imagetools inspect" && args[4] === "--raw") {
+  if (args[3] !== ${JSON.stringify(`${REPOSITORY}@`)} + ${JSON.stringify(index.digest)}) { console.error("ERROR: " + args[3] + ": not found"); process.exit(1); }
+  process.stdout.write(readFileSync(${JSON.stringify(path.join(directory, "staged-index"))}));
+  process.exit(0);
+}
 if (args.slice(0, 3).join(" ") === "buildx imagetools inspect" && args[4] === "--format") {
   const ref = args[3];
   const answer = registry.answers[ref];
@@ -237,10 +274,17 @@ process.exit(79);
   );
   chmodSync(path.join(bin, "docker"), 0o755);
   const file = path.join(directory, "release-manifest.json");
-  writeFileSync(file, manifestJson("1.2.3", manifest));
+  writeFileSync(
+    file,
+    manifestJson("1.2.3", {
+      images: { sealantd: { index: index.digest, platforms: PLATFORMS } },
+      ...manifest,
+    }),
+  );
   const result = bashStep(stepRun("finalize-images", "Publish the checked index as its version"), {
     env: {
       PATH: `${bin}:${process.env.PATH}`,
+      GITHUB_WORKSPACE: root,
       RUNNER_TEMP: directory,
       GITHUB_SHA: COMMIT,
       GITHUB_STEP_SUMMARY: path.join(directory, "summary.md"),
@@ -265,11 +309,91 @@ test("finalize reads :<version>, then creates it from the checked index when abs
   const result = finalize(t);
   assert.equal(result.status, 0, result.output);
   assert.deepEqual(result.calls, [
+    ["buildx", "imagetools", "inspect", `${REPOSITORY}@${INDEX}`, "--raw"],
     ["buildx", "imagetools", "inspect", FINAL, "--format", "{{json .Manifest}}"],
     CREATE,
     ["buildx", "imagetools", "inspect", FINAL, "--format", "{{json .Manifest}}"],
   ]);
   assert.deepEqual(result.registry.tags, { [FINAL]: INDEX });
+});
+
+test("finalize binds the index's platforms again, and writes nothing for a swapped, duplicated or wrong-variant one", (t) => {
+  // Each reaches finalize as if checkIndex and identity had been stubbed to pass: the manifest
+  // records the bad index, and nothing before this step looked at it.
+  for (const [label, index, problem] of [
+    [
+      "Astra's swapped labels",
+      indexDocument([child(PLATFORMS.amd64, "arm64"), child(PLATFORMS.arm64, "amd64")]),
+      new RegExp(`maps linux/amd64 to ${PLATFORMS.arm64}, not ${PLATFORMS.amd64}, the amd64 build`),
+    ],
+    [
+      "a duplicated platform",
+      indexDocument([
+        child(PLATFORMS.amd64, "amd64"),
+        child(PLATFORMS.arm64, "arm64"),
+        child(FOREIGN, "amd64"),
+      ]),
+      /has 2 linux\/amd64 entries, not one/,
+    ],
+    [
+      "a descriptor of the wrong variant",
+      indexDocument([child(PLATFORMS.amd64, "amd64"), child(PLATFORMS.arm64, "arm64", "v7")]),
+      /holds linux\/arm64\/v7/,
+    ],
+    [
+      "another build under one platform",
+      indexDocument([child(FOREIGN, "amd64"), child(PLATFORMS.arm64, "arm64")]),
+      new RegExp(`maps linux/amd64 to ${FOREIGN}, not ${PLATFORMS.amd64}`),
+    ],
+    [
+      "another build under arm64 alone",
+      indexDocument([child(PLATFORMS.amd64, "amd64"), child(FOREIGN, "arm64")]),
+      new RegExp(`maps linux/arm64 to ${FOREIGN}, not ${PLATFORMS.arm64}`),
+    ],
+  ]) {
+    const result = finalize(t, { index });
+    assert.equal(result.status, 1, `${label}: ${result.output}`);
+    assert.match(result.output, problem, label);
+    // Read, never written: not even :<version> is read before the binding passes.
+    assert.deepEqual(
+      result.calls,
+      [["buildx", "imagetools", "inspect", `${REPOSITORY}@${index.digest}`, "--raw"]],
+      label,
+    );
+    assert.deepEqual(result.registry.tags, {}, label);
+  }
+  // An index the registry cannot serve by the recorded digest writes nothing either.
+  const unserved = finalize(t, {
+    manifest: { images: { sealantd: { index: FOREIGN, platforms: PLATFORMS } } },
+  });
+  assert.equal(unserved.status, 1);
+  assert.deepEqual(creates(unserved), []);
+  // Astra's round 2: an attestation annotation on a runnable platform, first or last or a v8.
+  for (const [label, index] of annotatedRunnable()) {
+    const result = finalize(t, { index });
+    assert.equal(result.status, 1, `${label}: ${result.output}`);
+    assert.match(result.output, /annotated as an attestation for linux\//, label);
+    assert.deepEqual(creates(result), [], label);
+    assert.deepEqual(result.registry.tags, {}, label);
+  }
+  // A real BuildKit index, with its unknown/unknown attestations, is bound and tagged.
+  const attested = indexDocument([
+    child(PLATFORMS.amd64, "amd64"),
+    attestation(PLATFORMS.amd64),
+    child(PLATFORMS.arm64, "arm64"),
+    attestation(PLATFORMS.arm64),
+  ]);
+  const withAttestations = finalize(t, { index: attested });
+  assert.equal(withAttestations.status, 0, withAttestations.output);
+  assert.deepEqual(withAttestations.registry.tags, { [FINAL]: attested.digest });
+  // An arm64 build BuildKit labelled v8 is bound and tagged.
+  const v8 = indexDocument([
+    child(PLATFORMS.amd64, "amd64"),
+    child(PLATFORMS.arm64, "arm64", "v8"),
+  ]);
+  const tagged = finalize(t, { index: v8 });
+  assert.equal(tagged.status, 0, tagged.output);
+  assert.deepEqual(tagged.registry.tags, { [FINAL]: v8.digest });
 });
 
 test("finalize is done when :<version> already names this run's index: a rerun of failed jobs", (t) => {
@@ -539,7 +663,7 @@ test("identity resolves its arch through the index, and refuses an index that ma
       {
         index: indexDocument([
           child(PLATFORMS.amd64, "amd64"),
-          child(PLATFORMS.arm64, "amd64"),
+          child(FOREIGN, "amd64"),
           child(PLATFORMS.arm64, "arm64"),
         ]),
       },
@@ -573,6 +697,28 @@ test("identity resolves its arch through the index, and refuses an index that ma
   ]);
   const resolved = identity(t, { arch: "arm64", index: v8 });
   assert.equal(resolved.status, 0, resolved.output);
+  // An attestation annotation never hides a runnable descriptor from the binding.
+  for (const [label, index] of annotatedRunnable())
+    for (const arch of ["amd64", "arm64"]) {
+      const result = identity(t, { arch, index });
+      assert.equal(result.status, 1, `${label} ${arch}: ${result.output}`);
+      assert.match(result.output, /annotated as an attestation for linux\//, `${label} ${arch}`);
+      assert.ok(
+        result.calls.every(([command]) => command !== "pull"),
+        `${label} pulls nothing`,
+      );
+    }
+  // A real BuildKit index, its attestations annotated and for unknown/unknown, resolves.
+  const attested = indexDocument([
+    child(PLATFORMS.amd64, "amd64"),
+    attestation(PLATFORMS.amd64),
+    child(PLATFORMS.arm64, "arm64"),
+    attestation(PLATFORMS.arm64),
+  ]);
+  for (const arch of ["amd64", "arm64"]) {
+    const result = identity(t, { arch, index: attested });
+    assert.equal(result.status, 0, `${arch}: ${result.output}`);
+  }
 });
 
 test("identity refuses a wrong image ID, label, platform or --version, naming what it saw", (t) => {

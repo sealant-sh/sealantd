@@ -166,7 +166,9 @@ A `vX.Y.Z` tag runs `.github/workflows/release.yml` on GitHub-hosted runners:
    commit's `Cargo.toml` says. The workspace version there is `0.0.0`, which the release flow does
    not stamp, so today the daemon reports `sealantd 0.0.0` and the version label is what names the
    release; a `Cargo.toml` that says any version but `0.0.0` or this release's is refused.
-4. `finalize-images` writes `:X.Y.Z` from the checked index, under the lock below. It reads the tag
+4. `finalize-images` writes `:X.Y.Z` from the checked index, under the lock below. It first reads
+   that index by its digest and binds its platforms again, as `merge` and `identity` did: each
+   arch's platform must map to the build digest the manifest records for it. It reads the tag
    first: absent only when the registry answers exactly `ERROR: <ref>: not found`, already this
    run's index is done, any other digest is refused because the version is spent. After a create
    it reads the tag again, and that read decides.

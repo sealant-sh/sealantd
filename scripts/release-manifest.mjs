@@ -129,10 +129,18 @@ export function buildManifest({ version, commit, digests, indexes }) {
 
 const sha256 = (buffer) => `sha256:${createHash("sha256").update(buffer).digest("hex")}`;
 
-/** An entry BuildKit adds beside each platform manifest of an attested build. */
+/** Annotated as BuildKit annotates the attestation it adds beside a platform manifest. */
+const annotatedAttestation = (descriptor) =>
+  descriptor.annotations?.["vnd.docker.reference.type"] === "attestation-manifest";
+/**
+ * An attestation, which no platform resolution selects: annotated as one, and for no runnable
+ * platform (BuildKit writes unknown/unknown). The annotation alone excludes nothing: containerd's
+ * platform resolver does not read it, and takes the first descriptor whose platform matches.
+ */
 const isAttestation = (descriptor) =>
-  descriptor.annotations?.["vnd.docker.reference.type"] === "attestation-manifest" ||
-  (descriptor.platform?.os === "unknown" && descriptor.platform?.architecture === "unknown");
+  annotatedAttestation(descriptor) &&
+  descriptor.platform?.os === "unknown" &&
+  descriptor.platform?.architecture === "unknown";
 
 /** A registry document read by digest (`imagetools inspect …@<digest> --raw`): it must hash to it. */
 function document(bytes, digest, what) {
@@ -148,8 +156,24 @@ function document(bytes, digest, what) {
 }
 
 /** The index's runnable descriptor for each arch, refusing any other platform and any duplicate. */
+/**
+ * Every descriptor that is not an attestation counts toward a platform, whatever its annotations:
+ * an attestation annotation on a descriptor for a runnable platform is refused, any platform but
+ * the builds' is refused, and so is a digest the index lists twice. Each arch's entries come back in
+ * the index's order, so the first is the one containerd would select.
+ */
 function platformEntries(index, digest) {
   const entries = Object.fromEntries(ARCHES.map((arch) => [arch, []]));
+  for (const descriptor of index.manifests)
+    ensure(
+      isAttestation(descriptor) || !annotatedAttestation(descriptor),
+      `The index ${digest} has ${descriptor.digest} annotated as an attestation for ${platformName(descriptor.platform)}, a platform a consumer can select`,
+    );
+  const counted = new Map();
+  for (const descriptor of index.manifests)
+    counted.set(descriptor.digest, (counted.get(descriptor.digest) ?? 0) + 1);
+  for (const [listed, times] of counted)
+    ensure(times === 1, `The index ${digest} lists ${listed} ${times} times`);
   for (const descriptor of index.manifests.filter((entry) => !isAttestation(entry))) {
     const arch = archOf(descriptor.platform);
     ensure(
@@ -169,7 +193,9 @@ function platformEntries(index, digest) {
  * attested build) whose one runnable child is the build. The index must map each arch's platform to
  * that arch's build and to nothing else, hold every source's children (attestations too), and hold
  * nothing more. A platform label swapped between two descriptors, a platform listed twice or
- * missing, and a variant the build does not have are each refused.
+ * missing, a variant the build does not have, a digest listed twice, and an attestation annotation
+ * on a descriptor for a runnable platform are each refused: only an annotated unknown/unknown
+ * descriptor is an attestation (isAttestation).
  */
 export function checkIndex(metadata, indexBytes, sources) {
   const reported = [
@@ -189,6 +215,7 @@ export function checkIndex(metadata, indexBytes, sources) {
     `check-index needs exactly one source per arch (${ARCHES.join(", ")}), not ${sources.map(({ arch }) => arch).join(", ") || "none"}`,
   );
   const entries = platformEntries(index, digest);
+  // platformEntries refused any digest listed twice, so each descriptor is counted once here.
   const children = new Set(index.manifests.map((descriptor) => descriptor.digest));
   const expected = new Set();
   for (const { arch, digest: source, bytes } of sources) {
@@ -228,7 +255,9 @@ export function checkIndex(metadata, indexBytes, sources) {
 
 /**
  * The digest the index <bytes>, read by <digest>, maps <arch>'s platform to: what a consumer pulling
- * the index for that platform gets. Exactly one runnable descriptor may name the platform.
+ * the index for that platform gets. containerd takes the first descriptor whose platform matches,
+ * annotations aside; exactly one may match (platformEntries refuses the rest), so the first is the
+ * only one and it is the one the binding checked.
  */
 export function selectPlatform(bytes, digest, arch) {
   ensure(ARCHES.includes(arch), `No build for ${arch}`);
