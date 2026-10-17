@@ -8,7 +8,11 @@
 //! root: root only unpacks their archives into a directory of its own outside every home, and
 //! every read and write inside the home runs as the person ([`Home::as_owner`]).
 
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+use std::ffi::OsStr;
+use std::fs::File;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+
+use nix::fcntl::OFlag;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -140,6 +144,39 @@ impl Home {
         }
     }
 
+    /// The home opened for one request's copies ([`MadeDirs::open`]), as its owner.
+    fn made_dirs(&self) -> Result<MadeDirs, BootError> {
+        let uid = self
+            .run_as
+            .as_ref()
+            .map_or_else(|| nix::unistd::geteuid().as_raw(), |user| user.uid);
+        self.as_owner(|| MadeDirs::open(&self.dir, uid))
+    }
+
+    /// Once a request's copies are done, finished or failed: every directory they made gets its
+    /// mode ([`MadeDirs::apply`]); one left at its fresh mode fails the request, named, with
+    /// the request's own error when it had one.
+    fn finish_made_dirs<T>(
+        &self,
+        result: Result<T, BootError>,
+        mut made: MadeDirs,
+    ) -> Result<T, BootError> {
+        let left = self.as_owner(|| Ok(made.apply()))?;
+        if left.is_empty() {
+            return result;
+        }
+        let left = left
+            .iter()
+            .map(|(rel, why)| format!("{} ({why})", self.dir.join(rel).display()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let left = format!("left at the mode a new directory takes: {left}");
+        Err(match result {
+            Ok(_) => BootError::Dotfiles(left),
+            Err(error) => BootError::Dotfiles(format!("{error}; and {left}")),
+        })
+    }
+
     /// Where the dotfiles repo is checked out.
     fn checkout_dir(&self) -> PathBuf {
         self.dir.join(".local/share/chezmoi")
@@ -231,7 +268,8 @@ pub(crate) fn apply_repository(
     }
     clone_result?;
 
-    apply_tree(
+    let mut made = home.made_dirs()?;
+    let applied = apply_tree(
         &checkout,
         config.manager,
         config.target,
@@ -239,10 +277,16 @@ pub(crate) fn apply_repository(
         &config.bootstrap_command,
         home,
         mode,
-    )
+        &mut made,
+    );
+    home.finish_made_dirs(applied, made)
 }
 
 /// Apply one checked-out/extracted dotfiles tree: detect the manager, apply, run the bootstrap.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one tree of a request: the manifest entry's fields, the home, and the request's made directories"
+)]
 fn apply_tree(
     checkout: &Path,
     manager: DotfilesManager,
@@ -251,6 +295,7 @@ fn apply_tree(
     bootstrap_command: &str,
     home: &Home,
     mode: BootstrapMode,
+    made: &mut MadeDirs,
 ) -> Result<Option<PendingBootstrap>, BootError> {
     let resolution = home.as_owner(|| Ok(detect_manager(manager, checkout)))?;
     tracing::info!(
@@ -262,10 +307,11 @@ fn apply_tree(
     let target_dir = home.target_dir(target);
     match resolution.manager {
         ResolvedManager::Chezmoi => apply_chezmoi(checkout, home)?,
-        ResolvedManager::Stow => apply_stow(checkout, &target_dir, home)?,
+        ResolvedManager::Stow => apply_stow(checkout, &target_dir, home, made)?,
         ResolvedManager::Copy => home.as_owner(|| {
             mkdir_all(&target_dir)?;
-            copy_tree(checkout, &target_dir)
+            let (target, rel) = made.target(&target_dir)?;
+            copy_tree(checkout, &target, &target_dir, &rel, made)
         })?,
     }
 
@@ -369,27 +415,43 @@ fn apply_archives_staged_in(
     mode: BootstrapMode,
     staging_root: &Path,
 ) -> Result<Vec<PendingBootstrap>, BootError> {
-    let mut pending = Vec::new();
     let manifest_path = dir.join("manifest.json");
     let raw = std::fs::read_to_string(&manifest_path)
         .map_err(|e| BootError::io_path("read", &manifest_path, e))?;
     let manifest: ArchiveManifest = serde_json::from_str(&raw)
         .map_err(|e| BootError::Dotfiles(format!("invalid dotfiles archive manifest: {e}")))?;
-    let staging = match &home.run_as {
-        Some(_) if !manifest.archives.is_empty() => Some(RootStaging::create(staging_root)?),
-        _ => None,
-    };
-
-    for (index, entry) in manifest.archives.iter().enumerate() {
+    for entry in &manifest.archives {
         if entry.file.contains('/') || entry.file.contains("..") {
             return Err(BootError::Dotfiles(format!(
                 "dotfiles archive file name {:?} must be a plain basename",
                 entry.file
             )));
         }
+    }
+    let staging = match &home.run_as {
+        Some(_) if !manifest.archives.is_empty() => Some(RootStaging::create(staging_root)?),
+        _ => None,
+    };
+
+    let mut made = home.made_dirs()?;
+    let applied = apply_each_archive(dir, home, mode, &staging, &manifest, &mut made);
+    home.finish_made_dirs(applied, made)
+}
+
+/// [`apply_archives_staged_in`]'s archives, one after the other, into `made`.
+fn apply_each_archive(
+    dir: &Path,
+    home: &Home,
+    mode: BootstrapMode,
+    staging: &Option<RootStaging>,
+    manifest: &ArchiveManifest,
+    made: &mut MadeDirs,
+) -> Result<Vec<PendingBootstrap>, BootError> {
+    let mut pending = Vec::new();
+    for (index, entry) in manifest.archives.iter().enumerate() {
         let archive = dir.join(&entry.file);
         let tree = home.archive_staging_dir().join(index.to_string());
-        match &staging {
+        match staging {
             None => {
                 if tree.exists() {
                     std::fs::remove_dir_all(&tree)
@@ -423,6 +485,7 @@ fn apply_archives_staged_in(
                 .unwrap_or(DEFAULT_DOTFILES_BOOTSTRAP_COMMAND),
             home,
             mode,
+            made,
         )?);
     }
     Ok(pending)
@@ -1207,7 +1270,12 @@ fn apply_chezmoi(checkout: &Path, home: &Home) -> Result<(), BootError> {
 /// so a package sharing a directory with one (`.config`) is linked inside a real directory, and a
 /// path both provide fails the apply with stow's own conflict error instead of one side winning
 /// quietly. Loose top-level files (`README.md`) are not packages and are left out, as stow does.
-fn apply_stow(checkout: &Path, target_dir: &Path, home: &Home) -> Result<(), BootError> {
+fn apply_stow(
+    checkout: &Path,
+    target_dir: &Path,
+    home: &Home,
+    made: &mut MadeDirs,
+) -> Result<(), BootError> {
     let top = home.as_owner(|| {
         mkdir_all(target_dir)?;
         let top =
@@ -1217,8 +1285,16 @@ fn apply_stow(checkout: &Path, target_dir: &Path, home: &Home) -> Result<(), Boo
                 entries = %name_list(&top.home_entries),
                 "stow: top-level dot entries are not packages; copying them into the target"
             );
+            let (target, rel) = made.target(target_dir)?;
             for name in &top.home_entries {
-                copy_entry(&checkout.join(name), &target_dir.join(name))?;
+                copy_entry(
+                    &checkout.join(name),
+                    &target,
+                    OsStr::new(name),
+                    &target_dir.join(name),
+                    &rel.join(name),
+                    made,
+                )?;
             }
         }
         Ok(top)
@@ -1246,42 +1322,238 @@ fn apply_stow(checkout: &Path, target_dir: &Path, home: &Home) -> Result<(), Boo
     Ok(())
 }
 
-/// Recursively copy the dotfiles tree into the target, skipping the `.git` directory. A
-/// person's copy runs as them ([`Home::as_owner`]), so everything it writes is theirs.
-fn copy_tree(src: &Path, dst: &Path) -> Result<(), BootError> {
-    let entries = std::fs::read_dir(src).map_err(|e| BootError::io_path("read_dir", src, e))?;
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        if name == ".git" {
-            continue;
+/// `path` opened as a directory, never a link (`O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC`), with
+/// `flags` (`O_PATH` to walk through it, `O_RDONLY` to read it or set its mode).
+fn open_dir(path: &Path, flags: i32) -> std::io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    // `read`: the access mode std insists on; under `O_PATH` the kernel ignores it.
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(flags | nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
+        .open(path)
+}
+
+/// `name` under `dir`, opened the same way (`openat`).
+fn open_dir_at(dir: &File, name: &OsStr, flags: OFlag) -> nix::Result<File> {
+    let flags = flags | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
+    nix::fcntl::openat(dir, name, flags, nix::sys::stat::Mode::empty()).map(File::from)
+}
+
+/// One directory a copy made in the home: where (relative to the home), which inode, and the
+/// mode it gets once the request's every archive is in.
+struct MadeDir {
+    rel: PathBuf,
+    dev: u64,
+    ino: u64,
+    mode: u32,
+}
+
+/// The directories one request's copies make in a home, and the home root they are reached
+/// from: opened once, as the home's owner, never a link (`O_PATH`), and the owner's.
+///
+/// A directory the copy makes keeps the mode `mkdir` gave it, the fresh mode (`0o777` under the
+/// umask and under any default ACL on its parent), until the whole request is applied: a later
+/// archive of the request may write into it, and a `0555` directory would refuse that. Then
+/// [`MadeDirs::apply`] gives each one its mode, deepest first: the tree's mode and the fresh
+/// mode intersected, without set-id and sticky bits. That is never looser than the fresh mode,
+/// which is what the copy left before, under any umask or ACL. A directory that was there
+/// already is walked through (`O_PATH`) and never changed, its mode and bits included: a tree
+/// does not get to change a directory by merging files into it, and one the person can write
+/// through their group, or search but not read, takes the files as before.
+///
+/// Every `chmod` is an `fchmod` on a descriptor of the directory the copy made: at creation the
+/// one `openat` gave right after `mkdirat`, checked to be the owner's and empty; at the end the
+/// one a fresh walk from the home root gives, every component opened `O_NOFOLLOW`, checked to
+/// be the inode recorded at creation. A check that fails fails the request, naming the
+/// directory; nothing falls back to a pathname. What stays: a process of the same person can
+/// still, between `mkdirat` and `openat`, swap an empty directory of theirs into the name. That
+/// one then takes the tree's mode under the fresh mode, as the made one would have.
+struct MadeDirs {
+    root: File,
+    home: PathBuf,
+    uid: u32,
+    made: Vec<MadeDir>,
+}
+
+impl MadeDirs {
+    /// `home` opened for a request's copies, as its owner (`uid`: the person's, or the daemon's
+    /// own for a root home).
+    fn open(home: &Path, uid: u32) -> Result<Self, BootError> {
+        let root =
+            open_dir(home, nix::libc::O_PATH).map_err(|e| BootError::io_path("open", home, e))?;
+        let owner = root
+            .metadata()
+            .map_err(|e| BootError::io_path("stat", home, e))?
+            .uid();
+        if owner != uid {
+            return Err(BootError::Dotfiles(format!(
+                "{} is owned by uid {owner}, not uid {uid}",
+                home.display()
+            )));
         }
-        copy_entry(&entry.path(), &dst.join(&name))?;
+        Ok(Self {
+            root,
+            home: home.to_path_buf(),
+            uid,
+            made: Vec::new(),
+        })
+    }
+
+    /// `target` in the home (the home itself, or `.config`), opened to copy into (`O_PATH`),
+    /// and its path relative to the home.
+    fn target(&self, target: &Path) -> Result<(File, PathBuf), BootError> {
+        let rel = target
+            .strip_prefix(&self.home)
+            .map_err(|_| {
+                BootError::Dotfiles(format!(
+                    "{} is not in {}",
+                    target.display(),
+                    self.home.display()
+                ))
+            })?
+            .to_path_buf();
+        let mut dir = self
+            .root
+            .try_clone()
+            .map_err(|e| BootError::io_path("dup", &self.home, e))?;
+        let mut at = self.home.clone();
+        for component in rel.components() {
+            at.push(component);
+            dir = open_dir_at(&dir, component.as_os_str(), OFlag::O_PATH)
+                .map_err(|e| BootError::io_path("reach directory", &at, e.into()))?;
+        }
+        Ok((dir, rel))
+    }
+
+    /// Give every directory the request made its mode, deepest first. The directories left at
+    /// their fresh mode, with why, by path relative to the home: one the walk found replaced,
+    /// or one the `chmod` of failed.
+    fn apply(&mut self) -> Vec<(PathBuf, String)> {
+        let mut made = std::mem::take(&mut self.made);
+        made.sort_by_key(|dir| std::cmp::Reverse(dir.rel.components().count()));
+        let mut left = Vec::new();
+        for dir in made {
+            hold_for_test("final", &dir.rel);
+            if let Err(why) = self.set_mode(&dir) {
+                left.push((dir.rel, why));
+            }
+        }
+        left
+    }
+
+    fn set_mode(&self, dir: &MadeDir) -> Result<(), String> {
+        let mut components = dir.rel.components().peekable();
+        let mut at = self.root.try_clone().map_err(|e| format!("dup: {e}"))?;
+        while let Some(component) = components.next() {
+            let flags = if components.peek().is_some() {
+                OFlag::O_PATH
+            } else {
+                OFlag::O_RDONLY
+            };
+            at =
+                open_dir_at(&at, component.as_os_str(), flags).map_err(|e| format!("open: {e}"))?;
+        }
+        let meta = at.metadata().map_err(|e| format!("stat: {e}"))?;
+        if (meta.dev(), meta.ino()) != (dir.dev, dir.ino) {
+            return Err("replaced since the copy made it".to_owned());
+        }
+        at.set_permissions(std::fs::Permissions::from_mode(dir.mode))
+            .map_err(|e| format!("chmod: {e}"))
+    }
+}
+
+/// Recursively copy the dotfiles tree into `dst` (the directory `dst_path` names, opened, at
+/// `rel` in the home), skipping the `.git` directory. A person's copy runs as them
+/// ([`Home::as_owner`]), so everything it writes is theirs. The copy holds one descriptor per
+/// level of the tree, the directory it writes into: the source's entries are read into a list
+/// before the walk goes down, so a deep tree costs what it cost before, when that list was the
+/// open `ReadDir` itself.
+fn copy_tree(
+    src: &Path,
+    dst: &File,
+    dst_path: &Path,
+    rel: &Path,
+    made: &mut MadeDirs,
+) -> Result<(), BootError> {
+    let names: Vec<_> = std::fs::read_dir(src)
+        .map_err(|e| BootError::io_path("read_dir", src, e))?
+        .flatten()
+        .map(|entry| entry.file_name())
+        .filter(|name| name != ".git")
+        .collect();
+    for name in names {
+        copy_entry(
+            &src.join(&name),
+            dst,
+            &name,
+            &dst_path.join(&name),
+            &rel.join(&name),
+            made,
+        )?;
     }
     Ok(())
 }
 
-/// Copy one entry the way `cp -a` would: a directory recursively, a symlink as the same symlink
-/// (so a dangling or absolute link from the repository neither fails the apply nor is followed
-/// out of the tree), a file as its bytes and mode. A file or symlink already at the destination
-/// of a file or symlink is replaced rather than written through, so a later archive never edits
-/// the file an earlier one's link points at. A directory is merged into whatever directory is at
-/// its destination, including one reached through a symlink: a directory stow folded into an
-/// earlier archive's staging tree receives the later archive's files there. For a person that
-/// is only a directory they can write themselves: a link of theirs into another person's home
-/// fails here, naming it.
-fn copy_entry(from: &Path, to: &Path) -> Result<(), BootError> {
-    let file_type = std::fs::symlink_metadata(from)
-        .map_err(|e| BootError::io_path("stat", from, e))?
-        .file_type();
+/// Copy one entry the way `cp -a` would: a directory recursively, with the tree's mode once the
+/// request is applied ([`MadeDirs`]), a symlink as the same symlink (so a dangling or absolute
+/// link from the repository neither fails the apply nor is followed out of the tree), a file as
+/// its bytes and mode. A file or symlink already at the destination of a file or symlink is
+/// replaced rather than written through, so a later archive never edits the file an earlier
+/// one's link points at. A directory is merged into the directory at its destination, which
+/// keeps its own mode; a link standing there is refused, naming it, never followed. For a person
+/// the destination is only a directory they can write themselves.
+///
+/// A directory is made with `mkdirat` under `dst`, the opened parent (`EEXIST`: the one there is
+/// entered instead), then opened by that name with `O_NOFOLLOW` and checked to be the owner's
+/// and empty, so what the copy fills and later gives a mode is what it made. `to` is the
+/// pathname, for the error that names it; `rel` the same relative to the home.
+fn copy_entry(
+    from: &Path,
+    dst: &File,
+    name: &OsStr,
+    to: &Path,
+    rel: &Path,
+    made: &mut MadeDirs,
+) -> Result<(), BootError> {
+    let meta = std::fs::symlink_metadata(from).map_err(|e| BootError::io_path("stat", from, e))?;
+    let file_type = meta.file_type();
     if file_type.is_dir() {
-        match std::fs::metadata(to) {
-            Ok(meta) if meta.is_dir() => {}
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
-                return Err(BootError::io_path("reach directory", to, e));
+        let fresh = nix::sys::stat::Mode::from_bits_truncate(0o777);
+        let dir = match nix::sys::stat::mkdirat(dst, name, fresh) {
+            Ok(()) => {
+                hold_for_test("made", rel);
+                let dir = open_dir_at(dst, name, OFlag::O_RDONLY)
+                    .map_err(|e| BootError::io_path("open", to, e.into()))?;
+                let stat = dir
+                    .metadata()
+                    .map_err(|e| BootError::io_path("stat", to, e))?;
+                if stat.uid() != made.uid {
+                    return Err(BootError::Dotfiles(format!(
+                        "{} is owned by uid {}: not the directory the copy made",
+                        to.display(),
+                        stat.uid()
+                    )));
+                }
+                if !dir_is_empty(&dir).map_err(|e| BootError::io_path("read_dir", to, e))? {
+                    return Err(BootError::Dotfiles(format!(
+                        "{} is not empty: not the directory the copy made",
+                        to.display()
+                    )));
+                }
+                let fresh = stat.mode() & 0o7777;
+                made.made.push(MadeDir {
+                    rel: rel.to_path_buf(),
+                    dev: stat.dev(),
+                    ino: stat.ino(),
+                    mode: meta.permissions().mode() & fresh & 0o777,
+                });
+                dir
             }
-            _ => std::fs::create_dir_all(to).map_err(|e| BootError::io_path("mkdir -p", to, e))?,
-        }
-        return copy_tree(from, to);
+            Err(nix::errno::Errno::EEXIST) => open_dir_at(dst, name, OFlag::O_PATH)
+                .map_err(|e| BootError::io_path("reach directory", to, e.into()))?,
+            Err(e) => return Err(BootError::io_path("mkdir", to, e.into())),
+        };
+        return copy_tree(from, &dir, to, rel, made);
     }
     remove_non_directory(to)?;
     if file_type.is_symlink() {
@@ -1292,6 +1564,53 @@ fn copy_entry(from: &Path, to: &Path) -> Result<(), BootError> {
     }
     Ok(())
 }
+
+/// Whether the directory `dir` (opened to read) holds nothing but `.` and `..`.
+fn dir_is_empty(dir: &File) -> std::io::Result<bool> {
+    let mut entries = nix::dir::Dir::from_fd(dir.try_clone()?.into())?;
+    for entry in entries.iter() {
+        let entry = entry?;
+        let name = entry.file_name().to_bytes();
+        if name != b"." && name != b".." {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// A seam for the root tests, in a build with the `test-support` feature only: with
+/// `SEALANTD_DOTFILES_TEST_HOLD` set to `<point>:<name>=<gate>`, the copy of a directory it
+/// makes named `<name>` writes `<gate>.reached` and waits for `<gate>` at `<point>`: `made`,
+/// between `mkdirat` and the `openat` that follows it; `final`, before the directory gets its
+/// mode. A test can then rename things under the copy's feet and see what the copy does.
+#[cfg(feature = "test-support")]
+fn hold_for_test(point: &str, rel: &Path) {
+    let Some(hold) = std::env::var_os(crate::test_support::DOTFILES_HOLD_ENV) else {
+        return;
+    };
+    let hold = hold.to_string_lossy();
+    let Some((at, rest)) = hold.split_once(':') else {
+        return;
+    };
+    let Some((name, gate)) = rest.split_once('=') else {
+        return;
+    };
+    if at != point || rel.file_name() != Some(OsStr::new(name)) {
+        return;
+    }
+    let gate = Path::new(gate);
+    let _ = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(format!("{}.reached", gate.display()));
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !gate.exists() && std::time::Instant::now() < until {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+#[cfg(not(feature = "test-support"))]
+fn hold_for_test(_point: &str, _rel: &Path) {}
 
 /// Remove whatever non-directory sits at `path`. A directory is left for the caller's own
 /// operation to refuse, loudly.
@@ -1342,6 +1661,16 @@ mod tests {
     /// Set in CI, where stow and chezmoi are installed: a real-apply test that finds its tool
     /// missing fails instead of skipping.
     const REQUIRE_TOOLS_ENV: &str = "SEALANTD_REQUIRE_DOTFILES_TOOLS";
+
+    /// `copy_tree` of `src` into `home`, as one request, with the modes applied.
+    fn copy_into(src: &Path, home: &Path) -> Result<(), BootError> {
+        let mut made = MadeDirs::open(home, nix::unistd::geteuid().as_raw())?;
+        let (target, rel) = made.target(home)?;
+        let copied = copy_tree(src, &target, home, &rel, &mut made);
+        let left = made.apply();
+        assert!(left.is_empty(), "{left:?}");
+        copied
+    }
 
     /// Whether the real-apply test for `tool` can run. Without the tool it prints a visible skip
     /// line, unless [`REQUIRE_TOOLS_ENV`] is set, where it fails the test.
@@ -1585,7 +1914,7 @@ mod tests {
         std::fs::create_dir_all(src.path().join("nested")).expect("nested");
         std::fs::write(src.path().join("nested/file"), b"hi").expect("write");
 
-        copy_tree(src.path(), dst.path()).expect("copy");
+        copy_into(src.path(), dst.path()).expect("copy");
         assert!(dst.path().join(".vimrc").exists());
         assert!(dst.path().join("nested/file").exists());
         assert!(!dst.path().join(".git").exists());
@@ -1600,7 +1929,7 @@ mod tests {
         std::fs::write(src.path().join("real"), b"x").expect("write");
         std::os::unix::fs::symlink("real", src.path().join(".relative")).expect("symlink");
 
-        copy_tree(src.path(), dst.path()).expect("a dangling link does not fail the copy");
+        copy_into(src.path(), dst.path()).expect("a dangling link does not fail the copy");
         assert_eq!(
             std::fs::read_link(dst.path().join(".dangling")).expect("link"),
             Path::new("/nonexistent/sealant/target")
@@ -1621,7 +1950,7 @@ mod tests {
         std::os::unix::fs::symlink(&outside, dst.path().join(".zshrc")).expect("symlink");
         std::fs::write(src.path().join(".zshrc"), b"later\n").expect("write");
 
-        copy_tree(src.path(), dst.path()).expect("copy");
+        copy_into(src.path(), dst.path()).expect("copy");
         let written = dst.path().join(".zshrc");
         assert!(!written.symlink_metadata().expect("meta").is_symlink());
         assert_eq!(std::fs::read_to_string(written).expect("read"), "later\n");

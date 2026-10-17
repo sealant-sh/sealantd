@@ -876,19 +876,18 @@ async fn dotfiles_apply_as_the_user_and_answer_before_install_sh_ends() {
     }
     let staging = home.join(".local/share/sealant-dotfiles/0/install.sh");
     assert_eq!(std::fs::metadata(&staging).unwrap().uid(), BOB_UID);
-    // The modes the archive carries, on files, on its directories in the staged tree and on the
-    // tree itself (the archive's `./`); the directories the copy makes in the home take what a
-    // new directory there takes, as they always have: the daemon's umask, under whatever default
-    // ACL the home carries ([`made_dir_mode`]).
+    // The modes the archive carries, on files and on directories, in the staged tree and on the
+    // copies in the home alike; the staged tree itself (the archive's `./`) takes what a new
+    // directory in the home takes, as it always has: the daemon's umask, under whatever default
+    // ACL the home carries.
     let mode = |path: &Path| std::fs::symlink_metadata(path).unwrap().mode() & 0o7777;
-    let made = made_dir_mode(&home);
     let tree_mode = mode(&tree);
     for (path, expected) in [
         (".mtest-zshrc", 0o644),
         (".mtest-private", 0o600),
         (".mtest-bin/hello", 0o755),
-        (".mtest-bin", made),
-        (".config/mtest", made),
+        (".mtest-bin", 0o750),
+        (".config/mtest", mode(&tree.join(".config/mtest"))),
         (".local/share/sealant-dotfiles/0", tree_mode),
         (".local/share/sealant-dotfiles/0/.mtest-bin", 0o750),
         (".local/share/sealant-dotfiles/0/install.sh", 0o755),
@@ -959,6 +958,683 @@ fn assert_staging_empty() {
     assert_eq!((meta.uid(), meta.mode() & 0o7777), (0, 0o700));
     let left: Vec<_> = std::fs::read_dir(root).unwrap().flatten().collect();
     assert!(left.is_empty(), "staging left behind: {left:?}");
+}
+
+/// A directory the copy makes in the home takes the tree's mode and the mode a new directory
+/// there takes, intersected, without set-id and sticky bits: under umask `022`, `002` and `077`,
+/// and under a default ACL that gives new directories group write, and one whose mask gives them
+/// nothing. In every case the mode is the tree's under the fresh mode, and never wider than the
+/// fresh mode, what the copy left before. A `0555` directory keeps its mode and its file: it
+/// gets the mode once the whole request is in.
+#[tokio::test]
+async fn dotfiles_directories_take_the_tree_s_mode_under_what_a_new_directory_takes() {
+    if !ready() {
+        return;
+    }
+    let dir = scratch();
+    let home = PathBuf::from(format!("/home/{BOB}"));
+    // (path, mode in the tree)
+    let dir_modes = [
+        (".mtest-ssh", 0o700),
+        (".mtest-modes", 0o750),
+        (".mtest-modes/open", 0o755),
+        (".mtest-modes/open/private", 0o700),
+        (".mtest-modes/readonly", 0o555),
+        (".mtest-modes/wide", 0o775),
+        (".mtest-modes/wider", 0o777),
+        (".mtest-modes/suid", 0o4755),
+        (".mtest-modes/sgid", 0o2755),
+        (".mtest-modes/sticky", 0o1755),
+    ];
+    let files: Vec<(String, &str)> = dir_modes
+        .iter()
+        .map(|(path, _)| (format!("{path}/f"), "x\n"))
+        .collect();
+    let tree = write_tree(
+        dir.path(),
+        "tree",
+        &files
+            .iter()
+            .map(|(p, b)| (p.as_str(), *b))
+            .collect::<Vec<_>>(),
+        &[(".mtest-ssh/f", 0o600), (".mtest-modes/readonly/f", 0o444)]
+            .into_iter()
+            .chain(dir_modes)
+            .collect::<Vec<_>>(),
+    );
+    let archives = dir.path().join("archives");
+    pack_one(&tree, &archives, "copy", &[], &["."]);
+    let mut client = Client::start(dir.path());
+    let mode = |path: &Path| std::fs::symlink_metadata(path).unwrap().mode() & 0o7777;
+    let clear = || clear_bob_s_dotfiles(&home, &[".mtest-ssh", ".mtest-modes"]);
+
+    let group_rwx = format!("u::rwx,g::rwx,g:{EXTRA_GID}:rwx,m::rwx,o::rx");
+    let nothing = format!("u::rwx,g::---,g:{EXTRA_GID}:---,m::---,o::---");
+    // (case, what a new directory in the home then takes)
+    for (name, by, expected_fresh) in [
+        ("umask 022", HomeDirsBy::Umask(0o022), 0o755),
+        ("umask 002", HomeDirsBy::Umask(0o002), 0o775),
+        ("umask 077", HomeDirsBy::Umask(0o077), 0o700),
+        (
+            "default ACL, group rwx",
+            HomeDirsBy::Acl(group_rwx.as_str()),
+            0o775,
+        ),
+        (
+            "default ACL, mask ---",
+            HomeDirsBy::Acl(nothing.as_str()),
+            0o700,
+        ),
+    ] {
+        let case = HomeDirsCase::start(by, &home, dir.path());
+        clear();
+        let fresh = made_dir_mode(&home);
+        assert_eq!(fresh, expected_fresh, "{name}: what a new directory takes");
+
+        ok(client
+            .request(Command::DotfilesApply(Box::new(apply_bob(&archives))))
+            .await)
+        .unwrap();
+        for (path, source) in dir_modes {
+            let got = mode(&home.join(path));
+            assert_eq!(got, source & fresh & 0o777, "{name}: {path}");
+            assert_eq!(got & !fresh, 0, "{name}: {path} wider than a new directory");
+            let meta = std::fs::symlink_metadata(home.join(path)).unwrap();
+            assert_eq!((meta.uid(), meta.gid()), (BOB_UID, GID), "{name}: {path}");
+        }
+        assert_eq!(mode(&home.join(".mtest-ssh/f")), 0o600, "{name}");
+        assert_eq!(mode(&home.join(".mtest-modes/readonly/f")), 0o444, "{name}");
+        assert_eq!(
+            std::fs::read_to_string(home.join(".mtest-modes/readonly/f")).unwrap(),
+            "x\n",
+            "{name}"
+        );
+        if let HomeDirsBy::Acl(_) = by {
+            // The inherited entries stay; the mask is the mode's group bits, never wider than
+            // the fresh mode's.
+            for (path, source) in [(".mtest-ssh", 0o700), (".mtest-modes/wide", 0o775)] {
+                let acl = getfacl(&home.join(path));
+                let mask = format!("mask::{}", rwx((source & fresh) >> 3 & 0o7));
+                assert!(
+                    acl.contains(&mask) && acl.contains(&format!("group:{EXTRA_GROUP}:")),
+                    "{name}: {path}: {acl}"
+                );
+            }
+        }
+        clear();
+        drop(case);
+    }
+}
+
+/// A directory already in the home keeps its mode and bits, whatever the tree says, and takes
+/// the tree's files as it did before: one the person can only write and search (`0300`), and a
+/// root-owned one they write through their group (`0570`). A read-only one with setgid that
+/// they own but whose group is not theirs (`2555`) refuses the file, as before, and keeps its
+/// bits: nothing is ever `chmod`ed to make room.
+#[tokio::test]
+async fn existing_directories_in_the_home_keep_their_modes_and_bits() {
+    if !ready() {
+        return;
+    }
+    let dir = scratch();
+    let home = PathBuf::from(format!("/home/{BOB}"));
+    let mode = |path: &Path| std::fs::symlink_metadata(path).unwrap().mode() & 0o7777;
+    // Made with no ACL of its own (`setfacl -b`): under a default ACL on the home (GitHub's
+    // runners give one, inherited from `/home`, with a named entry) the directory would carry a
+    // mask, and a `chmod` then sets the mask, not the owning group's entry, so `bits` would not
+    // be the mode the test means.
+    let existing = |name: &str, uid: u32, gid: u32, bits: u32| {
+        let path = home.join(name);
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir(&path).unwrap();
+        assert!(
+            Std::new("setfacl")
+                .arg("-b")
+                .arg(&path)
+                .status_gated()
+                .unwrap()
+                .success(),
+            "setfacl -b {name}"
+        );
+        std::os::unix::fs::chown(&path, Some(uid), Some(gid)).unwrap();
+        std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(bits))
+            .unwrap();
+        assert_eq!(mode(&path), bits, "{name} as made");
+    };
+    existing(".mtest-ws", BOB_UID, GID, 0o300);
+    existing(".mtest-grp", 0, GID, 0o570);
+    existing(".mtest-sgid", BOB_UID, 0, 0o2555);
+    let clear = || {
+        clear_bob_s_dotfiles(&home, &[".mtest-ws", ".mtest-grp", ".mtest-sgid"]);
+    };
+    let mut client = Client::start(dir.path());
+
+    let tree = write_tree(
+        dir.path(),
+        "writable",
+        &[(".mtest-ws/f", "ws\n"), (".mtest-grp/f", "grp\n")],
+        &[],
+    );
+    let archives = dir.path().join("archives-writable");
+    pack_one(&tree, &archives, "copy", &[], &["."]);
+    ok(client
+        .request(Command::DotfilesApply(Box::new(apply_bob(&archives))))
+        .await)
+    .unwrap();
+    assert_eq!(mode(&home.join(".mtest-ws")), 0o300);
+    assert_eq!(mode(&home.join(".mtest-grp")), 0o570);
+    assert_eq!(std::fs::metadata(home.join(".mtest-grp")).unwrap().uid(), 0);
+    assert_eq!(
+        std::fs::read_to_string(home.join(".mtest-ws/f")).unwrap(),
+        "ws\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(home.join(".mtest-grp/f")).unwrap(),
+        "grp\n"
+    );
+
+    let tree = write_tree(dir.path(), "sgid", &[(".mtest-sgid/f", "sgid\n")], &[]);
+    let archives = dir.path().join("archives-sgid");
+    pack_one(&tree, &archives, "copy", &[], &["."]);
+    let refused = apply_refused(&mut client, BOB, &archives).await;
+    assert!(
+        refused.contains(&format!("{}/.mtest-sgid/f", home.display()))
+            && refused.contains("Permission denied"),
+        "{refused}"
+    );
+    assert_eq!(mode(&home.join(".mtest-sgid")), 0o2555, "{refused}");
+    clear();
+}
+
+/// A read-only directory of one archive (`0555`) takes a later archive's file in the same
+/// request: it keeps the mode `mkdir` gave it until the request is in, and is `0555` after. A
+/// request that fails part-way still gives every directory it made its mode: the `0555` one is
+/// `0555`, with the first archive's file, and the error names what failed.
+#[tokio::test]
+async fn a_read_only_directory_of_one_archive_takes_the_next_archive_s_files() {
+    if !ready() {
+        return;
+    }
+    let dir = scratch();
+    let home = PathBuf::from(format!("/home/{BOB}"));
+    let mode = |path: &Path| std::fs::symlink_metadata(path).unwrap().mode() & 0o7777;
+    let first = write_tree(
+        dir.path(),
+        "first",
+        &[(".mtest-ro/f", "one\n"), (".mtest-ro/blocker", "a file\n")],
+        &[(".mtest-ro", 0o555)],
+    );
+    // The same directory at 0755 in the tree: the mode is the first archive's, as `cp -a`
+    // leaves the directory it made.
+    let second = write_tree(dir.path(), "second", &[(".mtest-ro/f", "two\n")], &[]);
+    let clear = || clear_bob_s_dotfiles(&home, &[".mtest-ro"]);
+    let mut client = Client::start(dir.path());
+
+    clear();
+    let archives = dir.path().join("archives-merge");
+    pack_many(&[&first, &second], &archives);
+    ok(client
+        .request(Command::DotfilesApply(Box::new(apply_bob(&archives))))
+        .await)
+    .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(home.join(".mtest-ro/f")).unwrap(),
+        "two\n"
+    );
+    assert_eq!(mode(&home.join(".mtest-ro")), 0o555);
+    assert!(home.join(".mtest-ro/blocker").is_file());
+
+    // `blocker` is a directory in the later tree and a file in the home: the copy fails there.
+    clear();
+    let third = write_tree(dir.path(), "third", &[(".mtest-ro/blocker/x", "x\n")], &[]);
+    let archives = dir.path().join("archives-failing");
+    pack_many(&[&first, &third], &archives);
+    let refused = apply_refused(&mut client, BOB, &archives).await;
+    assert!(
+        refused.contains(&format!("{}/.mtest-ro/blocker", home.display())),
+        "{refused}"
+    );
+    assert_eq!(mode(&home.join(".mtest-ro")), 0o555, "{refused}");
+    assert_eq!(
+        std::fs::read_to_string(home.join(".mtest-ro/f")).unwrap(),
+        "one\n"
+    );
+    clear();
+}
+
+/// The copy gives a mode only to the directory it made: with the copy held between making
+/// `.mtest-swap` and opening it (`SEALANTD_DOTFILES_TEST_HOLD`), the new directory is renamed
+/// away and a directory of the person's with a file in it renamed into its place. The copy finds
+/// the directory not empty, refuses the request naming it, and that directory keeps its `0700`
+/// and its file. What the copy made is left where it was moved, at the mode `mkdir` gave it.
+#[tokio::test]
+async fn a_directory_replaced_before_the_copy_opens_it_is_refused() {
+    if !ready() {
+        return;
+    }
+    let dir = scratch();
+    let home = PathBuf::from(format!("/home/{BOB}"));
+    let mode = |path: &Path| std::fs::symlink_metadata(path).unwrap().mode() & 0o7777;
+    let clear = || {
+        clear_bob_s_dotfiles(&home, &[".mtest-swap", ".mtest-swap.moved", ".mtest-keep"]);
+    };
+    clear();
+    let keep = home.join(".mtest-keep");
+    std::fs::create_dir(&keep).unwrap();
+    std::fs::write(keep.join("secret"), "mine\n").unwrap();
+    for path in [&keep, &keep.join("secret")] {
+        std::os::unix::fs::chown(path, Some(BOB_UID), Some(GID)).unwrap();
+    }
+    std::fs::set_permissions(&keep, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+    let tree = write_tree(
+        dir.path(),
+        "tree",
+        &[(".mtest-swap/f", "x\n")],
+        &[(".mtest-swap", 0o750)],
+    );
+    let archives = dir.path().join("archives");
+    pack_one(&tree, &archives, "copy", &[], &["."]);
+    let fresh = made_dir_mode(&home);
+
+    let hold = Hold::at("made", ".mtest-swap", dir.path());
+    let swap = hold.then({
+        let home = home.clone();
+        move || {
+            std::fs::rename(home.join(".mtest-swap"), home.join(".mtest-swap.moved")).unwrap();
+            std::fs::rename(home.join(".mtest-keep"), home.join(".mtest-swap")).unwrap();
+        }
+    });
+    let mut client = Client::start(dir.path());
+    let refused = apply_refused(&mut client, BOB, &archives).await;
+    swap.join().unwrap();
+    drop(hold);
+    assert!(
+        refused.contains(&format!("{}/.mtest-swap", home.display()))
+            && refused.contains("not empty"),
+        "{refused}"
+    );
+    assert_eq!(mode(&home.join(".mtest-swap")), 0o700);
+    assert_eq!(
+        std::fs::read_to_string(home.join(".mtest-swap/secret")).unwrap(),
+        "mine\n"
+    );
+    assert!(!home.join(".mtest-swap/f").exists());
+    assert_eq!(mode(&home.join(".mtest-swap.moved")), fresh);
+    clear();
+}
+
+/// The mode goes on the directory the copy made, found again from the home root with no link
+/// followed: with the copy held before `.mtest-swap` gets its mode, the directory is renamed
+/// away and a link to a `0700` directory of the person's outside the home put in its place. The
+/// walk refuses the link, the request fails naming the directory as left at the mode `mkdir`
+/// gave it, and the directory outside stays `0700`.
+#[tokio::test]
+async fn a_swapped_pathname_does_not_take_the_copied_directory_s_mode() {
+    if !ready() {
+        return;
+    }
+    let dir = scratch();
+    let home = PathBuf::from(format!("/home/{BOB}"));
+    let mode = |path: &Path| std::fs::symlink_metadata(path).unwrap().mode() & 0o7777;
+    let victim = dir.path().join("victim");
+    std::fs::create_dir(&victim).unwrap();
+    std::os::unix::fs::chown(&victim, Some(BOB_UID), Some(GID)).unwrap();
+    std::fs::set_permissions(&victim, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+    let tree = write_tree(
+        dir.path(),
+        "tree",
+        &[(".mtest-swap/f", "x\n")],
+        &[(".mtest-swap", 0o750)],
+    );
+    let archives = dir.path().join("archives");
+    pack_one(&tree, &archives, "copy", &[], &["."]);
+    let clear = || {
+        let _ = std::fs::remove_file(home.join(".mtest-swap"));
+        clear_bob_s_dotfiles(&home, &[".mtest-swap", ".mtest-swap.moved"]);
+    };
+    clear();
+    let fresh = made_dir_mode(&home);
+
+    let hold = Hold::at("final", ".mtest-swap", dir.path());
+    let swap = hold.then({
+        let (home, victim) = (home.clone(), victim.clone());
+        move || {
+            std::fs::rename(home.join(".mtest-swap"), home.join(".mtest-swap.moved")).unwrap();
+            std::os::unix::fs::symlink(&victim, home.join(".mtest-swap")).unwrap();
+            std::os::unix::fs::lchown(home.join(".mtest-swap"), Some(BOB_UID), Some(GID)).unwrap();
+        }
+    });
+    let mut client = Client::start(dir.path());
+    let refused = apply_refused(&mut client, BOB, &archives).await;
+    swap.join().unwrap();
+    drop(hold);
+    assert!(
+        refused.contains("left at the mode a new directory takes")
+            && refused.contains(&format!("{}/.mtest-swap", home.display())),
+        "{refused}"
+    );
+    assert_eq!(
+        mode(&victim),
+        0o700,
+        "the directory outside the home is untouched"
+    );
+    assert_eq!(mode(&home.join(".mtest-swap.moved")), fresh);
+    assert!(
+        std::fs::symlink_metadata(home.join(".mtest-swap"))
+            .unwrap()
+            .is_symlink()
+    );
+    clear();
+}
+
+/// The group-writable fixture puts the home's default ACL back as it was, so the tests after it
+/// run under the ACL the suite started with (a default ACL on `/home` is inherited by the homes
+/// the suite makes).
+#[tokio::test]
+async fn the_group_writable_fixture_restores_the_home_s_default_acl() {
+    if !ready() {
+        return;
+    }
+    let dir = scratch();
+    let home = PathBuf::from(format!("/home/{BOB}"));
+    let setfacl = |args: &[&str]| {
+        assert!(
+            Std::new("setfacl")
+                .args(args)
+                .arg(&home)
+                .status_gated()
+                .unwrap()
+                .success(),
+            "setfacl {args:?}"
+        );
+    };
+    // The home as the suite found it (under a default ACL on `/home`, an inherited one), put
+    // back at the end the same way.
+    let original = dir.path().join("original-acl");
+    std::fs::write(&original, getfacl(&home)).unwrap();
+    setfacl(&["-k"]);
+    setfacl(&[
+        "-d",
+        "-m",
+        &format!("u::rwx,g::r-x,g:{EXTRA_GID}:r-x,m::r-x,o::---"),
+    ]);
+    let before = getfacl(&home);
+    assert!(before.contains("default:mask::r-x"), "{before}");
+    let entries = format!("u::rwx,g::rwx,g:{EXTRA_GID}:rwx,m::rwx,o::rx");
+    let case = HomeDirsCase::start(HomeDirsBy::Acl(&entries), &home, dir.path());
+    assert!(getfacl(&home).contains("default:mask::rwx"));
+    drop(case);
+    assert_eq!(getfacl(&home), before);
+    setfacl(&["-k"]);
+    assert!(!getfacl(&home).contains("default:"));
+    assert!(
+        Std::new("setfacl")
+            .arg(format!("--restore={}", original.display()))
+            .status_gated()
+            .unwrap()
+            .success()
+    );
+    assert_eq!(getfacl(&home), std::fs::read_to_string(&original).unwrap());
+}
+
+/// A tree 130 directories deep copies under a descriptor limit 200 above what the process has
+/// open: the copy holds one descriptor per level, the directory it writes into, as `main`'s
+/// `ReadDir` per level did, and the deepest directory gets its mode like any other.
+#[tokio::test]
+async fn a_deep_tree_copies_under_a_low_descriptor_limit() {
+    if !ready() {
+        return;
+    }
+    let dir = scratch();
+    let home = PathBuf::from(format!("/home/{BOB}"));
+    let mode = |path: &Path| std::fs::symlink_metadata(path).unwrap().mode() & 0o7777;
+    let depth = 130;
+    let mut rel = PathBuf::from(".mtest-deep");
+    for _ in 0..depth {
+        rel.push("d");
+    }
+    let tree = write_tree(
+        dir.path(),
+        "tree",
+        &[(rel.join("f").to_str().unwrap(), "deep\n")],
+        &[(rel.to_str().unwrap(), 0o700)],
+    );
+    let archives = dir.path().join("archives");
+    pack_one(&tree, &archives, "copy", &[], &["."]);
+    let clear = || clear_bob_s_dotfiles(&home, &[".mtest-deep"]);
+    clear();
+    let mut client = Client::start(dir.path());
+
+    let open = std::fs::read_dir("/proc/self/fd").unwrap().count();
+    let _limit = DescriptorLimit::lower_to(open + 200);
+    let response = client
+        .request(Command::DotfilesApply(Box::new(apply_bob(&archives))))
+        .await;
+    assert!(
+        matches!(response.outcome, ResponseOutcome::Ok { .. }),
+        "{depth} levels under {} descriptors: {:?}",
+        open + 200,
+        response.outcome
+    );
+    assert_eq!(
+        std::fs::read_to_string(home.join(&rel).join("f")).unwrap(),
+        "deep\n"
+    );
+    assert_eq!(mode(&home.join(&rel)), 0o700);
+    clear();
+}
+
+/// `RLIMIT_NOFILE`'s soft limit lowered for this process, put back when dropped.
+struct DescriptorLimit {
+    before: (u64, u64),
+}
+
+impl DescriptorLimit {
+    fn lower_to(limit: usize) -> Self {
+        use nix::sys::resource::{Resource, getrlimit, setrlimit};
+        let before = getrlimit(Resource::RLIMIT_NOFILE).unwrap();
+        setrlimit(Resource::RLIMIT_NOFILE, limit as u64, before.1).unwrap();
+        Self { before }
+    }
+}
+
+impl Drop for DescriptorLimit {
+    fn drop(&mut self) {
+        use nix::sys::resource::{Resource, setrlimit};
+        let _ = setrlimit(Resource::RLIMIT_NOFILE, self.before.0, self.before.1);
+    }
+}
+
+/// `bits` (0 to 7) as `getfacl` writes them.
+fn rwx(bits: u32) -> String {
+    ["r", "w", "x"]
+        .iter()
+        .enumerate()
+        .map(|(i, letter)| if bits & (4 >> i) != 0 { *letter } else { "-" })
+        .collect()
+}
+
+/// `dotfiles.apply` of `archives` for Bob.
+fn apply_bob(archives: &Path) -> DotfilesApplyArgs {
+    DotfilesApplyArgs {
+        user: BOB.to_owned(),
+        repository: None,
+        archive_dir: Some(archives.display().to_string()),
+        execution_id: None,
+    }
+}
+
+/// `<dir>/<name>`: `files` written (parents made), then `modes` set, in order.
+fn write_tree(dir: &Path, name: &str, files: &[(&str, &str)], modes: &[(&str, u32)]) -> PathBuf {
+    let tree = dir.join(name);
+    for (path, bytes) in files {
+        let path = tree.join(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, bytes).unwrap();
+    }
+    for (path, mode) in modes {
+        std::fs::set_permissions(
+            tree.join(path),
+            std::os::unix::fs::PermissionsExt::from_mode(*mode),
+        )
+        .unwrap();
+    }
+    tree
+}
+
+/// `getfacl -p path`.
+fn getfacl(path: &Path) -> String {
+    let out = Std::new("getfacl")
+        .arg("-p")
+        .arg(path)
+        .stdin(std::process::Stdio::null())
+        .output_gated()
+        .unwrap();
+    assert!(out.status.success(), "getfacl {}", path.display());
+    String::from_utf8(out.stdout).unwrap()
+}
+
+/// Removed as root, `tops` and the staged trees: the person could not, a `0555` directory
+/// refusing the unlink of its file (what `rm -rf` as the owner refuses too), and that is what a
+/// second apply's own removal of a staged tree runs into (a limit `main` has as well).
+fn clear_bob_s_dotfiles(home: &Path, tops: &[&str]) {
+    for top in tops {
+        let _ = std::fs::remove_dir_all(home.join(top));
+    }
+    for index in ["0", "1"] {
+        let _ = std::fs::remove_dir_all(home.join(".local/share/sealant-dotfiles").join(index));
+    }
+}
+
+/// What a new directory in a home takes its mode from: the process umask, or a default ACL on
+/// the home with these entries.
+#[derive(Clone, Copy)]
+enum HomeDirsBy<'a> {
+    Umask(u32),
+    Acl(&'a str),
+}
+
+/// One [`HomeDirsBy`] in effect, undone when dropped (a panic included): the umask put back, the
+/// home's ACL put back as `getfacl` recorded it before (`setfacl --restore`). A umask case takes
+/// the home's default ACL off meanwhile (the suite may run under one inherited from `/home`),
+/// so the umask is what a new directory takes.
+struct HomeDirsCase {
+    umask: Option<nix::sys::stat::Mode>,
+    acl: (PathBuf, PathBuf),
+}
+
+impl HomeDirsCase {
+    fn start(by: HomeDirsBy<'_>, home: &Path, scratch: &Path) -> Self {
+        let saved = scratch.join(format!("acl-{}", std::process::id()));
+        std::fs::write(&saved, getfacl(home)).unwrap();
+        let status = Std::new("setfacl")
+            .args(["-k"])
+            .arg(home)
+            .status_gated()
+            .unwrap();
+        assert!(status.success(), "setfacl -k on {}", home.display());
+        let umask = match by {
+            HomeDirsBy::Umask(mask) => Some(nix::sys::stat::umask(
+                nix::sys::stat::Mode::from_bits_truncate(mask),
+            )),
+            HomeDirsBy::Acl(entries) => {
+                let status = Std::new("setfacl")
+                    .args(["-d", "-m", entries])
+                    .arg(home)
+                    .status_gated()
+                    .unwrap();
+                assert!(status.success(), "setfacl -d on {}", home.display());
+                None
+            }
+        };
+        Self {
+            umask,
+            acl: (home.to_path_buf(), saved),
+        }
+    }
+}
+
+impl Drop for HomeDirsCase {
+    fn drop(&mut self) {
+        if let Some(before) = self.umask {
+            nix::sys::stat::umask(before);
+        }
+        let (home, saved) = &self.acl;
+        let _ = Std::new("setfacl").arg("-k").arg(home).status_gated();
+        let _ = Std::new("setfacl")
+            .arg(format!("--restore={}", saved.display()))
+            .status_gated();
+    }
+}
+
+/// The daemon held at `point` for the directory `name` (`sealantd::test_support`), set in this
+/// process's environment (one thread: `--test-threads 1`) and removed when dropped.
+struct Hold {
+    gate: PathBuf,
+}
+
+impl Hold {
+    fn at(point: &str, name: &str, scratch: &Path) -> Self {
+        let gate = scratch.join(format!("gate-{point}"));
+        unsafe {
+            std::env::set_var(
+                sealantd::test_support::DOTFILES_HOLD_ENV,
+                format!("{point}:{name}={}", gate.display()),
+            );
+        }
+        Self { gate }
+    }
+
+    /// Run `swap` once the daemon reaches the hold, then let it go.
+    fn then(&self, swap: impl FnOnce() + Send + 'static) -> std::thread::JoinHandle<()> {
+        let gate = self.gate.clone();
+        let reached = PathBuf::from(format!("{}.reached", gate.display()));
+        std::thread::spawn(move || {
+            let until = Instant::now() + Duration::from_secs(10);
+            while !reached.exists() && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(reached.exists(), "the copy never reached the hold");
+            swap();
+            std::fs::write(&gate, b"").unwrap();
+        })
+    }
+}
+
+impl Drop for Hold {
+    fn drop(&mut self) {
+        unsafe {
+            std::env::remove_var(sealantd::test_support::DOTFILES_HOLD_ENV);
+        }
+    }
+}
+
+/// `trees` packed as `<archives>/<n>.tar.gz`, one manifest applying each with the copy manager,
+/// no bootstrap, in order.
+fn pack_many(trees: &[&Path], archives: &Path) {
+    std::fs::create_dir_all(archives).unwrap();
+    let mut entries = Vec::new();
+    for (index, tree) in trees.iter().enumerate() {
+        assert!(
+            Std::new("tar")
+                .arg("-czf")
+                .arg(archives.join(format!("{index}.tar.gz")))
+                .arg("-C")
+                .arg(tree)
+                .arg(".")
+                .status_gated()
+                .unwrap()
+                .success()
+        );
+        entries.push(format!(
+            r#"{{"file":"{index}.tar.gz","manager":"copy","bootstrap":false}}"#
+        ));
+    }
+    std::fs::write(
+        archives.join("manifest.json"),
+        format!(r#"{{"archives":[{}]}}"#, entries.join(",")),
+    )
+    .unwrap();
 }
 
 /// `tree` packed as `<archives>/0.tar.gz`, with a manifest applying it with `manager`, no
@@ -1107,9 +1783,12 @@ async fn a_person_s_link_into_another_home_takes_none_of_their_dotfiles() {
     // 1. `~/.config` -> the other home's `.config`, then the copy manager.
     link(&bob.join(".config"), &cat.join(".config"));
     let refused = apply_refused(&mut client, BOB, &archives).await;
+    // Refused before the link is followed: a link where the tree has a directory is no
+    // directory to merge into.
     assert!(
         refused.contains(&format!("{}/.config", bob.display()))
-            && refused.contains("Permission denied"),
+            && (refused.contains("Not a directory")
+                || refused.contains("Too many levels of symbolic links")),
         "{refused}"
     );
     // 2. `~/.local/share/sealant-dotfiles` -> the other home's staged trees.
