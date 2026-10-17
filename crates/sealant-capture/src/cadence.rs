@@ -21,7 +21,9 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crate::aliases::Aliases;
 use crate::clock::Clock;
-use crate::engine::{CaptureEngine, Class, EngineError, SnapOutcome, SnapRequest, StagedCapture};
+use crate::engine::{
+    BulkPaused, CaptureEngine, Class, EngineError, SnapOutcome, SnapRequest, StagedCapture,
+};
 use crate::manifest::CaptureKind;
 use crate::ship::{ShipError, ShipWorker, Shipper, Staging};
 use crate::watch::{self, ChangeSignal, Invalidations, Mode, WatchHandle, WatchSpec};
@@ -377,6 +379,8 @@ struct Shared {
     aliases: Arc<Aliases>,
     /// The engine's invalidations: a name the alias thread found moved is read again.
     invalidations: Arc<Invalidations>,
+    /// Whether the engine holds a bulk build paused mid-way, read without the engine.
+    bulk_paused: BulkPaused,
     /// Each class's maximum interval: small, bulk (how often its polled aliases are stat'ed).
     alias_every: [Duration; 2],
     capture_bulk: bool,
@@ -868,6 +872,7 @@ impl CadenceRunner {
         let staging = engine.staging();
         let aliases = engine.aliases();
         let invalidations = engine.invalidations();
+        let bulk_paused = engine.bulk_paused();
         let clock = config.clock();
         let now = clock.now();
         let runner = Self {
@@ -906,6 +911,7 @@ impl CadenceRunner {
                 census: Mutex::new(None),
                 aliases,
                 invalidations,
+                bulk_paused,
                 alias_every: [cadence.max_interval, cadence.bulk_max_interval],
                 capture_bulk,
                 started: AtomicBool::new(false),
@@ -1149,13 +1155,7 @@ impl CadenceRunner {
     pub fn final_is_current_as_snapped(&self) -> bool {
         // A bulk build paused mid-way holds progress no capture lists yet; never waits for the
         // engine (`capture.status` reads this).
-        !self.shared.allowed()
-            && self.snaps_still_current(
-                self.shared
-                    .engine
-                    .try_lock()
-                    .is_ok_and(|e| !e.bulk_in_progress()),
-            )
+        !self.shared.allowed() && self.snaps_still_current(!self.shared.bulk_paused.get())
     }
 
     /// Whether nothing moved since the last final flush's snaps: no change signal since before
@@ -1642,12 +1642,6 @@ impl CadenceRunner {
     pub fn snapshot(&self) -> CadenceSnapshot {
         let c = &self.shared.counters;
         let st = self.shared.state();
-        let bulk_in_progress = self
-            .shared
-            .engine
-            .try_lock()
-            .map(|e| e.bulk_in_progress())
-            .unwrap_or(false);
         CadenceSnapshot {
             small_mode: st.small_mode,
             bulk_mode: st.bulk_mode,
@@ -1663,7 +1657,7 @@ impl CadenceRunner {
             forced: c.forced.load(Ordering::Relaxed),
             preemptions: c.preemptions.load(Ordering::Relaxed),
             overflows: c.overflows.load(Ordering::Relaxed),
-            bulk_in_progress,
+            bulk_in_progress: self.shared.bulk_paused.get(),
             bulk_running: c.bulk_running.load(Ordering::SeqCst),
             small_dirty: st.small.first_change.is_some(),
             bulk_dirty: st.bulk.first_change.is_some(),
