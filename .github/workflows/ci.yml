@@ -152,6 +152,7 @@ jobs:
           scripts/workflow-runners.test.mjs scripts/release-manifest.test.mjs
           scripts/release-publication.test.mjs scripts/release-overrides.test.mjs
           scripts/release-npm.test.mjs scripts/ci-concurrency.test.mjs
+          scripts/ci-test-support-gate.test.mjs
       - run: pnpm -r build
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo build --locked -p sealantd # the TypeScript e2e spawns the daemon binary

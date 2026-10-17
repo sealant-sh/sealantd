@@ -6,21 +6,48 @@
 #      tests turn it on through dev-dependencies, which no build of the daemon has);
 #   2. a crate that depends on sealant-capture without it can neither name `ManualClock` nor set
 #      `CaptureConfig::clock`, and with it (the probe's `control` feature) can do both.
+# It fails closed: a graph it cannot read, or a search that errs, fails the gate rather than
+# reading as "absent" (scripts/ci-test-support-gate.test.mjs).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+fail() {
+	echo "ci-test-support-gate: $*" >&2
+	exit 1
+}
+
+# Each graph is read whole, as a command of its own, before anything searches it.
+read_graph() {
+	local edges=$1 graph
+	if ! graph=$(cargo tree --workspace --target all --locked --prefix none -e "$edges"); then
+		fail "cargo tree -e $edges failed: the gate cannot say what that graph holds"
+	fi
+	printf '%s\n' "$graph"
+}
+
+# Whether `$2` holds the line `$1`: 0 yes, 1 no; a search that errs fails the gate.
+holds() {
+	local status=0
+	grep -qF -- "$1" <<<"$2" || status=$?
+	case $status in
+	0 | 1) return "$status" ;;
+	*) fail "searching a graph for '$1' failed (grep exited $status)" ;;
+	esac
+}
+
 feature='sealant-capture feature "test-support"'
-graph() { cargo tree --workspace --target all --locked --prefix none -e "$1"; }
-if graph normal,build,features | grep -qF "$feature"; then
+normal=$(read_graph normal,build,features) || exit 1
+# A graph read that succeeds holds the crate it is about: an empty one says nothing.
+holds 'sealant-capture v' "$normal" || fail "the normal and build graph does not list sealant-capture"
+if holds "$feature" "$normal"; then
 	echo "sealant-capture's test-support is enabled outside the tests:" >&2
-	cargo tree --workspace --target all --locked -e normal,build,features -i sealant-capture >&2
+	cargo tree --workspace --target all --locked -e normal,build,features -i sealant-capture >&2 || true
 	exit 1
 fi
 # The control: the tests do turn it on, so the check above looked for the right name.
-if ! graph normal,build,dev,features | grep -qF "$feature"; then
-	echo "no test turns on sealant-capture's test-support: the check above checks nothing" >&2
-	exit 1
-fi
+with_dev=$(read_graph normal,build,dev,features) || exit 1
+holds "$feature" "$with_dev" ||
+	fail "no test turns on sealant-capture's test-support: the check above checks nothing"
 
 probe=scripts/test-support-probe
 cp Cargo.lock "$probe/Cargo.lock"
@@ -32,18 +59,15 @@ for bin in names-the-manual-clock injects-a-clock; do
 	injects-a-clock) want='no field `clock` on type' ;;
 	esac
 	if out=$(check "$bin"); then
-		echo "$bin compiled without test-support" >&2
-		exit 1
+		fail "$bin compiled without test-support"
 	fi
-	if ! grep -qF "$want" <<<"$out"; then
-		echo "$bin failed without test-support, but not for the gate ($want):" >&2
+	if ! holds "$want" "$out"; then
 		echo "$out" >&2
-		exit 1
+		fail "$bin failed without test-support, but not for the gate ($want)"
 	fi
 	if ! out=$(check "$bin" --features control); then
-		echo "$bin did not compile with test-support (the control):" >&2
 		echo "$out" >&2
-		exit 1
+		fail "$bin did not compile with test-support (the control)"
 	fi
 done
 echo "sealant-capture's test-support: on in the tests only; the manual clock and clock injection are unreachable without it"
