@@ -181,6 +181,11 @@ pub struct CaptureConfig {
     pub cadence: Cadence,
     /// How the cadence learns about changes.
     pub watch: WatchPolicy,
+    /// Where the cadence's timers and the ship worker's tick read the time: real by default;
+    /// a test's [`crate::clock::ManualClock`] holds each timer to its period in virtual time.
+    /// Test support only: without the feature there is no field, and the clock is real.
+    #[cfg(feature = "test-support")]
+    pub clock: crate::clock::Clock,
     /// CPU budget for snapping and shipping, as a fraction of one core.
     pub cpu_fraction: f64,
     /// Threads a final snap reads files on (`crate::readahead`); 1 reads on the build's own.
@@ -240,6 +245,21 @@ pub struct CaptureConfig {
 pub const PER_REPOSITORY_FEATURES: [&str; 3] = ["object_format", "ref_format", "wide_times"];
 
 impl CaptureConfig {
+    /// The clock the cadence and the ship worker read: the one a test set in the `clock`
+    /// field (`test-support`).
+    #[cfg(feature = "test-support")]
+    pub(crate) fn clock(&self) -> crate::clock::Clock {
+        self.clock.clone()
+    }
+
+    /// The clock the cadence and the ship worker read: the real one, the only one without
+    /// `test-support`.
+    #[cfg(not(feature = "test-support"))]
+    #[allow(clippy::unused_self)]
+    pub(crate) fn clock(&self) -> crate::clock::Clock {
+        crate::clock::Clock::real()
+    }
+
     /// Defaults for `root`.
     #[must_use]
     pub fn new(worktree_id: &str, epoch: u64, root: &Path) -> Self {
@@ -257,6 +277,8 @@ impl CaptureConfig {
             capture_bulk: true,
             cadence: Cadence::default(),
             watch: WatchPolicy::default(),
+            #[cfg(feature = "test-support")]
+            clock: crate::clock::Clock::real(),
             cpu_fraction: crate::ship::DEFAULT_CPU_FRACTION,
             final_readers: std::thread::available_parallelism()
                 .map_or(1, std::num::NonZero::get)
