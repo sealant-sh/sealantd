@@ -155,10 +155,13 @@ A `vX.Y.Z` tag runs `.github/workflows/release.yml` on GitHub-hosted runners:
    push run on main did not pass (below).
 2. `build` builds each platform on its own native runner and pushes it by digest, with no tag.
    `merge` stages the two as one index under this run's own tag, `staging-<run>-<attempt>`, and
-   checks the index holds exactly the two platforms it was given. `release-manifest` records the
+   checks the index maps `linux/amd64` to the amd64 build and `linux/arm64` to the arm64 build,
+   and holds nothing else. `release-manifest` records the
    version, the commit, the index digest and both platform digests, and is kept for 90 days.
-3. `identity` runs on each arch: it pulls that platform by the digest the manifest records, and
-   checks that a container of it runs exactly the image ID the pull gave, that its labels carry
+3. `identity` runs on each arch: it reads the staged index by the digest the manifest records,
+   requires the digest it maps this arch's platform to (what a consumer of `:X.Y.Z` would pull) to
+   be this arch's build as its build job and the manifest record it, pulls that digest, and checks
+   that a container of it runs exactly the image ID the pull gave, that its labels carry
    this version, commit and repository, and that `sealantd --version` reports what the tagged
    commit's `Cargo.toml` says. The workspace version there is `0.0.0`, which the release flow does
    not stamp, so today the daemon reports `sealantd 0.0.0` and the version label is what names the
@@ -205,7 +208,8 @@ and index digests for a day, the release manifest for 90 days):
 | What happened | What re-running the failed jobs does |
 | --- | --- |
 | `stable-tag` refused a commit whose `ci` had not passed yet | Re-run it once `ci` has passed; nothing was built. |
-| `build`, `merge`, `release-manifest` or `identity` failed | Nothing final was written. The re-run stages a new `staging-<run>-<attempt>`. |
+| `build` or `merge` failed | Nothing final was written. The re-run stages a new `staging-<run>-<attempt>`. |
+| `release-manifest` or `identity` failed | Nothing final was written. The re-run checks the index this run already staged. |
 | `finalize-images` failed after its create | The read finds this run's index and passes, with a warning if the create had reported an error. Absent, unreadable or another digest fails. |
 | `:X.Y.Z` exists at this run's index; `npm` failed | `finalize-images` does nothing; `npm` publishes. |
 

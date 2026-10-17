@@ -48,11 +48,31 @@ const bashStep = (run, options) =>
 
 const REPOSITORY = "ghcr.io/sealant-ci/sealantd";
 const COMMIT = "f".repeat(40);
-const INDEX = `sha256:${createHash("sha256").update("sealantd").digest("hex")}`;
 const PLATFORMS = {
   amd64: `sha256:${createHash("sha256").update("sealantd/amd64").digest("hex")}`,
   arm64: `sha256:${createHash("sha256").update("sealantd/arm64").digest("hex")}`,
 };
+/** An index's descriptor of `digest` for linux/<architecture>[/<variant>]. */
+const child = (digest, architecture, variant) => ({
+  mediaType: "application/vnd.oci.image.manifest.v1+json",
+  digest,
+  size: 1,
+  platform: { os: "linux", architecture, ...(variant === undefined ? {} : { variant }) },
+});
+/** An index of `children`, as the registry serves it: its bytes and the digest it is read by. */
+const indexDocument = (children) => {
+  const bytes = Buffer.from(
+    JSON.stringify({
+      schemaVersion: 2,
+      mediaType: "application/vnd.oci.image.index.v1+json",
+      manifests: children,
+    }),
+  );
+  return { bytes, digest: `sha256:${createHash("sha256").update(bytes).digest("hex")}` };
+};
+/** The index merge staged: each arch's platform names that arch's build. */
+const STAGED = indexDocument([child(PLATFORMS.amd64, "amd64"), child(PLATFORMS.arm64, "arm64")]);
+const INDEX = STAGED.digest;
 const manifestJson = (version, extra = {}) =>
   JSON.stringify({
     version,
@@ -64,11 +84,31 @@ const manifestJson = (version, extra = {}) =>
 // --- merge ---
 
 test("merge stages the index under this run's own tag, never :<version>", (t) => {
+  // Each build's digest arrives in a directory named for its arch, never merged into one, so the
+  // index can be bound to the build each arch's job made; identity reads its own arch's the same way.
+  const downloads = releaseJobs.merge.steps.filter((entry) =>
+    entry.uses?.startsWith("actions/download-artifact@"),
+  );
+  assert.deepEqual(
+    downloads.map((entry) => entry.with),
+    [{ path: "/tmp/digests", pattern: "digests-sealantd--*" }],
+  );
+  assert.ok(
+    releaseJobs.identity.steps.some(
+      (entry) =>
+        entry.uses?.startsWith("actions/download-artifact@") &&
+        entry.with?.name === "digests-sealantd--${{ matrix.platform.arch }}",
+    ),
+  );
   const directory = scratch(t, "sealantd-merge-");
   const digests = path.join(directory, "digests");
   for (const name of ["bin", "digests", "tmp"]) mkdirSync(path.join(directory, name));
   const platforms = ["a1".repeat(32), "b2".repeat(32)];
-  for (const digest of platforms) writeFileSync(path.join(digests, digest), "");
+  // One directory per build, named for its arch, as download-artifact lays them out.
+  for (const [at, arch] of ["amd64", "arm64"].entries()) {
+    mkdirSync(path.join(digests, `digests-sealantd--${arch}`));
+    writeFileSync(path.join(digests, `digests-sealantd--${arch}`, platforms[at]), "");
+  }
   const calls = path.join(directory, "calls.jsonl");
   writeFileSync(calls, "");
   writeFileSync(
@@ -87,8 +127,8 @@ process.exit(args[2] === "inspect" && process.env.FAIL_INSPECT ? 74 : 0);
   chmodSync(path.join(directory, "bin", "docker"), 0o755);
   const run = (environment = {}) => {
     writeFileSync(calls, "");
-    const result = bashStep(stepRun("merge", "Stage the multi-arch index under this run's tag"), {
-      cwd: digests,
+    const step = stepRun("merge", "Stage the multi-arch index under this run's tag");
+    const result = bashStep(step.replaceAll("/tmp/digests", digests), {
       env: {
         PATH: `${path.join(directory, "bin")}:${process.env.PATH}`,
         RUNNER_TEMP: path.join(directory, "tmp"),
@@ -117,12 +157,18 @@ process.exit(args[2] === "inspect" && process.env.FAIL_INSPECT ? 74 : 0);
   ]);
   for (const failure of [{ FAIL_CREATE: "1" }, { FAIL_INSPECT: "1" }])
     assert.notEqual(run(failure).status, 0, JSON.stringify(failure));
-  // A stray file in the digests artifact is refused before anything is pushed.
-  writeFileSync(path.join(digests, "latest"), "");
+  // The sources go to create amd64 first, each from the artifact named for its arch; a stray or
+  // missing file in either is refused before anything is pushed.
+  writeFileSync(path.join(digests, "digests-sealantd--arm64", "latest"), "");
   const stray = run();
   assert.equal(stray.status, 1);
-  assert.match(stray.stdout, /"latest" in the digests artifact is not an image digest/);
+  assert.match(stray.stdout, /The arm64 digests artifact holds '.*latest.*', not one image digest/);
   assert.deepEqual(stray.calls, []);
+  rmSync(path.join(digests, "digests-sealantd--arm64"), { recursive: true });
+  const missing = run();
+  assert.equal(missing.status, 1);
+  assert.match(missing.stdout, /The arm64 digests artifact holds '\*', not one image digest/);
+  assert.deepEqual(missing.calls, []);
 });
 
 // --- finalize-images ---
@@ -322,8 +368,10 @@ test("finalize refuses another release's manifest or a missing index, writing no
 
 /**
  * The identity step as written, in a checkout holding `cargo` as Cargo.toml's workspace version,
- * against a stand-in docker. The pull of the manifest's digest gives `id`; every later read must
- * name that ID. The image answers `platform` and `labels`; a container of it runs `running` (by
+ * against a stand-in docker. The registry serves `index` (the staged index by default) by its
+ * digest, which the manifest records as the run's index; this arch's build job recorded `build`
+ * (the manifest's platform digest by default). The pull of the digest the index maps this arch to
+ * gives `id`; every later read must name that ID. The image answers `platform` and `labels`; a container of it runs `running` (by
  * default the image it was created from) and prints `reported`, exiting `exit`.
  */
 const identity = (t, fixture = {}) => {
@@ -342,7 +390,15 @@ const identity = (t, fixture = {}) => {
   );
   const arch = fixture.arch ?? "amd64";
   const id = fixture.id ?? `sha256:${"1".repeat(64)}`;
+  const index = fixture.index ?? STAGED;
+  const build = fixture.build ?? PLATFORMS[arch];
+  const built = path.join(directory, "built");
+  mkdirSync(built);
+  writeFileSync(path.join(built, build.slice("sha256:".length)), "");
+  writeFileSync(path.join(directory, "staged-index"), index.bytes);
   const state = {
+    indexRef: `${REPOSITORY}@${index.digest}`,
+    unreadableIndex: false,
     pulled: `${REPOSITORY}@${PLATFORMS[arch]}`,
     id,
     platform: `linux/${arch}`,
@@ -366,6 +422,11 @@ const state = JSON.parse(fs.readFileSync(${JSON.stringify(path.join(directory, "
 const args = process.argv.slice(2);
 fs.appendFileSync(${JSON.stringify(calls)}, JSON.stringify(args) + "\\n");
 const answer = (text) => { process.stdout.write(text + "\\n"); process.exit(0); };
+if (args.slice(0, 3).join(" ") === "buildx imagetools inspect" && args[4] === "--raw") {
+  if (args[3] !== state.indexRef || state.unreadableIndex) { console.error("ERROR: " + args[3] + ": not found"); process.exit(1); }
+  process.stdout.write(fs.readFileSync(${JSON.stringify(path.join(directory, "staged-index"))}));
+  process.exit(0);
+}
 if (args[0] === "pull") process.exit(args[1] === state.pulled ? 0 : 1);
 if (args[0] === "image" && args[1] === "inspect" && args[3] === "--format") {
   if (args[4] === "{{.Id}}" && args[2] === state.pulled) answer(state.id);
@@ -389,7 +450,12 @@ process.exit(79);
   );
   chmodSync(path.join(bin, "docker"), 0o755);
   const file = path.join(directory, "release-manifest.json");
-  writeFileSync(file, manifestJson(version));
+  writeFileSync(
+    file,
+    manifestJson(version, {
+      images: { sealantd: { index: index.digest, platforms: PLATFORMS } },
+    }),
+  );
   const result = bashStep(stepRun("identity", "Check this arch's image is this release's"), {
     cwd: checkout,
     env: {
@@ -399,6 +465,8 @@ process.exit(79);
       GITHUB_REPOSITORY: "sealant-sh/sealantd",
       REPOSITORY,
       MANIFEST: file,
+      BUILT: built,
+      RUNNER_TEMP: directory,
       VERSION: version,
       ARCH: arch,
     },
@@ -412,6 +480,7 @@ test("identity pulls its own arch's digest from the manifest and runs exactly th
     assert.equal(result.status, 0, result.output);
     const id = `sha256:${"1".repeat(64)}`;
     assert.deepEqual(result.calls, [
+      ["buildx", "imagetools", "inspect", `${REPOSITORY}@${INDEX}`, "--raw"],
       ["pull", `${REPOSITORY}@${PLATFORMS[arch]}`],
       ["image", "inspect", `${REPOSITORY}@${PLATFORMS[arch]}`, "--format", "{{.Id}}"],
       ["image", "inspect", id, "--format", "{{.Os}}/{{.Architecture}}"],
@@ -432,6 +501,78 @@ test("identity pulls its own arch's digest from the manifest and runs exactly th
   const stamped = identity(t, { cargo: "1.2.3" });
   assert.equal(stamped.status, 0, stamped.output);
   assert.match(stamped.output, /reports 'sealantd 1\.2\.3'/);
+});
+
+test("identity resolves its arch through the index, and refuses an index that maps it to another build", (t) => {
+  // Astra's round 1: the receipt records a swapped index whose amd64 and arm64 labels are
+  // exchanged. No checkIndex runs here, as if it had been stubbed to pass; identity alone refuses.
+  const swapped = indexDocument([child(PLATFORMS.amd64, "arm64"), child(PLATFORMS.arm64, "amd64")]);
+  for (const arch of ["amd64", "arm64"]) {
+    const result = identity(t, { arch, index: swapped });
+    assert.equal(result.status, 1, `${arch}: ${result.output}`);
+    const other = PLATFORMS[arch === "amd64" ? "arm64" : "amd64"];
+    assert.match(
+      result.output,
+      new RegExp(
+        `The index ${swapped.digest} maps linux/${arch} to ${other}; this arch's build is ${PLATFORMS[arch]}`,
+      ),
+    );
+    // Nothing is pulled from a swapped index.
+    assert.deepEqual(result.calls, [
+      ["buildx", "imagetools", "inspect", `${REPOSITORY}@${swapped.digest}`, "--raw"],
+    ]);
+  }
+  const other = `sha256:${"9".repeat(64)}`;
+  for (const [label, fixture, problem] of [
+    [
+      "a build job that recorded another digest",
+      { build: other },
+      new RegExp(`maps linux/amd64 to ${PLATFORMS.amd64}; this arch's build is ${other}`),
+    ],
+    [
+      "an index that maps the arch to another digest",
+      { index: indexDocument([child(other, "amd64"), child(PLATFORMS.arm64, "arm64")]) },
+      new RegExp(`maps linux/amd64 to ${other}; this arch's build is ${PLATFORMS.amd64}`),
+    ],
+    [
+      "a duplicated platform",
+      {
+        index: indexDocument([
+          child(PLATFORMS.amd64, "amd64"),
+          child(PLATFORMS.arm64, "amd64"),
+          child(PLATFORMS.arm64, "arm64"),
+        ]),
+      },
+      /has 2 linux\/amd64 entries, not one/,
+    ],
+    [
+      "a descriptor of the wrong variant",
+      {
+        arch: "arm64",
+        index: indexDocument([
+          child(PLATFORMS.amd64, "amd64"),
+          child(PLATFORMS.arm64, "arm64", "v7"),
+        ]),
+      },
+      /holds linux\/arm64\/v7/,
+    ],
+    ["an index the registry does not serve", { docker: { unreadableIndex: true } }, /not found/],
+  ]) {
+    const result = identity(t, fixture);
+    assert.equal(result.status, 1, `${label}: ${result.output}`);
+    assert.match(result.output, problem, label);
+    assert.ok(
+      result.calls.every(([command]) => command !== "pull"),
+      `${label} pulls nothing`,
+    );
+  }
+  // An index BuildKit wrote with arm64's v8 variant resolves.
+  const v8 = indexDocument([
+    child(PLATFORMS.amd64, "amd64"),
+    child(PLATFORMS.arm64, "arm64", "v8"),
+  ]);
+  const resolved = identity(t, { arch: "arm64", index: v8 });
+  assert.equal(resolved.status, 0, resolved.output);
 });
 
 test("identity refuses a wrong image ID, label, platform or --version, naming what it saw", (t) => {

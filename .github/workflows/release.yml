@@ -4,8 +4,9 @@
 # 1. stable-tag refuses anything but a stable tag of a commit whose `ci` push run on main passed.
 # 2. build pushes each platform by digest, untagged; merge stages the index under this run's own
 #    tag, staging-<run>-<attempt>; release-manifest records every digest.
-# 3. identity pulls each platform by digest on its own arch and checks it is this release's build:
-#    the image ID it runs, its labels, and `sealantd --version`. Identity checks, not acceptance:
+# 3. identity resolves each platform through the staged index on its own arch, requires the index to
+#    map it to that arch's build, pulls it and checks it is this release's build: the image ID it
+#    runs, its labels, and `sealantd --version`. Identity checks, not acceptance:
 #    a sealantd image is accepted by Core, which pins it by digest and runs its workspace e2e
 #    against exactly that digest before Core releases (docs/runtime/integration.md, Stable releases).
 # 4. finalize-images writes :<version>, once, from the checked index; npm publishes after it.
@@ -228,11 +229,11 @@ jobs:
           # setup-node v6 restores a package-manager cache by itself when packageManager names npm.
           package-manager-cache: false
           node-version: 24
+      # One directory per build, named for its arch: which digest is which arch's build is kept.
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: /tmp/digests
           pattern: digests-sealantd--*
-          merge-multiple: true
       - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
@@ -240,16 +241,17 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
       # scripts/release-publication.test.mjs runs this step as written, against a stand-in docker.
       - name: Stage the multi-arch index under this run's tag
-        working-directory: /tmp/digests
         env:
           REPOSITORY: ghcr.io/${{ github.repository }}
         run: |
           set -euo pipefail
           tag=staging-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT
           sources=()
-          for digest in *; do
-            if [[ ! $digest =~ ^[0-9a-f]{64}$ ]]; then
-              echo "::error::\"$digest\" in the digests artifact is not an image digest."
+          for arch in amd64 arm64; do
+            built=(/tmp/digests/digests-sealantd--"$arch"/*)
+            digest=${built[0]##*/}
+            if [[ ${#built[@]} -ne 1 || ! $digest =~ ^[0-9a-f]{64}$ ]]; then
+              echo "::error::The $arch digests artifact holds '${built[*]##*/}', not one image digest."
               exit 1
             fi
             sources+=("$REPOSITORY@sha256:$digest")
@@ -260,7 +262,7 @@ jobs:
           docker buildx imagetools inspect "$REPOSITORY:$tag"
       # The index digest goes in the release manifest: the one create reported, never the tag's,
       # which another writer can move. That index and each source are read by digest, and the index
-      # must hold exactly the sources, for amd64 and arm64.
+      # must hold exactly the sources, each arch's build under that arch's platform.
       # scripts/release-manifest.test.mjs runs this step as written, against a stand-in docker.
       - name: Check and record the index digest
         working-directory: ${{ runner.temp }}/index
@@ -275,10 +277,10 @@ jobs:
           fi
           docker buildx imagetools inspect "$REPOSITORY@$digest" --raw >index.json
           sources=()
-          for file in /tmp/digests/*; do
-            source=${file##*/}
+          for arch in amd64 arm64; do
+            source=$(cd "/tmp/digests/digests-sealantd--$arch" && ls)
             docker buildx imagetools inspect "$REPOSITORY@sha256:$source" --raw >"source-$source.json"
-            sources+=("sha256:$source=source-$source.json")
+            sources+=("$arch=sha256:$source=source-$source.json")
           done
           node "$GITHUB_WORKSPACE/scripts/release-manifest.mjs" check-index create.json \
             index.json "${sources[@]}" >digest
@@ -334,10 +336,11 @@ jobs:
           if-no-files-found: error
           retention-days: 90
 
-  # Identity checks, not acceptance: each arch's platform, pulled by the digest the manifest
-  # records, must be this release's build. It must run as the image ID it was pulled as, carry this
-  # version, commit and source as labels, and its daemon must report the version the tagged
-  # commit's Cargo.toml gives. A mislabelled or broken index stops here, before :<version> exists.
+  # Identity checks, not acceptance: each arch's platform, as the index the manifest records maps
+  # it, must be this arch's build, and that build must be this release's. It must run as the image
+  # ID it was pulled as, carry this version, commit and source as labels, and its daemon must report
+  # the version the tagged commit's Cargo.toml gives. A mislabelled, swapped or broken index stops
+  # here, before :<version> exists.
   identity:
     name: Identity check (${{ matrix.platform.arch }})
     needs: [stable-tag, release-manifest]
@@ -369,7 +372,15 @@ jobs:
         with:
           name: release-manifest
           path: ${{ runner.temp }}/release
-      # Pulled anonymously, as a consumer pulls it. sealantd reports Cargo's workspace version, which
+      # This arch's build digest, as its build job recorded it.
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: digests-sealantd--${{ matrix.platform.arch }}
+          path: ${{ runner.temp }}/built
+      # The platform is resolved through the index, as a consumer of :<version> resolves it: the
+      # index is read by the digest the manifest records, and the digest it maps this arch's platform
+      # to must be this arch's build, as its build job and the manifest both record it. Then that
+      # digest is pulled anonymously, as a consumer pulls it. sealantd reports Cargo's workspace version, which
       # the release flow does not stamp: while Cargo.toml says 0.0.0 the daemon reports 0.0.0, and
       # the version label is what names the release. Cargo.toml saying any version but 0.0.0 or this
       # release's is refused.
@@ -378,6 +389,7 @@ jobs:
         env:
           REPOSITORY: ghcr.io/${{ github.repository }}
           MANIFEST: ${{ runner.temp }}/release/release-manifest.json
+          BUILT: ${{ runner.temp }}/built
           VERSION: ${{ needs.stable-tag.outputs.version }}
           ARCH: ${{ matrix.platform.arch }}
         run: |
@@ -397,7 +409,20 @@ jobs:
             echo "::error::Cargo.toml's workspace version is '$cargo', neither 0.0.0 nor $VERSION."
             exit 1
           fi
-          digest=$(node scripts/release-manifest.mjs digest "$MANIFEST" sealantd "$ARCH")
+          receipt=$(node scripts/release-manifest.mjs digest "$MANIFEST" sealantd "$ARCH")
+          index=$(jq -r '.images.sealantd.index' "$MANIFEST")
+          built=("$BUILT"/*)
+          build=sha256:${built[0]##*/}
+          if [[ ${#built[@]} -ne 1 || ! $build =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::The $ARCH digests artifact holds '${built[*]##*/}', not one image digest."
+            exit 1
+          fi
+          docker buildx imagetools inspect "$REPOSITORY@$index" --raw >"$RUNNER_TEMP/index.json"
+          digest=$(node scripts/release-manifest.mjs select "$RUNNER_TEMP/index.json" "$index" "$ARCH")
+          if ! [[ $digest == "$build" && $digest == "$receipt" ]]; then
+            echo "::error::The index $index maps linux/$ARCH to $digest; this arch's build is $build and the manifest records $receipt. Nothing was published."
+            exit 1
+          fi
           docker pull "$REPOSITORY@$digest"
           id=$(docker image inspect "$REPOSITORY@$digest" --format '{{.Id}}')
           if [[ ! $id =~ ^sha256:[0-9a-f]{64}$ ]]; then

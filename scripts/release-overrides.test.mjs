@@ -18,6 +18,8 @@ import { parse } from "yaml";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
 const RELEASE = "release.yml";
+/** The workflows that publish, where the release graph starts: Next holds an id-token too. */
+const ROOTS = [RELEASE, "next.yml"];
 const OVERRIDES = ["RELEASE_TEST_RETRY_MS", "REPUBLISH_TEST_WAIT", "REPUBLISH_TEST_PACOTE"];
 const NAMED = new RegExp(OVERRIDES.join("|"), "i");
 
@@ -112,8 +114,9 @@ const RULE = {
 };
 
 /**
- * The problems in <workflows> (file name → text), and the release graph it read: release.yml and
- * every workflow it calls through `uses: ./.github/workflows/…`, transitively.
+ * The problems in <workflows> (file name → text), and the release graph it read: the ROOTS
+ * (release.yml and next.yml) and every workflow they call through `uses: ./.github/workflows/…`,
+ * transitively.
  *
  * Rules 1 and 2 read each line of a workflow twice: as written, comments included, and in every
  * string value YAML decodes from it, which is what the runner hands Bash or sets in the environment
@@ -128,8 +131,7 @@ const RULE = {
  *
  * Writes to $GITHUB_ENV outside the release graph are allowed (no workflow here writes one today).
  * A job's $GITHUB_ENV reaches only that job's later steps, never another job, so it cannot reach a
- * release job, nor can a workflow's env reach a workflow it does not call. next.yml is not in the
- * release graph, so rule 1 does not cover it; rules 2 and 3 do.
+ * release job, nor can a workflow's env reach a workflow it does not call.
  *
  * What a text scan of the workflows cannot see:
  * - a name a release step assembles from pieces at run time and exports itself, after its preamble
@@ -150,7 +152,7 @@ function overrideProblems(workflows, { skip = new Set() } = {}) {
     Object.entries(workflows).map(([file, text]) => [file, parse(text) ?? {}]),
   );
   const graph = new Set();
-  for (const pending = [RELEASE]; pending.length > 0;) {
+  for (const pending = [...ROOTS]; pending.length > 0;) {
     const file = pending.pop();
     if (graph.has(file)) continue;
     graph.add(file);
@@ -196,7 +198,7 @@ test("no workflow sets a test delay, and only the release workflow and its tests
   const { graph, problems } = overrideProblems(workflows);
   t.diagnostic(`release graph: ${[...graph].toSorted().join(", ")}`);
   assert.deepEqual(problems, []);
-  assert.deepEqual([...graph], [RELEASE]);
+  assert.deepEqual([...graph].toSorted(), [...ROOTS].toSorted());
   // Every approved line is still there: an approval outlives nothing it was given for.
   for (const [file, approved] of Object.entries(OVERRIDE_LINES)) {
     const lines = new Set(workflows[file].split("\n").map((line) => line.trim()));
@@ -456,10 +458,17 @@ test("$GITHUB_ENV writes outside the release graph pass, and the same write insi
     overrideProblems(withStep(workflows, "ci.yml", "node", runStep(write))).problems,
     [],
   );
-  const released = overrideProblems(withStep(workflows, RELEASE, "build", runStep(write)));
-  assert.ok(
-    released.problems.some((problem) => TEXT.test(problem) && problem.includes("release.yml:")),
-  );
+  for (const [file, job] of [
+    [RELEASE, "build"],
+    ["next.yml", "image"],
+    ["next.yml", "publish"],
+  ]) {
+    const inside = overrideProblems(withStep(workflows, file, job, runStep(write)));
+    assert.ok(
+      inside.problems.some((problem) => TEXT.test(problem) && problem.includes(`${file}:`)),
+      `${file} ${job}`,
+    );
+  }
   // A workflow release.yml calls joins the graph, and its writes fail too.
   const called = {
     ...workflows,
