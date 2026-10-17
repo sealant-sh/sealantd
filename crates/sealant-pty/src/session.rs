@@ -2394,3 +2394,130 @@ mod tests {
         assert_eq!(String::from_utf8_lossy(&out), "one\ntwo\n");
     }
 }
+
+/// Diagnostic only (branch diag/pty-fds-arm64, never merged): how often a just-spawned git
+/// still lists a descriptor of the spawning process in /proc/<pid>/fd, and whether it is gone
+/// once git has finished its exec.
+#[cfg(test)]
+mod diag {
+    use super::*;
+    use sealant_process::spawn::CommandGateExt;
+
+    fn fd_info(pid: u32, fd: &str) -> Option<String> {
+        let target = std::fs::read_link(format!("/proc/{pid}/fd/{fd}")).ok()?;
+        let info = std::fs::read_to_string(format!("/proc/{pid}/fdinfo/{fd}")).unwrap_or_default();
+        let pick = |k: &str| info.lines().find(|l| l.starts_with(k)).unwrap_or("").replace('\t', " ");
+        Some(format!("{fd} -> {} [{} {} {} {}]", target.display(), pick("flags:"), pick("mnt_id:"), pick("ino:"), pick("tty-index:")))
+    }
+
+    fn all_fds(pid: u32) -> Vec<String> {
+        let mut out = Vec::new();
+        if let Ok(dir) = std::fs::read_dir(format!("/proc/{pid}/fd")) {
+            for e in dir.flatten() {
+                if let Some(i) = fd_info(pid, &e.file_name().to_string_lossy()) {
+                    out.push(i);
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn diag_exec_window() {
+        let me = std::process::id();
+        println!("DIAG kernel: {}", std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default().trim());
+        println!("DIAG test process fds before any session:");
+        for f in all_fds(me) {
+            println!("DIAG   {f}");
+        }
+        let rt = tests_runtime();
+        let session = rt
+            .open(OpenSessionArgs {
+                user: None,
+                execution_id: None,
+                shell: Some("/bin/sh".to_owned()),
+                args: vec!["-c".to_owned(), "exec sleep 600".to_owned()],
+                cwd: None,
+                env: vec![],
+                cols: 80,
+                rows: 24,
+                term: None,
+                mode: SessionMode::Pty,
+            })
+            .expect("open");
+        println!("DIAG test process fds with the session open:");
+        let with_session = all_fds(me);
+        for f in &with_session {
+            println!("DIAG   {f}");
+        }
+        let masters: Vec<String> = with_session
+            .iter()
+            .filter(|f| f.contains("ptmx"))
+            .map(|f| f.split(' ').next().unwrap().to_owned())
+            .collect();
+        let (runs, mut early, mut gone_after) = (2000, 0, 0);
+        let mut shown = 0;
+        for _ in 0..runs {
+            let git = std::process::Command::new("git")
+                .args(["hash-object", "--stdin"])
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn_gated()
+                .expect("spawn git");
+            let pid = git.pid() as u32;
+            let comm_then = std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default();
+            let held: Vec<String> = masters.iter().filter_map(|m| fd_info(pid, m)).collect();
+            if !held.is_empty() {
+                early += 1;
+                // Once git runs and sleeps in its read, look again.
+                let until = Instant::now() + Duration::from_secs(5);
+                loop {
+                    let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default();
+                    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+                    let state = stat.rsplit_once(')').and_then(|(_, r)| r.split_whitespace().next().map(str::to_owned));
+                    if comm.trim().rsplit('/').next() == Some("git") && state.as_deref() == Some("S") {
+                        break;
+                    }
+                    if Instant::now() > until {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                let after: Vec<String> = masters.iter().filter_map(|m| fd_info(pid, m)).collect();
+                if after.is_empty() {
+                    gone_after += 1;
+                }
+                if shown < 5 {
+                    shown += 1;
+                    println!("DIAG early read: comm then {:?}, held {held:?}; after the exec: comm {:?}, held {after:?}", comm_then.trim(), std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default().trim());
+                }
+            }
+            git.communicate(None).expect("git ends");
+        }
+        println!("DIAG RESULT: {runs} gits spawned while the session was open; {early} listed the session's master right after spawn; {gone_after} of those no longer did once git ran");
+        let _ = rt.close(&session.session_id);
+    }
+
+    fn tests_runtime() -> SessionRuntime {
+        let rt = sealant_runtime_core::new_runtime_id();
+        let clock = Arc::new(Clock::new());
+        let idgen = Arc::new(IdGenerator::new(&rt));
+        let bus = Arc::new(EventBus::new(rt.clone(), clock.clone(), idgen.clone(), 1024));
+        let mut config = RuntimeConfig::new(rt);
+        config.workspace_root = std::env::temp_dir();
+        config.default_shell = "/bin/sh".to_owned();
+        config.shutdown_grace_ms = 500;
+        SessionRuntime {
+            registry: Arc::new(SessionRegistry::new()),
+            bus,
+            idgen,
+            status: Arc::new(RuntimeStatus::new()),
+            clock,
+            config: Arc::new(config),
+            extra_env: Arc::new(std::sync::Mutex::new(Vec::new())),
+            redactor: Arc::new(Redactor::default()),
+        }
+    }
+}

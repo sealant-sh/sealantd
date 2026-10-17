@@ -59,7 +59,7 @@ jobs:
 
   rust:
     needs: changes
-    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.code != 'false') }}
+    if: false # diagnostic branch: arm64 only
     runs-on: ${{ inputs.runner && inputs.runner != 'box' && inputs.runner || fromJSON('["self-hosted","box","linux","x64"]') }}
     timeout-minutes: 30
     steps:
@@ -97,7 +97,6 @@ jobs:
   # there. fmt is architecture-independent and stays on the job above.
   rust-arm64:
     needs: changes
-    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.code != 'false') }}
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 30
     steps:
@@ -105,27 +104,26 @@ jobs:
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: scripts/ci-install-dotfiles-tools.sh
-      # nextest runs the test binaries side by side, each test in its own process: cargo test ran
-      # the 100 binaries one after another (~120 s of tests that take ~20 s side by side).
       - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
         with:
           tool: cargo-nextest@0.9.146
-      - run: cargo nextest run --workspace --no-fail-fast
-        env:
-          SEALANTD_REQUIRE_DOTFILES_TOOLS: "1"
-          # Hosted runners impose no no-new-privileges: the per-person runtime test must prove
-          # the daemon leaves it unset, not pass with nothing to show.
-          SEALANTD_REQUIRE_NNP_FREE: "1"
-      - run: cargo test --workspace --doc
+      - name: the runner's descriptors
+        run: |
+          uname -a
+          ls -l /proc/self/fd
+          for f in /proc/self/fd/*; do echo "$f: $(readlink $f)"; cat /proc/self/fdinfo/${f##*/} 2>/dev/null | tr '\n' ' '; echo; done
+      - name: exec window (diagnostic)
+        run: cargo test -p sealant-pty --lib diag_exec_window -- --nocapture 2>&1 | grep DIAG
+      - name: the original test, 30 runs
+        run: |
+          for i in $(seq 30); do
+            cargo nextest run -p sealant-pty -E 'test(a_ptys_descriptors_stay_with_its_session)' 2>&1 | grep -E "^\s+(PASS|FAIL) \[|holds" | head -3
+          done | sort | uniq -c
 
   node:
     needs: changes
-    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.code != 'false') }}
+    if: false # diagnostic branch: arm64 only
     runs-on: ${{ inputs.runner && inputs.runner != 'box' && inputs.runner || fromJSON('["self-hosted","box","linux","x64"]') }}
     timeout-minutes: 20
     steps:
