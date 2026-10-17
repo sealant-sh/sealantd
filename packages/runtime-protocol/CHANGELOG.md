@@ -9,6 +9,14 @@ above this one, so the Version PR moves these lines into it. -->
   or a final flush that stages a capture wakes it to ship, and `stop` wakes it to exit, as before.
   The tick deadline is unchanged: with nothing waking it, the next pass is due 5 s after the
   previous one. Only the early passes nothing asked for are gone (#182).
+- A directory the dotfiles copy makes in a home takes the mode it has in the dotfiles tree and
+  the mode a new directory there takes, intersected, without set-id and sticky bits: a `.ssh`
+  shipped `0700` is `0700`, and nothing comes out wider than a new directory would under the
+  daemon's umask or the home's default ACL. The modes go on once the request's every archive is
+  in, deepest first, each set on the directory the copy made and found again by inode, so a
+  later archive still writes into a `0555` directory of an earlier one. A directory already in
+  the home is never changed, its mode and bits included, and a link standing where the tree has
+  a directory is refused rather than followed. Files and symlinks are copied as before (#181).
 
 ## 0.19.0
 

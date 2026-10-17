@@ -17,6 +17,15 @@ pub mod shutdown;
 pub mod sweep;
 pub mod unclaimed;
 
+/// What the root tests reach into the daemon with, in a build with the `test-support` feature
+/// only (`scripts/ci-test-support-gate.sh` keeps it out of every build of the daemon).
+#[cfg(feature = "test-support")]
+pub mod test_support {
+    /// `<point>:<name>=<gate>`: the dotfiles copy holds at `point` (`made`, `final`) for the
+    /// directory named `name` until `gate` exists, having written `<gate>.reached`.
+    pub const DOTFILES_HOLD_ENV: &str = "SEALANTD_DOTFILES_TEST_HOLD";
+}
+
 pub use app::run;
 pub use boot::{BootConfig, run_boot};
 pub use runtime::Runtime;

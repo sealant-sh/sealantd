@@ -15,11 +15,14 @@ const gate = path.join(here, "ci-test-support-gate.sh");
 
 // What a graph read answers: `fail` exits 101 as a cargo error would; `absent` and `present` are a
 // graph without and with the feature; `empty` succeeds with nothing.
+const crates = "sealantd v0.0.0 (/w/crates/sealantd)\\nsealant-capture v0.0.0 (/w/crates/sealant-capture)\\n";
 const graphs = {
-  absent:
-    'sealantd v0.0.0 (/w/crates/sealantd)\\nsealant-capture v0.0.0 (/w/crates/sealant-capture)\\nsealant-capture feature "default"\\n',
-  present:
-    'sealantd v0.0.0 (/w/crates/sealantd)\\nsealant-capture v0.0.0 (/w/crates/sealant-capture)\\nsealant-capture feature "test-support"\\n',
+  absent: `${crates}sealant-capture feature "default"\\nsealantd feature "default"\\n`,
+  present: `${crates}sealant-capture feature "test-support"\\nsealantd feature "test-support"\\n`,
+  // sealant-capture's off and sealantd's on: the gate reads each crate's feature on its own.
+  sealantd: `${crates}sealant-capture feature "default"\\nsealantd feature "test-support"\\n`,
+  // sealant-capture's on and sealantd's off.
+  capture: `${crates}sealant-capture feature "test-support"\\nsealantd feature "default"\\n`,
   empty: "",
 };
 
@@ -33,11 +36,13 @@ const fakeCargo = (t, { normal, dev, grepFails = false }) => {
     `#!/bin/sh
 case "$*" in
 *"tree "*"-i sealant-capture"*) exit 0 ;;
+*"tree "*"-i sealantd"*) exit 0 ;;
 *"tree "*"-e normal,build,features") ${answer(normal)} ;;
 *"tree "*"-e normal,build,dev,features") ${answer(dev)} ;;
 *"check "*"--features control") exit 0 ;;
 *"check "*names-the-manual-clock) echo 'error[E0432]: unresolved import \`sealant_capture::ManualClock\`'; exit 101 ;;
 *"check "*injects-a-clock) echo 'error[E0609]: no field \`clock\` on type \`CaptureConfig\`'; exit 101 ;;
+*"check "*names-the-dotfiles-hold) echo 'error[E0432]: unresolved import \`sealantd::test_support\`'; exit 101 ;;
 esac
 echo "fake cargo: unexpected: $*" >&2
 exit 99
@@ -58,7 +63,7 @@ const run = (t, graphsRead) =>
     env: { ...process.env, PATH: fakeCargo(t, graphsRead) },
   });
 
-const passed = "sealant-capture's test-support: on in the tests only";
+const passed = "test-support: on in the tests only";
 
 test("with every graph read sound and the probes refused, the gate passes", (t) => {
   const r = run(t, { normal: "absent", dev: "present" });
@@ -89,7 +94,19 @@ test("a normal graph read that succeeds empty fails the gate", (t) => {
 test("the feature in the normal graph fails the gate", (t) => {
   const r = run(t, { normal: "present", dev: "present" });
   assert.notEqual(r.status, 0);
-  assert.match(r.stderr, /enabled outside the tests/);
+  assert.match(r.stderr, /sealant-capture's test-support is enabled outside the tests/);
+});
+
+test("sealantd's feature alone in the normal graph fails the gate", (t) => {
+  const r = run(t, { normal: "sealantd", dev: "present" });
+  assert.notEqual(r.status, 0);
+  assert.match(r.stderr, /sealantd's test-support is enabled outside the tests/);
+});
+
+test("a control graph with sealant-capture's feature but not sealantd's fails the gate", (t) => {
+  const r = run(t, { normal: "absent", dev: "capture" });
+  assert.notEqual(r.status, 0);
+  assert.match(r.stderr, /no test turns on sealantd's test-support/);
 });
 
 test("a control graph without the feature fails the gate: the check would look for nothing", (t) => {
