@@ -29,9 +29,10 @@ permissions:
 
 # A pull request's new push cancels its previous run. A push to main is never cancelled: each main
 # commit gets its own group, so every one finishes, and `next` (which runs on a passed `ci` of a
-# main push) sees every main commit, not only the last of a quick series.
+# main push) sees every main commit, not only the last of a quick series. A dispatch is its own
+# group: sharing its commit's would let it cancel that commit's push run, and Next with it.
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  group: ci-${{ github.workflow }}-${{ github.event_name == 'workflow_dispatch' && format('dispatch-{0}', github.run_id) || (github.event_name == 'pull_request' && github.ref || github.sha) }}
   cancel-in-progress: true
 
 jobs:
@@ -148,7 +149,7 @@ jobs:
           scripts/republish.test.mjs scripts/next-tag.test.mjs scripts/ci-docs-only.test.mjs
           scripts/workflow-runners.test.mjs scripts/release-manifest.test.mjs
           scripts/release-publication.test.mjs scripts/release-overrides.test.mjs
-          scripts/release-npm.test.mjs
+          scripts/release-npm.test.mjs scripts/ci-concurrency.test.mjs
       - run: pnpm -r build
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo build --locked -p sealantd # the TypeScript e2e spawns the daemon binary
