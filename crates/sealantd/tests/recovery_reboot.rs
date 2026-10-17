@@ -12,7 +12,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::process::Command as Proc;
+use std::process::{Command as Proc, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -20,6 +20,7 @@ use sealant_capture::{
     BlobSink, CaptureConfig, CaptureEngine, CaptureKind, Class, InMemoryRegistrar, LocalDir,
     MaterializeClass, MaterializeTargets, Materializer, Registrar, SnapRequest,
 };
+use sealant_process::spawn::CommandGateExt;
 use sealantd::boot::capture::boot_from;
 use sealantd::boot::config::{BootConfig, CaptureSourceConfig, EnvSource};
 use sealantd::boot::lock::DiskLock;
@@ -217,11 +218,15 @@ fn a_recovery_reboot_on_its_own_disk_saves_it_and_a_second_is_refused() {
     }
 
     // A second boot on the same disk, the real binary, `--recovery`: refused, 75, untouched.
+    // Through the spawn gate: the daemon above runs this process's orphan reaper, which reaps
+    // any exited child the gate does not list, and a bare `output()` here then fails with
+    // ECHILD (sealantd#178, `sealant_process::spawn`).
     let second = Proc::new(env!("CARGO_BIN_EXE_sealantd"))
         .args(["boot", "--recovery"])
         .env_clear()
         .envs(env_pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())))
-        .output()
+        .stdin(Stdio::null())
+        .output_gated()
         .expect("sealantd boot --recovery");
     let stderr = String::from_utf8_lossy(&second.stderr);
     assert_eq!(second.status.code(), Some(75), "{stderr}");
