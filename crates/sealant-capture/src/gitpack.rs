@@ -402,7 +402,7 @@ fn spawn_with(command: &mut Command, limit: Option<std::time::Duration>) -> io::
         overdue: bounds.git_overdue,
         limit,
     };
-    let mut child = command.spawn_gated()?;
+    let mut child = command.spawn_helper()?;
     child.bound(bound);
     Ok(child)
 }

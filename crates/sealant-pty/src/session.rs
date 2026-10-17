@@ -1832,7 +1832,7 @@ mod tests {
     }
 
     /// Where a terminal descriptor a process holds comes from: a session's master or slave, one
-    /// the test process held before it opened any session (its launcher's), or neither.
+    /// the test process held before it opened any session, or neither.
     fn origin(fd: &OpenFd, sessions: &[(&str, &OpenFd, &OpenFd)], before: &[OpenFd]) -> String {
         for (name, master, slave) in sessions {
             if fd.same_file(master) {
@@ -1854,19 +1854,27 @@ mod tests {
     /// a command run as `exec` runs it, nor a git run as the capture engine runs it. The check
     /// holds whatever the descriptor is; each one found is named by where it came from: a
     /// session's master or slave (matched by mount, inode and PTY, not by PTY number alone),
-    /// one the test process inherited from its launcher, or neither.
+    /// one the test process held before it opened a session, or neither.
+    ///
+    /// The order follows sealantd's: the start marking first, then a master opened without
+    /// close-on-exec. Sessions and the command spawn the default way, which keeps that master
+    /// from every child; the git spawns as a helper, which needs it marked first. A spawn that
+    /// runs as a person or what a request names, misfiled as a helper, meets the unmarked master
+    /// and the sweep's check fails the test.
     // Two workers: the leaders and the command are this test's children, and the runtime reaps
     // them on one while the guards wait on the other.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_ptys_descriptors_stay_with_its_session() {
         use sealant_process::spawn::CommandGateExt;
 
-        // A launcher's master: open in the test process without close-on-exec before any session,
-        // as whatever starts sealantd may leave one. No child may get it (sealant_process::spawn).
+        // What sealantd does first: whatever its launcher left open is marked close-on-exec.
+        sealant_process::spawn::mark_at_start().expect("the start marking");
+        // A master opened after that without close-on-exec, as sealantd would open one that
+        // lacked the flag. No child spawned the default way gets it (sealant_process::spawn).
         let own: i32 = std::process::id().try_into().expect("a pid");
-        let launcher =
+        let unflagged =
             nix::pty::posix_openpt(nix::fcntl::OFlag::O_RDWR | nix::fcntl::OFlag::O_NOCTTY)
-                .expect("open a launcher's master");
+                .expect("open a master without close-on-exec");
         // What the test process holds before any session: whatever its launcher passed it, and
         // the master above.
         let before = open_fds(own);
@@ -1973,26 +1981,24 @@ mod tests {
             .expect("exec a command");
         let command_group = GroupGuard { pgid: command.pgid };
 
-        // A git, as the capture engine runs one: blocked on its stdin until the test closes it.
-        let git = std::process::Command::new("git")
-            .args(["hash-object", "--stdin"])
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn_gated()
-            .expect("spawn git");
-
         for (pid, program) in [
             (first.pid, "sleep"),
             (second.pid, "sh"),
             (second_child, "sleep"),
             (command.pid, "sleep"),
-            (git.pid(), "git"),
         ] {
             exec_done(pid, program).await;
         }
-        let mut held = Vec::new();
-        for (who, pid, slave) in [
+        let held_by = |who: &str, pid: i32, slave: Option<&OpenFd>| -> Vec<String> {
+            terminal_fds(pid)
+                .into_iter()
+                // A session's processes have its slave as stdin, stdout and stderr, nothing else.
+                .filter(|fd| !(fd.fd <= 2 && slave.is_some_and(|s| fd.same_file(s))))
+                .map(|fd| format!("{who} holds {}: {fd:?}", origin(&fd, &sessions, &before)))
+                .collect()
+        };
+        let inherited: Vec<&OpenFd> = before.iter().filter(|fd| fd.is_terminal()).collect();
+        let held: Vec<String> = [
             ("the first session's leader", first.pid, Some(&first_slave)),
             (
                 "the second session's leader",
@@ -2005,24 +2011,39 @@ mod tests {
                 Some(&second_slave),
             ),
             ("a command run as exec runs it", command.pid, None),
-            ("a git run as the capture engine runs it", git.pid(), None),
-        ] {
-            for fd in terminal_fds(pid) {
-                // A session's processes have its slave as stdin, stdout and stderr, nothing else.
-                if fd.fd <= 2 && slave.is_some_and(|s| fd.same_file(s)) {
-                    continue;
-                }
-                held.push(format!(
-                    "{who} holds {}: {fd:?}",
-                    origin(&fd, &sessions, &before)
-                ));
-            }
-        }
-        let inherited: Vec<&OpenFd> = before.iter().filter(|fd| fd.is_terminal()).collect();
+        ]
+        .into_iter()
+        .flat_map(|(who, pid, slave)| held_by(who, pid, slave))
+        .collect();
         assert!(
             held.is_empty(),
             "terminal descriptors where none belongs:\n{}\n(the test process held these \
              terminal descriptors before it opened a session: {inherited:?})",
+            held.join("\n")
+        );
+
+        // A helper spawn needs every descriptor close-on-exec: in tests the sweep before it
+        // panics on one without the flag. Marked now, the master stands for one sealantd opened
+        // with it.
+        nix::fcntl::fcntl(
+            &unflagged,
+            nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC),
+        )
+        .expect("mark the master close-on-exec");
+        // A git, as the capture engine runs one (a helper): blocked on its stdin until the test
+        // closes it.
+        let git = std::process::Command::new("git")
+            .args(["hash-object", "--stdin"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn_helper()
+            .expect("spawn git");
+        exec_done(git.pid(), "git").await;
+        let held = held_by("a git run as the capture engine runs it", git.pid(), None);
+        assert!(
+            held.is_empty(),
+            "terminal descriptors where none belongs:\n{}",
             held.join("\n")
         );
 
@@ -2035,7 +2056,7 @@ mod tests {
             .expect("close the first session");
         rt.close(&second.session_id)
             .expect("close the second session");
-        drop(launcher);
+        drop(unflagged);
         assert!(command_group.end(), "the command is left over");
         assert!(first_group.end(), "the first session is left over");
         assert!(second_group.end(), "the second session is left over");

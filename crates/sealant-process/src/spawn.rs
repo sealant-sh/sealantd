@@ -22,6 +22,7 @@
 use std::collections::HashSet;
 use std::io::{self, Read, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Output, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::thread::JoinHandle;
@@ -131,6 +132,98 @@ pub fn mark_inherited_close_on_exec() -> io::Result<()> {
         result => result,
     }
 }
+
+/// Whether this process has run its start marking ([`mark_at_start`]).
+static STARTED: AtomicBool = AtomicBool::new(false);
+
+/// What sealantd does first: mark every descriptor its launcher left open from 3 up close-on-exec
+/// ([`mark_inherited_close_on_exec`]), and record that it did, for the check before a helper
+/// spawn ([`sweep_before_helper_spawn`]).
+///
+/// # Errors
+/// The marking's.
+pub fn mark_at_start() -> io::Result<()> {
+    mark_inherited_close_on_exec()?;
+    STARTED.store(true, Ordering::Release);
+    Ok(())
+}
+
+/// Before a helper spawn ([`spawn_helper_std`]), in the parent: every descriptor from 3 up is
+/// marked close-on-exec, so the child needs no `pre_exec` and std starts it with `posix_spawn`
+/// (any `pre_exec` makes std fork, and a fork copies the page tables: about 16 µs per resident
+/// MiB, 0.37 s more for a small snap of a 900 MB capture).
+///
+/// It is a backstop for a missing flag, not a replacement for it. A descriptor another thread
+/// opens without close-on-exec between this sweep and the spawn is still inherited, so every
+/// open in sealantd must set `O_CLOEXEC`.
+///
+/// Test and debug builds check that first: once the start marking has run, a descriptor from 3
+/// up without close-on-exec is a missing `O_CLOEXEC`, and the sweep panics naming it. Two kinds
+/// are let through:
+/// 1. Every descriptor, before this process's start marking has run: a process that never ran
+///    sealantd's start (a test binary, whose launcher, cargo or a CI runner, may pass it pipes
+///    without the flag) gets the start marking here instead, and nothing is checked.
+/// 2. In this crate's own tests, the descriptors they plant without the flag on purpose.
+///
+/// # Errors
+/// The marking's: no helper starts when it fails.
+pub fn sweep_before_helper_spawn() -> io::Result<()> {
+    if !cfg!(any(test, debug_assertions)) {
+        return mark_inherited_close_on_exec();
+    }
+    // Held through the marking: a test checks that its plant is inheritable while it holds this.
+    #[cfg(test)]
+    let planted = PLANTED.lock().unwrap_or_else(PoisonError::into_inner);
+    #[cfg(test)]
+    let planted = |fd| planted.contains(&fd);
+    #[cfg(not(test))]
+    let planted = |_: i32| false;
+    if STARTED.load(Ordering::Acquire) {
+        assert_close_on_exec(planted)?;
+    }
+    mark_at_start()
+}
+
+/// Panic when a descriptor from 3 up of this process, not `planted`, lacks close-on-exec. One
+/// gone before it is read is skipped; so is the listing's own, closed before any is read.
+#[allow(
+    unsafe_code,
+    reason = "F_GETFD on a descriptor number this process may close meanwhile: EBADF then"
+)]
+fn assert_close_on_exec(planted: impl Fn(i32) -> bool) -> io::Result<()> {
+    let mut fds = Vec::new();
+    for entry in std::fs::read_dir("/proc/self/fd")? {
+        if let Some(fd) = entry?
+            .file_name()
+            .to_str()
+            .and_then(|n| n.parse::<i32>().ok())
+        {
+            fds.push(fd);
+        }
+    }
+    for fd in fds.into_iter().filter(|&fd| fd >= 3 && !planted(fd)) {
+        // SAFETY: F_GETFD reads a descriptor's flags and touches no memory of ours.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        if flags < 0 || flags & libc::FD_CLOEXEC != 0 {
+            continue;
+        }
+        let Ok(target) = std::fs::read_link(format!("/proc/self/fd/{fd}")) else {
+            continue;
+        };
+        panic!(
+            "fd {fd} ({}) is open without close-on-exec; a helper spawn would pass it on (open \
+             it with O_CLOEXEC)",
+            target.display()
+        );
+    }
+    Ok(())
+}
+
+/// The descriptors this crate's tests plant without close-on-exec on purpose: the check before
+/// a helper spawn lets them through, so tests that run at once do not trip it on each other's.
+#[cfg(test)]
+static PLANTED: std::sync::LazyLock<Mutex<HashSet<i32>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashSet::new()));
 
 #[cfg(test)]
 thread_local! {
@@ -290,7 +383,9 @@ fn close_inherited_on_exec(command: &mut Command) {
 }
 
 /// Spawn a [`std::process::Command`] under the gate. The child gets no descriptor of this
-/// process beyond the stdio it is given ([`close_inherited_on_exec`]).
+/// process beyond the stdio it is given ([`close_inherited_on_exec`]). This is the spawn for
+/// anything that may run as a person, or whose program or arguments come from a request; only
+/// sealantd's own helpers may use [`spawn_helper_std`].
 ///
 /// # Errors
 /// Returns whatever `Command::spawn` returns; `PermissionDenied` from a thread acting with a
@@ -298,6 +393,28 @@ fn close_inherited_on_exec(command: &mut Command) {
 pub fn spawn_std(command: &mut Command) -> io::Result<(Child, SpawnedPid)> {
     refuse_on_fs_user_thread()?;
     close_inherited_on_exec(command);
+    spawn_registered(command)
+}
+
+/// Spawn one of sealantd's own helpers under the gate: a process sealantd runs as itself, with
+/// no identity change (no uid, gid or groups set, no [`crate::identity::RunAs`]), and a program
+/// and arguments sealantd chose. Anything else spawns with [`spawn_std`].
+///
+/// The child gets no `pre_exec`, so std starts it with `posix_spawn` instead of a fork; the
+/// descriptors are marked close-on-exec in this process first instead
+/// ([`sweep_before_helper_spawn`]).
+///
+/// # Errors
+/// The sweep's, then whatever `Command::spawn` returns; `PermissionDenied` from a thread acting
+/// with a person's filesystem identity.
+pub fn spawn_helper_std(command: &mut Command) -> io::Result<(Child, SpawnedPid)> {
+    refuse_on_fs_user_thread()?;
+    sweep_before_helper_spawn()?;
+    spawn_registered(command)
+}
+
+/// `command.spawn()`, its pid registered under the lock it is spawned under.
+fn spawn_registered(command: &mut Command) -> io::Result<(Child, SpawnedPid)> {
     let mut gate = lock_gate();
     #[allow(
         clippy::disallowed_methods,
@@ -311,7 +428,8 @@ pub fn spawn_std(command: &mut Command) -> io::Result<(Child, SpawnedPid)> {
 
 /// Spawn a [`tokio::process::Command`] under the gate. The caller must keep the guard until the
 /// child has been reaped (usually: move it into the task that awaits `child.wait()`). The child
-/// gets no descriptor of this process beyond the stdio it is given ([`close_inherited_on_exec`]).
+/// gets no descriptor of this process beyond the stdio it is given ([`close_inherited_on_exec`]),
+/// whoever it runs as and whatever it runs.
 ///
 /// # Errors
 /// Returns whatever `tokio::process::Command::spawn` returns; `PermissionDenied` from a thread
@@ -649,6 +767,11 @@ impl GatedChild {
 /// Gated equivalents of the blocking [`std::process::Command`] terminators. Every daemon-internal
 /// spawn uses these instead of `spawn`/`output`/`status` so the orphan reaper never mistakes the
 /// child for an adopted orphan (see the module docs).
+///
+/// The `*_gated` ones ([`spawn_std`]) are the default, for anything that may run as a person or
+/// whose program or arguments come from a request. The `*_helper` ones ([`spawn_helper_std`])
+/// are only for a process sealantd runs as itself, with no identity change, and a program and
+/// arguments sealantd chose.
 pub trait CommandGateExt {
     /// Like [`Command::spawn`], with the pid registered in the gate.
     ///
@@ -668,6 +791,24 @@ pub trait CommandGateExt {
     /// # Errors
     /// Returns whatever spawning or waiting for the child returns.
     fn status_gated(&mut self) -> io::Result<ExitStatus>;
+
+    /// [`Self::spawn_gated`] for one of sealantd's own helpers ([`spawn_helper_std`]).
+    ///
+    /// # Errors
+    /// The sweep's, or whatever `Command::spawn` returns.
+    fn spawn_helper(&mut self) -> io::Result<GatedChild>;
+
+    /// [`Self::output_gated`] for one of sealantd's own helpers ([`spawn_helper_std`]).
+    ///
+    /// # Errors
+    /// Returns whatever spawning or waiting for the child returns.
+    fn output_helper(&mut self) -> io::Result<Output>;
+
+    /// [`Self::status_gated`] for one of sealantd's own helpers ([`spawn_helper_std`]).
+    ///
+    /// # Errors
+    /// Returns whatever spawning or waiting for the child returns.
+    fn status_helper(&mut self) -> io::Result<ExitStatus>;
 }
 
 impl CommandGateExt for Command {
@@ -688,6 +829,24 @@ impl CommandGateExt for Command {
     fn status_gated(&mut self) -> io::Result<ExitStatus> {
         self.spawn_gated()?.wait()
     }
+
+    fn spawn_helper(&mut self) -> io::Result<GatedChild> {
+        let (child, spawned) = spawn_helper_std(self)?;
+        Ok(GatedChild {
+            child,
+            spawned,
+            watchdog: None,
+        })
+    }
+
+    fn output_helper(&mut self) -> io::Result<Output> {
+        self.stdout(Stdio::piped()).stderr(Stdio::piped());
+        self.spawn_helper()?.wait_with_output()
+    }
+
+    fn status_helper(&mut self) -> io::Result<ExitStatus> {
+        self.spawn_helper()?.wait()
+    }
 }
 
 #[cfg(test)]
@@ -695,9 +854,12 @@ mod tests {
     use super::*;
 
     /// A descriptor of this process without close-on-exec, as a launcher may leave one (`dup`
-    /// copies without the flag), and its number.
-    fn inheritable_fd() -> (std::os::fd::OwnedFd, i32) {
+    /// copies without the flag), and its number. It is registered as planted ([`PLANTED`]) until
+    /// it is closed, under the same lock the check before a helper spawn holds, so that check
+    /// never sees it unregistered and never marks it before it is checked here.
+    fn inheritable_fd() -> (Planted, i32) {
         use std::os::fd::AsRawFd;
+        let mut planted = PLANTED.lock().unwrap_or_else(PoisonError::into_inner);
         let null = std::fs::File::open("/dev/null").expect("open /dev/null");
         let fd = nix::unistd::dup(&null).expect("dup");
         let flags = nix::fcntl::fcntl(&fd, nix::fcntl::FcntlArg::F_GETFD).expect("F_GETFD");
@@ -706,7 +868,41 @@ mod tests {
             "the planted descriptor is inheritable"
         );
         let n = fd.as_raw_fd();
-        (fd, n)
+        planted.insert(n);
+        (Planted(Some(fd)), n)
+    }
+
+    /// A planted descriptor: closed and unregistered together, under the lock.
+    struct Planted(Option<std::os::fd::OwnedFd>);
+
+    impl std::os::fd::AsFd for Planted {
+        fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+            self.0.as_ref().expect("open until dropped").as_fd()
+        }
+    }
+
+    impl Drop for Planted {
+        fn drop(&mut self) {
+            use std::os::fd::AsRawFd;
+            let mut planted = PLANTED.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some(fd) = self.0.take() {
+                let n = fd.as_raw_fd();
+                drop(fd);
+                planted.remove(&n);
+            }
+        }
+    }
+
+    /// Whether `fd` is marked close-on-exec.
+    fn close_on_exec(fd: &impl std::os::fd::AsFd) -> bool {
+        let flags = nix::fcntl::fcntl(fd, nix::fcntl::FcntlArg::F_GETFD).expect("F_GETFD");
+        nix::fcntl::FdFlag::from_bits_truncate(flags).contains(nix::fcntl::FdFlag::FD_CLOEXEC)
+    }
+
+    /// The marking in this process, under the plants' lock (see [`inheritable_fd`]).
+    fn mark_here() -> io::Result<()> {
+        let _planted = PLANTED.lock().unwrap_or_else(PoisonError::into_inner);
+        mark_inherited_close_on_exec()
     }
 
     /// A shell that echoes its stdin to stdout, writes to stderr, and says whether it holds `fd`.
@@ -767,12 +963,8 @@ mod tests {
     fn without_close_range_the_walk_marks_every_descriptor() {
         PRETEND.with(|p| p.set(1));
         let (fd, n) = inheritable_fd();
-        mark_inherited_close_on_exec().expect("the walk");
-        let flags = nix::fcntl::fcntl(&fd, nix::fcntl::FcntlArg::F_GETFD).expect("F_GETFD");
-        assert!(
-            nix::fcntl::FdFlag::from_bits_truncate(flags).contains(nix::fcntl::FdFlag::FD_CLOEXEC),
-            "the walk marked fd {n}"
-        );
+        mark_here().expect("the walk");
+        assert!(close_on_exec(&fd), "the walk marked fd {n}");
         drop(fd);
 
         let (_std_fd, n) = inheritable_fd();
@@ -819,6 +1011,53 @@ mod tests {
         PRETEND.with(|p| p.set(0));
     }
 
+    /// The sweep before a helper spawn, as release builds run it, marks a descriptor of this
+    /// process that lacks close-on-exec.
+    #[test]
+    fn the_sweep_marks_a_descriptor_without_close_on_exec() {
+        let (fd, n) = inheritable_fd();
+        mark_here().expect("the sweep");
+        assert!(close_on_exec(&fd), "the sweep marked fd {n}");
+    }
+
+    /// A child of a helper spawn keeps its stdin, stdout and stderr, and gets no other descriptor
+    /// of this process: the sweep marked the one planted without close-on-exec.
+    #[test]
+    fn a_helper_gets_its_stdio_and_no_other_descriptor() {
+        let (_fd, n) = inheritable_fd();
+        let (child, spawned) = spawn_helper_std(
+            Command::new("/bin/sh")
+                .args(probe(n))
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped()),
+        )
+        .expect("spawn");
+        let out = GatedChild {
+            child,
+            spawned,
+            watchdog: None,
+        }
+        .communicate(Some(b"in\n".to_vec()))
+        .expect("run");
+        assert!(out.status.success(), "{out:?}");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "out:in\ngone\n");
+        assert_eq!(String::from_utf8_lossy(&out.stderr), "err\n");
+
+        let (_fd, n) = inheritable_fd();
+        let out = Command::new("/bin/sh")
+            .args([
+                "-c",
+                &format!("echo err >&2; [ -e /proc/$$/fd/{n} ] && echo held || echo gone"),
+            ])
+            .stdin(Stdio::null())
+            .output_helper()
+            .expect("run");
+        assert!(out.status.success(), "{out:?}");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "gone\n");
+        assert_eq!(String::from_utf8_lossy(&out.stderr), "err\n");
+    }
+
     /// When neither `close_range` nor the walk works, nothing is marked and nothing is spawned:
     /// the marking errs, and so do both spawns.
     #[test]
@@ -826,6 +1065,7 @@ mod tests {
         PRETEND.with(|p| p.set(2));
         assert!(mark_inherited_close_on_exec().is_err(), "the marking errs");
         let std_spawn = spawn_std(Command::new("/bin/true").stdin(Stdio::null()));
+        let helper_spawn = spawn_helper_std(Command::new("/bin/true").stdin(Stdio::null()));
         let tokio_spawn = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -835,16 +1075,27 @@ mod tests {
             });
         PRETEND.with(|p| p.set(0));
         assert!(std_spawn.is_err(), "spawn_std refused: {std_spawn:?}");
+        assert!(
+            helper_spawn.is_err(),
+            "spawn_helper_std refused: {helper_spawn:?}"
+        );
         assert!(tokio_spawn.is_err(), "spawn_tokio refused: {tokio_spawn:?}");
     }
 
-    /// A program that cannot be run is still reported by the spawn, by both gates: the backstop
-    /// keeps the pipe std reports a failed exec through.
+    /// A program that cannot be run is still reported by the spawn, by every gate: the backstop
+    /// keeps the pipe std reports a failed exec through, and `posix_spawn` reports it itself.
     #[tokio::test]
     async fn a_failed_exec_is_still_reported() {
         let missing = "/nonexistent/sealant-program";
         let std_error = spawn_std(&mut Command::new(missing)).expect_err("no such program");
         assert_eq!(std_error.kind(), io::ErrorKind::NotFound, "{std_error}");
+        let helper_error =
+            spawn_helper_std(&mut Command::new(missing)).expect_err("no such program");
+        assert_eq!(
+            helper_error.kind(),
+            io::ErrorKind::NotFound,
+            "{helper_error}"
+        );
         let tokio_error =
             spawn_tokio(&mut tokio::process::Command::new(missing)).expect_err("no such program");
         assert_eq!(tokio_error.kind(), io::ErrorKind::NotFound, "{tokio_error}");
