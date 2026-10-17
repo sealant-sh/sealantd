@@ -1,5 +1,6 @@
 //! Runtime-level proofs of the cadence (ADR-0015 *Cadence and budgets*) against a fake
-//! registrar and a `LocalDir` sink: real files, the real watcher, wall-clock timers.
+//! registrar and a `LocalDir` sink: real files, the real watcher, and timers on the wall clock
+//! or, where a test says so, on a [`ManualClock`] (sealantd#167).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -12,7 +13,7 @@ use sealant_capture::manifest::CaptureKind;
 use sealant_capture::registrar::HeadInfo;
 use sealant_capture::{
     Cadence, CadenceRunner, CaptureConfig, CaptureEngine, ChangeSignal, InMemoryRegistrar,
-    LocalDir, WatchMode,
+    LocalDir, ManualClock, WatchMode,
 };
 use sealant_process::CommandGateExt;
 
@@ -114,6 +115,104 @@ impl Fixture {
             std::thread::sleep(Duration::from_millis(25));
         }
         None
+    }
+}
+
+/// A runner whose timers and ship worker run on a [`ManualClock`], and what it was seen to do,
+/// each at the virtual time since the runner settled it was first seen.
+///
+/// The clock moves only when the test moves it, and stops at each time one of the runner's
+/// threads waits for ([`ManualClock::advance_next`]), so a timer fires at its own time and is
+/// seen then. The work after it — the snap, the worker's wake-up, the ship, the registration —
+/// takes no virtual time: the clock waits for it to finish before it moves on
+/// ([`ManualClock::settle`]). A capture that waits for anything on the clock (the worker's
+/// tick, after a missed wake-up) registers that much later in virtual time, whatever CPU the
+/// test gets.
+struct OnClock<'a> {
+    fx: &'a Fixture,
+    runner: CadenceRunner,
+    clock: ManualClock,
+    start: Instant,
+    /// When the chain grew.
+    registered: Vec<Duration>,
+    /// When the max-interval timer, and the quiet timer, fired (each time its counter rose).
+    max_fired: Vec<Duration>,
+    quiet_fired: Vec<Duration>,
+}
+
+impl<'a> OnClock<'a> {
+    fn start(fx: &'a Fixture, mut config: CaptureConfig) -> Self {
+        let clock = ManualClock::new();
+        config.clock = clock.clock();
+        let runner = fx.runner(config);
+        clock.settle();
+        let start = clock.now();
+        Self {
+            fx,
+            runner,
+            clock,
+            start,
+            registered: Vec::new(),
+            max_fired: Vec::new(),
+            quiet_fired: Vec::new(),
+        }
+    }
+
+    /// Virtual time since the start.
+    fn now(&self) -> Duration {
+        self.clock.now() - self.start
+    }
+
+    fn sample(&mut self) {
+        let now = self.now();
+        let snap = self.runner.snapshot();
+        while self.max_fired.len() < snap.max_fired as usize {
+            self.max_fired.push(now);
+        }
+        while self.quiet_fired.len() < snap.quiet_fired as usize {
+            self.quiet_fired.push(now);
+        }
+        while self.registered.len() < self.fx.chain().len() {
+            self.registered.push(now);
+        }
+    }
+
+    /// Move the clock once: to the next time a thread waits for, or to `at` if that is sooner.
+    fn step(&mut self, at: Duration) {
+        self.clock.advance_next(self.start + at);
+        self.sample();
+    }
+
+    /// Move the clock to `at`, seeing what happens at each time on the way.
+    fn run_to(&mut self, at: Duration) {
+        while self.now() < at {
+            self.step(at);
+        }
+    }
+
+    /// Move the clock until the chain holds `n` captures, for at most `timeout`; how long it
+    /// took, `None` past `timeout`.
+    fn wait_for_chain(&mut self, n: usize, timeout: Duration) -> Option<Duration> {
+        let from = self.now();
+        self.sample();
+        while self.registered.len() < n {
+            if self.now() >= from + timeout {
+                return None;
+            }
+            self.step(from + timeout);
+        }
+        Some(self.registered[n - 1].saturating_sub(from))
+    }
+
+    /// Write `contents` to `rel` now: back once the watcher delivered it and the runner did
+    /// what it does on it, so the change is at this virtual time.
+    fn write(&mut self, rel: &str, contents: &str) {
+        fs::write(self.fx.root.join(rel), contents).unwrap();
+        self.runner
+            .settle_watcher()
+            .expect("the watcher delivers the write");
+        self.clock.settle();
+        self.sample();
     }
 }
 
@@ -248,63 +347,43 @@ fn a_change_registers_within_the_quiet_period() {
 /// (b) Writes every 500 ms for 15 s: captures register at most every `max_interval` (10 s),
 /// never more than one per quiet period, then one more once the writer stops.
 ///
-/// The timers are held to the configured periods (they do no I/O); what follows each — the
-/// snap, the worker's wake-up, the ship, the registration — to the same work forced on this
-/// machine ([`after_timer_bound`]), as in (a): on a slow disk a fixed second for it failed.
+/// On a [`ManualClock`] ([`OnClock`]): the writes and every timer are at their virtual times, so
+/// the timers are held to the configured periods whatever CPU the test gets (sealantd#160). What
+/// follows each timer — the snap, the worker's wake-up, the ship, the registration — takes no
+/// virtual time, so it is held to none: a capture that waited for the worker's tick (a missed
+/// wake-up) registers seconds after its timer.
 #[test]
 fn continuous_writes_register_at_the_max_interval() {
     let fx = Fixture::build();
     let cadence = Cadence::default();
     let (quiet, max_interval) = (cadence.quiet, cadence.max_interval);
-    let runner = fx.runner(fx.config(cadence));
-    let start = Instant::now();
-    let mut registered: Vec<Duration> = Vec::new();
-    // When the max-interval timer, and the quiet timer, fired (each time its counter rose).
-    let mut max_fired: Vec<Duration> = Vec::new();
-    let mut quiet_fired: Vec<Duration> = Vec::new();
-    let mut seen = 0usize;
-    let mut sample = |registered: &mut Vec<Duration>, seen: &mut usize| {
-        let snap = runner.snapshot();
-        while max_fired.len() < snap.max_fired as usize {
-            max_fired.push(start.elapsed());
-        }
-        while quiet_fired.len() < snap.quiet_fired as usize {
-            quiet_fired.push(start.elapsed());
-        }
-        let n = fx.chain().len();
-        if n > *seen {
-            registered.push(start.elapsed());
-            *seen = n;
-        }
-    };
+    let mut t = OnClock::start(&fx, fx.config(cadence));
+    // The snap, ship and registration after a timer, in virtual time.
+    let bound = Duration::ZERO;
     let mut i = 0u32;
     let mut last_write = Duration::ZERO;
-    while start.elapsed() < Duration::from_secs(15) {
-        fs::write(fx.root.join("src/busy.rs"), format!("// {i}\n")).unwrap();
-        last_write = start.elapsed();
+    while t.now() < Duration::from_secs(15) {
+        t.write("src/busy.rs", &format!("// {i}\n"));
+        last_write = t.now();
         i += 1;
-        let until = start.elapsed() + Duration::from_millis(500);
-        while start.elapsed() < until {
-            sample(&mut registered, &mut seen);
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        t.run_to(last_write + Duration::from_millis(500));
     }
-    let during = registered.clone();
+    let during = t.registered.clone();
     // The writer stopped: the quiet timer fires once more.
-    let settle = Instant::now();
-    while settle.elapsed() < Duration::from_secs(5) || registered.len() == during.len() {
-        sample(&mut registered, &mut seen);
+    let settle = t.now();
+    t.run_to(settle + Duration::from_secs(5));
+    while t.registered.len() == during.len() {
         assert!(
-            settle.elapsed() < Duration::from_secs(60),
-            "the quiet timer fires once the writer stops: {registered:?}"
+            t.now() < settle + Duration::from_secs(60),
+            "the quiet timer fires once the writer stops: {:?}",
+            t.registered
         );
-        std::thread::sleep(Duration::from_millis(5));
+        t.step(settle + Duration::from_secs(60));
     }
-    let forced = forced_capture();
-    let bound = after_timer_bound(forced);
+    let (registered, max_fired, quiet_fired) = (&t.registered, &t.max_fired, &t.quiet_fired);
     eprintln!(
         "(b) registrations at {registered:?}; max timer at {max_fired:?}; quiet timer at \
-         {quiet_fired:?}; last write {last_write:?}; forced snap + ship {forced:?}"
+         {quiet_fired:?}; last write {last_write:?} (virtual time)"
     );
     assert!(
         (1..=2).contains(&during.len()),
@@ -322,8 +401,7 @@ fn continuous_writes_register_at_the_max_interval() {
     );
     assert!(
         during[0] >= first_timer && during[0] - first_timer <= bound,
-        "snap + ship after the max-interval timer took {:?}; forced, the same work took \
-         {forced:?}",
+        "snap + ship after the max-interval timer took {:?} of virtual time",
         during[0].saturating_sub(first_timer)
     );
     for w in registered.windows(2) {
@@ -347,13 +425,13 @@ fn continuous_writes_register_at_the_max_interval() {
     let last = *registered.last().unwrap();
     assert!(
         last >= last_timer && last - last_timer <= bound,
-        "snap + ship after the quiet timer took {:?}; forced, the same work took {forced:?}",
+        "snap + ship after the quiet timer took {:?} of virtual time",
         last.saturating_sub(last_timer)
     );
-    let snap = runner.snapshot();
+    let snap = t.runner.snapshot();
     assert!(snap.max_fired >= 1, "{snap:?}");
     assert!(snap.quiet_fired >= 1, "{snap:?}");
-    runner.stop();
+    t.runner.stop();
 }
 
 /// (c) An overflow drops the watcher: snaps still happen, at the max interval; a budget of 0
@@ -496,31 +574,36 @@ fn overflow_and_a_missing_budget_fall_back_to_polling() {
 
 /// (d) Bulk changes alone produce no small-class capture and exactly one coalesced bulk capture
 /// that carries the previous git/workspace sections.
+///
+/// On a [`ManualClock`] ([`OnClock`]): the burst is twenty writes 75 ms apart in virtual time,
+/// well inside the bulk quiet period, however long the test's real writes take (sealantd#160,
+/// `ci` run 39029483289).
 #[test]
 fn bulk_changes_alone_produce_one_coalesced_bulk_capture() {
     let fx = Fixture::build();
-    let runner = fx.runner(fx.config(fast_bulk(Cadence::default(), 1000, 4000)));
-    let snap = runner.snapshot();
+    let mut t = OnClock::start(&fx, fx.config(fast_bulk(Cadence::default(), 1000, 4000)));
+    let snap = t.runner.snapshot();
     assert_eq!(snap.small_mode, WatchMode::Watched);
     assert_eq!(snap.bulk_mode, WatchMode::Watched);
-    let base = runner.snap(CaptureKind::Checkpoint).unwrap();
+    let base = t.runner.snap(CaptureKind::Checkpoint).unwrap();
     assert!(!base.unchanged);
-    fx.wait_for_chain(1, Duration::from_secs(5)).unwrap();
+    t.wait_for_chain(1, Duration::from_secs(5)).unwrap();
 
     // A burst of bulk writes.
     for i in 0..20 {
-        fs::write(
-            fx.root.join(format!("node_modules/pkg/lib/m{i}.js")),
-            format!("module.exports = {i};\n"),
-        )
-        .unwrap();
-        std::thread::sleep(Duration::from_millis(75));
+        t.write(
+            &format!("node_modules/pkg/lib/m{i}.js"),
+            &format!("module.exports = {i};\n"),
+        );
+        let next = t.now() + Duration::from_millis(75);
+        t.run_to(next);
     }
-    let took = fx
+    let took = t
         .wait_for_chain(2, Duration::from_secs(8))
         .expect("one bulk capture registers");
-    eprintln!("(d) bulk burst → bulk capture registered {took:?} after the burst");
-    std::thread::sleep(Duration::from_secs(3));
+    eprintln!("(d) bulk burst → bulk capture registered {took:?} after the burst (virtual time)");
+    let after = t.now() + Duration::from_secs(3);
+    t.run_to(after);
     let chain = fx.chain();
     assert_eq!(chain.len(), 2, "one coalesced bulk capture: {chain:#?}");
     let head = &chain[1].manifest;
@@ -531,11 +614,11 @@ fn bulk_changes_alone_produce_one_coalesced_bulk_capture() {
         "the workspace section is copied from the checkpoint"
     );
     assert_eq!(head.sections.git, chain[0].manifest.sections.git);
-    let snap = runner.snapshot();
+    let snap = t.runner.snapshot();
     assert_eq!(snap.small_snaps, 1, "only the forced checkpoint: {snap:?}");
     assert_eq!(snap.bulk_snaps, 1, "{snap:?}");
     assert_eq!(snap.bulk_staged, 1, "{snap:?}");
-    runner.stop();
+    t.runner.stop();
 }
 
 /// (e) A due small snap is not delayed by an in-progress bulk build beyond one chunk's work:
