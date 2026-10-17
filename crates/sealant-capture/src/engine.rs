@@ -151,7 +151,7 @@ fn ldd_version() -> Option<String> {
     let out = std::process::Command::new("ldd")
         .arg("--version")
         .stdin(std::process::Stdio::null())
-        .output_gated()
+        .output_helper()
         .ok()?;
     let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
     text.push_str(&String::from_utf8_lossy(&out.stderr));

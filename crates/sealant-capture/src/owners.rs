@@ -207,7 +207,7 @@ pub fn apply_default_acl(dirs: &[&Path], gid: u32) -> io::Result<()> {
         .arg(format!("u::rwx,g::rwx,g:{gid}:rwx,m::rwx,o::rx"))
         .args(&present)
         .stdin(Stdio::null())
-        .output_gated()?;
+        .output_helper()?;
     if out.status.success() {
         Ok(())
     } else {

@@ -218,6 +218,17 @@ fn build_config(cli: &ServeArgs) -> RuntimeConfig {
 /// Parse arguments and dispatch. With no subcommand, runs the control server (the bare SDK-spawn
 /// invocation); with `boot`, runs the PID-1 supervisor. Returns the process exit code.
 pub fn run() -> ExitCode {
+    // Whatever started sealantd may have left descriptors open without close-on-exec: mark them,
+    // so no child inherits them (each spawn, or the sweep before a helper spawn, marks them again:
+    // sealant_process::spawn). When they cannot be marked, no spawn could start either: refuse to
+    // start.
+    if let Err(error) = sealant_process::spawn::mark_at_start() {
+        eprintln!(
+            "sealantd: marking inherited descriptors close-on-exec failed: {error} (it needs \
+             close_range with CLOSE_RANGE_CLOEXEC, Linux 5.11, or a readable /proc/self/fd)"
+        );
+        return ExitCode::FAILURE;
+    }
     let cli = Cli::parse();
     match cli.command {
         Some(Command::Boot(args)) => crate::boot::run_boot(&args.log_level, args.recovery),
