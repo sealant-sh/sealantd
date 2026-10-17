@@ -1251,6 +1251,7 @@ dependencies = [
  "sealant-pty",
  "sealant-runtime-core",
  "sealant-telemetry",
+ "sealantd",
  "serde",
  "serde_json",
  "sha2",

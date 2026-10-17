@@ -32,9 +32,16 @@ base64 = { workspace = true }
 thiserror = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
-nix = { workspace = true }
+nix = { workspace = true, features = ["dir"] }
+
+[features]
+# The dotfiles copy's hold seam (`SEALANTD_DOTFILES_TEST_HOLD`): for the root tests only. Only
+# this crate's own tests enable it (the dev-dependency below); no build of the daemon may
+# (`scripts/ci-test-support-gate.sh`).
+test-support = []
 
 [dev-dependencies]
+sealantd = { path = ".", features = ["test-support"] }
 sealant-protocol = { workspace = true }
 sealant-control = { workspace = true }
 sealant-runtime-core = { workspace = true }
