@@ -28,13 +28,13 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: corepack enable
-      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           # setup-node v6 restores a package-manager cache by itself when packageManager names npm.
           package-manager-cache: false
           node-version: 24
       - run: pnpm install --frozen-lockfile --ignore-scripts
-      - uses: changesets/action@a45c4d594aa4e2c509dc14a9f2b3b67ba3780d0d # v1.9.0
+      - uses: changesets/action@ae32849d5ba541f9ae29e40e22a623bc13562f51 # v2.1.2
         with:
           version: pnpm changeset version
           # No `publish:` — this workflow never publishes. Merge the Version PR, then tag to release.
