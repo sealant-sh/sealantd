@@ -1397,6 +1397,59 @@ mod tests {
         }
     }
 
+    /// A session's process group, owned by the test (sealantd#183): a helper its leader started
+    /// outlives the leader, and nothing else ends it. [`Self::end`] kills what is left and waits
+    /// until the group is empty; dropping the guard does the same when the test fails first.
+    struct GroupGuard {
+        pgid: i32,
+    }
+
+    impl GroupGuard {
+        /// Whether any process is left in the group (a zombie not yet reaped counts).
+        fn alive(&self) -> bool {
+            nix::sys::signal::killpg(Pid::from_raw(self.pgid), None).is_ok()
+        }
+
+        /// Kill every process left in the group and wait until none is; `false` when one is
+        /// still there after ten seconds. A process the group's leader started is not this
+        /// test's child: once killed, init reaps it. A leader is, and the runtime reaps it: on a
+        /// single-threaded runtime it cannot while this waits, so end a live leader's group on
+        /// a multi-threaded one.
+        fn end(&self) -> bool {
+            if self.alive() {
+                let _ = nix::sys::signal::killpg(Pid::from_raw(self.pgid), NixSignal::SIGKILL);
+            }
+            let until = Instant::now() + Duration::from_secs(10);
+            while self.alive() {
+                if Instant::now() >= until {
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            true
+        }
+    }
+
+    impl Drop for GroupGuard {
+        fn drop(&mut self) {
+            let _ = self.end();
+        }
+    }
+
+    /// The `/dev/ptmx` and `/dev/pts/*` descriptors `pid` holds, as `(fd, target)`.
+    fn terminal_fds(pid: i32) -> Vec<(u32, String)> {
+        std::fs::read_dir(format!("/proc/{pid}/fd"))
+            .expect("the leader's descriptors")
+            .filter_map(|entry| {
+                let entry = entry.ok()?;
+                let fd = entry.file_name().to_str()?.parse().ok()?;
+                let target = std::fs::read_link(entry.path()).ok()?;
+                let target = target.to_string_lossy().into_owned();
+                (target == "/dev/ptmx" || target.starts_with("/dev/pts/")).then_some((fd, target))
+            })
+            .collect()
+    }
+
     async fn output_until_exit(rx: &mut Receiver<EventEnvelope>) -> Vec<u8> {
         let mut out = Vec::new();
         loop {
@@ -1600,6 +1653,9 @@ mod tests {
                 24,
             ))
             .expect("open");
+        // The helper ignores the hangup and may outlive the leader: the test ends it
+        // (sealantd#183).
+        let group = GroupGuard { pgid: opened.pid };
         rt.attach(&opened.session_id, channel.clone(), out_tx, None)
             .await
             .expect("attach");
@@ -1619,6 +1675,182 @@ mod tests {
         .expect("helper output must not extend the attachment after leader exit");
 
         assert_eq!(exit_code, Some(0));
+        assert!(
+            group.end(),
+            "a process of the test's session is left over after it"
+        );
+    }
+
+    /// The PTY of a session's leader: the `n` of the `/dev/pts/<n>` on its stdin.
+    fn pty_index(pid: i32) -> u32 {
+        std::fs::read_link(format!("/proc/{pid}/fd/0"))
+            .expect("the leader's stdin")
+            .to_string_lossy()
+            .strip_prefix("/dev/pts/")
+            .and_then(|n| n.parse().ok())
+            .expect("the leader's stdin is a pty slave")
+    }
+
+    /// The descriptors `pid` holds on PTY `index`, its slave or its master, as `(fd, what)`.
+    fn fds_on_pty(pid: i32, index: u32) -> Vec<(u32, String)> {
+        let slave = format!("/dev/pts/{index}");
+        terminal_fds(pid)
+            .into_iter()
+            .filter(|(fd, target)| {
+                *target == slave || (target == "/dev/ptmx" && master_index(pid, *fd) == Some(index))
+            })
+            .collect()
+    }
+
+    /// The PTY a master descriptor of `pid` belongs to (`tty-index` in its fdinfo).
+    fn master_index(pid: i32, fd: u32) -> Option<u32> {
+        std::fs::read_to_string(format!("/proc/{pid}/fdinfo/{fd}"))
+            .ok()?
+            .lines()
+            .find_map(|line| line.strip_prefix("tty-index:"))
+            .and_then(|n| n.trim().parse().ok())
+    }
+
+    /// The children of `pid`, from every process's parent in `/proc`.
+    fn children(pid: i32) -> Vec<i32> {
+        std::fs::read_dir("/proc")
+            .expect("/proc")
+            .filter_map(|entry| {
+                let child: i32 = entry.ok()?.file_name().to_str()?.parse().ok()?;
+                let stat = std::fs::read_to_string(format!("/proc/{child}/stat")).ok()?;
+                // `pid (comm) state ppid …`: the comm may hold spaces, so read after its `)`.
+                let ppid: i32 = stat
+                    .rsplit_once(')')?
+                    .1
+                    .split_whitespace()
+                    .nth(1)?
+                    .parse()
+                    .ok()?;
+                (ppid == pid).then_some(child)
+            })
+            .collect()
+    }
+
+    /// A PTY's descriptors stay with the session it belongs to (sealantd#183). While one session
+    /// is open, no process sealantd starts holds its master or its slave: not a second session's
+    /// leader, nor what that leader runs, nor a command run as `exec` runs it, nor a git run as
+    /// the capture engine runs it. And no session leader holds a PTY master at all, its own
+    /// included, and nothing on a terminal beyond its stdin, stdout and stderr.
+    // Two workers: the leaders and the command are this test's children, and the runtime reaps
+    // them on one while the guards wait on the other.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_ptys_descriptors_stay_with_its_session() {
+        use sealant_process::spawn::CommandGateExt;
+
+        let rt = runtime();
+        let first = rt
+            .open(session_args(&["-c", "exec sleep 30"], 80, 24))
+            .expect("open the first session");
+        let first_group = GroupGuard { pgid: first.pid };
+        let first_pty = pty_index(first.pid);
+
+        // The second session's leader runs a child of its own.
+        let second = rt
+            .open(session_args(&["-c", "sleep 30 & wait"], 80, 24))
+            .expect("open the second session");
+        let second_group = GroupGuard { pgid: second.pid };
+        let until = Instant::now() + Duration::from_secs(10);
+        let second_child = loop {
+            if let Some(child) = children(second.pid).first() {
+                break *child;
+            }
+            assert!(
+                Instant::now() < until,
+                "the second session's leader started its child"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+
+        // A command, as `exec` runs one.
+        let processes = sealant_process::ProcessRuntime {
+            registry: Arc::new(sealant_process::ProcessRegistry::new()),
+            bus: rt.bus.clone(),
+            idgen: rt.idgen.clone(),
+            status: rt.status.clone(),
+            clock: rt.clock.clone(),
+            config: rt.config.clone(),
+            extra_env: Arc::new(std::sync::Mutex::new(Vec::new())),
+            redactor: rt.redactor.clone(),
+        };
+        let command = processes
+            .exec(
+                sealant_protocol::ExecArgs {
+                    execution_id: None,
+                    session_id: None,
+                    executable: "/bin/sleep".to_owned(),
+                    args: vec!["30".to_owned()],
+                    cwd: None,
+                    env: vec![],
+                    stdin: false,
+                    attach: false,
+                    timeout_millis: None,
+                    background: false,
+                    capture: None,
+                    graceful_signal: None,
+                    user: None,
+                },
+                None,
+            )
+            .expect("exec a command");
+        let command_group = GroupGuard { pgid: command.pgid };
+
+        // A git, as the capture engine runs one: blocked on its stdin until the test closes it.
+        let git = std::process::Command::new("git")
+            .args(["hash-object", "--stdin"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn_gated()
+            .expect("spawn git");
+
+        let mut held = Vec::new();
+        for (who, pid) in [
+            ("the second session's leader", second.pid),
+            ("the second session's leader's child", second_child),
+            ("a command run as exec runs it", command.pid),
+            ("a git run as the capture engine runs it", git.pid()),
+        ] {
+            let fds = fds_on_pty(pid, first_pty);
+            if !fds.is_empty() {
+                held.push(format!("{who} holds {fds:?}"));
+            }
+        }
+        for (name, pid) in [("first", first.pid), ("second", second.pid)] {
+            let fds = terminal_fds(pid);
+            if fds.len() != 3
+                || fds
+                    .iter()
+                    .any(|(fd, target)| *fd > 2 || target == "/dev/ptmx")
+            {
+                held.push(format!(
+                    "the {name} session's leader holds terminal descriptors beyond its stdin, \
+                     stdout and stderr: {fds:?}"
+                ));
+            }
+        }
+        assert!(
+            held.is_empty(),
+            "the first session's pty is /dev/pts/{first_pty}:\n{}",
+            held.join("\n")
+        );
+
+        git.communicate(None)
+            .expect("git ends once its stdin closes");
+        processes
+            .kill(&command.process_id)
+            .expect("kill the command");
+        rt.close(&first.session_id)
+            .expect("close the first session");
+        rt.close(&second.session_id)
+            .expect("close the second session");
+        assert!(command_group.end(), "the command is left over");
+        assert!(first_group.end(), "the first session is left over");
+        assert!(second_group.end(), "the second session is left over");
     }
 
     #[tokio::test]

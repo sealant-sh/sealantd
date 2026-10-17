@@ -26,6 +26,41 @@ fn set_nonblocking(fd: std::os::fd::RawFd) -> io::Result<()> {
     Ok(())
 }
 
+/// Allocate a PTY pair with both ends close-on-exec from the moment they exist, its window size
+/// set. The master stays open in sealantd for the session's life, and this slave descriptor until
+/// the leader is spawned; a descriptor without the flag is inherited by every process sealantd
+/// starts while it is open (sealantd#183). `openpty(3)` sets no flag, and setting one after it
+/// would leave a window for a spawn on another thread. The leader gets the slave only as its
+/// stdin, stdout and stderr, which the spawn duplicates without the flag.
+fn open_pty(cols: u16, rows: u16) -> io::Result<(OwnedFd, OwnedFd)> {
+    use nix::fcntl::OFlag;
+    let flags = OFlag::O_RDWR | OFlag::O_NOCTTY | OFlag::O_CLOEXEC;
+    let master = nix::pty::posix_openpt(flags).map_err(to_io)?;
+    nix::pty::grantpt(&master).map_err(to_io)?;
+    nix::pty::unlockpt(&master).map_err(to_io)?;
+    let name = nix::pty::ptsname_r(&master).map_err(to_io)?;
+    let slave =
+        nix::fcntl::open(name.as_str(), flags, nix::sys::stat::Mode::empty()).map_err(to_io)?;
+    set_window_size(slave.as_raw_fd(), cols, rows)?;
+    Ok((OwnedFd::from(master), slave))
+}
+
+fn set_window_size(fd: std::os::fd::RawFd, cols: u16, rows: u16) -> io::Result<()> {
+    let winsize = libc::winsize {
+        ws_row: rows,
+        ws_col: cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    // SAFETY: `fd` is a valid PTY descriptor; `&winsize` is valid for the duration of the ioctl.
+    let result = unsafe { libc::ioctl(fd, libc::TIOCSWINSZ, &winsize) };
+    if result < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
 /// A spawned PTY session: the (non-blocking) master, the child, and its OS pid.
 #[derive(Debug)]
 pub struct PtyChild {
@@ -53,15 +88,7 @@ pub fn spawn(
     term: &str,
     run_as: Option<&sealant_process::identity::RunAs>,
 ) -> io::Result<PtyChild> {
-    let winsize = nix::pty::Winsize {
-        ws_row: rows,
-        ws_col: cols,
-        ws_xpixel: 0,
-        ws_ypixel: 0,
-    };
-    let pty = nix::pty::openpty(Some(&winsize), None).map_err(to_io)?;
-    let master = pty.master;
-    let slave = pty.slave;
+    let (master, slave) = open_pty(cols, rows)?;
     set_nonblocking(master.as_raw_fd())?;
     // A leader that runs as a user owns its terminal, as a login gives one (`ttyname` and
     // `/dev/pts/N` opened by path work for it, `mesg` and GnuPG's pinentry included).
@@ -209,20 +236,7 @@ pub async fn write_all(master: &AsyncFd<OwnedFd>, mut data: &[u8]) -> io::Result
 /// # Errors
 /// Returns an I/O error if the ioctl fails.
 pub fn resize(master: &AsyncFd<OwnedFd>, cols: u16, rows: u16) -> io::Result<()> {
-    let winsize = libc::winsize {
-        ws_row: rows,
-        ws_col: cols,
-        ws_xpixel: 0,
-        ws_ypixel: 0,
-    };
-    let fd = master.get_ref().as_raw_fd();
-    // SAFETY: `fd` is a valid PTY master; `&winsize` is valid for the duration of the ioctl.
-    let result = unsafe { libc::ioctl(fd, libc::TIOCSWINSZ, &winsize) };
-    if result < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
+    set_window_size(master.get_ref().as_raw_fd(), cols, rows)
 }
 
 /// Whether an I/O error from [`read`] means the slave end has closed (end of session output).
