@@ -1,7 +1,10 @@
-// The test-only delay overrides stay out of the workflows (sealant-sh/mend #1034, merged as #1036;
-// ported from sealant-sh/sealant tooling/scripts/release-overrides.test.mjs, rule for rule).
-// RELEASE_TEST_RETRY_MS shortens the retried reads in release.yml's steps, and REPUBLISH_TEST_WAIT
-// the npm integrity read-back; only the tests may set them. The guard is a plain text scan of the
+// The test-only overrides stay out of the workflows (sealant-sh/mend #1034, merged as #1036; ported
+// from sealant-sh/sealant tooling/scripts/release-overrides.test.mjs, rule for rule).
+// RELEASE_TEST_RETRY_MS shortens the retried reads in release.yml's steps, REPUBLISH_TEST_WAIT the
+// npm integrity read-back, and REPUBLISH_TEST_PACOTE swaps the pacote a publishing job's tarball
+// check loads, in next.yml's publish and release.yml's npm job, both holding an id-token: set by a
+// workflow, it would run code of the setter's choosing beside the npm credential. Only the tests may
+// set them. The guard is a plain text scan of the
 // workflow files with no shell parser: it refuses text, so it never has to work out what Bash would
 // make of a script, and it cannot hang.
 import assert from "node:assert/strict";
@@ -15,7 +18,7 @@ import { parse } from "yaml";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
 const RELEASE = "release.yml";
-const OVERRIDES = ["RELEASE_TEST_RETRY_MS", "REPUBLISH_TEST_WAIT"];
+const OVERRIDES = ["RELEASE_TEST_RETRY_MS", "REPUBLISH_TEST_WAIT", "REPUBLISH_TEST_PACOTE"];
 const NAMED = new RegExp(OVERRIDES.join("|"), "i");
 
 // Rule 1. Text no workflow in the release graph may contain anywhere, comments included: none needs it.
@@ -25,11 +28,11 @@ const REFUSED_IN_RELEASE = [
   [/allow_unsecure_commands/i, "the switch that brings back the retired ::set-env command"],
 ];
 
-// Rule 2. The only lines, trimmed and whole, that may name an override, all in release.yml: the
-// reads and each retrying step's preamble as they stand. Any other line naming one fails, so
-// `: "${NAME:=0}"`, `export NAME=0`, `NAME=0 cmd`, `read NAME`, `printf -v NAME`, `declare NAME`
-// and a `NAME<<EOF` record all do.
-const OVERRIDE_LINES = new Map([
+// Rule 2. The only lines, trimmed and whole, that may name an override, by workflow: release.yml's
+// reads and each retrying step's preamble as they stand, and next.yml's pacote read. Any other line
+// naming one fails, so `: "${NAME:=0}"`, `export NAME=0`, `NAME=0 cmd`, `read NAME`, `printf -v
+// NAME`, `declare NAME` and a `NAME<<EOF` record all do.
+const RELEASE_LINES = new Map([
   [
     "# RELEASE_TEST_RETRY_MS, never a workflow; the log says which delays this run used.",
     "the comment over the retry preamble",
@@ -52,11 +55,22 @@ const OVERRIDE_LINES = new Map([
     "a retry wait, a read with the production default",
   ],
 ]);
+const OVERRIDE_LINES = {
+  [RELEASE]: RELEASE_LINES,
+  "next.yml": new Map([
+    [
+      "pacote=${REPUBLISH_TEST_PACOTE:-$(npm root -g)/npm/node_modules/pacote}",
+      "the republish block's pacote, a read with npm's own as the default",
+    ],
+  ]),
+};
 
-// Rule 4. The tracked files that may name an override: the release workflow and its tests. A
-// script a release job runs could otherwise write $GITHUB_ENV itself.
+// Rule 4. The tracked files that may name an override: the workflows that read one and their tests.
+// A script a release job runs could otherwise write $GITHUB_ENV itself.
 const NAMING_FILES = [
+  ".github/workflows/next.yml",
   ".github/workflows/release.yml",
+  "scripts/republish.test.mjs",
   "scripts/release-overrides.test.mjs",
   "scripts/release-publication.test.mjs",
 ];
@@ -106,14 +120,16 @@ const RULE = {
  * (`run: "… \"$GITHUB_\x45NV\""` is written without GITHUB_ENV and decodes to it). A problem found
  * only in a decoded value says so.
  * 1. No file in the release graph contains any text of REFUSED_IN_RELEASE.
- * 2. A line naming an override is one of OVERRIDE_LINES in release.yml (and does not continue the
- *    line before it); in any other workflow, no line names one.
+ * 2. A line naming an override is one of its workflow's OVERRIDE_LINES (and does not continue the
+ *    line before it); in a workflow with none, no line names one.
  * 3. No workflow has an override as a key: env or with at workflow, job or step level, a matrix
  *    entry, or a key YAML unescapes into one (`"RELEASE_TEST_\x52ETRY_MS": 0`), which rule 2 does
  *    not see.
  *
- * Writes to $GITHUB_ENV outside the release graph are allowed (no workflow here writes one today). A job's $GITHUB_ENV reaches only that job's later steps, never another job, so it cannot
- * reach a release job, nor can a workflow's env reach a workflow it does not call.
+ * Writes to $GITHUB_ENV outside the release graph are allowed (no workflow here writes one today).
+ * A job's $GITHUB_ENV reaches only that job's later steps, never another job, so it cannot reach a
+ * release job, nor can a workflow's env reach a workflow it does not call. next.yml is not in the
+ * release graph, so rule 1 does not cover it; rules 2 and 3 do.
  *
  * What a text scan of the workflows cannot see:
  * - a name a release step assembles from pieces at run time and exports itself, after its preamble
@@ -159,8 +175,7 @@ function overrideProblems(workflows, { skip = new Set() } = {}) {
               problems.push(`${RULE.text}${decoded}: ${where} names ${what}: ${line.trim()}`);
         if (skip.has("lines") || !NAMED.test(line)) continue;
         const allowed =
-          file === RELEASE &&
-          OVERRIDE_LINES.has(line.trim()) &&
+          (OVERRIDE_LINES[file]?.has(line.trim()) ?? false) &&
           !(lines[index - 1] ?? "").trimEnd().endsWith("\\");
         if (!allowed) problems.push(`${RULE.lines}${decoded}: ${where}: ${line.trim()}`);
       }
@@ -183,9 +198,11 @@ test("no workflow sets a test delay, and only the release workflow and its tests
   assert.deepEqual(problems, []);
   assert.deepEqual([...graph], [RELEASE]);
   // Every approved line is still there: an approval outlives nothing it was given for.
-  const lines = new Set(workflows[RELEASE].split("\n").map((line) => line.trim()));
-  for (const line of OVERRIDE_LINES.keys())
-    assert.ok(lines.has(line), `approved but gone: ${line}`);
+  for (const [file, approved] of Object.entries(OVERRIDE_LINES)) {
+    const lines = new Set(workflows[file].split("\n").map((line) => line.trim()));
+    for (const line of approved.keys())
+      assert.ok(lines.has(line), `approved but gone from ${file}: ${line}`);
+  }
   const named = execFileSync("git", ["grep", "-l", "-i", "-E", OVERRIDES.join("|")], {
     cwd: root,
     encoding: "utf8",
@@ -317,7 +334,7 @@ const mutations = () => {
       LINE,
       KEY,
     ],
-    // The names belong to release.yml alone: even an approved read fails anywhere else.
+    // An approval belongs to its workflow alone: even an approved read fails anywhere else.
     [
       "an approved read in another workflow",
       withStep(
@@ -325,6 +342,57 @@ const mutations = () => {
         "next.yml",
         "image",
         runStep("if [[ -z ${RELEASE_TEST_RETRY_MS:-} ]]; then echo production; fi"),
+      ),
+      LINE,
+    ],
+    // The pacote override: a module path an id-token job would load.
+    [
+      "the pacote through a heredoc",
+      withStep(
+        workflows,
+        RELEASE,
+        "npm",
+        runStep(`printf '%s\\n' 'REPUBLISH_TEST_PACOTE<<EOF' /tmp/evil EOF >>"$GITHUB_ENV"`),
+      ),
+      TEXT,
+      LINE,
+    ],
+    [
+      "the pacote as a step env key",
+      withStep(workflows, RELEASE, "npm", [
+        "  env:",
+        "    REPUBLISH_TEST_PACOTE: /tmp/evil",
+        "  run: true",
+      ]),
+      LINE,
+      KEY,
+    ],
+    [
+      "the pacote as a step env key in next.yml's publish",
+      withStep(workflows, "next.yml", "publish", [
+        "  env:",
+        "    REPUBLISH_TEST_PACOTE: /tmp/evil",
+        "  run: true",
+      ]),
+      LINE,
+      KEY,
+    ],
+    [
+      "the pacote key YAML unescapes",
+      withStep(workflows, RELEASE, "npm", [
+        "  env:",
+        '    "REPUBLISH_TEST_\\x50ACOTE": /tmp/evil',
+        "  run: true",
+      ]),
+      KEY,
+    ],
+    [
+      "next.yml's approved pacote read in another workflow",
+      withStep(
+        workflows,
+        "ci.yml",
+        "node",
+        runStep("pacote=${REPUBLISH_TEST_PACOTE:-$(npm root -g)/npm/node_modules/pacote}"),
       ),
       LINE,
     ],
@@ -362,8 +430,12 @@ test("each rule is load-bearing: without it, some mutation passes unseen", () =>
     "set -a with ${NAME:=0}",
     "export",
     "an approved read in another workflow",
+    "next.yml's approved pacote read in another workflow",
   ]);
-  assert.deepEqual(unseen("keys"), ["a step env key YAML unescapes"]);
+  assert.deepEqual(unseen("keys"), [
+    "a step env key YAML unescapes",
+    "the pacote key YAML unescapes",
+  ]);
   assert.deepEqual(unseen("decoded"), [
     "GITHUB_ENV escaped in a double-quoted run",
     "an assignment escaped in a double-quoted run",
