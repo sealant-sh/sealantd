@@ -834,6 +834,13 @@ impl CaptureRuntime {
         &self.runner
     }
 
+    /// Where the engine's schedules and its flushes' deadlines read the time: the real clock, or
+    /// a test's manual one.
+    #[must_use]
+    pub fn clock(&self) -> &sealant_capture::Clock {
+        self.runner.clock()
+    }
+
     /// The lease epoch.
     #[must_use]
     pub fn lease_epoch(&self) -> LeaseEpochReport {
@@ -856,8 +863,8 @@ mod tests {
     use sealant_capture::registrar::{HeadInfo, PlanRemote, PlanSource};
     use sealant_capture::sink::BlobSource;
     use sealant_capture::{
-        BlobSink, CaptureConfig, CaptureEngine, CaptureKind as EngineKind, Class,
-        InMemoryRegistrar, LocalDir, Materializer, SnapRequest,
+        BlobSink, CaptureConfig, CaptureEngine, CaptureKind as EngineKind, Class, Clock,
+        InMemoryRegistrar, LocalDir, ManualClock, Materializer, SnapRequest,
     };
     use sealant_protocol::{
         CaptureFlushKind, Command, CommandResult, ControlRequest, RequestId, ResponseOutcome,
@@ -937,11 +944,12 @@ mod tests {
         )
     }
 
-    /// A store that refuses every PUT (403, not retried) until `opens`, then takes them: an
-    /// upload that cannot finish before then, whatever a flush does meanwhile.
+    /// A store that refuses every PUT (403, not retried) until `opens` on `clock`, then takes
+    /// them: an upload that cannot finish before then, whatever a flush does meanwhile.
     struct Gate {
         inner: Arc<dyn BlobSink>,
         opens: Instant,
+        clock: Clock,
     }
 
     impl BlobSink for Gate {
@@ -950,7 +958,7 @@ mod tests {
             key: &str,
             source: BlobSource<'_>,
         ) -> Result<sealant_capture::sink::PutOutcome, sealant_capture::sink::SinkError> {
-            if Instant::now() < self.opens {
+            if self.clock.now() < self.opens {
                 return Err(sealant_capture::sink::SinkError::Http {
                     method: "PUT",
                     key: key.to_owned(),
@@ -969,6 +977,85 @@ mod tests {
         }
     }
 
+    /// The most a test moves a manual clock while it waits for one request ([`on_clock`]).
+    const CLOCK_LIMIT: Duration = Duration::from_secs(600);
+
+    /// [`boot_tuned`] on `manual`: the engine's schedules and its flushes' deadlines read it.
+    fn boot_on_clock(
+        base: &Path,
+        manual: &ManualClock,
+        wrap: impl FnOnce(Arc<dyn BlobSink>) -> Arc<dyn BlobSink>,
+        tune: impl FnOnce(&mut CaptureConfig),
+    ) -> (CaptureBoot, Arc<InMemoryRegistrar>) {
+        boot_tuned(base, wrap, |config| {
+            config.clock = manual.clock();
+            tune(config);
+        })
+    }
+
+    /// `request` dispatched on `runtime`, as a task of its own.
+    fn dispatch(
+        runtime: &Arc<Runtime>,
+        request: ControlRequest,
+    ) -> impl std::future::Future<Output = sealant_protocol::ControlResponse> + Send + 'static {
+        let runtime = Arc::clone(runtime);
+        async move { runtime.dispatch(request).await }
+    }
+
+    /// A final flush on `runtime` ([`Runtime::final_flush`]), as a task of its own.
+    fn final_flush(
+        runtime: &Arc<Runtime>,
+        grace_ms: u64,
+    ) -> impl std::future::Future<Output = CaptureStatusReport> + Send + 'static {
+        let runtime = Arc::clone(runtime);
+        async move { runtime.final_flush(None, Some(grace_ms)).await.unwrap() }
+    }
+
+    /// Run `request` (a flush) while moving `manual`: once the flush entered the clock (it waits
+    /// on it from then on), settle and move to the next time a thread waits for, until the flush
+    /// left the clock or the request ended. Returns its outcome and how long it took in virtual
+    /// time. Nothing moves the clock before the flush entered it (the quiesce, a request that
+    /// never reaches a flush), nor after it left.
+    async fn on_clock<T: Send + 'static>(
+        manual: &ManualClock,
+        request: impl std::future::Future<Output = T> + Send + 'static,
+    ) -> (T, Duration) {
+        let entries = manual.entries();
+        let start = manual.now();
+        let task = tokio::spawn(request);
+        let clock = manual.clone();
+        let (task, took) = tokio::task::spawn_blocking(move || {
+            let limit = start + CLOCK_LIMIT;
+            loop {
+                if task.is_finished() {
+                    return (task, clock.now() - start);
+                }
+                if clock.entries() == entries {
+                    std::thread::sleep(Duration::from_millis(1));
+                    continue;
+                }
+                clock.settle();
+                if clock.entered() == 0 {
+                    return (task, clock.now() - start);
+                }
+                assert!(
+                    clock.now() < limit,
+                    "the request did not finish in {CLOCK_LIMIT:?} of the clock"
+                );
+                clock.advance_next(limit);
+            }
+        })
+        .await
+        .unwrap();
+        (task.await.unwrap(), took)
+    }
+
+    /// Move `manual` once: to the next time a thread waits for, or to `limit` when that is
+    /// sooner ([`ManualClock::advance_next`]).
+    fn step(manual: &ManualClock, limit: Instant) {
+        tokio::task::block_in_place(|| manual.advance_next(limit));
+    }
+
     fn flush_report(resp: sealant_protocol::ControlResponse) -> CaptureStatusReport {
         let ResponseOutcome::Ok {
             result: Some(CommandResult::CaptureStatus(report)),
@@ -983,11 +1070,28 @@ mod tests {
     /// configured), so a flush the caller gave 30 s ended at 10 s with the capture still staged.
     /// Here the store takes nothing for 11 s: a suspend flush with a 30 s deadline keeps going
     /// past 10 s and returns with the capture registered, under the default grace.
+    ///
+    /// On a manual clock (sealantd#164): the store opens, the flush's retries and its deadline
+    /// are all in virtual time, so the flush returns at the first retry at or after 11 s
+    /// whatever CPU the test gets.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_flush_deadline_is_honoured_past_the_ten_second_grace() {
         let tmp = tempfile::tempdir().unwrap();
-        let opens = Instant::now() + Duration::from_millis(11_000);
-        let (boot, registrar) = boot_with(tmp.path(), |inner| Arc::new(Gate { inner, opens }));
+        let manual = ManualClock::new();
+        let opens = manual.now() + Duration::from_millis(11_000);
+        let clock = manual.clock();
+        let (boot, registrar) = boot_on_clock(
+            tmp.path(),
+            &manual,
+            |inner| {
+                Arc::new(Gate {
+                    inner,
+                    opens,
+                    clock,
+                })
+            },
+            |_| {},
+        );
         let mut config = RuntimeConfig::new(new_runtime_id());
         config.workspace_root = tmp.path().join("ws");
         assert_eq!(config.shutdown_grace_ms, 10_000, "the default grace");
@@ -999,26 +1103,35 @@ mod tests {
         let capture = CaptureRuntime::new(boot);
         assert!(runtime.install_capture(capture.clone()));
 
-        let start = Instant::now();
-        let report = flush_report(
-            runtime
-                .dispatch(ControlRequest::new(
+        let (resp, took) = on_clock(
+            &manual,
+            dispatch(
+                &runtime,
+                ControlRequest::new(
                     RequestId::new("r1"),
                     Command::CaptureFlush {
                         kind: CaptureFlushKind::Suspend,
                         deadline_ms: Some(30_000),
                         grace_ms: None,
                     },
-                ))
-                .await,
-        );
-        let took = start.elapsed();
-        assert!(Instant::now() >= opens, "returned once the store took it");
+                ),
+            ),
+        )
+        .await;
+        let report = flush_report(resp);
+        assert!(manual.now() >= opens, "returned once the store took it");
         assert!(
             took > Duration::from_millis(10_500),
             "past the old clamp: {took:?}"
         );
         assert!(took < Duration::from_secs(25), "{took:?}");
+        // Exactly: the store refuses each try at once, and the flush tries again every 200 ms
+        // (`RetryPolicy::backoff`) until it opens at 11 s.
+        assert_eq!(
+            took,
+            Duration::from_secs(11),
+            "the first try once it opened"
+        );
         assert_eq!(report.pending, 0, "{report:?}");
         assert_eq!(report.pending_bytes, 0, "{report:?}");
         assert_eq!(registrar.chain().len(), 1);
@@ -1033,11 +1146,28 @@ mod tests {
     /// ends past the grace answers with its error (on a loaded runner a 300 ms grace was spent
     /// before the pass ended, and the flush answered the store's 403). The store opens well
     /// after the grace.
+    ///
+    /// On a manual clock (sealantd#162: the grace ran out in real time during a slow snap and
+    /// the flush answered the store's 403): the grace, the store opening and the retries are in
+    /// virtual time, where the snap and every refused pass take none.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn without_a_deadline_suspend_takes_the_grace_and_final_takes_what_it_needs() {
         let tmp = tempfile::tempdir().unwrap();
-        let opens = Instant::now() + Duration::from_secs(6);
-        let (boot, registrar) = boot_with(tmp.path(), |inner| Arc::new(Gate { inner, opens }));
+        let manual = ManualClock::new();
+        let opens = manual.now() + Duration::from_secs(6);
+        let clock = manual.clock();
+        let (boot, registrar) = boot_on_clock(
+            tmp.path(),
+            &manual,
+            |inner| {
+                Arc::new(Gate {
+                    inner,
+                    opens,
+                    clock,
+                })
+            },
+            |_| {},
+        );
         let mut config = RuntimeConfig::new(new_runtime_id());
         config.workspace_root = tmp.path().join("ws");
         let runtime = Runtime::new(config, Arc::new(ShutdownSignal::new(2_000)));
@@ -1048,25 +1178,28 @@ mod tests {
         // still as its final flush captured it, and never answers complete.
         capture.start_without_harness(runtime.clone());
 
-        let start = Instant::now();
-        let report = flush_report(
-            runtime
-                .dispatch(ControlRequest::new(
+        let (resp, took) = on_clock(
+            &manual,
+            dispatch(
+                &runtime,
+                ControlRequest::new(
                     RequestId::new("r1"),
                     Command::CaptureFlush {
                         kind: CaptureFlushKind::Suspend,
                         deadline_ms: None,
                         grace_ms: None,
                     },
-                ))
-                .await,
-        );
-        let took = start.elapsed();
+                ),
+            ),
+        )
+        .await;
+        let report = flush_report(resp);
         assert!(
             took < Duration::from_millis(4_500),
             "the grace bounds it: {took:?}"
         );
-        assert!(Instant::now() < opens, "the store still refuses");
+        assert_eq!(took, Duration::from_secs(2), "the grace, exactly");
+        assert!(manual.now() < opens, "the store still refuses");
         assert_eq!(report.pending, 1, "{report:?}");
         assert_eq!(report.pending_bulk, 0, "{report:?}");
         assert!(report.pending_bytes > 0, "{report:?}");
@@ -1075,19 +1208,26 @@ mod tests {
         assert_eq!(capture.status().pending_bytes, report.pending_bytes);
         assert!(registrar.chain().is_empty());
 
-        let report = flush_report(
-            runtime
-                .dispatch(ControlRequest::new(
+        let (resp, took) = on_clock(
+            &manual,
+            dispatch(
+                &runtime,
+                ControlRequest::new(
                     RequestId::new("r2"),
                     Command::CaptureFlush {
                         kind: CaptureFlushKind::Final,
                         deadline_ms: None,
                         grace_ms: None,
                     },
-                ))
-                .await,
-        );
-        assert!(Instant::now() >= opens);
+                ),
+            ),
+        )
+        .await;
+        let report = flush_report(resp);
+        assert!(manual.now() >= opens);
+        // Exactly: refused at 2 s, it tries again after 400 ms, doubling (`RetryPolicy`): at
+        // 2.4, 3.2 and 4.8 s, still refused, then at 8 s, after the store opened at 6 s.
+        assert_eq!(took, Duration::from_secs(6), "the first try once it opened");
         assert_eq!(
             (report.pending, report.pending_bulk, report.pending_bytes),
             (0, 0, 0),
@@ -2564,11 +2704,28 @@ mod tests {
     /// `complete: false`, `incomplete_reason: "ship-failed"` (it answered like a finished flush
     /// before, with the capture still staged), and a final flush without a deadline then
     /// completes it once the store takes it.
+    ///
+    /// On a manual clock (sealantd#161: a slow start let the deadline pass before the ship
+    /// failed, and the reason read `deadline`): the store opening, the deadline and the retries
+    /// are in virtual time, where the snaps and every refused pass take none.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_final_flush_that_cannot_ship_by_its_deadline_is_incomplete() {
         let tmp = tempfile::tempdir().unwrap();
-        let opens = Instant::now() + Duration::from_millis(1_500);
-        let (boot, _registrar) = boot_with(tmp.path(), |inner| Arc::new(Gate { inner, opens }));
+        let manual = ManualClock::new();
+        let opens = manual.now() + Duration::from_millis(1_500);
+        let clock = manual.clock();
+        let (boot, _registrar) = boot_on_clock(
+            tmp.path(),
+            &manual,
+            |inner| {
+                Arc::new(Gate {
+                    inner,
+                    opens,
+                    clock,
+                })
+            },
+            |_| {},
+        );
         let mut config = RuntimeConfig::new(new_runtime_id());
         config.workspace_root = tmp.path().join("ws");
         let runtime = Runtime::new(config, Arc::new(ShutdownSignal::new(1_000)));
@@ -2580,22 +2737,37 @@ mod tests {
         capture.start_without_harness(runtime.clone());
 
         let flush = |rid: &'static str, deadline_ms| {
-            runtime.dispatch(ControlRequest::new(
-                RequestId::new(rid),
-                Command::CaptureFlush {
-                    kind: CaptureFlushKind::Final,
-                    deadline_ms,
-                    grace_ms: None,
-                },
-            ))
+            dispatch(
+                &runtime,
+                ControlRequest::new(
+                    RequestId::new(rid),
+                    Command::CaptureFlush {
+                        kind: CaptureFlushKind::Final,
+                        deadline_ms,
+                        grace_ms: None,
+                    },
+                ),
+            )
         };
-        let report = flush_report(flush("r1", Some(300)).await);
+        let (resp, took) = on_clock(&manual, flush("r1", Some(300))).await;
+        let report = flush_report(resp);
         assert!(!report.complete, "{report:?}");
         assert_eq!(report.incomplete_reason.as_deref(), Some("ship-failed"));
         assert!(report.pending > 0 && report.pending_bytes > 0, "{report:?}");
         assert!(runtime.capture_incomplete());
+        assert_eq!(took, Duration::from_millis(300), "the deadline, exactly");
+        assert!(manual.now() < opens, "the store still refuses");
 
-        let report = flush_report(flush("r2", None).await);
+        let (resp, took) = on_clock(&manual, flush("r2", None)).await;
+        let report = flush_report(resp);
+        assert!(manual.now() >= opens, "complete once the store took it");
+        // Exactly: from 300 ms it tries again after 400 ms, then 800 ms (`RetryPolicy`), and the
+        // store opens at 1.5 s, the second try.
+        assert_eq!(
+            took,
+            Duration::from_millis(1_200),
+            "the first try once it opened"
+        );
         assert!(report.complete, "{report:?}");
         assert_eq!(report.pending, 0);
         assert!(!runtime.capture_incomplete());
@@ -2831,17 +3003,28 @@ mod tests {
     /// clocks fired on what the watcher saw after the last snap. Once a final flush stopped
     /// every writer, nothing snaps on a schedule any more (a forced snap still does), and a
     /// capture being built or staged after the final one is not complete until it has shipped.
+    ///
+    /// On a manual clock: the class timers fire on it (50 ms quiet, 200 ms maximum interval),
+    /// and the test waits 300 ms of it after each change, so each timer would have fired had a
+    /// snap been allowed, whatever CPU the test gets. Every read is racy (`racy_window`): the
+    /// bulk build after the final one reads all its files whatever time passed since they were
+    /// written. With the default 2 s window a runner that reached the final flush's bulk snap
+    /// more than 2 s after writing them trusted their stat, the later build read one file, and
+    /// it staged before its 11th yield check (sealantd#167: `cargo test` 10 of 10 under load).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn after_a_final_flush_nothing_snaps_on_a_schedule() {
         let tmp = tempfile::tempdir().unwrap();
-        let (boot, _registrar) = boot_tuned(
+        let manual = ManualClock::new();
+        let (boot, _registrar) = boot_on_clock(
             tmp.path(),
+            &manual,
             |store| store,
             |config| {
                 config.cadence.quiet = Duration::from_millis(50);
                 config.cadence.max_interval = Duration::from_millis(200);
                 config.cadence.bulk_quiet = Duration::from_millis(50);
                 config.cadence.bulk_max_interval = Duration::from_millis(200);
+                config.racy_window = Duration::MAX;
             },
         );
         let ws = boot.layout.working_directory.clone();
@@ -2865,7 +3048,7 @@ mod tests {
             .expect("spawn");
         capture.start(runtime.clone(), harness.process_id);
 
-        let report = runtime.final_flush(None, Some(3_000)).await.unwrap();
+        let (report, _) = on_clock(&manual, final_flush(&runtime, 3_000)).await;
         assert!(report.complete, "{report:?}");
         assert!(capture.status().complete, "current until something changes");
         let after_final = capture.runner().snapshot();
@@ -2875,6 +3058,8 @@ mod tests {
         // on this disk only (review 2026-09-28 #15: status said complete through all of it).
         std::fs::write(ws.join("after.txt"), "after the final flush\n").unwrap();
         std::fs::write(ws.join("node_modules/pkg/late.js"), "late\n").unwrap();
+        // The watcher's events for those writes are in the class clocks before the clock moves.
+        capture.runner().settle_watcher().unwrap();
         for _ in 0..5 {
             capture
                 .runner()
@@ -2882,7 +3067,10 @@ mod tests {
             capture
                 .runner()
                 .signal(sealant_capture::ChangeSignal::Changed(Class::Bulk));
-            tokio::time::sleep(Duration::from_millis(300)).await;
+            let from = manual.now();
+            while manual.now() < from + Duration::from_millis(300) {
+                step(&manual, from + Duration::from_millis(300));
+            }
             let status = capture.status();
             assert!(!status.bulk_building, "{status:?}");
             assert!(!status.complete, "{status:?}");
@@ -2917,7 +3105,7 @@ mod tests {
         assert_eq!(building.incomplete_reason.as_deref(), Some("pending"));
 
         // The final flush again: the build is finished, shipped, and the executor complete.
-        let again = runtime.final_flush(None, Some(3_000)).await.unwrap();
+        let (again, _) = on_clock(&manual, final_flush(&runtime, 3_000)).await;
         assert!(again.complete, "{again:?}");
         assert!(!again.bulk_building, "{again:?}");
         let saved = capture.runner().snapshot();
@@ -2989,10 +3177,11 @@ mod tests {
         assert!(runtime.capture_incomplete());
     }
 
-    /// A store that spends `delay` on every PUT.
+    /// A store that spends `delay` of `clock` on every PUT.
     struct Slow {
         inner: Arc<dyn BlobSink>,
         delay: Duration,
+        clock: Clock,
     }
 
     impl BlobSink for Slow {
@@ -3001,7 +3190,7 @@ mod tests {
             key: &str,
             source: BlobSource<'_>,
         ) -> Result<sealant_capture::sink::PutOutcome, sealant_capture::sink::SinkError> {
-            std::thread::sleep(self.delay);
+            self.clock.sleep(self.delay);
             self.inner.put_if_absent(key, source)
         }
 
@@ -3149,6 +3338,7 @@ mod tests {
             Arc::new(Slow {
                 inner,
                 delay: Duration::from_millis(100),
+                clock: Clock::real(),
             })
         });
         let ws = tmp.path().join("ws");
@@ -3208,15 +3398,28 @@ mod tests {
     /// ship worker keeps uploading until `capture.status` says `complete`. The same final flush
     /// asked again then answers `complete` without stopping the writers again or taking a new
     /// capture of the unchanged disk.
+    ///
+    /// On a manual clock: each PUT takes 150 ms of it, and the deadline is on it too, so the
+    /// flush meets its deadline with captures still uploading whatever CPU the test gets (a
+    /// loaded runner used to ship everything before a real-time deadline it had spent
+    /// snapping).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_final_flush_past_its_deadline_resumes_to_complete() {
         let tmp = tempfile::tempdir().unwrap();
-        let (boot, registrar) = boot_with(tmp.path(), |inner| {
-            Arc::new(Slow {
-                inner,
-                delay: Duration::from_millis(150),
-            })
-        });
+        let manual = ManualClock::new();
+        let clock = manual.clock();
+        let (boot, registrar) = boot_on_clock(
+            tmp.path(),
+            &manual,
+            |inner| {
+                Arc::new(Slow {
+                    inner,
+                    delay: Duration::from_millis(150),
+                    clock,
+                })
+            },
+            |_| {},
+        );
         let ws = tmp.path().join("ws");
         let mut config = RuntimeConfig::new(new_runtime_id());
         config.workspace_root = ws.clone();
@@ -3230,26 +3433,36 @@ mod tests {
         capture.start(runtime.clone(), harness.process_id);
 
         let flush = |rid: &'static str, deadline_ms| {
-            runtime.dispatch(ControlRequest::new(
-                RequestId::new(rid),
-                Command::CaptureFlush {
-                    kind: CaptureFlushKind::Final,
-                    deadline_ms,
-                    grace_ms: Some(2_000),
-                },
-            ))
+            dispatch(
+                &runtime,
+                ControlRequest::new(
+                    RequestId::new(rid),
+                    Command::CaptureFlush {
+                        kind: CaptureFlushKind::Final,
+                        deadline_ms,
+                        grace_ms: Some(2_000),
+                    },
+                ),
+            )
         };
-        let report = flush_report(flush("r1", Some(100)).await);
+        let (resp, took) = on_clock(&manual, flush("r1", Some(100))).await;
+        let report = flush_report(resp);
         assert!(!report.complete, "{report:?}");
         assert_eq!(report.incomplete_reason.as_deref(), Some("deadline"));
         assert!(report.pending > 0, "{report:?}");
         assert_eq!(runtime.quiesce_count(), 1);
+        // The deadline (100 ms) is asked between objects: the PUTs in flight (150 ms) end first.
+        assert_eq!(
+            took,
+            Duration::from_millis(150),
+            "past its deadline by one PUT"
+        );
 
         // Still up, still closed, and the worker ships the rest.
         assert_eq!(runtime.state(), sealant_protocol::RuntimeState::Healthy);
         assert!(runtime.admission_is_closed());
         assert_eq!(runtime.health_report().active_processes, 0);
-        let start = Instant::now();
+        let start = manual.now();
         let status = loop {
             let status = capture.status();
             if status.complete {
@@ -3260,13 +3473,19 @@ mod tests {
                 Some("deadline"),
                 "{status:?}"
             );
-            assert!(start.elapsed() < Duration::from_secs(60), "{status:?}");
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(manual.now() - start < Duration::from_secs(60), "{status:?}");
+            step(&manual, start + Duration::from_secs(60));
         };
+        assert_eq!(
+            manual.now() - start,
+            Duration::from_millis(150),
+            "the worker ships the rest at once, one PUT long"
+        );
         assert_eq!(status.pending, 0);
         let registered = registrar.chain().len();
 
-        let report = flush_report(flush("r2", Some(10_000)).await);
+        let (resp, _) = on_clock(&manual, flush("r2", Some(10_000))).await;
+        let report = flush_report(resp);
         assert!(report.complete, "{report:?}");
         assert_eq!(runtime.quiesce_count(), 1, "no second quiesce");
         assert_eq!(
@@ -3283,15 +3502,23 @@ mod tests {
     /// returned at its deadline has not sealed: once the worker has shipped the rest,
     /// `capture.status` reads `sealing` (never `complete`), and the final flush asked again
     /// seals without a second quiesce; a third stages nothing.
+    ///
+    /// On a manual clock, as [`a_final_flush_past_its_deadline_resumes_to_complete`]: a PUT
+    /// takes 150 ms of it, so nothing registers by the 100 ms deadline whatever CPU the test
+    /// gets (a loaded runner used to ship everything first and read `sealing`).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_complete_final_flush_is_sealed_in_the_store_before_it_says_complete() {
         let tmp = tempfile::tempdir().unwrap();
-        let (boot, registrar) = boot_tuned(
+        let manual = ManualClock::new();
+        let clock = manual.clock();
+        let (boot, registrar) = boot_on_clock(
             tmp.path(),
+            &manual,
             |inner| {
                 Arc::new(Slow {
                     inner,
                     delay: Duration::from_millis(150),
+                    clock,
                 })
             },
             |config| config.executor = Some(EXECUTOR.to_owned()),
@@ -3308,20 +3535,30 @@ mod tests {
             .expect("spawn");
         capture.start(runtime.clone(), harness.process_id);
         let flush = |rid: &'static str, deadline_ms| {
-            runtime.dispatch(ControlRequest::new(
-                RequestId::new(rid),
-                Command::CaptureFlush {
-                    kind: CaptureFlushKind::Final,
-                    deadline_ms,
-                    grace_ms: Some(2_000),
-                },
-            ))
+            dispatch(
+                &runtime,
+                ControlRequest::new(
+                    RequestId::new(rid),
+                    Command::CaptureFlush {
+                        kind: CaptureFlushKind::Final,
+                        deadline_ms,
+                        grace_ms: Some(2_000),
+                    },
+                ),
+            )
         };
-        let report = flush_report(flush("r1", Some(100)).await);
+        let (resp, took) = on_clock(&manual, flush("r1", Some(100))).await;
+        let report = flush_report(resp);
         assert!(!report.complete, "{report:?}");
         assert_eq!(report.incomplete_reason.as_deref(), Some("deadline"));
+        // The deadline (100 ms) is asked between objects: the PUTs in flight (150 ms) end first.
+        assert_eq!(
+            took,
+            Duration::from_millis(150),
+            "past its deadline by one PUT"
+        );
         // The worker ships the rest; nothing is sealed, so nothing reads complete.
-        let start = Instant::now();
+        let start = manual.now();
         let status = loop {
             let status = capture.status();
             assert!(
@@ -3331,14 +3568,26 @@ mod tests {
             if status.pending == 0 && status.incomplete_reason.as_deref() == Some("sealing") {
                 break status;
             }
-            assert!(start.elapsed() < Duration::from_secs(60), "{status:?}");
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(manual.now() - start < Duration::from_secs(60), "{status:?}");
+            step(&manual, start + Duration::from_secs(60));
         };
+        assert_eq!(
+            manual.now() - start,
+            Duration::from_millis(150),
+            "the worker ships the rest at once, one PUT long"
+        );
         assert!(registrar.seals().is_empty(), "{status:?}");
         assert!(runtime.capture_incomplete());
 
         // Core, on an empty but unconfirmed queue, asks again: the flush seals and says so.
-        let report = flush_report(flush("r2", Some(30_000)).await);
+        let (resp, took) = on_clock(&manual, flush("r2", Some(30_000))).await;
+        let report = flush_report(resp);
+        // The sealing capture is staged and shipped: one PUT.
+        assert_eq!(
+            took,
+            Duration::from_millis(150),
+            "the sealing capture's PUT"
+        );
         assert!(report.complete, "{report:?}");
         assert_eq!(runtime.quiesce_count(), 1, "no second quiesce");
         let chain = registrar.chain();
@@ -3382,7 +3631,8 @@ mod tests {
 
         // Asked again: nothing staged, the same seal.
         let registered = chain.len();
-        let report = flush_report(flush("r3", Some(30_000)).await);
+        let (resp, _) = on_clock(&manual, flush("r3", Some(30_000))).await;
+        let report = flush_report(resp);
         assert!(report.complete, "{report:?}");
         assert_eq!(registrar.chain().len(), registered);
         assert_eq!(registrar.seals().len(), 1);

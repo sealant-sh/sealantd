@@ -42,6 +42,9 @@ test-support = []
 
 [dev-dependencies]
 sealantd = { path = ".", features = ["test-support"] }
+# The manual clock (`ManualClock`, `CaptureConfig::clock`) for the capture tests: test builds only
+# (`scripts/ci-test-support-gate.sh`).
+sealant-capture = { workspace = true, features = ["test-support"] }
 sealant-protocol = { workspace = true }
 sealant-control = { workspace = true }
 sealant-runtime-core = { workspace = true }
