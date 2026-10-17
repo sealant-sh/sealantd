@@ -219,13 +219,12 @@ fn build_config(cli: &ServeArgs) -> RuntimeConfig {
 /// invocation); with `boot`, runs the PID-1 supervisor. Returns the process exit code.
 pub fn run() -> ExitCode {
     // Whatever started sealantd may have left descriptors open without close-on-exec: mark them,
-    // so no child inherits them (each spawn marks them again, sealant_process::spawn). The same
-    // call needs Linux 5.11, which every spawn needs too: refuse to start on an older kernel.
+    // so no child inherits them (each spawn marks them again, sealant_process::spawn). When they
+    // cannot be marked, no spawn could start either: refuse to start.
     if let Err(error) = sealant_process::spawn::mark_inherited_close_on_exec() {
         eprintln!(
-            "sealantd: marking inherited descriptors close-on-exec failed ({error}): sealantd needs \
-             {} or later (close_range with CLOSE_RANGE_CLOEXEC)",
-            sealant_process::spawn::KERNEL_FLOOR
+            "sealantd: marking inherited descriptors close-on-exec failed: {error} (it needs \
+             close_range with CLOSE_RANGE_CLOEXEC, Linux 5.11, or a readable /proc/self/fd)"
         );
         return ExitCode::FAILURE;
     }

@@ -113,16 +113,47 @@ fn refuse_on_fs_user_thread() -> io::Result<()> {
     Ok(())
 }
 
-/// The oldest kernel sealantd runs on: `close_range(2)` with `CLOSE_RANGE_CLOEXEC` came in 5.11.
-pub const KERNEL_FLOOR: &str = "Linux 5.11";
-
-/// Mark every descriptor from 3 up close-on-exec: `close_range(3, ~0U, CLOSE_RANGE_CLOEXEC)`, one
-/// system call, which allocates nothing and takes no lock, so it may run between fork and exec.
-/// Descriptors 0 to 2 are left as they are.
+/// Mark every descriptor from 3 up close-on-exec, leaving 0 to 2 as they are. Nothing here
+/// allocates or takes a lock, so it may run between fork and exec.
+///
+/// `close_range(3, ~0U, CLOSE_RANGE_CLOEXEC)` does it in one system call on Linux 5.11 and later.
+/// A kernel without it (`ENOSYS` before 5.9, `EINVAL` for the flag before 5.11: Debian 11,
+/// Amazon Linux 2, RHEL 8) gets [`mark_by_walking`]: every descriptor `/proc/self/fd` lists, read
+/// with `getdents64` into a buffer on the stack, marked with `fcntl`.
 ///
 /// # Errors
-/// The kernel's, on one older than [`KERNEL_FLOOR`].
+/// When neither works: the walk's error.
 pub fn mark_inherited_close_on_exec() -> io::Result<()> {
+    match close_range_cloexec() {
+        Err(error) if matches!(error.raw_os_error(), Some(libc::ENOSYS | libc::EINVAL)) => {
+            mark_by_walking()
+        }
+        result => result,
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// What a test makes the marking do on its own thread, and in what that thread spawns (a
+    /// child is a copy of the thread that forked it): 0 as it is, 1 as on a kernel without
+    /// `close_range` (the walk), 2 also with a walk that cannot open `/proc/self/fd`.
+    static PRETEND: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn pretend() -> u8 {
+    PRETEND.with(std::cell::Cell::get)
+}
+
+#[cfg(not(test))]
+fn pretend() -> u8 {
+    0
+}
+
+fn close_range_cloexec() -> io::Result<()> {
+    if pretend() > 0 {
+        return Err(io::Error::from_raw_os_error(libc::ENOSYS));
+    }
     #[allow(
         unsafe_code,
         reason = "a raw system call: libc has no close_range wrapper on musl"
@@ -143,13 +174,108 @@ pub fn mark_inherited_close_on_exec() -> io::Result<()> {
     }
 }
 
+/// Mark every descriptor from 3 up that `/proc/self/fd` lists close-on-exec: the directory read
+/// with raw `getdents64` into a buffer on the stack, each name parsed as a number in place, each
+/// descriptor marked with `fcntl(F_SETFD, FD_CLOEXEC)`. No allocation, no lock: open, getdents64,
+/// fcntl and close are all safe between fork and exec. The directory's own descriptor is opened
+/// close-on-exec and closed before it returns.
+///
+/// # Errors
+/// Opening or reading `/proc/self/fd`, or marking a descriptor it lists (one gone by then is
+/// skipped).
+#[allow(
+    unsafe_code,
+    reason = "raw system calls on a stack buffer: nothing here may allocate between fork and exec"
+)]
+fn mark_by_walking() -> io::Result<()> {
+    let path: &std::ffi::CStr = if pretend() == 2 {
+        c"/proc/self/sealant-no-such-directory"
+    } else {
+        c"/proc/self/fd"
+    };
+    // SAFETY: a NUL-terminated path and flags; the descriptor is closed on every path below.
+    let dir = unsafe {
+        libc::open(
+            path.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if dir < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let result = walk(dir);
+    // SAFETY: `dir` is the descriptor opened above, closed once.
+    unsafe { libc::close(dir) };
+    result
+}
+
+/// The walk of [`mark_by_walking`] over the open directory `dir`.
+#[allow(
+    unsafe_code,
+    reason = "raw system calls on a stack buffer: nothing here may allocate between fork and exec"
+)]
+fn walk(dir: libc::c_int) -> io::Result<()> {
+    // `struct linux_dirent64` needs 8-byte alignment: a buffer of u64.
+    let mut buf = [0u64; 512];
+    let size = std::mem::size_of_val(&buf);
+    loop {
+        // SAFETY: getdents64 writes at most `size` bytes into `buf`, which outlives the call.
+        let read = unsafe { libc::syscall(libc::SYS_getdents64, dir, buf.as_mut_ptr(), size) };
+        if read < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if read == 0 {
+            return Ok(());
+        }
+        let read = usize::try_from(read).unwrap_or(0).min(size);
+        let bytes = buf.as_ptr().cast::<u8>();
+        let mut offset = 0;
+        // Each record: d_ino (u64), d_off (i64), d_reclen (u16), d_type (u8), d_name (NUL-ended).
+        while offset + 19 < read {
+            // SAFETY: `offset + 19 < read <= size`: the record's header lies inside the buffer.
+            let reclen =
+                usize::from(unsafe { bytes.add(offset + 16).cast::<u16>().read_unaligned() });
+            if reclen == 0 || offset + reclen > read {
+                return Err(io::Error::from_raw_os_error(libc::EIO));
+            }
+            let mut fd: libc::c_int = 0;
+            let mut digits = 0;
+            let mut name = offset + 19;
+            while name < offset + reclen {
+                // SAFETY: `name < offset + reclen <= read`: inside the record.
+                let byte = unsafe { *bytes.add(name) };
+                if !byte.is_ascii_digit() {
+                    break;
+                }
+                fd = fd
+                    .saturating_mul(10)
+                    .saturating_add(libc::c_int::from(byte - b'0'));
+                digits += 1;
+                name += 1;
+            }
+            // `.` and `..` have no digits; every other name is a descriptor number.
+            if digits > 0 && fd >= 3 && fd != dir {
+                // SAFETY: F_SETFD on a descriptor number; a closed one answers EBADF.
+                let marked = unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+                if marked < 0 {
+                    let error = io::Error::last_os_error();
+                    if error.raw_os_error() != Some(libc::EBADF) {
+                        return Err(error);
+                    }
+                }
+            }
+            offset += reclen;
+        }
+    }
+}
+
 /// A child gets its stdin, stdout and stderr, and no other descriptor of sealantd's: in the
 /// child, after its stdio is in place and just before it execs, every descriptor from 3 up is
 /// marked close-on-exec ([`mark_inherited_close_on_exec`]) — one sealantd opened without the
 /// flag, or inherited from whatever started it, included (sealantd#183). The error pipe std
-/// reports a failed exec through is already close-on-exec, and stays open until the exec. A
-/// kernel older than [`KERNEL_FLOOR`] fails the spawn: no child starts with descriptors it was
-/// not given.
+/// reports a failed exec through is already close-on-exec, and stays open until the exec. When the
+/// marking fails (neither `close_range` nor the `/proc/self/fd` walk works), the spawn fails: no
+/// child starts with descriptors it was not given.
 fn close_inherited_on_exec(command: &mut Command) {
     use std::os::unix::process::CommandExt;
     #[allow(
@@ -632,6 +758,84 @@ mod tests {
         assert!(out.status.success(), "{out:?}");
         assert_eq!(String::from_utf8_lossy(&out.stdout), "out:in\ngone\n");
         assert_eq!(String::from_utf8_lossy(&out.stderr), "err\n");
+    }
+
+    /// On a kernel without `close_range` (pretended on this thread), the walk of `/proc/self/fd`
+    /// marks a descriptor of this process, and children of both spawns get their stdio and no
+    /// other descriptor (sealantd#183).
+    #[test]
+    fn without_close_range_the_walk_marks_every_descriptor() {
+        PRETEND.with(|p| p.set(1));
+        let (fd, n) = inheritable_fd();
+        mark_inherited_close_on_exec().expect("the walk");
+        let flags = nix::fcntl::fcntl(&fd, nix::fcntl::FcntlArg::F_GETFD).expect("F_GETFD");
+        assert!(
+            nix::fcntl::FdFlag::from_bits_truncate(flags).contains(nix::fcntl::FdFlag::FD_CLOEXEC),
+            "the walk marked fd {n}"
+        );
+        drop(fd);
+
+        let (_std_fd, n) = inheritable_fd();
+        let out = Command::new("/bin/sh")
+            .args(probe(n))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn_gated()
+            .expect("spawn")
+            .communicate(Some(b"in\n".to_vec()))
+            .expect("run");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "out:in\ngone\n",
+            "{out:?}"
+        );
+        assert_eq!(String::from_utf8_lossy(&out.stderr), "err\n");
+
+        let (_tokio_fd, n) = inheritable_fd();
+        let out = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime")
+            .block_on(async {
+                use tokio::io::AsyncWriteExt;
+                let mut command = tokio::process::Command::new("/bin/sh");
+                command
+                    .args(probe(n))
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped());
+                let (mut child, _spawned) = spawn_tokio(&mut command).expect("spawn");
+                let mut stdin = child.stdin.take().expect("stdin");
+                stdin.write_all(b"in\n").await.expect("write");
+                drop(stdin);
+                child.wait_with_output().await.expect("run")
+            });
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "out:in\ngone\n",
+            "{out:?}"
+        );
+        PRETEND.with(|p| p.set(0));
+    }
+
+    /// When neither `close_range` nor the walk works, nothing is marked and nothing is spawned:
+    /// the marking errs, and so do both spawns.
+    #[test]
+    fn when_the_walk_cannot_run_nothing_is_spawned() {
+        PRETEND.with(|p| p.set(2));
+        assert!(mark_inherited_close_on_exec().is_err(), "the marking errs");
+        let std_spawn = spawn_std(Command::new("/bin/true").stdin(Stdio::null()));
+        let tokio_spawn = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime")
+            .block_on(async {
+                spawn_tokio(&mut tokio::process::Command::new("/bin/true")).map(|_| ())
+            });
+        PRETEND.with(|p| p.set(0));
+        assert!(std_spawn.is_err(), "spawn_std refused: {std_spawn:?}");
+        assert!(tokio_spawn.is_err(), "spawn_tokio refused: {tokio_spawn:?}");
     }
 
     /// A program that cannot be run is still reported by the spawn, by both gates: the backstop
