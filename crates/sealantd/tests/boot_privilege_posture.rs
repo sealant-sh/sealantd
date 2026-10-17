@@ -87,7 +87,8 @@ fn booted_posture(owner_map: Option<&str>) -> (String, String) {
     if let Some(map) = owner_map {
         boot.env("SEALANT_CAPTURE_OWNER_MAP", map);
     }
-    let mut child = boot.spawn().expect("spawn sealantd boot");
+    let (mut child, spawned) =
+        sealant_process::spawn::spawn_std(&mut boot).expect("spawn sealantd boot");
     let started = Instant::now();
     let waited = asked.recv_timeout(Duration::from_secs(20));
     let status =
@@ -98,6 +99,7 @@ fn booted_posture(owner_map: Option<&str>) -> (String, String) {
         let _ = stderr.read_to_string(&mut log);
     }
     let _ = child.wait();
+    drop(spawned);
     assert!(
         waited.is_ok(),
         "the boot never asked for its plan within {:?}:\n{log}",

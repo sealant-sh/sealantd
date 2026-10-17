@@ -8,20 +8,22 @@ use std::ffi::OsStr;
 use std::fs;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::sync::Arc;
 
 use sealant_capture::{
     CadenceRunner, CaptureConfig, CaptureEngine, InMemoryRegistrar, LocalDir, MaterializeClass,
     MaterializeTargets, Materializer,
 };
+use sealant_process::CommandGateExt;
 
 fn git_raw(root: &Path, args: &[&OsStr]) -> Output {
     let out = Command::new("git")
         .current_dir(root)
         .env("GIT_OPTIONAL_LOCKS", "0")
         .args(args)
-        .output()
+        .stdin(Stdio::null())
+        .output_gated()
         .expect("git");
     assert!(
         out.status.success(),
@@ -142,7 +144,7 @@ fn two_raw_ref_names_keep_both_branches_and_their_commits() {
         let present = Command::new("git")
             .current_dir(&fx.out)
             .args(["cat-file", "-e", oid])
-            .status()
+            .status_gated()
             .unwrap()
             .success();
         assert!(present, "commit {oid} was not restored");

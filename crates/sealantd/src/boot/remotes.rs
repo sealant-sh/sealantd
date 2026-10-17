@@ -110,6 +110,7 @@ fn validate(remote: &PlanRemote) -> Result<(), BootError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sealant_process::CommandGateExt;
     use std::process::Command;
 
     fn remote(name: &str, url: &str) -> PlanRemote {
@@ -124,7 +125,8 @@ mod tests {
             .arg("-C")
             .arg(root)
             .args(["remote", "get-url", name])
-            .output()
+            .stdin(std::process::Stdio::null())
+            .output_gated()
             .expect("git");
         out.status
             .success()

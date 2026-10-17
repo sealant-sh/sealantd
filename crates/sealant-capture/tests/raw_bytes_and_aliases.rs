@@ -11,7 +11,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -20,6 +20,7 @@ use sealant_capture::{
     CadenceRunner, CaptureConfig, CaptureEngine, CaptureKind, Class, InMemoryRegistrar, Incomplete,
     LocalDir, MaterializeClass, MaterializeTargets, Materializer, SnapRequest, WatchMode,
 };
+use sealant_process::CommandGateExt;
 
 const EXECUTOR: &str = "exec-r6";
 
@@ -28,7 +29,8 @@ fn git(root: &Path, args: &[&str]) {
         .current_dir(root)
         .env("GIT_OPTIONAL_LOCKS", "0")
         .args(args)
-        .output()
+        .stdin(Stdio::null())
+        .output_gated()
         .expect("git");
     assert!(
         out.status.success(),

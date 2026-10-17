@@ -8,8 +8,9 @@
 //! without a session token, exits 75.
 
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 
+use sealant_process::CommandGateExt;
 use sealantd::unclaimed::{self, Placeholder};
 
 fn recover(base: &Path, disk: &Path) -> Output {
@@ -28,7 +29,8 @@ fn recover(base: &Path, disk: &Path) -> Output {
             "echo harness > harness-ran.txt",
         )
         .env("PATH", std::env::var("PATH").unwrap_or_default())
-        .output()
+        .stdin(Stdio::null())
+        .output_gated()
         .expect("sealantd boot --recovery")
 }
 

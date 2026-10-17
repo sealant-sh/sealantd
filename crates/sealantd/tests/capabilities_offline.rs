@@ -6,6 +6,7 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use sealant_control::{read_frame, write_frame};
+use sealant_process::CommandGateExt;
 use sealant_protocol::{
     ClientMessage, Command, CommandResult, ControlRequest, RequestId, ResponseOutcome,
     ServerMessage,
@@ -19,7 +20,8 @@ async fn the_offline_report_is_the_booted_one() {
     let offline = std::process::Command::new(exe)
         .args(["capabilities", "--json"])
         .env_clear()
-        .output()
+        .stdin(Stdio::null())
+        .output_gated()
         .expect("run sealantd capabilities");
     assert!(offline.status.success());
     // The exact shape Core's image probe parses (sealant#327 reads `supports`): one line, these
@@ -39,15 +41,16 @@ async fn the_offline_report_is_the_booted_one() {
     let offline: serde_json::Value =
         serde_json::from_slice(&offline.stdout).expect("one JSON object");
 
-    let mut child = tokio::process::Command::new(exe)
-        .args(["--stdio", "--log-level", "off", "--workspace"])
-        .arg(std::env::temp_dir())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
-        .expect("spawn sealantd");
+    let (mut child, _spawned) = sealant_process::spawn::spawn_tokio(
+        tokio::process::Command::new(exe)
+            .args(["--stdio", "--log-level", "off", "--workspace"])
+            .arg(std::env::temp_dir())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true),
+    )
+    .expect("spawn sealantd");
     let mut stdin = child.stdin.take().expect("stdin");
     let mut stdout = child.stdout.take().expect("stdout");
     let body = sealant_protocol::encode_client(&ClientMessage::Request(ControlRequest::new(
@@ -88,7 +91,8 @@ async fn the_offline_report_is_the_booted_one() {
     // One name per line without `--json`.
     let lines = std::process::Command::new(exe)
         .arg("capabilities")
-        .output()
+        .stdin(Stdio::null())
+        .output_gated()
         .expect("run sealantd capabilities");
     assert_eq!(
         String::from_utf8_lossy(&lines.stdout)

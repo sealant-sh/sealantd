@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 use sealant_capture::{
     BlobSink, CaptureConfig, CaptureEngine, InMemoryRegistrar, LocalDir, Registrar,
 };
+use sealant_process::CommandGateExt;
 use sealant_runtime_core::{RuntimeConfig, new_runtime_id};
 use sealantd::boot::capture::{CaptureBoot, SourceLayout};
 use sealantd::capture::CaptureRuntime;
@@ -32,7 +33,8 @@ fn git(root: &Path, args: &[&str]) {
         .current_dir(root)
         .env("GIT_OPTIONAL_LOCKS", "0")
         .args(args)
-        .output()
+        .stdin(std::process::Stdio::null())
+        .output_gated()
         .expect("git");
     assert!(out.status.success(), "git {args:?}");
 }
@@ -79,7 +81,7 @@ fn orphan(dir: &Path, name: &str, mark: &str, nap: u32, target: &Path) -> String
         .args(["-c", &script])
         .current_dir(ws)
         .env("SEALANTD_SWEEP_MARK", mark)
-        .status()
+        .status_gated()
         .unwrap();
     assert!(status.success());
     let start = Instant::now();
@@ -104,7 +106,7 @@ fn idle_orphan(dir: &Path, name: &str, mark: &str) -> String {
         .args(["-c", &script])
         .current_dir(dir)
         .env("SEALANTD_SWEEP_MARK", mark)
-        .status()
+        .status_gated()
         .unwrap();
     assert!(status.success());
     let start = Instant::now();
@@ -161,7 +163,7 @@ impl Drop for Reap {
     fn drop(&mut self) {
         for file in &self.0 {
             if let Ok(pid) = std::fs::read_to_string(file) {
-                let _ = Proc::new("kill").args(["-9", pid.trim()]).status();
+                let _ = Proc::new("kill").args(["-9", pid.trim()]).status_gated();
             }
         }
     }

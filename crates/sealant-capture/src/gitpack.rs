@@ -4187,6 +4187,7 @@ pub fn read_tree_into_index(repo: &GitRepo, tree: &str) -> Result<(), GitError> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sealant_process::CommandGateExt;
 
     fn fixture() -> (tempfile::TempDir, GitRepo) {
         let dir = tempfile::tempdir().unwrap();
@@ -4227,7 +4228,8 @@ mod tests {
             Command::new("git")
                 .args(["init", "--bare", "-q"])
                 .arg(&bare)
-                .output()
+                .stdin(std::process::Stdio::null())
+                .output_gated()
                 .unwrap(),
         )
         .unwrap();
@@ -4406,7 +4408,8 @@ mod tests {
             .unwrap()
             .env("GIT_INDEX_FILE", &tmp_index)
             .args(&without_flag)
-            .output()
+            .stdin(std::process::Stdio::null())
+            .output_gated()
             .unwrap();
         assert!(
             out.status.success(),
@@ -4417,7 +4420,8 @@ mod tests {
             .unwrap()
             .env("GIT_INDEX_FILE", &tmp_index)
             .args(["ls-files", "-s"])
-            .output()
+            .stdin(std::process::Stdio::null())
+            .output_gated()
             .unwrap();
         let listing = String::from_utf8_lossy(&out.stdout).to_string();
         assert!(listing.contains("plain.txt"), "{listing}");

@@ -13,7 +13,7 @@ use std::fs;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::sync::Arc;
 
 use nix::sys::stat::{UtimensatFlags, utimensat};
@@ -25,6 +25,7 @@ use sealant_capture::{
     CadenceRunner, CaptureConfig, CaptureEngine, InMemoryRegistrar, LocalDir, MaterializeClass,
     MaterializeTargets, Materializer,
 };
+use sealant_process::CommandGateExt;
 
 const EXECUTOR: &str = "exec-r7";
 
@@ -33,7 +34,8 @@ fn git_out(root: &Path, args: &[&OsStr]) -> Output {
         .current_dir(root)
         .env("GIT_OPTIONAL_LOCKS", "0")
         .args(args)
-        .output()
+        .stdin(Stdio::null())
+        .output_gated()
         .expect("git")
 }
 

@@ -10,7 +10,7 @@
 
 use std::fs;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -18,6 +18,7 @@ use sealant_capture::{
     BlobSink, CaptureConfig, CaptureEngine, CaptureKind, Class, InMemoryRegistrar, LocalDir,
     MaterializeClass, MaterializeTargets, Materializer, Registrar, SnapRequest,
 };
+use sealant_process::CommandGateExt;
 
 /// Steps a restage takes: journal written, committed, the bulk capture's queue file, the small
 /// capture's queue file, the sweep. A crash "after" the last one leaves only the journal.
@@ -28,7 +29,8 @@ fn git(root: &Path, args: &[&str]) {
         .current_dir(root)
         .env("GIT_OPTIONAL_LOCKS", "0")
         .args(args)
-        .output()
+        .stdin(Stdio::null())
+        .output_gated()
         .expect("git");
     assert!(
         out.status.success(),

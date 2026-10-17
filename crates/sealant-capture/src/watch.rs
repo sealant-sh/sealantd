@@ -1093,6 +1093,7 @@ fn watch_new_bulk(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sealant_process::CommandGateExt;
 
     fn spec(root: &Path, home: Option<PathBuf>) -> WatchSpec {
         WatchSpec {
@@ -1120,7 +1121,7 @@ mod tests {
             std::process::Command::new("git")
                 .args(["init", "-q"])
                 .current_dir(&root)
-                .status()
+                .status_gated()
                 .unwrap()
                 .success()
         );

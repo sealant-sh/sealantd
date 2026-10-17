@@ -39,6 +39,13 @@ impl SpawnsAfterQuiesce {
     fn touch(&self) {
         let stopped = self.runtime.get().is_some_and(|rt| rt.writers_stopped());
         if stopped && !self.spawned.swap(true, Ordering::SeqCst) {
+            // Outside the spawn gate on purpose: the census leaves the gate's pids to the helper
+            // that spawned them, and this writer stands for a process the capture did not start.
+            // No orphan reaper runs in this binary to take its exit status.
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "an ungated descendant is what the census must find"
+            )]
             let child = std::process::Command::new("sh")
                 .arg("-c")
                 .arg(format!(

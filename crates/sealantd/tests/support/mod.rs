@@ -9,6 +9,7 @@ use sealant_capture::{
     BlobSink, CaptureConfig, CaptureEngine, InMemoryRegistrar, LocalDir, MaterializeClass,
     MaterializeTargets, Materializer, Registrar,
 };
+use sealant_process::CommandGateExt;
 use sealant_runtime_core::{RuntimeConfig, new_runtime_id};
 use sealantd::boot::capture::{CaptureBoot, SourceLayout};
 use sealantd::capture::CaptureRuntime;
@@ -19,7 +20,8 @@ pub(crate) fn git(root: &Path, args: &[&str]) {
         .current_dir(root)
         .env("GIT_OPTIONAL_LOCKS", "0")
         .args(args)
-        .output()
+        .stdin(std::process::Stdio::null())
+        .output_gated()
         .expect("git");
     assert!(out.status.success(), "git {args:?}");
 }

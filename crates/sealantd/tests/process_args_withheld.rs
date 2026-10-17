@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use sealant_control::{read_frame, write_frame};
 use sealant_eventlog::{FsyncPolicy, Spool, SpoolConfig};
+use sealant_process::SpawnedPid;
 use sealant_protocol::{
     ClientMessage, Command, ControlRequest, EventEnvelope, EventId, EventPayload, ExecArgs,
     OpenSessionArgs, ProcessStarted, RequestId, RuntimeId, SCHEMA_VERSION, Sequence, ServerMessage,
@@ -85,23 +86,24 @@ fn spooled_starts(dir: &Path) -> Vec<ProcessStarted> {
     starts
 }
 
-fn spawn_daemon(spool: &Path) -> (Child, ChildStdin, ChildStdout) {
-    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_sealantd"))
-        .arg("--stdio")
-        .arg("--workspace")
-        .arg(std::env::temp_dir())
-        .arg("--spool-dir")
-        .arg(spool)
-        .arg("--log-level")
-        .arg("off")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn sealantd");
+fn spawn_daemon(spool: &Path) -> (Child, SpawnedPid, ChildStdin, ChildStdout) {
+    let (mut child, spawned) = sealant_process::spawn::spawn_tokio(
+        tokio::process::Command::new(env!("CARGO_BIN_EXE_sealantd"))
+            .arg("--stdio")
+            .arg("--workspace")
+            .arg(std::env::temp_dir())
+            .arg("--spool-dir")
+            .arg(spool)
+            .arg("--log-level")
+            .arg("off")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null()),
+    )
+    .expect("spawn sealantd");
     let stdin = child.stdin.take().expect("stdin");
     let stdout = child.stdout.take().expect("stdout");
-    (child, stdin, stdout)
+    (child, spawned, stdin, stdout)
 }
 
 async fn send<W: AsyncWrite + Unpin>(writer: &mut W, id: &str, command: Command) {
@@ -155,7 +157,7 @@ async fn shut_down(mut child: Child, stdin: ChildStdin) {
 #[tokio::test]
 async fn exec_and_session_publish_counts_never_argument_text() {
     let spool = tempfile::tempdir().expect("spool");
-    let (child, mut stdin, mut stdout) = spawn_daemon(spool.path());
+    let (child, _spawned, mut stdin, mut stdout) = spawn_daemon(spool.path());
 
     let exec_script = "exit 0";
     send(
@@ -263,7 +265,7 @@ async fn an_older_daemons_spooled_arguments_are_scrubbed_on_start() {
     }
     assert!(contains_marker(&spool_bytes(spool.path())));
 
-    let (child, mut stdin, mut stdout) = spawn_daemon(spool.path());
+    let (child, _spawned, mut stdin, mut stdout) = spawn_daemon(spool.path());
     // The delivery task replays (and rewrites) the spool before it delivers anything new, so once
     // this exec's events arrived the old segment has been scrubbed. Any replayed event this
     // connection sees is checked for the marker with every other frame.

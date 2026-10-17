@@ -10,9 +10,10 @@
 //! `tcp://127.0.0.1:<port>`) with `busybox` loaded, and the `docker` CLI on `PATH`. Without it
 //! the test says so and passes.
 
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::time::Duration;
 
+use sealant_process::CommandGateExt;
 use sealantd::docker::{DockerEndpoint, stop_all};
 
 fn docker(host: &str, args: &[&str]) -> Output {
@@ -20,7 +21,8 @@ fn docker(host: &str, args: &[&str]) -> Output {
         .arg("-H")
         .arg(host)
         .args(args)
-        .output()
+        .stdin(Stdio::null())
+        .output_gated()
         .expect("docker");
     assert!(
         out.status.success(),

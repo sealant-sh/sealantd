@@ -17,6 +17,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use sealant_capture::bounds::{self, Bounds};
+use sealant_process::CommandGateExt;
 use sealant_protocol::{CaptureClass, CaptureKind, CaptureStatusReport};
 use sealantd::capture::CaptureRuntime;
 use support::boot;
@@ -26,7 +27,8 @@ fn stalling_git(dir: &Path, mark: &Path) {
     let real = String::from_utf8(
         std::process::Command::new("sh")
             .args(["-c", "command -v git"])
-            .output()
+            .stdin(std::process::Stdio::null())
+            .output_gated()
             .unwrap()
             .stdout,
     )

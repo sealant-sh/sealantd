@@ -165,17 +165,18 @@ async fn in_process_exec_streams_events_and_reports_exit() {
 #[tokio::test]
 async fn binary_stdio_roundtrips_binary_unsafe_output_and_shuts_down() {
     let exe = env!("CARGO_BIN_EXE_sealantd");
-    let mut child = tokio::process::Command::new(exe)
-        .arg("--stdio")
-        .arg("--workspace")
-        .arg(std::env::temp_dir())
-        .arg("--log-level")
-        .arg("off")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn sealantd");
+    let (mut child, _spawned) = sealant_process::spawn::spawn_tokio(
+        tokio::process::Command::new(exe)
+            .arg("--stdio")
+            .arg("--workspace")
+            .arg(std::env::temp_dir())
+            .arg("--log-level")
+            .arg("off")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null()),
+    )
+    .expect("spawn sealantd");
 
     let mut stdin = child.stdin.take().expect("stdin");
     let mut stdout = child.stdout.take().expect("stdout");

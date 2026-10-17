@@ -72,26 +72,27 @@ async fn binary_serves_health_over_wss_and_unix_socket() {
     let port = free_port();
     let socket = dir.path().join("control.sock");
     let exe = env!("CARGO_BIN_EXE_sealantd");
-    let mut child = tokio::process::Command::new(exe)
-        .arg("--socket")
-        .arg(&socket)
-        .arg("--workspace")
-        .arg(dir.path())
-        .arg("--log-level")
-        .arg("off")
-        .arg("--wss-listen")
-        .arg(format!("127.0.0.1:{port}"))
-        .arg("--wss-cert")
-        .arg(&cert_path)
-        .arg("--wss-key")
-        .arg(&key_path)
-        .arg("--wss-client-ca")
-        .arg(&ca_path)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn sealantd");
+    let (mut child, _spawned) = sealant_process::spawn::spawn_tokio(
+        tokio::process::Command::new(exe)
+            .arg("--socket")
+            .arg(&socket)
+            .arg("--workspace")
+            .arg(dir.path())
+            .arg("--log-level")
+            .arg("off")
+            .arg("--wss-listen")
+            .arg(format!("127.0.0.1:{port}"))
+            .arg("--wss-cert")
+            .arg(&cert_path)
+            .arg("--wss-key")
+            .arg(&key_path)
+            .arg("--wss-client-ca")
+            .arg(&ca_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+    )
+    .expect("spawn sealantd");
 
     // Unix socket: still the readiness signal.
     let mut unix = None;
@@ -191,13 +192,17 @@ async fn binary_serves_health_over_wss_and_unix_socket() {
 #[tokio::test]
 async fn binary_refuses_partial_wss_configuration() {
     let exe = env!("CARGO_BIN_EXE_sealantd");
-    let output = tokio::process::Command::new(exe)
-        .arg("--workspace")
-        .arg(std::env::temp_dir())
-        .arg("--wss-listen")
-        .arg("127.0.0.1:1")
-        .output()
-        .await
-        .expect("run");
-    assert!(!output.status.success(), "partial wss flags must fail fast");
+    let (mut child, _spawned) = sealant_process::spawn::spawn_tokio(
+        tokio::process::Command::new(exe)
+            .arg("--workspace")
+            .arg(std::env::temp_dir())
+            .arg("--wss-listen")
+            .arg("127.0.0.1:1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+    )
+    .expect("run");
+    let status = child.wait().await.expect("run");
+    assert!(!status.success(), "partial wss flags must fail fast");
 }
