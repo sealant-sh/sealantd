@@ -1,16 +1,18 @@
 // release.yml's steps that decide what a stable release writes, run as written against stand-in
-// docker commands and a stub GitHub API; and the job graph they sit in. Ported from sealant-sh/sealant
-// tooling/scripts/release-publication.test.mjs (itself from sealant-sh/mend), for sealantd's one
-// image, its identity checks and its ci check.
+// docker commands and a stub GitHub API; and the job graph they sit in, push and dry run. Ported from
+// sealant-sh/sealant tooling/scripts/release-publication.test.mjs (itself from sealant-sh/mend), for
+// sealantd's one image, its identity checks and its ci check. npm's step is release-npm.test.mjs's.
 import assert from "node:assert/strict";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   chmodSync,
   copyFileSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -103,11 +105,25 @@ const annotatedRunnable = () => {
 /** The index merge staged: each arch's platform names that arch's build. */
 const STAGED = indexDocument([child(PLATFORMS.amd64, "amd64"), child(PLATFORMS.arm64, "arm64")]);
 const INDEX = STAGED.digest;
+const tarballRecord = (name, version) => {
+  const digest = createHash("sha512").update(name).digest();
+  return {
+    file: `${name.slice(1).replace("/", "-")}-${version}.tgz`,
+    sha512: digest.toString("hex"),
+    integrity: `sha512-${digest.toString("base64")}`,
+  };
+};
 const manifestJson = (version, extra = {}) =>
   JSON.stringify({
     version,
     commit: COMMIT,
     images: { sealantd: { index: INDEX, platforms: PLATFORMS } },
+    packages: Object.fromEntries(
+      ["@sealant/runtime-protocol", "@sealant/runtime-client"].map((name) => [
+        name,
+        tarballRecord(name, version),
+      ]),
+    ),
     ...extra,
   });
 
@@ -491,11 +507,13 @@ test("finalize refuses another release's manifest or a missing index, writing no
 // --- identity ---
 
 /**
- * The identity step as written, in a checkout holding `cargo` as Cargo.toml's workspace version,
- * against a stand-in docker. The registry serves `index` (the staged index by default) by its
- * digest, which the manifest records as the run's index; this arch's build job recorded `build`
- * (the manifest's platform digest by default). The pull of the digest the index maps this arch to
- * gives `id`; every later read must name that ID. The image answers `platform` and `labels`; a container of it runs `running` (by
+ * The identity job's pull and check steps as written, one after the other as the runner runs them,
+ * in a checkout holding `cargo` as Cargo.toml's workspace version, against a stand-in docker. The
+ * registry serves `index` (the staged index by default) by its digest, which the manifest records
+ * as the run's index; this arch's build job recorded `build` (the manifest's platform digest by
+ * default). The pull of the digest the index maps this arch to gives `id` (`recorded` replaces what
+ * the pull wrote, as a load would); every later read must name that ID. A pull step that refuses
+ * ends the job there, as on the runner. The image answers `platform` and `labels`; a container of it runs `running` (by
  * default the image it was created from) and prints `reported`, exiting `exit`.
  */
 const identity = (t, fixture = {}) => {
@@ -580,20 +598,29 @@ process.exit(79);
       images: { sealantd: { index: index.digest, platforms: PLATFORMS } },
     }),
   );
+  const env = {
+    PATH: `${bin}:${process.env.PATH}`,
+    RUNNER_ARCH: fixture.runner ?? (arch === "amd64" ? "X64" : "ARM64"),
+    RUNNER_TEMP: directory,
+    GITHUB_SHA: COMMIT,
+    GITHUB_REPOSITORY: "sealant-sh/sealantd",
+    REPOSITORY,
+    MANIFEST: file,
+    BUILT: built,
+    VERSION: version,
+    ARCH: arch,
+  };
+  const pulled = bashStep(stepRun("identity", "Pull this run's image by digest"), {
+    cwd: checkout,
+    env,
+  });
+  if (pulled.status !== 0)
+    return { ...pulled, output: pulled.stdout + pulled.stderr, calls: readCalls(calls) };
+  if (fixture.recorded !== undefined)
+    writeFileSync(path.join(directory, "image-id"), fixture.recorded);
   const result = bashStep(stepRun("identity", "Check this arch's image is this release's"), {
     cwd: checkout,
-    env: {
-      PATH: `${bin}:${process.env.PATH}`,
-      RUNNER_ARCH: fixture.runner ?? (arch === "amd64" ? "X64" : "ARM64"),
-      GITHUB_SHA: COMMIT,
-      GITHUB_REPOSITORY: "sealant-sh/sealantd",
-      REPOSITORY,
-      MANIFEST: file,
-      BUILT: built,
-      RUNNER_TEMP: directory,
-      VERSION: version,
-      ARCH: arch,
-    },
+    env,
   });
   return { ...result, output: result.stdout + result.stderr, calls: readCalls(calls) };
 };
@@ -625,6 +652,13 @@ test("identity pulls its own arch's digest from the manifest and runs exactly th
   const stamped = identity(t, { cargo: "1.2.3" });
   assert.equal(stamped.status, 0, stamped.output);
   assert.match(stamped.output, /reports 'sealantd 1\.2\.3'/);
+  // A dry run's label is its whole version; the daemon reports the X.Y.Z it stamps.
+  const dry = identity(t, { version: "1.2.3-dryrun.9.1", cargo: "1.2.3" });
+  assert.equal(dry.status, 0, dry.output);
+  assert.match(
+    dry.output,
+    /is 1\.2\.3-dryrun\.9\.1 from f{40}, and its daemon reports 'sealantd 1\.2\.3'/,
+  );
 });
 
 test("identity resolves its arch through the index, and refuses an index that maps it to another build", (t) => {
@@ -727,12 +761,17 @@ test("identity refuses a wrong image ID, label, platform or --version, naming wh
     [
       "a container running another image",
       { docker: { running: other } },
-      /The container runs sha256:2{64}, not sha256:1{64}, the image pulled by digest/,
+      /The container runs sha256:2{64}, not sha256:1{64}, the image pulled or loaded/,
     ],
     [
       "an ID that is not one",
       { docker: { id: "sealantd:latest" } },
-      /pulled as 'sealantd:latest', not an image ID/,
+      /This job pulled or loaded 'sealantd:latest', not an image ID/,
+    ],
+    [
+      "an ID recorded with something after it",
+      { recorded: `sha256:${"1".repeat(64)} sha256:${"2".repeat(64)}\n` },
+      /not an image ID/,
     ],
     [
       "another version label",
@@ -845,6 +884,7 @@ const ciRun = (change = {}) => ({
 });
 const ciCheck = async (t, answers, environment = {}) => {
   const api = await githubRuns(t, answers);
+  const summary = path.join(scratch(t, "sealantd-ci-check-"), "summary.md");
   const child = spawn(
     "bash",
     [
@@ -862,6 +902,10 @@ const ciCheck = async (t, answers, environment = {}) => {
         GITHUB_SHA: COMMIT,
         GH_TOKEN: "test-token",
         RELEASE_TEST_RETRY_MS: "1",
+        GITHUB_EVENT_NAME: "push",
+        VERSION: "1.2.3",
+        TARGET: "ghcr",
+        GITHUB_STEP_SUMMARY: summary,
         ...environment,
       },
     },
@@ -870,7 +914,12 @@ const ciCheck = async (t, answers, environment = {}) => {
   child.stdout.on("data", (chunk) => (output += chunk));
   child.stderr.on("data", (chunk) => (output += chunk));
   const status = await new Promise((done) => child.on("close", done));
-  return { status, output, requests: api.requests };
+  return {
+    status,
+    output,
+    requests: api.requests,
+    summary: existsSync(summary) ? readFileSync(summary, "utf8") : "",
+  };
 };
 
 test("the ci check passes a commit whose ci push run on main succeeded", async (t) => {
@@ -931,16 +980,76 @@ test("the ci check retries a failed read, then fails: an unreadable answer is ne
   }
 });
 
+// --- the ci check in a dry run ---
+
+test("a dry run reports a commit without a passed ci run, and still fails on a read that fails", async (t) => {
+  const dry = {
+    GITHUB_EVENT_NAME: "workflow_dispatch",
+    VERSION: "1.2.3-dryrun.38700000001.1",
+    TARGET: "archive",
+  };
+  const reported = await ciCheck(
+    t,
+    [{ body: { workflow_runs: [ciRun({ conclusion: "failure" })] } }],
+    dry,
+  );
+  assert.equal(reported.status, 0, reported.output);
+  assert.match(reported.output, /^::warning::No ci push run on main passed for f{40}/m);
+  assert.doesNotMatch(reported.output, /::error::/);
+  assert.match(reported.summary, /^A release would refuse:$/m);
+  // A passed run is reported as passed, with no warning.
+  const passed = await ciCheck(t, [{ body: { workflow_runs: [ciRun()] } }], dry);
+  assert.equal(passed.status, 0, passed.output);
+  assert.doesNotMatch(passed.output, /::warning::/);
+  assert.equal(passed.summary, "");
+  // A read that fails gives no verdict to report: the dry run fails too.
+  const down = await ciCheck(t, [{ status: 500, body: {} }], dry);
+  assert.equal(down.status, 1);
+  assert.match(down.output, /::error::GitHub answered 500/);
+  // Only a dispatch building to archives with a derived dry-run version reports.
+  for (const [label, change] of [
+    ["to GHCR", { TARGET: "ghcr" }],
+    ["a release version", { VERSION: "1.2.3" }],
+    ["a dry-run version of run 0", { VERSION: "1.2.3-dryrun.0.1" }],
+    ["a dry-run version without its attempt", { VERSION: "1.2.3-dryrun.9" }],
+    ["a prerelease", { VERSION: "1.2.3-next.4" }],
+  ]) {
+    const refused = await ciCheck(t, [{ body: { workflow_runs: [] } }], { ...dry, ...change });
+    assert.equal(refused.status, 1, label);
+    assert.match(refused.output, /::error::A dispatch is a dry run/, label);
+    assert.equal(refused.requests.length, 0, label);
+  }
+  // A push never reports, whatever its target or version say.
+  const push = await ciCheck(t, [{ body: { workflow_runs: [] } }], {
+    TARGET: "archive",
+    VERSION: "1.2.3-dryrun.9.1",
+  });
+  assert.equal(push.status, 1);
+  assert.match(push.output, /::error::No ci push run on main passed/);
+  assert.equal(push.summary, "");
+  // The step reads the resolved version and target, and is the only route to a report.
+  const step = releaseJobs["stable-tag"].steps.find(
+    (entry) => entry.name === "Refuse a commit whose ci did not pass on main",
+  );
+  assert.equal(step.env.VERSION, "${{ steps.resolve.outputs.version }}");
+  assert.equal(step.env.TARGET, "${{ steps.resolve.outputs.target }}");
+  assert.equal(releaseText.match(/verdict=report/g).length, 1);
+});
+
 // --- the retry delays (sealant-sh/mend #1033) ---
 
 const RETRY_MS = 1500;
+/** Each step with retried reads, and the text its delay preamble ends before. */
 const delaySteps = () => ({
-  "ci check": stepRun("stable-tag", "Refuse a commit whose ci did not pass on main"),
+  "ci check": [
+    stepRun("stable-tag", "Refuse a commit whose ci did not pass on main"),
+    "verdict=refuse",
+  ],
+  npm: [stepRun("npm", "Publish to npm"), "# --- floor ---"],
 });
 const occurrences = (text, pattern) => text.match(new RegExp(pattern, "g"))?.length ?? 0;
-const preambleOf = (run) => run.slice(0, run.indexOf("# shellcheck disable"));
-const runPreamble = (run, environment) =>
-  spawnSync("bash", ["--noprofile", "--norc", "-e", "-c", preambleOf(run)], {
+const runPreamble = ([run, end], environment) =>
+  spawnSync("bash", ["--noprofile", "--norc", "-e", "-c", run.slice(0, run.indexOf(end))], {
     encoding: "utf8",
     env: { PATH: process.env.PATH, ...environment },
   });
@@ -952,22 +1061,22 @@ test("every retry waits the production delay by default", () => {
     occurrences(releaseText, retry.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")),
     occurrences(releaseText, "setTimeout\\("),
   );
-  assert.ok(occurrences(releaseText, "setTimeout\\(") >= 1);
-  for (const run of Object.values(delaySteps()))
+  assert.ok(occurrences(releaseText, "setTimeout\\(") >= 2);
+  for (const [run] of Object.values(delaySteps()))
     assert.ok(run.includes(`echo "retry backoff: production (${RETRY_MS} ms × attempt)"`));
 });
 
 test("each step with retried reads logs the delay it runs with, once, before anything else", () => {
-  for (const [name, run] of Object.entries(delaySteps())) {
-    const production = runPreamble(run, {});
+  for (const [name, step] of Object.entries(delaySteps())) {
+    const production = runPreamble(step, {});
     assert.equal(production.status, 0, `${name}: ${production.stderr}`);
     assert.match(production.stdout, /^retry backoff: production \(1500 ms × attempt\)$/m, name);
     assert.equal(occurrences(production.stdout, "retry backoff"), 1, name);
-    const overridden = runPreamble(run, { RELEASE_TEST_RETRY_MS: "7" });
+    const overridden = runPreamble(step, { RELEASE_TEST_RETRY_MS: "7" });
     assert.equal(overridden.status, 0, `${name}: ${overridden.stderr}`);
     assert.match(overridden.stdout, /^retry backoff: overridden to 7 ms × attempt$/m, name);
     // A value that is not a number of milliseconds fails the step, and is not echoed.
-    const garbage = runPreamble(run, { RELEASE_TEST_RETRY_MS: "1500; secret-token" });
+    const garbage = runPreamble(step, { RELEASE_TEST_RETRY_MS: "1500; secret-token" });
     assert.notEqual(garbage.status, 0, name);
     assert.match(
       garbage.stdout,
@@ -994,11 +1103,11 @@ const writes = (definition) =>
   definition.environment !== undefined ||
   Object.values(definition.permissions ?? {}).some((level) => level === "write");
 const CHANNEL = { group: "sealantd-release-channel", "cancel-in-progress": false, queue: "max" };
-const CHANNEL_WRITERS = ["finalize-images", "npm"];
+const PUBLISHERS = ["finalize-images", "npm"];
 
 test("every channel writer queues on one release channel lock; nothing else holds it", () => {
   for (const [name, definition] of Object.entries(releaseJobs)) {
-    if (CHANNEL_WRITERS.includes(name)) assert.deepEqual(definition.concurrency, CHANNEL, name);
+    if (PUBLISHERS.includes(name)) assert.deepEqual(definition.concurrency, CHANNEL, name);
     else assert.equal(definition.concurrency, undefined, name);
   }
   assert.equal(releaseDocument.concurrency, undefined, "the lock is per job, not per run");
@@ -1019,7 +1128,7 @@ test("every channel writer queues on one release channel lock; nothing else hold
   );
 });
 
-test("only finalize writes :<version>, and nothing writes :latest or :X.Y", () => {
+test("only finalize writes :<version> to GHCR, and nothing writes :latest or :X.Y", () => {
   const registryWrites = [];
   for (const [name, definition] of Object.entries(releaseJobs))
     for (const entry of definition.steps ?? []) {
@@ -1028,25 +1137,34 @@ test("only finalize writes :<version>, and nothing writes :latest or :X.Y", () =
           /imagetools create|docker push|docker tag|skopeo copy|crane |oras /.test(line) &&
           !/^\s*echo /.test(line)
         )
-          registryWrites.push({ at: name, line: line.trim() });
+          registryWrites.push({ at: name, line: line.trim(), entry });
       if (/push=true/.test(entry.with?.outputs ?? ""))
         registryWrites.push({ at: name, line: entry.with.outputs });
       // No metadata-action, which tagged :<version>, :X.Y and :latest together before any check.
       assert.doesNotMatch(entry.uses ?? "", /metadata-action/, name);
       assert.equal(entry.with?.tags, undefined, `${name} tags an image through an action`);
     }
-  const tagged = (pattern) =>
-    registryWrites.filter(({ line }) => pattern.test(line)).map(({ at }) => at);
+  // archive-merge writes only to the registry it starts on loopback, inside the job.
+  const loopback = registryWrites.filter(({ at }) => at === "archive-merge");
+  assert.ok(loopback.length >= 2);
+  for (const { entry } of loopback) assert.equal(entry.env.REPOSITORY, "127.0.0.1:5000/sealantd");
+  for (const name of ["archive-build", "archive-merge"]) {
+    assert.deepEqual(releaseJobs[name].permissions, { contents: "read" }, name);
+    for (const step of releaseJobs[name].steps)
+      assert.doesNotMatch(step.uses ?? "", /login-action/, name);
+  }
+  assert.match(
+    releaseJobs["archive-build"].steps.find((step) => step.id === "build").with.outputs,
+    /^type=docker,dest=/,
+  );
+  const ghcr = registryWrites.filter(({ at }) => at !== "archive-merge");
+  const tagged = (pattern) => ghcr.filter(({ line }) => pattern.test(line)).map(({ at }) => at);
   assert.deepEqual(tagged(/:\$VERSION"|\$ref"/), ["finalize-images"]);
   assert.deepEqual(tagged(/:\$tag"/), ["merge"]);
   assert.deepEqual(tagged(/latest|\$\{?(major|minor)|:\$\{?VERSION%/i), []);
-  for (const { line } of registryWrites.filter(({ at }) => at === "build"))
+  for (const { line } of ghcr.filter(({ at }) => at === "build"))
     assert.match(line, /push-by-digest=true/);
-  assert.deepEqual(registryWrites.map(({ at }) => at).toSorted(), [
-    "build",
-    "finalize-images",
-    "merge",
-  ]);
+  assert.deepEqual(ghcr.map(({ at }) => at).toSorted(), ["build", "finalize-images", "merge"]);
   // finalize's one target is $REPOSITORY:$VERSION.
   assert.match(
     stepRun("finalize-images", "Publish the checked index as its version"),
@@ -1057,7 +1175,790 @@ test("only finalize writes :<version>, and nothing writes :latest or :X.Y", () =
   assert.doesNotMatch(code, /:latest\b|type=raw,value=latest|major\}\}\.\{\{minor|pattern=\{\{/);
 });
 
-test("finalize waits for the identity checks on both arches, and npm for finalize", () => {
+// --- every image a publishing workflow runs, by digest ---
+
+/** A reference pinned by its sha256 digest, with or without a tag (a registry port is allowed). */
+const PINNED = /^[a-z0-9][a-z0-9._/:-]*@sha256:[0-9a-f]{64}$/;
+/** A word shaped like an image reference that names a registry path or a tag (so `:` or `/`). */
+const IMAGE_LIKE =
+  /^(?=.*[:/])[a-z0-9][a-z0-9._-]*(:[0-9]+)?(\/[a-z0-9][a-z0-9._-]*)*(:[A-Za-z0-9_][A-Za-z0-9_.-]{0,127})?$/;
+
+// docker's options, from the Docker CLI's own help, client 29.8.1 (API 1.56): `docker --help`
+// (Global Options), `docker run --help`, `docker create --help` and `docker pull --help`; `docker
+// container run`, `docker container create` and `docker image pull` are their aliases and print the
+// same options (https://docs.docker.com/reference/cli/docker/container/run/,
+// …/container/create/, …/image/pull/). An option shown with a type (`--stop-timeout int`) takes a
+// value; one without is a flag. Options the help hides (`--net`, deprecated ones) are not here, so
+// they fail the scan as unknown rather than be guessed at. Regenerate from a newer CLI's help.
+const DOCKER_OPTIONS = {
+  global: {
+    flags: new Set(["-D", "--debug", "--tls", "--tlsverify", "-v", "--version"]),
+    values: new Set([
+      "--config",
+      "-c",
+      "--context",
+      "-H",
+      "--host",
+      "-l",
+      "--log-level",
+      "--tlscacert",
+      "--tlscert",
+      "--tlskey",
+    ]),
+  },
+  run: {
+    flags: new Set([
+      "-d",
+      "--detach",
+      "--help",
+      "--init",
+      "-i",
+      "--interactive",
+      "--no-healthcheck",
+      "--oom-kill-disable",
+      "--privileged",
+      "-P",
+      "--publish-all",
+      "-q",
+      "--quiet",
+      "--read-only",
+      "--rm",
+      "--sig-proxy",
+      "-t",
+      "--tty",
+      "--use-api-socket",
+    ]),
+    values: new Set([
+      "--add-host",
+      "--annotation",
+      "-a",
+      "--attach",
+      "--blkio-weight",
+      "--blkio-weight-device",
+      "--cap-add",
+      "--cap-drop",
+      "--cgroup-parent",
+      "--cgroupns",
+      "--cidfile",
+      "--cpu-period",
+      "--cpu-quota",
+      "--cpu-rt-period",
+      "--cpu-rt-runtime",
+      "-c",
+      "--cpu-shares",
+      "--cpus",
+      "--cpuset-cpus",
+      "--cpuset-mems",
+      "--detach-keys",
+      "--device",
+      "--device-cgroup-rule",
+      "--device-read-bps",
+      "--device-read-iops",
+      "--device-write-bps",
+      "--device-write-iops",
+      "--dns",
+      "--dns-option",
+      "--dns-search",
+      "--domainname",
+      "--entrypoint",
+      "-e",
+      "--env",
+      "--env-file",
+      "--expose",
+      "--gpus",
+      "--group-add",
+      "--health-cmd",
+      "--health-interval",
+      "--health-retries",
+      "--health-start-interval",
+      "--health-start-period",
+      "--health-timeout",
+      "-h",
+      "--hostname",
+      "--ip",
+      "--ip6",
+      "--ipc",
+      "--isolation",
+      "-l",
+      "--label",
+      "--label-file",
+      "--link",
+      "--link-local-ip",
+      "--log-driver",
+      "--log-opt",
+      "--mac-address",
+      "-m",
+      "--memory",
+      "--memory-reservation",
+      "--memory-swap",
+      "--memory-swappiness",
+      "--mount",
+      "--name",
+      "--network",
+      "--network-alias",
+      "--oom-score-adj",
+      "--pid",
+      "--pids-limit",
+      "--platform",
+      "-p",
+      "--publish",
+      "--pull",
+      "--restart",
+      "--runtime",
+      "--security-opt",
+      "--shm-size",
+      "--stop-signal",
+      "--stop-timeout",
+      "--storage-opt",
+      "--sysctl",
+      "--tmpfs",
+      "--ulimit",
+      "--umask",
+      "-u",
+      "--user",
+      "--userns",
+      "--uts",
+      "-v",
+      "--volume",
+      "--volume-driver",
+      "--volumes-from",
+      "-w",
+      "--workdir",
+    ]),
+  },
+  create: {
+    flags: new Set([
+      "--help",
+      "--init",
+      "-i",
+      "--interactive",
+      "--no-healthcheck",
+      "--oom-kill-disable",
+      "--privileged",
+      "-P",
+      "--publish-all",
+      "-q",
+      "--quiet",
+      "--read-only",
+      "--rm",
+      "-t",
+      "--tty",
+      "--use-api-socket",
+    ]),
+    values: new Set([
+      "--add-host",
+      "--annotation",
+      "-a",
+      "--attach",
+      "--blkio-weight",
+      "--blkio-weight-device",
+      "--cap-add",
+      "--cap-drop",
+      "--cgroup-parent",
+      "--cgroupns",
+      "--cidfile",
+      "--cpu-period",
+      "--cpu-quota",
+      "--cpu-rt-period",
+      "--cpu-rt-runtime",
+      "-c",
+      "--cpu-shares",
+      "--cpus",
+      "--cpuset-cpus",
+      "--cpuset-mems",
+      "--device",
+      "--device-cgroup-rule",
+      "--device-read-bps",
+      "--device-read-iops",
+      "--device-write-bps",
+      "--device-write-iops",
+      "--dns",
+      "--dns-option",
+      "--dns-search",
+      "--domainname",
+      "--entrypoint",
+      "-e",
+      "--env",
+      "--env-file",
+      "--expose",
+      "--gpus",
+      "--group-add",
+      "--health-cmd",
+      "--health-interval",
+      "--health-retries",
+      "--health-start-interval",
+      "--health-start-period",
+      "--health-timeout",
+      "-h",
+      "--hostname",
+      "--ip",
+      "--ip6",
+      "--ipc",
+      "--isolation",
+      "-l",
+      "--label",
+      "--label-file",
+      "--link",
+      "--link-local-ip",
+      "--log-driver",
+      "--log-opt",
+      "--mac-address",
+      "-m",
+      "--memory",
+      "--memory-reservation",
+      "--memory-swap",
+      "--memory-swappiness",
+      "--mount",
+      "--name",
+      "--network",
+      "--network-alias",
+      "--oom-score-adj",
+      "--pid",
+      "--pids-limit",
+      "--platform",
+      "-p",
+      "--publish",
+      "--pull",
+      "--restart",
+      "--runtime",
+      "--security-opt",
+      "--shm-size",
+      "--stop-signal",
+      "--stop-timeout",
+      "--storage-opt",
+      "--sysctl",
+      "--tmpfs",
+      "--ulimit",
+      "--umask",
+      "-u",
+      "--user",
+      "--userns",
+      "--uts",
+      "-v",
+      "--volume",
+      "--volume-driver",
+      "--volumes-from",
+      "-w",
+      "--workdir",
+    ]),
+  },
+  pull: { flags: new Set(["-a", "--all-tags", "-q", "--quiet"]), values: new Set(["--platform"]) },
+};
+/** The docker subcommands that start or fetch an image, by the words that name them. */
+const IMAGE_COMMANDS = [
+  [["container", "run"], "run"],
+  [["container", "create"], "create"],
+  [["image", "pull"], "pull"],
+  [["run"], "run"],
+  [["create"], "create"],
+  [["pull"], "pull"],
+];
+
+/**
+ * A run: block lexed as Bash would split it into commands of words, enough to find docker's
+ * arguments: single quotes, double quotes (a `$VAR` inside stays part of its word) and backslash
+ * escapes never split a word; a backslash-newline joins lines; `#` at a word's start comments to the
+ * line's end; newlines, `;`, `&`, `|`, `(`, `)`, `<` and `>` end a command. Each word is {text,
+ * dynamic}: dynamic when the shell expands something in it (`$`, `$(…)`, backticks). The body of each
+ * command substitution is lexed too, as its own commands.
+ */
+const lexShell = (source) => {
+  const commands = [[]];
+  let word = null;
+  const add = (text, dynamic = false) => {
+    word ??= { text: "", dynamic: false };
+    word.text += text;
+    word.dynamic ||= dynamic;
+  };
+  const endWord = () => {
+    if (word !== null) commands.at(-1).push(word);
+    word = null;
+  };
+  const endCommand = () => {
+    endWord();
+    if (commands.at(-1).length > 0) commands.push([]);
+  };
+  /** The body of the `$(` whose body starts at `from`, and the index past its `)`. */
+  const substitution = (from) => {
+    let depth = 1;
+    let quote = null;
+    for (let at = from; at < source.length; at += 1) {
+      const c = source[at];
+      if (quote === "'") {
+        if (c === "'") quote = null;
+      } else if (c === "\\") at += 1;
+      else if (quote === '"') {
+        if (c === '"') quote = null;
+      } else if (c === "'" || c === '"') quote = c;
+      else if (c === "(") depth += 1;
+      else if (c === ")" && (depth -= 1) === 0) return [source.slice(from, at), at + 1];
+    }
+    throw new Error(`an unclosed $( in: ${source.slice(from - 2, from + 60)}`);
+  };
+  const nested = [];
+  /** Reads an expansion at `at` (`$(…)`, `` `…` `` or `$`) into the word; the index past it. */
+  const expansion = (at) => {
+    if (source.startsWith("$(", at)) {
+      const [body, next] = substitution(at + 2);
+      nested.push(body);
+      add("$(…)", true);
+      return next;
+    }
+    if (source[at] === "`") {
+      const close = source.indexOf("`", at + 1);
+      if (close < 0) throw new Error("an unclosed backtick");
+      nested.push(source.slice(at + 1, close));
+      add("`…`", true);
+      return close + 1;
+    }
+    add("$", true);
+    return at + 1;
+  };
+  let at = 0;
+  while (at < source.length) {
+    const c = source[at];
+    if (c === "\\") {
+      if (source[at + 1] !== "\n") add(source[at + 1] ?? "");
+      at += 2;
+    } else if (c === "'") {
+      const close = source.indexOf("'", at + 1);
+      if (close < 0) throw new Error(`an unclosed ' in: ${source.slice(at, at + 60)}`);
+      add(source.slice(at + 1, close));
+      at = close + 1;
+    } else if (c === '"') {
+      add("");
+      at += 1;
+      while (source[at] !== '"') {
+        if (at >= source.length) throw new Error('an unclosed "');
+        if (source[at] === "\\" && '$`"\\\n'.includes(source[at + 1])) {
+          if (source[at + 1] !== "\n") add(source[at + 1]);
+          at += 2;
+        } else if (source[at] === "$" || source[at] === "`") at = expansion(at);
+        else add(source[at++]);
+      }
+      at += 1;
+    } else if (c === "$" || c === "`") at = expansion(at);
+    else if (c === "#" && word === null) {
+      const newline = source.indexOf("\n", at);
+      at = newline < 0 ? source.length : newline;
+    } else if (c === "\n" || ";&|()<>".includes(c)) {
+      endCommand();
+      at += 1;
+    } else if (/\s/.test(c)) {
+      endWord();
+      at += 1;
+    } else add(source[at++]);
+  }
+  endCommand();
+  return [...commands.filter((command) => command.length > 0), ...nested.flatMap(lexShell)];
+};
+
+/**
+ * Moves past the options at `words[at]` by `table` (getopt-style: `--name value`, `--name=value`,
+ * `-e value`, `-evalue`, and flag clusters such as `-dit`); the index of the first operand, or -1
+ * after reporting an option the table does not know, or one the shell builds, in `problems`.
+ */
+const pastOptions = (words, at, table, what, problems) => {
+  while (at < words.length && words[at].text.startsWith("-") && words[at].text !== "-") {
+    const { text, dynamic } = words[at];
+    if (text === "--") return at + 1;
+    if (text.startsWith("--")) {
+      const [name] = text.split("=", 1);
+      const inline = text.includes("=");
+      if (!inline && dynamic) {
+        problems.push(`${what} ${text}: an option the shell builds`);
+        return -1;
+      }
+      if (table.values.has(name)) at += inline ? 1 : 2;
+      else if (table.flags.has(name) && !inline) at += 1;
+      else {
+        problems.push(`${what} ${name}: an option this scan does not know`);
+        return -1;
+      }
+      continue;
+    }
+    let consumed = 1;
+    for (let k = 1; k < text.length; k += 1) {
+      const option = `-${text[k]}`;
+      if (table.flags.has(option)) continue;
+      if (table.values.has(option)) {
+        if (k === text.length - 1) consumed = 2;
+        break;
+      }
+      problems.push(`${what} ${text}: an option this scan does not know`);
+      return -1;
+    }
+    at += consumed;
+  }
+  return at;
+};
+
+/**
+ * Every image a run: block hands docker to start or fetch. Each command's `docker` word (or
+ * `…/docker`) is read past docker's global options to its subcommand; for run, create, pull,
+ * container run/create and image pull, past that subcommand's options to the first operand, the
+ * image. Returns {command, image, literal} for each, and {problem} for what the scan refuses to
+ * guess at: an option the tables do not know or the shell builds, a subcommand with no image, and a
+ * literal image-like word (a `:` or a `/`, not an option, no digest) anywhere after an image the
+ * shell builds, so an ordinary option value the tables missed can never pass as the image and
+ * exempt the real one.
+ *
+ * What it cannot check: an image name the shell builds from variables at run time (literal false:
+ * a release job pulls one by the digest its run's release manifest records, which other tests hold);
+ * an image a script or an action the job calls starts; docker reached under another name (an
+ * alias, a function, a variable holding its path); and options a newer CLI adds until the tables
+ * are regenerated, which fail the scan instead.
+ */
+const dockerImages = (run) => {
+  const found = [];
+  const problems = [];
+  for (const words of lexShell(run))
+    for (let start = 0; start < words.length; start += 1) {
+      if (words[start].dynamic || !/(^|\/)docker$/.test(words[start].text)) continue;
+      let at = pastOptions(words, start + 1, DOCKER_OPTIONS.global, "docker", problems);
+      if (at < 0) continue;
+      const match = IMAGE_COMMANDS.find(([names]) =>
+        names.every((name, k) => words[at + k]?.text === name && !words[at + k].dynamic),
+      );
+      if (match === undefined) continue;
+      const [names, options] = match;
+      const command = `docker ${names.join(" ")}`;
+      at = pastOptions(words, at + names.length, DOCKER_OPTIONS[options], command, problems);
+      if (at < 0) continue;
+      const operand = words[at];
+      if (operand === undefined) {
+        problems.push(`${command} names no image`);
+        continue;
+      }
+      found.push({ command, image: operand.text, literal: !operand.dynamic });
+      if (!operand.dynamic) continue;
+      for (const later of words.slice(at + 1))
+        if (
+          !later.dynamic &&
+          !later.text.startsWith("-") &&
+          IMAGE_LIKE.test(later.text) &&
+          !later.text.includes("@sha256:")
+        )
+          problems.push(
+            `${command}: ${later.text} follows the image the shell builds (${operand.text}) and is not pinned by digest`,
+          );
+    }
+  return [...found, ...problems.map((problem) => ({ problem }))];
+};
+
+/** Every image a workflow names in YAML: a step's `uses: docker://…`, a job's container, its services. */
+const yamlImages = (document) => {
+  const found = [];
+  for (const [name, job] of Object.entries(document.jobs ?? {})) {
+    if (job.container !== undefined)
+      found.push({
+        at: `${name} container`,
+        image: typeof job.container === "string" ? job.container : job.container?.image,
+      });
+    for (const [service, definition] of Object.entries(job.services ?? {}))
+      found.push({
+        at: `${name} services.${service}`,
+        image: typeof definition === "string" ? definition : definition?.image,
+      });
+    for (const step of job.steps ?? [])
+      if (String(step.uses ?? "").startsWith("docker://"))
+        found.push({
+          at: `${name} ${step.name ?? step.uses}`,
+          image: step.uses.slice("docker://".length),
+        });
+  }
+  return found;
+};
+
+/** release.yml, every workflow it calls through `uses: ./.github/workflows/…`, and next.yml. */
+const publishingWorkflows = () => {
+  const files = new Set();
+  for (const pending = ["release.yml", "next.yml"]; pending.length > 0;) {
+    const file = pending.pop();
+    if (files.has(file)) continue;
+    files.add(file);
+    for (const job of Object.values(workflow(file).jobs ?? {})) {
+      const called = /^\.\/\.github\/workflows\/([^/]+)$/.exec(job?.uses ?? "");
+      if (called) pending.push(called[1]);
+    }
+  }
+  return [...files].toSorted();
+};
+
+/** Every image `document` (a parsed workflow) runs, starts or pulls, and every problem reading it. */
+const workflowImages = (document) => {
+  const images = [];
+  const problems = [];
+  for (const [name, job] of Object.entries(document.jobs ?? {}))
+    for (const step of job.steps ?? []) {
+      const where = `${name} ${step.name ?? step.uses ?? step.run?.slice(0, 40)}`;
+      for (const found of dockerImages(step.run ?? ""))
+        if (found.problem !== undefined) problems.push(`${where}: ${found.problem}`);
+        else images.push({ at: where, ...found });
+      // BuildKit runs privileged, and performs the push.
+      if (String(step.uses ?? "").startsWith("docker/setup-buildx-action@")) {
+        const driver = /(?:^|,)image=([^,\s]+)/.exec(step.with?.["driver-opts"] ?? "");
+        images.push({
+          at: where,
+          image: driver?.[1] ?? "<the action's default BuildKit>",
+          literal: true,
+        });
+      }
+    }
+  for (const found of yamlImages(document))
+    images.push({ ...found, image: String(found.image), literal: true });
+  return { images, problems };
+};
+/** The images a workflow names that are not pinned by digest, and its reading problems. */
+const unpinned = (document) => {
+  const { images, problems } = workflowImages(document);
+  return [
+    ...problems,
+    ...images
+      .filter(({ image, literal }) => literal && !PINNED.test(image))
+      .map(({ at, image }) => `${at}: ${image} is not pinned by digest`),
+  ];
+};
+
+test("every image a publishing workflow starts, pulls or runs as a container is pinned by digest", () => {
+  const files = publishingWorkflows();
+  assert.deepEqual(files, ["next.yml", "release.yml"]);
+  for (const file of files) assert.deepEqual(unpinned(workflow(file)), [], file);
+  // The lexer reads every run: block of every workflow without refusing one.
+  for (const file of workflowFiles())
+    for (const job of Object.values(workflow(file).jobs ?? {}))
+      for (const step of job.steps ?? []) assert.doesNotThrow(() => lexShell(step.run ?? ""), file);
+});
+
+// A new image in the release, pinned or built at run time, fails here until someone has looked.
+test("the images release.yml starts today, by name or as the shell builds them", () => {
+  // The dry run's loopback registry is the one image started by name; the identity check's pull
+  // and create name the image the shell built from the manifest.
+  const { images } = workflowImages(workflow("release.yml"));
+  assert.deepEqual(
+    images
+      .filter(({ at }) => !/setup-buildx/.test(at))
+      .map(({ at, command, image, literal }) => [at.split(" ")[0], command, image, literal]),
+    [
+      [
+        "archive-merge",
+        "docker run",
+        "registry:2@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373",
+        true,
+      ],
+      ["identity", "docker pull", "$REPOSITORY@$digest", false],
+      ["identity", "docker create", "$id", false],
+    ],
+  );
+});
+
+test("the shell lexer keeps quoted words whole and finds commands inside substitutions", () => {
+  const words = (source) =>
+    lexShell(source).map((command) =>
+      command.map(({ text, dynamic }) => (dynamic ? `${text}*` : text)),
+    );
+  assert.deepEqual(words(`docker run --env "BANNER=hello $BUILD_LABEL" -e FOO="a b" x`), [
+    ["docker", "run", "--env", "BANNER=hello $BUILD_LABEL*", "-e", "FOO=a b", "x"],
+  ]);
+  assert.deepEqual(words("a 'x=y z' b\\ c \\\n  d # e f\ng;h|i&&j"), [
+    ["a", "x=y z", "b c", "d"],
+    ["g"],
+    ["h"],
+    ["i"],
+    ["j"],
+  ]);
+  assert.deepEqual(words('out="$(docker run "a b" "$(echo c)")"; `docker pull d`'), [
+    ["out=$(…)*"],
+    ["`…`*"],
+    ["docker", "run", "a b", "$(…)*"],
+    ["echo", "c"],
+    ["docker", "pull", "d"],
+  ]);
+  assert.deepEqual(words(`x=\${y:-$(npm root -g)/p} '$(not run)' "\\$z"`), [
+    ["x=${y:-$(…)/p}*", "$(not run)", "$z"],
+    ["npm", "root", "-g"],
+  ]);
+});
+
+test("the image scan reads docker's options, quotes, continuations and subcommand forms", () => {
+  const PIN = `@sha256:${"a".repeat(64)}`;
+  const images = (run) =>
+    dockerImages(run).map((found) => found.problem ?? [found.command, found.image, found.literal]);
+  const unpinnedAlpine = [["docker run", "alpine:3.22", true]];
+  for (const [label, run, expected] of [
+    ["plain", "docker run --rm alpine:3.22 true", unpinnedAlpine],
+    [
+      "a global option with a value",
+      "docker --context default run --rm alpine:3.22 true",
+      unpinnedAlpine,
+    ],
+    [
+      "global options in every form",
+      "docker -H unix:///x --config=/c --debug -l info run -d --name x -p 1:1 alpine:3.22",
+      unpinnedAlpine,
+    ],
+    [
+      "a continuation that leaves two spaces",
+      "docker \\\n  run --rm alpine:3.22 true",
+      unpinnedAlpine,
+    ],
+    [
+      "a continuation between options",
+      "docker run --rm \\\n    --name x \\\n    alpine:3.22 true",
+      unpinnedAlpine,
+    ],
+    // Astra's round 2: an option value the scan took for a dynamic image.
+    [
+      "a value option an old table lacked",
+      'docker run --rm --stop-timeout "$STOP_TIMEOUT" alpine:3.22 true',
+      unpinnedAlpine,
+    ],
+    [
+      "a quoted value with a space and a variable",
+      'docker run --rm --env "BANNER=hello $BUILD_LABEL" alpine:3.22 true',
+      unpinnedAlpine,
+    ],
+    ["a value quoted mid-word", 'docker run -e FOO="a b" alpine:3.22', unpinnedAlpine],
+    [
+      "a single-quoted value",
+      "docker run --label 'x=y z' alpine",
+      [["docker run", "alpine", true]],
+    ],
+    [
+      "a value attached to its short option",
+      "docker run -eFOO=1 -p8080:80 alpine:3.22",
+      unpinnedAlpine,
+    ],
+    ["a flag cluster", "docker run -dit alpine:3.22 sh", unpinnedAlpine],
+    [
+      "a flag cluster ending in a value option",
+      "docker run -ite FOO=1 alpine:3.22",
+      unpinnedAlpine,
+    ],
+    [
+      "docker container run",
+      "docker container run alpine:3.22",
+      [["docker container run", "alpine:3.22", true]],
+    ],
+    [
+      "docker container create",
+      "docker container create --stop-timeout 5 alpine:3.22",
+      [["docker container create", "alpine:3.22", true]],
+    ],
+    [
+      "docker create, inside a quoted $()",
+      'id="$(docker create "alpine:3.22" --version)"',
+      [["docker create", "alpine:3.22", true]],
+    ],
+    [
+      "docker pull with a platform",
+      "docker pull --platform linux/arm64 alpine:3.22",
+      [["docker pull", "alpine:3.22", true]],
+    ],
+    [
+      "docker image pull",
+      "docker image pull -q alpine:3.22",
+      [["docker image pull", "alpine:3.22", true]],
+    ],
+    ["an option=value", "docker run --name=x alpine:3.22", unpinnedAlpine],
+    ["after a pipe", "true | docker run -i alpine:3.22 cat", [["docker run", "alpine:3.22", true]]],
+    ["by path", "/usr/bin/docker run alpine:3.22", unpinnedAlpine],
+    [
+      "pinned",
+      `docker run --rm alpine:3.22${PIN} true`,
+      [["docker run", `alpine:3.22${PIN}`, true]],
+    ],
+    // An image the shell builds is exempt only with nothing image-like after it.
+    ["built at run time", 'docker run --rm "$IMAGE" true', [["docker run", "$IMAGE", false]]],
+    [
+      "a real dynamic pull",
+      'docker pull "$X/$y@$digest"',
+      [["docker pull", "$X/$y@$digest", false]],
+    ],
+    [
+      "a literal image after one the shell builds",
+      'docker run --rm "$IMAGE" alpine:3.22 true',
+      [
+        ["docker run", "$IMAGE", false],
+        "docker run: alpine:3.22 follows the image the shell builds ($IMAGE) and is not pinned by digest",
+      ],
+    ],
+    [
+      "a pinned word after one the shell builds",
+      `docker run --rm "$IMAGE" alpine${PIN}`,
+      [["docker run", "$IMAGE", false]],
+    ],
+    [
+      "an option the scan does not know, then a variable",
+      "docker run --frobnicate $X alpine:3.22",
+      ["docker run --frobnicate: an option this scan does not know"],
+    ],
+    [
+      "a hidden alias the help does not list",
+      "docker run --net host alpine:3.22",
+      ["docker run --net: an option this scan does not know"],
+    ],
+    [
+      "a global option the scan does not know",
+      "docker -Z run alpine:3.22",
+      ["docker -Z: an option this scan does not know"],
+    ],
+    [
+      "an option the shell builds",
+      'docker run "$FLAGS" alpine:3.22',
+      [
+        ["docker run", "$FLAGS", false],
+        "docker run: alpine:3.22 follows the image the shell builds ($FLAGS) and is not pinned by digest",
+      ],
+    ],
+    [
+      "a long option the shell builds",
+      "docker run --$OPT alpine:3.22",
+      ["docker run --$OPT: an option the shell builds"],
+    ],
+    ["no image", "docker run --rm", ["docker run names no image"]],
+    ["a comment", "# docker run alpine:3.22", []],
+    ["a quoted mention", 'echo "docker run alpine:3.22"', []],
+    [
+      "commands that start nothing",
+      'docker buildx imagetools create --tag x y\ndocker image inspect "$id"',
+      [],
+    ],
+  ])
+    assert.deepEqual(images(run), expected, label);
+  // The YAML forms.
+  const yaml = (jobs) => unpinned({ jobs });
+  assert.deepEqual(yaml({ a: { container: "alpine:3.22", steps: [] } }), [
+    "a container: alpine:3.22 is not pinned by digest",
+  ]);
+  assert.deepEqual(yaml({ a: { container: { image: "alpine:3.22" }, steps: [] } }), [
+    "a container: alpine:3.22 is not pinned by digest",
+  ]);
+  assert.deepEqual(yaml({ a: { services: { cache: { image: "redis:7" } }, steps: [] } }), [
+    "a services.cache: redis:7 is not pinned by digest",
+  ]);
+  assert.deepEqual(yaml({ a: { steps: [{ name: "s", uses: "docker://alpine:3.22" }] } }), [
+    "a s: alpine:3.22 is not pinned by digest",
+  ]);
+  // An expression is not a pin either.
+  assert.deepEqual(yaml({ a: { container: "${{ matrix.image }}", steps: [] } }), [
+    "a container: ${{ matrix.image }} is not pinned by digest",
+  ]);
+  assert.deepEqual(
+    yaml({
+      a: {
+        container: `alpine:3.22${PIN}`,
+        services: { cache: `redis:7${PIN}` },
+        steps: [{ name: "s", uses: `docker://alpine${PIN}` }, { run: `docker run alpine${PIN}` }],
+      },
+    }),
+    [],
+  );
+  for (const image of ["registry:2", "registry", "registry:2@sha256:abc", "moby/buildkit:v0.33.1"])
+    assert.doesNotMatch(image, PINNED, image);
+});
+
+test("finalize waits for the identity checks on both arches, and npm for finalize and pack", () => {
   const above = (name, seen = new Set()) => {
     for (const need of [releaseJobs[name].needs ?? []].flat())
       if (!seen.has(need)) above(need, seen.add(need));
@@ -1066,23 +1967,424 @@ test("finalize waits for the identity checks on both arches, and npm for finaliz
   assert.ok(releaseJobs["finalize-images"].needs.includes("identity"));
   for (const job of ["identity", "release-manifest", "merge", "build", "stable-tag"])
     assert.ok(above("finalize-images").has(job), job);
-  assert.ok(releaseJobs.npm.needs.includes("finalize-images"));
+  for (const job of ["finalize-images", "pack"])
+    assert.ok(releaseJobs.npm.needs.includes(job), job);
   assert.ok(above("npm").has("identity"));
+  assert.ok(above("release-manifest").has("pack"));
   // Both arches, each on its own native hosted runner.
-  for (const name of ["build", "identity"])
+  for (const name of ["build", "archive-build", "identity"])
     assert.deepEqual(releaseJobs[name].strategy.matrix.platform, [
       { arch: "amd64", runner: "ubuntu-24.04" },
       { arch: "arm64", runner: "ubuntu-24.04-arm" },
     ]);
   assert.equal(releaseJobs.identity.strategy["fail-fast"], false);
-  // No job's `if` lets a publisher run after a job above it failed or was skipped.
-  for (const name of ["finalize-images", "npm"])
-    assert.equal(releaseJobs[name].if, undefined, name);
   // The ci check runs before anything builds, with the one extra permission it needs.
   assert.deepEqual(releaseJobs["stable-tag"].permissions, { contents: "read", actions: "read" });
-  assert.deepEqual(releaseJobs.build.needs, "stable-tag");
   // Identity reads only: it pulls anonymously and logs in nowhere.
   assert.deepEqual(releaseJobs.identity.permissions, { contents: "read" });
   for (const entry of releaseJobs.identity.steps)
     assert.doesNotMatch(entry.uses ?? "", /login-action/);
+});
+
+/** Actions a job holding an id-token may use: none checks out or runs repository code. */
+const CREDENTIAL_ACTIONS = /^actions\/(setup-node|download-artifact)@[0-9a-f]{40}$/;
+/** Commands that install dependencies, run a build tool or run a repository file. */
+const BUILDS =
+  /\b(pnpm|npx|yarn|corepack|tsgo|tsc|tsx|turbo|esbuild|vite|make|cargo|buf)\b|\bnpm (install|ci|i|run|exec|rebuild|test|start|pack|version)\b|\bnode (?!-e\b)\S|\bdocker (build|buildx build)\b/;
+const workflowFiles = () =>
+  readdirSync(path.join(root, ".github/workflows")).filter((name) => /\.ya?ml$/.test(name));
+const workflow = (file) =>
+  parse(readFileSync(path.join(root, ".github/workflows", file), "utf8")) ?? {};
+
+test("no job holding an id-token checks out, installs dependencies or runs a build tool", () => {
+  let holders = 0;
+  for (const file of workflowFiles()) {
+    const { jobs = {}, permissions = {} } = workflow(file);
+    assert.notEqual(permissions["id-token"], "write", `${file} grants an id-token to every job`);
+    for (const [name, definition] of Object.entries(jobs)) {
+      if (definition.permissions?.["id-token"] !== "write") continue;
+      holders += 1;
+      for (const step of definition.steps ?? []) {
+        if (step.uses !== undefined) assert.match(step.uses, CREDENTIAL_ACTIONS, `${file} ${name}`);
+        // Comments aside, which name what the job does not do.
+        const code = (step.run ?? "").replace(/^\s*(#|echo ).*$/gm, "");
+        // next.yml's republish block repacks with `npm pack --ignore-scripts`, which runs no package
+        // code; release.yml's never repacks.
+        const allowed = file === "next.yml" ? code.replace(/npm pack --ignore-scripts/g, "") : code;
+        assert.doesNotMatch(allowed, BUILDS, `${file} ${name} ${step.name ?? step.uses}`);
+      }
+    }
+  }
+  assert.equal(holders, 2, "next.yml's publish and release.yml's npm hold the only id-tokens");
+  // The guard itself catches what the old stable npm job did.
+  for (const line of [
+    "pnpm install --frozen-lockfile --ignore-scripts",
+    "pnpm -r build",
+    "pnpm -r publish --access public --no-git-checks --provenance",
+    "corepack enable",
+    "npm ci",
+    'npm version "$VERSION" --no-git-tag-version',
+    "node scripts/release-manifest.mjs digest",
+    "npx tsc",
+    "docker build -f docker/Dockerfile .",
+  ])
+    assert.match(line, BUILDS, line);
+  for (const line of [
+    "npm publish x.tgz --tag latest",
+    "npm view a dist.integrity",
+    "node -e 'x'",
+    "npm config get registry",
+  ])
+    assert.doesNotMatch(line, BUILDS, line);
+  const npm = stepRun("npm", "Publish to npm");
+  assert.match(npm, /npm publish "\$tarball" --tag latest --access public --ignore-scripts "\$@"/);
+  assert.doesNotMatch(npm, /npm pack|writeFileSync|rebuild_tarball|publish_rebuilt/);
+  assert.deepEqual(
+    releaseJobs.npm.steps
+      .filter((step) => step.uses?.startsWith("actions/download-artifact@"))
+      .map((step) => step.with),
+    [
+      { name: "npm-tarballs", path: "npm" },
+      { name: "release-manifest", path: "release" },
+    ],
+  );
+  assert.deepEqual(releaseJobs.npm.permissions, { "id-token": "write" });
+  assert.equal(releaseJobs.npm.environment, "release");
+  // pack builds with no credential at all.
+  assert.deepEqual(releaseJobs.pack.permissions, { contents: "read" });
+  assert.equal(
+    releaseJobs.pack.steps.find((step) => step.uses?.startsWith("actions/checkout@")).with[
+      "persist-credentials"
+    ],
+    false,
+  );
+});
+
+// GitHub's rule: a job whose `if` names no status function runs only if every job above it, however
+// far up, succeeded; a skipped job counts as not succeeded. `fail` names jobs that fail when they run.
+const callsStatusFunction = (condition) =>
+  /\b(always|cancelled|success|failure)\s*\(\s*\)/.test(
+    String(condition ?? "").replace(/'(?:[^']|'')*'/g, "''"),
+  );
+const simulateRun = ({ graph = releaseJobs, event = "push", fail = [] } = {}) => {
+  const needsOf = (name) => [graph[name].needs ?? []].flat();
+  const ancestors = (name, seen = new Set()) => {
+    for (const need of needsOf(name)) if (!seen.has(need)) ancestors(need, seen.add(need));
+    return seen;
+  };
+  const result = {};
+  const pending = new Set(Object.keys(graph));
+  while (pending.size > 0) {
+    const ready = [...pending].filter((name) => needsOf(name).every((need) => need in result));
+    assert.ok(ready.length > 0, "the workflow's needs form a cycle");
+    for (const name of ready) {
+      let expression = (graph[name].if ?? "").replace(/^\$\{\{\s*|\s*\}\}$/g, "").trim();
+      if (!callsStatusFunction(expression))
+        expression = expression === "" ? "success()" : `success() && (${expression})`;
+      const allAbove = [...ancestors(name)].every((job) => result[job] === "success");
+      const script = expression
+        .replace(/!cancelled\(\)/g, "true")
+        .replace(/always\(\)/g, "true")
+        .replace(/success\(\)/g, String(allAbove))
+        .replace(
+          /failure\(\)/g,
+          String([...ancestors(name)].some((job) => result[job] === "failure")),
+        )
+        .replace(/inputs\.dry_run/g, JSON.stringify(event === "workflow_dispatch"))
+        .replace(/github\.event_name/g, JSON.stringify(event))
+        .replace(/github\.repository/g, JSON.stringify("sealant-sh/sealantd"))
+        .replace(/needs\.([\w-]+)\.outputs\.([\w-]+)/g, (_, need, output) =>
+          JSON.stringify(simulatedOutput(need, output, event)),
+        )
+        .replace(/needs\.([\w-]+)\.result/g, (_, need) => JSON.stringify(result[need]))
+        .replace(/!=/g, "!==")
+        .replace(/(?<![!=])==/g, "===");
+      const runs = Function(`"use strict"; return (${script});`)();
+      if (!runs) result[name] = "skipped";
+      else if (fail.includes(name)) result[name] = "failure";
+      else result[name] = "success";
+      pending.delete(name);
+    }
+  }
+  return result;
+};
+/** What a job that ran reports, for the outputs job conditions read. */
+const simulatedOutput = (job, output, event) => {
+  if (output === "target") return event === "push" ? "ghcr" : "archive";
+  return "";
+};
+
+test("a tag push runs both publishers after the identity checks; a failure above runs neither", () => {
+  const push = simulateRun();
+  for (const name of Object.keys(releaseJobs))
+    assert.equal(push[name], name.startsWith("archive-") ? "skipped" : "success", name);
+  // A commit whose ci did not pass fails stable-tag: nothing builds, nothing publishes.
+  for (const failed of ["stable-tag", "build", "merge", "pack", "release-manifest", "identity"]) {
+    const run = simulateRun({ fail: [failed] });
+    for (const name of PUBLISHERS) assert.equal(run[name], "skipped", `${name} after ${failed}`);
+  }
+  // npm publishes only after finalize wrote :<version>.
+  assert.equal(simulateRun({ fail: ["finalize-images"] }).npm, "skipped");
+  const stableTagFailed = simulateRun({ fail: ["stable-tag"] });
+  for (const name of Object.keys(releaseJobs).filter((job) => job !== "stable-tag"))
+    assert.equal(stableTagFailed[name], "skipped", name);
+});
+
+test("a dry-run dispatch builds to archives and checks them, and runs nothing that publishes", () => {
+  const dispatch = simulateRun({ event: "workflow_dispatch" });
+  for (const name of [
+    "stable-tag",
+    "archive-build",
+    "archive-merge",
+    "pack",
+    "release-manifest",
+    "identity",
+  ])
+    assert.equal(dispatch[name], "success", name);
+  for (const name of ["build", "merge", ...PUBLISHERS])
+    assert.equal(dispatch[name], "skipped", name);
+  // A failed archive leg stops the identity checks there too.
+  const failed = simulateRun({ event: "workflow_dispatch", fail: ["archive-merge"] });
+  assert.equal(failed["release-manifest"], "skipped");
+  assert.equal(failed.identity, "skipped");
+  // Every job that writes, holds an environment or could mint an id-token is skipped on a dispatch.
+  const writers = Object.entries(releaseJobs).filter(([, definition]) => writes(definition));
+  assert.deepEqual(writers.map(([name]) => name).toSorted(), [
+    "build",
+    "finalize-images",
+    "merge",
+    "npm",
+  ]);
+  for (const [name] of writers) assert.equal(dispatch[name], "skipped", name);
+  // And on a push the archive jobs, which hold nothing, never run.
+  const push = simulateRun();
+  for (const name of ["archive-build", "archive-merge"]) assert.equal(push[name], "skipped", name);
+  // Nothing in this workflow can delete or rewrite artifacts or runs.
+  for (const [name, definition] of Object.entries(releaseJobs))
+    assert.notEqual(definition.permissions?.actions, "write", name);
+});
+
+test("every job that publishes runs only on a tag push, building only to GHCR", () => {
+  for (const name of ["build", "merge"])
+    assert.equal(releaseJobs[name].if, "needs.stable-tag.outputs.target == 'ghcr'", name);
+  for (const name of ["archive-build", "archive-merge"])
+    assert.equal(releaseJobs[name].if, "needs.stable-tag.outputs.target == 'archive'", name);
+  for (const name of PUBLISHERS)
+    assert.match(
+      releaseJobs[name].if,
+      /^\$\{\{ !cancelled\(\) && github\.event_name == 'push' && /,
+      name,
+    );
+});
+
+// The same rule across every workflow. A job whose `if` names no status function is skipped when
+// any job above it was. Each such job below a job that can be skipped is listed here with why that
+// skip is also this job's; a new one fails until someone has looked.
+const SKIPPED_TOGETHER = new Map([
+  ["release.yml merge", "same target as build above it"],
+  ["release.yml archive-merge", "same target as archive-build above it"],
+  // next.yml: plan skips only outside sealant-sh/sealantd or for a ci run that did not pass, and the
+  // rest only when it decides not to publish.
+  ["next.yml image", "plan skips only on a fork or a failed ci; publish is plan's decision"],
+  ["next.yml image-tag", "skipped exactly when plan decided not to publish"],
+  ["next.yml pack", "skipped exactly when plan decided not to publish"],
+  ["next.yml publish", "skipped exactly when plan decided not to publish"],
+]);
+
+test("no workflow job is skipped behind a job its own path expected to skip, unless reviewed", () => {
+  const exposed = [];
+  for (const file of workflowFiles()) {
+    const { jobs: all = {} } = workflow(file);
+    const needsOf = (name) => [all[name]?.needs ?? []].flat();
+    const ancestors = (name, seen = new Set()) => {
+      for (const need of needsOf(name)) if (!seen.has(need)) ancestors(need, seen.add(need));
+      return seen;
+    };
+    for (const [name, job] of Object.entries(all)) {
+      if (callsStatusFunction(job.if)) continue;
+      if ([...ancestors(name)].some((above) => all[above]?.if !== undefined))
+        exposed.push(`${file} ${name}`);
+    }
+  }
+  assert.deepEqual(exposed.toSorted(), [...SKIPPED_TOGETHER.keys()].toSorted());
+  assert.equal(callsStatusFunction("inputs.dry_run && 'always()' != ''"), false);
+  assert.equal(callsStatusFunction("${{ !cancelled() && github.event_name == 'push' }}"), true);
+  assert.equal(callsStatusFunction(undefined), false);
+});
+
+// --- the dry run ---
+
+const resolveStep = releaseJobs["stable-tag"].steps.find((step) => step.id === "resolve");
+/** The resolve step as written, in a checkout whose packages/runtime-client is at `client`. */
+const resolve = (t, environment, client = "0.19.0") => {
+  const directory = scratch(t, "sealantd-release-resolve-");
+  mkdirSync(path.join(directory, "packages/runtime-client"), { recursive: true });
+  writeFileSync(
+    path.join(directory, "packages/runtime-client/package.json"),
+    JSON.stringify({ name: "@sealant/runtime-client", version: client }),
+  );
+  const output = path.join(directory, "output");
+  writeFileSync(output, "");
+  const result = bashStep(resolveStep.run, {
+    cwd: directory,
+    env: {
+      PATH: process.env.PATH,
+      GITHUB_RUN_ID: "38700000001",
+      GITHUB_RUN_ATTEMPT: "2",
+      GITHUB_OUTPUT: output,
+      ...environment,
+    },
+  });
+  const values = Object.fromEntries(
+    readFileSync(output, "utf8")
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => line.split("=")),
+  );
+  return { status: result.status, output: result.stdout + result.stderr, ...values };
+};
+
+test("a dispatch is a dry run or nothing, and its version is always derived from the run", (t) => {
+  assert.deepEqual(releaseDocument.on.workflow_dispatch.inputs, {
+    dry_run: {
+      description: "Build, check and pack a release without publishing anything",
+      required: true,
+      type: "boolean",
+    },
+  });
+  assert.equal(resolveStep.env.DRY_RUN, "${{ inputs.dry_run }}");
+  const dispatch = {
+    GITHUB_EVENT_NAME: "workflow_dispatch",
+    GITHUB_REF: "refs/heads/feature",
+    GITHUB_REF_NAME: "feature",
+  };
+  const dry = resolve(t, { ...dispatch, DRY_RUN: "true" });
+  assert.equal(dry.status, 0, dry.output);
+  assert.equal(dry.version, "0.19.0-dryrun.38700000001.2");
+  assert.equal(dry.target, "archive");
+  // Nothing the dispatcher controls names the version: not the ref, not a tag-shaped ref name.
+  assert.equal(
+    resolve(t, {
+      ...dispatch,
+      DRY_RUN: "true",
+      GITHUB_REF: "refs/tags/v0.20.0",
+      GITHUB_REF_NAME: "v0.20.0",
+      VERSION: "0.20.0",
+    }).version,
+    "0.19.0-dryrun.38700000001.2",
+  );
+  // A runtime-client version that is not X.Y.Z gives no version at all.
+  for (const client of ["0.20.0-next.4", "", "0.20"]) {
+    const refused = resolve(t, { ...dispatch, DRY_RUN: "true" }, client);
+    assert.equal(refused.status, 1, client);
+    assert.equal(refused.version, undefined, client);
+  }
+  for (const value of ["false", "", "1"]) {
+    const refused = resolve(t, { ...dispatch, DRY_RUN: value });
+    assert.equal(refused.status, 1, value);
+    assert.match(refused.output, /only dry-runs a release/);
+    assert.equal(refused.version, undefined);
+  }
+  const tag = resolve(t, {
+    GITHUB_EVENT_NAME: "push",
+    GITHUB_REF: "refs/tags/v0.20.0",
+    GITHUB_REF_NAME: "v0.20.0",
+  });
+  assert.deepEqual([tag.status, tag.version, tag.target], [0, "0.20.0", "ghcr"]);
+  for (const name of ["v0.20.0-next.4", "v0.20", "v1234567890.0.0", "v01.0.0"]) {
+    const prerelease = resolve(t, {
+      GITHUB_EVENT_NAME: "push",
+      GITHUB_REF: `refs/tags/${name}`,
+      GITHUB_REF_NAME: name,
+    });
+    assert.equal(prerelease.status, 1, name);
+    assert.match(prerelease.output, /is not a stable vX\.Y\.Z tag/, name);
+  }
+  assert.equal(
+    resolve(t, {
+      GITHUB_EVENT_NAME: "push",
+      GITHUB_REF: "refs/heads/main",
+      GITHUB_REF_NAME: "main",
+    }).status,
+    1,
+  );
+  assert.equal(resolve(t, { GITHUB_EVENT_NAME: "schedule" }).status, 1);
+});
+
+test("a dry-run-shaped tag is refused before anything builds; a push only ever builds to GHCR", (t) => {
+  for (const name of [
+    "v0.19.0-dryrun.38700000001.1",
+    "v0.0.0-dryrun.9.1",
+    "v0.20.0-next.4.dryrun.1.1",
+  ]) {
+    const pushed = resolve(t, {
+      GITHUB_EVENT_NAME: "push",
+      GITHUB_REF: `refs/tags/${name}`,
+      GITHUB_REF_NAME: name,
+    });
+    assert.equal(pushed.status, 1, name);
+    assert.match(pushed.output, /is a dry-run version; a dry run is a dispatch, never a tag/);
+    assert.equal(pushed.version, undefined);
+    assert.equal(pushed.target, undefined);
+  }
+  assert.match(resolveStep.run, /push\/ghcr \| workflow_dispatch\/archive\) ;;/);
+  // Every job below takes the version and target from stable-tag, and nowhere else.
+  assert.doesNotMatch(releaseText, /inputs\.version/);
+  for (const [name, definition] of Object.entries(releaseJobs)) {
+    if (name === "stable-tag") continue;
+    assert.ok([definition.needs].flat().includes("stable-tag"), `${name} needs stable-tag`);
+    for (const entry of definition.steps ?? [])
+      assert.doesNotMatch(entry.run ?? "", /GITHUB_REF_NAME#/, name);
+  }
+  assert.deepEqual(simulateRun({ fail: ["stable-tag"] }).build, "skipped");
+});
+
+const REFUSE = "Refuse a version that is not this tag's release";
+
+test("every job that publishes first refuses a dry-run version, from the input or from the tag", () => {
+  const writers = Object.entries(releaseJobs).filter(([, definition]) => writes(definition));
+  for (const [name, definition] of writers) {
+    assert.equal(definition.steps[0].name, REFUSE, name);
+    assert.deepEqual(
+      definition.steps[0].env,
+      { VERSION: "${{ needs.stable-tag.outputs.version }}" },
+      name,
+    );
+    assert.ok(definition.needs.includes("stable-tag"), name);
+  }
+  const run = (GITHUB_EVENT_NAME, GITHUB_REF_NAME, VERSION) =>
+    bashStep(releaseJobs.npm.steps[0].run, {
+      env: { PATH: process.env.PATH, GITHUB_EVENT_NAME, GITHUB_REF_NAME, VERSION },
+    });
+  assert.equal(run("push", "v0.20.0", "0.20.0").status, 0);
+  for (const [event, ref, version] of [
+    // A dry run's version, however it arrived: derived on a dispatch, or from a pushed tag.
+    ["workflow_dispatch", "main", "0.19.0-dryrun.38700000001.1"],
+    ["push", "v0.19.0-dryrun.38700000001.1", "0.19.0-dryrun.38700000001.1"],
+    // A plain version that is not this run's tag, or a release version on a dispatch.
+    ["push", "v0.20.0", "0.19.0-dryrun.38700000001.1"],
+    ["workflow_dispatch", "v0.20.0", "0.20.0"],
+    ["push", "v0.20.1", "0.20.0"],
+    ["push", "v0.20.0-next.4", "0.20.0-next.4"],
+    ["push", "v1234567890.0.0", "1234567890.0.0"],
+    ["push", "v", ""],
+  ]) {
+    const refused = run(event, ref, version);
+    assert.equal(refused.status, 1, `${event} ${ref} ${version}`);
+    assert.match(refused.stdout, /not a plain X\.Y\.Z release of its own tag/);
+  }
+  // Every copy of the step is the same.
+  for (const [name, definition] of writers)
+    assert.equal(definition.steps[0].run, releaseJobs.npm.steps[0].run, name);
+});
+
+test("the stray check reads the X.Y.Z a dry run stamps", () => {
+  const step = releaseJobs["stable-tag"].steps.find(
+    (entry) => entry.name === "Refuse a release that leaves out one of its next builds",
+  );
+  assert.match(step.run, /--stray "v\$\{VERSION%%-\*\}"/);
+  assert.equal(step.env.VERSION, "${{ steps.resolve.outputs.version }}");
+  // Nothing in stable-tag carries on past a failure.
+  for (const entry of releaseJobs["stable-tag"].steps)
+    assert.equal(entry["continue-on-error"], undefined, entry.name);
 });
