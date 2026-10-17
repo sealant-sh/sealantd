@@ -20,6 +20,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::aliases::Aliases;
+use crate::clock::Clock;
 use crate::engine::{CaptureEngine, Class, EngineError, SnapOutcome, SnapRequest, StagedCapture};
 use crate::manifest::CaptureKind;
 use crate::ship::{ShipError, ShipWorker, Shipper, Staging};
@@ -204,9 +205,9 @@ pub enum Trigger {
     Reconcile,
 }
 
-/// One class's clock.
+/// One class's timers.
 #[derive(Debug, Clone, Copy)]
-struct Clock {
+struct ClassClock {
     first_change: Option<Instant>,
     last_change: Option<Instant>,
     last_snap: Instant,
@@ -215,12 +216,12 @@ struct Clock {
     reconcile: Duration,
 }
 
-impl Clock {
-    fn new(quiet: Duration, max: Duration, reconcile: Duration) -> Self {
+impl ClassClock {
+    fn new(now: Instant, quiet: Duration, max: Duration, reconcile: Duration) -> Self {
         Self {
             first_change: None,
             last_change: None,
-            last_snap: Instant::now(),
+            last_snap: now,
             quiet,
             max,
             reconcile,
@@ -275,8 +276,8 @@ impl Clock {
 
 #[derive(Debug)]
 struct State {
-    small: Clock,
-    bulk: Clock,
+    small: ClassClock,
+    bulk: ClassClock,
     small_mode: Mode,
     bulk_mode: Mode,
     /// The watcher overflowed: the cadence thread drops it.
@@ -350,6 +351,8 @@ pub struct CadenceSnapshot {
 }
 
 struct Shared {
+    /// Where the timers and the ship worker's tick read the time ([`crate::CaptureConfig::clock`]).
+    clock: Clock,
     engine: Mutex<CaptureEngine>,
     staging: Arc<Staging>,
     shipper: Arc<Shipper>,
@@ -412,6 +415,11 @@ impl Shared {
         health[usize::from(class == Class::Bulk)].record(class, result);
     }
 
+    /// Wake the class loops (and the alias loop): the state changed.
+    fn notify(&self) {
+        self.clock.notify_all(&self.cv);
+    }
+
     fn state(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -429,7 +437,7 @@ impl Shared {
     }
 
     fn signal(&self, signal: ChangeSignal) {
-        let now = Instant::now();
+        let now = self.clock.now();
         // Every signal counts (a change, an overflow, an unwatched directory): a final flush
         // after it snaps again.
         self.changes.fetch_add(1, Ordering::SeqCst);
@@ -489,7 +497,7 @@ impl Shared {
             }
         }
         drop(st);
-        self.cv.notify_all();
+        self.notify();
     }
 
     /// A small-class snap of `kind`: flags the engine so a bulk build yields, clears the small
@@ -511,7 +519,7 @@ impl Shared {
                 .unwrap_or_else(PoisonError::into_inner);
             self.yield_cv.notify_all();
         }
-        self.state().small.last_snap = Instant::now();
+        self.state().small.last_snap = self.clock.now();
         self.counters.small_snaps.fetch_add(1, Ordering::Relaxed);
         self.record(
             Class::Small,
@@ -524,7 +532,7 @@ impl Shared {
             self.counters.small_staged.fetch_add(1, Ordering::Relaxed);
             self.wake_worker();
         }
-        self.cv.notify_all();
+        self.notify();
         result
     }
 
@@ -605,7 +613,7 @@ impl Shared {
             }
         };
         self.counters.bulk_running.store(false, Ordering::SeqCst);
-        self.state().bulk.last_snap = Instant::now();
+        self.state().bulk.last_snap = self.clock.now();
         self.counters.bulk_snaps.fetch_add(1, Ordering::Relaxed);
         self.record(
             Class::Bulk,
@@ -618,7 +626,7 @@ impl Shared {
             self.counters.bulk_staged.fetch_add(1, Ordering::Relaxed);
             self.wake_worker();
         }
-        self.cv.notify_all();
+        self.notify();
         result
     }
 
@@ -682,14 +690,7 @@ impl Shared {
         if st.stop || !unchanged(&st) {
             return;
         }
-        match at {
-            Some(at) => drop(
-                self.cv
-                    .wait_timeout(st, at.saturating_duration_since(Instant::now()))
-                    .unwrap_or_else(PoisonError::into_inner),
-            ),
-            None => drop(self.cv.wait(st).unwrap_or_else(PoisonError::into_inner)),
-        }
+        drop(self.clock.wait_until(&self.cv, st, at));
     }
 
     /// The small-class loop.
@@ -717,7 +718,7 @@ impl Shared {
             if overflowed {
                 self.drop_watch();
             }
-            let now = Instant::now();
+            let now = self.clock.now();
             match due {
                 Some((at, trigger)) if at <= now => {
                     if !self.allowed() || self.shipper.is_fenced() {
@@ -758,10 +759,10 @@ impl Shared {
     /// name is dirtied, each name noted for its class's next build. Runs whatever the caller
     /// allows (it snaps nothing): a change after a final flush makes its status not current.
     fn run_aliases(&self) {
-        let now = Instant::now();
+        let now = self.clock.now();
         let mut next = [now + self.alias_every[0], now + self.alias_every[1]];
         loop {
-            let now = Instant::now();
+            let now = self.clock.now();
             let due = [next[0] <= now, next[1] <= now];
             if due.iter().any(|d| *d) {
                 let moved = self.aliases.poll(due);
@@ -794,11 +795,7 @@ impl Shared {
             if st.stop {
                 return;
             }
-            drop(
-                self.cv
-                    .wait_timeout(st, at.saturating_duration_since(Instant::now()))
-                    .unwrap_or_else(PoisonError::into_inner),
-            );
+            drop(self.clock.wait_until(&self.cv, st, Some(at)));
         }
     }
 
@@ -812,7 +809,7 @@ impl Shared {
                 }
                 Self::bulk_wake(&st)
             };
-            let now = Instant::now();
+            let now = self.clock.now();
             match due {
                 Some((at, trigger)) if at <= now => {
                     // A bulk class held for the byte quota still snaps: the newer capture
@@ -870,15 +867,24 @@ impl CadenceRunner {
         let staging = engine.staging();
         let aliases = engine.aliases();
         let invalidations = engine.invalidations();
+        let clock = config.clock.clone();
+        let now = clock.now();
         let runner = Self {
             shared: Arc::new(Shared {
+                clock,
                 engine: Mutex::new(engine),
                 staging,
                 shipper,
                 worker: Mutex::new(None),
                 state: Mutex::new(State {
-                    small: Clock::new(cadence.quiet, cadence.max_interval, cadence.reconcile),
-                    bulk: Clock::new(
+                    small: ClassClock::new(
+                        now,
+                        cadence.quiet,
+                        cadence.max_interval,
+                        cadence.reconcile,
+                    ),
+                    bulk: ClassClock::new(
+                        now,
                         cadence.bulk_quiet,
                         cadence.bulk_max_interval,
                         cadence.bulk_reconcile,
@@ -917,7 +923,7 @@ impl CadenceRunner {
         runner.shared.shipper.set_repair_hook(Arc::new(move || {
             if let Some(shared) = weak.upgrade() {
                 shared.state().repair = true;
-                shared.cv.notify_all();
+                shared.notify();
             }
         }));
         runner
@@ -950,7 +956,11 @@ impl CadenceRunner {
             .allow
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = allow;
-        match ShipWorker::spawn(Arc::clone(&self.shared.shipper), SHIP_TICK) {
+        match ShipWorker::spawn(
+            Arc::clone(&self.shared.shipper),
+            SHIP_TICK,
+            &self.shared.clock,
+        ) {
             Ok(worker) => {
                 *self
                     .shared
@@ -999,32 +1009,35 @@ impl CadenceRunner {
             let mut st = self.shared.state();
             st.small_mode = small_mode;
             st.bulk_mode = bulk_mode;
-            let now = Instant::now();
+            let now = self.shared.clock.now();
             st.small.last_snap = now;
             st.bulk.last_snap = now;
         }
 
         let mut threads = self.threads.lock().unwrap_or_else(PoisonError::into_inner);
         let shared = Arc::clone(&self.shared);
-        if let Ok(h) = thread::Builder::new()
-            .name("capture-cadence".into())
-            .spawn(move || shared.run_small())
+        if let Ok(h) = self
+            .shared
+            .clock
+            .spawn("capture-cadence", move || shared.run_small())
         {
             threads.push(h);
         }
         if self.shared.capture_bulk {
             let shared = Arc::clone(&self.shared);
-            if let Ok(h) = thread::Builder::new()
-                .name("capture-bulk".into())
-                .spawn(move || shared.run_bulk())
+            if let Ok(h) = self
+                .shared
+                .clock
+                .spawn("capture-bulk", move || shared.run_bulk())
             {
                 threads.push(h);
             }
         }
         let shared = Arc::clone(&self.shared);
-        if let Ok(h) = thread::Builder::new()
-            .name("capture-aliases".into())
-            .spawn(move || shared.run_aliases())
+        if let Ok(h) = self
+            .shared
+            .clock
+            .spawn("capture-aliases", move || shared.run_aliases())
         {
             threads.push(h);
         }
@@ -1033,6 +1046,15 @@ impl CadenceRunner {
     /// Feed a change signal by hand (tests; a daemon-side event source).
     pub fn signal(&self, signal: ChangeSignal) {
         self.shared.signal(signal);
+    }
+
+    /// Wait until the watcher has delivered every change made before now to the class clocks
+    /// ([`WatchHandle::settle`]); `Ok` at once without a watcher.
+    ///
+    /// # Errors
+    /// Why nothing can be said of what is still queued.
+    pub fn settle_watcher(&self) -> Result<(), String> {
+        self.shared.settle_watcher()
     }
 
     /// A forced small-class snap of `kind` (turn boundary, checkpoint): ahead of the timers and
@@ -1639,7 +1661,7 @@ impl CadenceRunner {
             let mut st = self.shared.state();
             st.stop = true;
         }
-        self.shared.cv.notify_all();
+        self.shared.notify();
         {
             let _g = self
                 .shared

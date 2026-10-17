@@ -181,6 +181,9 @@ pub struct CaptureConfig {
     pub cadence: Cadence,
     /// How the cadence learns about changes.
     pub watch: WatchPolicy,
+    /// Where the cadence's timers and the ship worker's tick read the time: real by default;
+    /// a test's [`crate::clock::ManualClock`] holds each timer to its period in virtual time.
+    pub clock: crate::clock::Clock,
     /// CPU budget for snapping and shipping, as a fraction of one core.
     pub cpu_fraction: f64,
     /// Threads a final snap reads files on (`crate::readahead`); 1 reads on the build's own.
@@ -257,6 +260,7 @@ impl CaptureConfig {
             capture_bulk: true,
             cadence: Cadence::default(),
             watch: WatchPolicy::default(),
+            clock: crate::clock::Clock::real(),
             cpu_fraction: crate::ship::DEFAULT_CPU_FRACTION,
             final_readers: std::thread::available_parallelism()
                 .map_or(1, std::num::NonZero::get)

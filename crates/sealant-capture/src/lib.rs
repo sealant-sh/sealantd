@@ -13,6 +13,7 @@ pub mod aliases;
 pub mod bounds;
 pub mod cadence;
 pub mod chunk;
+pub mod clock;
 mod cpu;
 pub mod engine;
 pub mod gitpack;
@@ -36,6 +37,7 @@ pub mod watch;
 pub mod worktree_meta;
 
 pub use cadence::{CadenceRunner, CadenceSnapshot, Census, FinalFlush, Incomplete, SnapHealth};
+pub use clock::{Clock, ManualClock};
 pub use engine::{
     Cadence, CaptureConfig, CaptureEngine, Class, EngineError, ReadReport, ReadReports,
     SnapOutcome, SnapRequest, SnapStats, StagedCapture, UNREADABLE_PATHS_CAP,
