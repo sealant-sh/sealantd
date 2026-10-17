@@ -1397,6 +1397,160 @@ mod tests {
         }
     }
 
+    /// A session's process group, owned by the test (sealantd#183): a helper its leader started
+    /// outlives the leader, and nothing else ends it. [`Self::end`] kills what is left and waits
+    /// until the group is empty; dropping the guard does the same when the test fails first.
+    struct GroupGuard {
+        pgid: i32,
+    }
+
+    impl GroupGuard {
+        /// Whether any process is left in the group (a zombie not yet reaped counts).
+        fn alive(&self) -> bool {
+            nix::sys::signal::killpg(Pid::from_raw(self.pgid), None).is_ok()
+        }
+
+        /// Kill every process left in the group and wait until none is; `false` when one is
+        /// still there after ten seconds. A process the group's leader started is not this
+        /// test's child: once killed, init reaps it. A leader is, and the runtime reaps it: on a
+        /// single-threaded runtime it cannot while this waits, so end a live leader's group on
+        /// a multi-threaded one.
+        fn end(&self) -> bool {
+            if self.alive() {
+                let _ = nix::sys::signal::killpg(Pid::from_raw(self.pgid), NixSignal::SIGKILL);
+            }
+            let until = Instant::now() + Duration::from_secs(10);
+            while self.alive() {
+                if Instant::now() >= until {
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            true
+        }
+    }
+
+    impl Drop for GroupGuard {
+        fn drop(&mut self) {
+            let _ = self.end();
+        }
+    }
+
+    /// One open descriptor of a process, as `/proc` names it: what it points at and the identity
+    /// of its open file (mount, inode, `tty-index` of a PTY master).
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct OpenFd {
+        fd: u32,
+        target: String,
+        mnt_id: u64,
+        ino: u64,
+        tty_index: Option<u32>,
+        /// The descriptor's `flags` (octal in fdinfo), `O_CLOEXEC` included.
+        flags: u32,
+    }
+
+    impl OpenFd {
+        /// A PTY master: `/dev/ptmx`, or its devpts alias `/dev/pts/ptmx`.
+        fn is_master(&self) -> bool {
+            self.target == "/dev/ptmx" || self.target.ends_with("/pts/ptmx")
+        }
+
+        /// Marked close-on-exec.
+        fn close_on_exec(&self) -> bool {
+            self.flags & 0o2_000_000 != 0
+        }
+
+        /// A PTY master or a PTY slave.
+        fn is_terminal(&self) -> bool {
+            self.is_master() || self.target.starts_with("/dev/pts/")
+        }
+
+        /// The same open file as `other`: the same target on the same mount and inode, and for a
+        /// master the same PTY. The descriptor number may differ.
+        fn same_file(&self, other: &Self) -> bool {
+            self.target == other.target
+                && self.mnt_id == other.mnt_id
+                && self.ino == other.ino
+                && self.tty_index == other.tty_index
+        }
+    }
+
+    /// Every open descriptor of `pid`. A descriptor that cannot be read fails the test: it never
+    /// reads as absent. One that is gone between the listing and its read (the process closed
+    /// it meanwhile: the test process's other threads, a program starting up) makes the whole
+    /// set be read again, up to a hundred times.
+    fn open_fds(pid: i32) -> Vec<OpenFd> {
+        for _ in 0..100 {
+            if let Some(fds) = read_fds(pid) {
+                return fds;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("the descriptors of {pid} kept changing while they were read");
+    }
+
+    /// One read of `pid`'s descriptors; `None` when one was gone before it could be read.
+    fn read_fds(pid: i32) -> Option<Vec<OpenFd>> {
+        let dir = format!("/proc/{pid}/fd");
+        let mut fds = Vec::new();
+        for entry in std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("list {dir}: {e}")) {
+            let entry = entry.unwrap_or_else(|e| panic!("list {dir}: {e}"));
+            let name = entry.file_name();
+            let fd: u32 = name
+                .to_str()
+                .and_then(|n| n.parse().ok())
+                .unwrap_or_else(|| panic!("{dir}: {name:?} is not a descriptor"));
+            let target = match std::fs::read_link(entry.path()) {
+                Ok(target) => target.to_string_lossy().into_owned(),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+                Err(e) => panic!("read {dir}/{fd}: {e}"),
+            };
+            let info = match std::fs::read_to_string(format!("/proc/{pid}/fdinfo/{fd}")) {
+                Ok(info) => info,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+                Err(e) => panic!("read /proc/{pid}/fdinfo/{fd}: {e}"),
+            };
+            let field = |key: &str| {
+                info.lines()
+                    .find_map(|line| line.strip_prefix(key))
+                    .map(str::trim)
+            };
+            let number = |key: &str| -> u64 {
+                field(key)
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or_else(|| panic!("/proc/{pid}/fdinfo/{fd} has no {key}: {info}"))
+            };
+            let flags = field("flags:")
+                .and_then(|v| u32::from_str_radix(v, 8).ok())
+                .unwrap_or_else(|| panic!("/proc/{pid}/fdinfo/{fd} has no flags: {info}"));
+            let mut open = OpenFd {
+                fd,
+                mnt_id: number("mnt_id:"),
+                ino: number("ino:"),
+                tty_index: None,
+                flags,
+                target,
+            };
+            if open.is_master() {
+                open.tty_index = Some(
+                    field("tty-index:")
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or_else(|| panic!("master {dir}/{fd} has no tty-index: {info}")),
+                );
+            }
+            fds.push(open);
+        }
+        Some(fds)
+    }
+
+    /// The terminal descriptors (PTY masters and slaves) `pid` holds.
+    fn terminal_fds(pid: i32) -> Vec<OpenFd> {
+        open_fds(pid)
+            .into_iter()
+            .filter(OpenFd::is_terminal)
+            .collect()
+    }
+
     async fn output_until_exit(rx: &mut Receiver<EventEnvelope>) -> Vec<u8> {
         let mut out = Vec::new();
         loop {
@@ -1600,6 +1754,9 @@ mod tests {
                 24,
             ))
             .expect("open");
+        // The helper ignores the hangup and may outlive the leader: the test ends it
+        // (sealantd#183).
+        let group = GroupGuard { pgid: opened.pid };
         rt.attach(&opened.session_id, channel.clone(), out_tx, None)
             .await
             .expect("attach");
@@ -1619,6 +1776,269 @@ mod tests {
         .expect("helper output must not extend the attachment after leader exit");
 
         assert_eq!(exit_code, Some(0));
+        assert!(
+            group.end(),
+            "a process of the test's session is left over after it"
+        );
+    }
+
+    /// The children of `pid`, from every process's parent in `/proc`.
+    fn children(pid: i32) -> Vec<i32> {
+        std::fs::read_dir("/proc")
+            .expect("/proc")
+            .filter_map(|entry| {
+                let child: i32 = entry.ok()?.file_name().to_str()?.parse().ok()?;
+                let stat = std::fs::read_to_string(format!("/proc/{child}/stat")).ok()?;
+                // `pid (comm) state ppid …`: the comm may hold spaces, so read after its `)`.
+                let ppid: i32 = stat
+                    .rsplit_once(')')?
+                    .1
+                    .split_whitespace()
+                    .nth(1)?
+                    .parse()
+                    .ok()?;
+                (ppid == pid).then_some(child)
+            })
+            .collect()
+    }
+
+    /// Wait until `pid` runs `program` and sleeps in it: its exec has finished, and so has the
+    /// program's start (which opens and closes files of its own). The kernel names the process
+    /// (`comm`: the program, or the path it was run by) only after it has closed the descriptors
+    /// marked close-on-exec, and a process read before that (a spawn can return as soon as the
+    /// exec has replaced the child's memory) can still list a descriptor it is about to close.
+    async fn exec_done(pid: i32, program: &str) {
+        let until = Instant::now() + Duration::from_secs(10);
+        loop {
+            let comm = std::fs::read_to_string(format!("/proc/{pid}/comm"))
+                .unwrap_or_else(|e| panic!("read /proc/{pid}/comm: {e}"));
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .unwrap_or_else(|e| panic!("read /proc/{pid}/stat: {e}"));
+            // `pid (comm) state …`: the state follows the comm's closing parenthesis.
+            let sleeping = stat
+                .rsplit_once(')')
+                .and_then(|(_, rest)| rest.split_whitespace().next())
+                == Some("S");
+            if comm.trim_end().rsplit('/').next() == Some(program) && sleeping {
+                return;
+            }
+            assert!(
+                Instant::now() < until,
+                "{pid} runs {program} and sleeps in it within ten seconds (comm {comm:?}, \
+                 stat {stat:?})"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// Where a terminal descriptor a process holds comes from: a session's master or slave, one
+    /// the test process held before it opened any session (its launcher's), or neither.
+    fn origin(fd: &OpenFd, sessions: &[(&str, &OpenFd, &OpenFd)], before: &[OpenFd]) -> String {
+        for (name, master, slave) in sessions {
+            if fd.same_file(master) {
+                return format!("the {name} session's master");
+            }
+            if fd.same_file(slave) {
+                return format!("the {name} session's slave");
+            }
+        }
+        if before.iter().any(|b| fd.same_file(b)) {
+            return "a descriptor the test process held before it opened a session".to_owned();
+        }
+        "a terminal descriptor of no session of this test".to_owned()
+    }
+
+    /// A PTY's descriptors stay with the session it belongs to (sealantd#183). While sessions
+    /// are open, no process sealantd starts holds a terminal descriptor beyond its stdin, stdout
+    /// and stderr: not a session's leader (its own master included), nor what a leader runs, nor
+    /// a command run as `exec` runs it, nor a git run as the capture engine runs it. The check
+    /// holds whatever the descriptor is; each one found is named by where it came from: a
+    /// session's master or slave (matched by mount, inode and PTY, not by PTY number alone),
+    /// one the test process inherited from its launcher, or neither.
+    // Two workers: the leaders and the command are this test's children, and the runtime reaps
+    // them on one while the guards wait on the other.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_ptys_descriptors_stay_with_its_session() {
+        use sealant_process::spawn::CommandGateExt;
+
+        // A launcher's master: open in the test process without close-on-exec before any session,
+        // as whatever starts sealantd may leave one. No child may get it (sealant_process::spawn).
+        let own: i32 = std::process::id().try_into().expect("a pid");
+        let launcher =
+            nix::pty::posix_openpt(nix::fcntl::OFlag::O_RDWR | nix::fcntl::OFlag::O_NOCTTY)
+                .expect("open a launcher's master");
+        // What the test process holds before any session: whatever its launcher passed it, and
+        // the master above.
+        let before = open_fds(own);
+        assert!(
+            before
+                .iter()
+                .any(|fd| fd.is_master() && !fd.close_on_exec()),
+            "the test process holds a master without close-on-exec before any session: {before:?}"
+        );
+
+        let rt = runtime();
+        let first = rt
+            .open(session_args(&["-c", "exec sleep 30"], 80, 24))
+            .expect("open the first session");
+        let first_group = GroupGuard { pgid: first.pid };
+        let second = rt
+            .open(session_args(&["-c", "sleep 30 & wait"], 80, 24))
+            .expect("open the second session");
+        let second_group = GroupGuard { pgid: second.pid };
+
+        exec_done(first.pid, "sleep").await;
+        exec_done(second.pid, "sh").await;
+        // Each session's slave is its leader's stdin; its master is the one master the test
+        // process holds now, on that PTY, that it did not hold before.
+        let now = open_fds(own);
+        let session = |leader: i32| {
+            let slave = open_fds(leader)
+                .into_iter()
+                .find(|fd| fd.fd == 0)
+                .expect("the leader's stdin");
+            let index: u32 = slave
+                .target
+                .strip_prefix("/dev/pts/")
+                .and_then(|n| n.parse().ok())
+                .unwrap_or_else(|| panic!("the leader's stdin is a pty slave: {slave:?}"));
+            let masters: Vec<&OpenFd> = now
+                .iter()
+                .filter(|fd| fd.is_master() && fd.tty_index == Some(index))
+                .filter(|fd| !before.iter().any(|b| b.same_file(fd)))
+                .collect();
+            // The positive control: the oracle finds the master sealantd holds for the session,
+            // and it is close-on-exec whatever a spawn does.
+            assert_eq!(
+                masters.len(),
+                1,
+                "the test process holds exactly one new master on /dev/pts/{index}: {now:?}"
+            );
+            assert!(
+                masters[0].close_on_exec(),
+                "the session's master is close-on-exec: {:?}",
+                masters[0]
+            );
+            (masters[0].clone(), slave)
+        };
+        let (first_master, first_slave) = session(first.pid);
+        let (second_master, second_slave) = session(second.pid);
+        let sessions = [
+            ("first", &first_master, &first_slave),
+            ("second", &second_master, &second_slave),
+        ];
+
+        let until = Instant::now() + Duration::from_secs(10);
+        let second_child = loop {
+            if let Some(child) = children(second.pid).first() {
+                break *child;
+            }
+            assert!(
+                Instant::now() < until,
+                "the second session's leader started its child"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+
+        // A command, as `exec` runs one.
+        let processes = sealant_process::ProcessRuntime {
+            registry: Arc::new(sealant_process::ProcessRegistry::new()),
+            bus: rt.bus.clone(),
+            idgen: rt.idgen.clone(),
+            status: rt.status.clone(),
+            clock: rt.clock.clone(),
+            config: rt.config.clone(),
+            extra_env: Arc::new(std::sync::Mutex::new(Vec::new())),
+            redactor: rt.redactor.clone(),
+        };
+        let command = processes
+            .exec(
+                sealant_protocol::ExecArgs {
+                    execution_id: None,
+                    session_id: None,
+                    executable: "/bin/sleep".to_owned(),
+                    args: vec!["30".to_owned()],
+                    cwd: None,
+                    env: vec![],
+                    stdin: false,
+                    attach: false,
+                    timeout_millis: None,
+                    background: false,
+                    capture: None,
+                    graceful_signal: None,
+                    user: None,
+                },
+                None,
+            )
+            .expect("exec a command");
+        let command_group = GroupGuard { pgid: command.pgid };
+
+        // A git, as the capture engine runs one: blocked on its stdin until the test closes it.
+        let git = std::process::Command::new("git")
+            .args(["hash-object", "--stdin"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn_gated()
+            .expect("spawn git");
+
+        for (pid, program) in [
+            (first.pid, "sleep"),
+            (second.pid, "sh"),
+            (second_child, "sleep"),
+            (command.pid, "sleep"),
+            (git.pid(), "git"),
+        ] {
+            exec_done(pid, program).await;
+        }
+        let mut held = Vec::new();
+        for (who, pid, slave) in [
+            ("the first session's leader", first.pid, Some(&first_slave)),
+            (
+                "the second session's leader",
+                second.pid,
+                Some(&second_slave),
+            ),
+            (
+                "the second session's leader's child",
+                second_child,
+                Some(&second_slave),
+            ),
+            ("a command run as exec runs it", command.pid, None),
+            ("a git run as the capture engine runs it", git.pid(), None),
+        ] {
+            for fd in terminal_fds(pid) {
+                // A session's processes have its slave as stdin, stdout and stderr, nothing else.
+                if fd.fd <= 2 && slave.is_some_and(|s| fd.same_file(s)) {
+                    continue;
+                }
+                held.push(format!(
+                    "{who} holds {}: {fd:?}",
+                    origin(&fd, &sessions, &before)
+                ));
+            }
+        }
+        let inherited: Vec<&OpenFd> = before.iter().filter(|fd| fd.is_terminal()).collect();
+        assert!(
+            held.is_empty(),
+            "terminal descriptors where none belongs:\n{}\n(the test process held these \
+             terminal descriptors before it opened a session: {inherited:?})",
+            held.join("\n")
+        );
+
+        git.communicate(None)
+            .expect("git ends once its stdin closes");
+        processes
+            .kill(&command.process_id)
+            .expect("kill the command");
+        rt.close(&first.session_id)
+            .expect("close the first session");
+        rt.close(&second.session_id)
+            .expect("close the second session");
+        drop(launcher);
+        assert!(command_group.end(), "the command is left over");
+        assert!(first_group.end(), "the first session is left over");
+        assert!(second_group.end(), "the second session is left over");
     }
 
     #[tokio::test]

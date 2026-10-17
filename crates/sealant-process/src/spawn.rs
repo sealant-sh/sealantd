@@ -113,13 +113,65 @@ fn refuse_on_fs_user_thread() -> io::Result<()> {
     Ok(())
 }
 
-/// Spawn a [`std::process::Command`] under the gate.
+/// The oldest kernel sealantd runs on: `close_range(2)` with `CLOSE_RANGE_CLOEXEC` came in 5.11.
+pub const KERNEL_FLOOR: &str = "Linux 5.11";
+
+/// Mark every descriptor from 3 up close-on-exec: `close_range(3, ~0U, CLOSE_RANGE_CLOEXEC)`, one
+/// system call, which allocates nothing and takes no lock, so it may run between fork and exec.
+/// Descriptors 0 to 2 are left as they are.
+///
+/// # Errors
+/// The kernel's, on one older than [`KERNEL_FLOOR`].
+pub fn mark_inherited_close_on_exec() -> io::Result<()> {
+    #[allow(
+        unsafe_code,
+        reason = "a raw system call: libc has no close_range wrapper on musl"
+    )]
+    // SAFETY: close_range takes two descriptor numbers and flags, and touches no memory of ours.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_close_range,
+            3 as libc::c_uint,
+            libc::c_uint::MAX,
+            libc::CLOSE_RANGE_CLOEXEC,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+/// A child gets its stdin, stdout and stderr, and no other descriptor of sealantd's: in the
+/// child, after its stdio is in place and just before it execs, every descriptor from 3 up is
+/// marked close-on-exec ([`mark_inherited_close_on_exec`]) — one sealantd opened without the
+/// flag, or inherited from whatever started it, included (sealantd#183). The error pipe std
+/// reports a failed exec through is already close-on-exec, and stays open until the exec. A
+/// kernel older than [`KERNEL_FLOOR`] fails the spawn: no child starts with descriptors it was
+/// not given.
+fn close_inherited_on_exec(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    #[allow(
+        unsafe_code,
+        reason = "pre_exec: the closure runs in the child between fork and exec"
+    )]
+    // SAFETY: the closure makes one system call and builds an `io::Error` from errno (no
+    // allocation): nothing that is unsafe between fork and exec in a multithreaded process.
+    unsafe {
+        command.pre_exec(mark_inherited_close_on_exec);
+    }
+}
+
+/// Spawn a [`std::process::Command`] under the gate. The child gets no descriptor of this
+/// process beyond the stdio it is given ([`close_inherited_on_exec`]).
 ///
 /// # Errors
 /// Returns whatever `Command::spawn` returns; `PermissionDenied` from a thread acting with a
 /// person's filesystem identity.
 pub fn spawn_std(command: &mut Command) -> io::Result<(Child, SpawnedPid)> {
     refuse_on_fs_user_thread()?;
+    close_inherited_on_exec(command);
     let mut gate = lock_gate();
     #[allow(
         clippy::disallowed_methods,
@@ -132,7 +184,8 @@ pub fn spawn_std(command: &mut Command) -> io::Result<(Child, SpawnedPid)> {
 }
 
 /// Spawn a [`tokio::process::Command`] under the gate. The caller must keep the guard until the
-/// child has been reaped (usually: move it into the task that awaits `child.wait()`).
+/// child has been reaped (usually: move it into the task that awaits `child.wait()`). The child
+/// gets no descriptor of this process beyond the stdio it is given ([`close_inherited_on_exec`]).
 ///
 /// # Errors
 /// Returns whatever `tokio::process::Command::spawn` returns; `PermissionDenied` from a thread
@@ -141,6 +194,7 @@ pub fn spawn_tokio(
     command: &mut tokio::process::Command,
 ) -> io::Result<(tokio::process::Child, SpawnedPid)> {
     refuse_on_fs_user_thread()?;
+    close_inherited_on_exec(command.as_std_mut());
     let mut gate = lock_gate();
     #[allow(
         clippy::disallowed_methods,
@@ -513,6 +567,84 @@ impl CommandGateExt for Command {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A descriptor of this process without close-on-exec, as a launcher may leave one (`dup`
+    /// copies without the flag), and its number.
+    fn inheritable_fd() -> (std::os::fd::OwnedFd, i32) {
+        use std::os::fd::AsRawFd;
+        let null = std::fs::File::open("/dev/null").expect("open /dev/null");
+        let fd = nix::unistd::dup(&null).expect("dup");
+        let flags = nix::fcntl::fcntl(&fd, nix::fcntl::FcntlArg::F_GETFD).expect("F_GETFD");
+        assert!(
+            !nix::fcntl::FdFlag::from_bits_truncate(flags).contains(nix::fcntl::FdFlag::FD_CLOEXEC),
+            "the planted descriptor is inheritable"
+        );
+        let n = fd.as_raw_fd();
+        (fd, n)
+    }
+
+    /// A shell that echoes its stdin to stdout, writes to stderr, and says whether it holds `fd`.
+    fn probe(fd: i32) -> [String; 2] {
+        [
+            "-c".to_owned(),
+            format!(
+                "read line; echo \"out:$line\"; echo err >&2; \
+                 if [ -e /proc/$$/fd/{fd} ]; then echo held; else echo gone; fi"
+            ),
+        ]
+    }
+
+    /// A child of `spawn_std` keeps its stdin, stdout and stderr, and gets no other descriptor of
+    /// this process: not one without close-on-exec either (sealantd#183).
+    #[test]
+    fn a_std_child_gets_its_stdio_and_no_other_descriptor() {
+        let (_fd, n) = inheritable_fd();
+        let out = Command::new("/bin/sh")
+            .args(probe(n))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn_gated()
+            .expect("spawn")
+            .communicate(Some(b"in\n".to_vec()))
+            .expect("run");
+        assert!(out.status.success(), "{out:?}");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "out:in\ngone\n");
+        assert_eq!(String::from_utf8_lossy(&out.stderr), "err\n");
+    }
+
+    /// The same for a child of `spawn_tokio`.
+    #[tokio::test]
+    async fn a_tokio_child_gets_its_stdio_and_no_other_descriptor() {
+        use tokio::io::AsyncWriteExt;
+        let (_fd, n) = inheritable_fd();
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command
+            .args(probe(n))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let (mut child, _spawned) = spawn_tokio(&mut command).expect("spawn");
+        let mut stdin = child.stdin.take().expect("stdin");
+        stdin.write_all(b"in\n").await.expect("write");
+        drop(stdin);
+        let out = child.wait_with_output().await.expect("run");
+        assert!(out.status.success(), "{out:?}");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "out:in\ngone\n");
+        assert_eq!(String::from_utf8_lossy(&out.stderr), "err\n");
+    }
+
+    /// A program that cannot be run is still reported by the spawn, by both gates: the backstop
+    /// keeps the pipe std reports a failed exec through.
+    #[tokio::test]
+    async fn a_failed_exec_is_still_reported() {
+        let missing = "/nonexistent/sealant-program";
+        let std_error = spawn_std(&mut Command::new(missing)).expect_err("no such program");
+        assert_eq!(std_error.kind(), io::ErrorKind::NotFound, "{std_error}");
+        let tokio_error =
+            spawn_tokio(&mut tokio::process::Command::new(missing)).expect_err("no such program");
+        assert_eq!(tokio_error.kind(), io::ErrorKind::NotFound, "{tokio_error}");
+    }
 
     #[test]
     fn a_spawned_pid_is_never_reaped_and_an_adopted_one_always_is() {
