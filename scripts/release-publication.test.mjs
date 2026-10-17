@@ -1175,6 +1175,30 @@ test("only finalize writes :<version> to GHCR, and nothing writes :latest or :X.
   assert.doesNotMatch(code, /:latest\b|type=raw,value=latest|major\}\}\.\{\{minor|pattern=\{\{/);
 });
 
+test("every image a job starts or builds with is pinned by digest", () => {
+  const PINNED = /^[a-z0-9][a-z0-9./-]*(:[\w.-]+)?@sha256:[0-9a-f]{64}$/;
+  const started = [];
+  for (const [name, definition] of Object.entries(releaseJobs))
+    for (const entry of definition.steps ?? []) {
+      for (const line of (entry.run ?? "").replace(/\\\n\s*/g, " ").split("\n")) {
+        const run = /\bdocker run\b(.*)$/.exec(line);
+        if (run) started.push({ at: name, image: run[1].trim().split(/\s+/).at(-1) });
+      }
+      const driver = /(?:^|,)image=([^,\s]+)/.exec(entry.with?.["driver-opts"] ?? "");
+      if (entry.uses?.startsWith("docker/setup-buildx-action@"))
+        started.push({ at: name, image: driver?.[1] ?? "<the action's unpinned default>" });
+    }
+  for (const { at, image } of started) assert.match(image, PINNED, `${at} starts ${image}`);
+  // The dry run's loopback registry is one of them.
+  assert.deepEqual(
+    started.filter(({ image }) => image.startsWith("registry:")).map(({ at }) => at),
+    ["archive-merge"],
+  );
+  // The guard refuses what was there before, and a tag-only or digest-less reference.
+  for (const image of ["registry:2", "registry", "registry:2@sha256:abc", "moby/buildkit:v0.33.1"])
+    assert.doesNotMatch(image, PINNED, image);
+});
+
 test("finalize waits for the identity checks on both arches, and npm for finalize and pack", () => {
   const above = (name, seen = new Set()) => {
     for (const need of [releaseJobs[name].needs ?? []].flat())
