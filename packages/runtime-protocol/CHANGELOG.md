@@ -5,10 +5,10 @@
 <!-- Written by hand, with no changeset: `changeset version` puts the next release's section
 above this one, so the Version PR moves these lines into it. -->
 
-- The capture ship worker no longer runs a pass when its wait returns spuriously. It ships when a
-  snap, a repair, a final flush or `stop` wakes it, or when its 5 s tick comes, as before. A pass
-  is never later than it could be before (at most one tick after the previous one ends, with
-  nothing waking it); only passes nothing asked for are gone (#182).
+- The capture ship worker no longer runs a pass when its wait returns spuriously. A snap, a repair
+  or a final flush that stages a capture wakes it to ship, and `stop` wakes it to exit, as before.
+  The tick deadline is unchanged: with nothing waking it, the next pass is due 5 s after the
+  previous one. Only the early passes nothing asked for are gone (#182).
 
 ## 0.19.0
 

@@ -1078,6 +1078,7 @@ dependencies = [
  "ring",
  "rustls",
  "rustls-pemfile",
+ "sealant-capture",
  "sealant-process",
  "serde",
  "serde_json",

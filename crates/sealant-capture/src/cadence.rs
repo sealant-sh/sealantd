@@ -351,7 +351,7 @@ pub struct CadenceSnapshot {
 }
 
 struct Shared {
-    /// Where the timers and the ship worker's tick read the time ([`crate::CaptureConfig::clock`]).
+    /// Where the timers and the ship worker's tick read the time: the real clock, or a test's.
     clock: Clock,
     engine: Mutex<CaptureEngine>,
     staging: Arc<Staging>,
@@ -867,7 +867,7 @@ impl CadenceRunner {
         let staging = engine.staging();
         let aliases = engine.aliases();
         let invalidations = engine.invalidations();
-        let clock = config.clock.clone();
+        let clock = config.clock();
         let now = clock.now();
         let runner = Self {
             shared: Arc::new(Shared {
