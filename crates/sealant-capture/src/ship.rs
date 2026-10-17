@@ -10,13 +10,17 @@
 //! parts in flight, whose threads' CPU is charged to the same cycle (network waits are not).
 //! Smaller objects go up [`DEFAULT_UPLOADS_IN_FLIGHT`] at a time, a batch of URLs minted in one
 //! channel call ahead of their PUTs; their threads' CPU is charged to the cycle as well.
+//!
+//! When the shipper gives up or asks again (a flush's deadline, the cutoff, every backoff and the
+//! waits between passes) it reads its [`Clock`]: the real clock, or a test's
+//! ([`Shipper::with_clock`]). How fast an upload runs, and the duty cycle, stay on the real clock.
 
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -1175,6 +1179,30 @@ struct Pass {
     repair: Option<u64>,
 }
 
+/// The lock a pass holds ([`Shipper::take_pass`]): waited for through the shipper's clock, so a
+/// thread waiting for it while the pass sleeps on that clock (a backoff, under a manual clock a
+/// slow store) counts as waiting, not running.
+#[derive(Debug, Default)]
+struct PassLock {
+    /// A pass holds it.
+    held: Mutex<bool>,
+    /// It was let go.
+    freed: Condvar,
+}
+
+/// A pass's hold on [`PassLock`]: let go (and its waiters woken) when it drops.
+struct PassGuard<'a> {
+    shipper: &'a Shipper,
+}
+
+impl Drop for PassGuard<'_> {
+    fn drop(&mut self) {
+        let pass = &self.shipper.pass;
+        *lock(&pass.held) = false;
+        self.shipper.clock.notify_all(&pass.freed);
+    }
+}
+
 /// Uploads staged captures oldest-first and registers each, one pass at a time.
 pub struct Shipper {
     staging: Arc<Staging>,
@@ -1185,11 +1213,13 @@ pub struct Shipper {
     multipart: MultipartConfig,
     /// Single-PUT uploads in flight at once.
     uploads_in_flight: usize,
+    /// Where its deadlines, its backoffs and its waits read the time ([`Self::with_clock`]).
+    clock: Clock,
     /// Held by a pass. Two passes over one queue raced for the same objects: each consumed PUT
     /// URLs the other had minted, the loser minted one key per call, and the registrar's
     /// `upload.urls` call quota ran out (observed: `no url for …/trees/<sha>` after a flush ran
     /// beside the worker through an 800 MB bulk upload).
-    pass: Mutex<()>,
+    pass: PassLock,
     /// Flushes waiting for the pass; the worker's bulk upload yields to them.
     waiting: AtomicUsize,
     /// Per class, the capture held for the byte quota and when to ask again.
@@ -1271,7 +1301,8 @@ impl Shipper {
             retry: RetryPolicy::default(),
             multipart: MultipartConfig::DEFAULT,
             uploads_in_flight: DEFAULT_UPLOADS_IN_FLIGHT,
-            pass: Mutex::new(()),
+            clock: Clock::real(),
+            pass: PassLock::default(),
             waiting: AtomicUsize::new(0),
             held: Mutex::new([None, None]),
             hold_backoff: HOLD_BACKOFF,
@@ -1332,6 +1363,7 @@ impl Shipper {
         req: &RegisterRequest,
         until: Option<Instant>,
     ) -> Result<(), String> {
+        let _entered = self.clock.enter();
         let describe = |answer: &SealAnswer| {
             let reason = answer.reason.as_deref().unwrap_or("no reason given");
             match answer.state {
@@ -1377,8 +1409,8 @@ impl Shipper {
                 }
                 let wait = self.backoff(asks);
                 match self.bound(until) {
-                    Some(at) if Instant::now() + wait >= at => return Err(why),
-                    _ => thread::sleep(wait),
+                    Some(at) if self.clock.now() + wait >= at => return Err(why),
+                    _ => self.clock.sleep(wait),
                 }
             }
             asks += 1;
@@ -1424,6 +1456,15 @@ impl Shipper {
         self
     }
 
+    /// Where its deadlines, its backoffs and its waits read the time: the real clock unless a
+    /// test gives it its manual one ([`crate::CaptureConfig::clock`], which
+    /// [`crate::CaptureEngine::shipper`] passes on).
+    #[must_use]
+    pub fn with_clock(mut self, clock: Clock) -> Self {
+        self.clock = clock;
+        self
+    }
+
     /// CPU budget as a fraction of one core.
     #[must_use]
     pub fn with_cpu_fraction(mut self, fraction: f64) -> Self {
@@ -1461,9 +1502,10 @@ impl Shipper {
         self
     }
 
-    /// No flush ships past `at` from now on, whatever deadline its caller gave, and one running
-    /// returns once it passes (between objects): the daemon's shutdown deadline, after which it
-    /// exits with what is left still staged. The earliest cutoff set holds.
+    /// No flush ships past `at` (on the shipper's clock) from now on, whatever deadline its caller
+    /// gave, and one running returns once it passes (between objects): the daemon's shutdown
+    /// deadline, after which it exits with what is left still staged. The earliest cutoff set
+    /// holds.
     pub fn set_cutoff(&self, at: Instant) {
         let mut cutoff = lock(&self.cutoff);
         *cutoff = Some(cutoff.map_or(at, |c| c.min(at)));
@@ -1471,16 +1513,17 @@ impl Shipper {
 
     /// Whether the cutoff passed: retries stop, and what is left stays staged.
     fn cut_off(&self) -> bool {
-        lock(&self.cutoff).is_some_and(|c| Instant::now() >= c)
+        lock(&self.cutoff).is_some_and(|c| self.clock.now() >= c)
     }
 
     /// Sleep `wait` between retries, or until the cutoff when that comes first.
     fn retry_sleep(&self, wait: Duration) {
-        let wait = match *lock(&self.cutoff) {
-            Some(c) => wait.min(c.saturating_duration_since(Instant::now())),
+        let cutoff = *lock(&self.cutoff);
+        let wait = match cutoff {
+            Some(c) => wait.min(c.saturating_duration_since(self.clock.now())),
             None => wait,
         };
-        thread::sleep(wait);
+        self.clock.sleep(wait);
     }
 
     /// `until`, or the cutoff when that comes first.
@@ -1499,7 +1542,7 @@ impl Shipper {
         let wait = first
             .saturating_mul(1u32 << (outage.0 - 1).min(16))
             .min(max);
-        outage.1 = Some(Instant::now() + wait);
+        outage.1 = Some(self.clock.now() + wait);
         let passes = outage.0;
         drop(outage);
         tracing::warn!(
@@ -1512,7 +1555,7 @@ impl Shipper {
 
     /// When shipping asks again after a failed pass, while that is still ahead.
     fn outage_retry_at(&self) -> Option<Instant> {
-        lock(&self.outage).1.filter(|at| Instant::now() < *at)
+        lock(&self.outage).1.filter(|at| self.clock.now() < *at)
     }
 
     /// The registrar answered that the lease is not live: pause shipping until the backoff
@@ -1523,7 +1566,7 @@ impl Shipper {
         lease.0 += 1;
         let (first, max) = self.lease_backoff;
         let wait = first.saturating_mul(1u32 << (lease.0 - 1).min(16)).min(max);
-        lease.1 = Some(Instant::now() + wait);
+        lease.1 = Some(self.clock.now() + wait);
         let answers = lease.0;
         drop(lease);
         self.status.lease_lost.store(true, Ordering::Relaxed);
@@ -1552,7 +1595,7 @@ impl Shipper {
 
     /// When shipping asks again after a lease-lost answer, while that is still ahead.
     fn lease_retry_at(&self) -> Option<Instant> {
-        lock(&self.lease).1.filter(|at| Instant::now() < *at)
+        lock(&self.lease).1.filter(|at| self.clock.now() < *at)
     }
 
     /// The captures held for the byte quota, per class: queued with their bytes, asked for
@@ -1651,7 +1694,7 @@ impl Shipper {
     fn held_back(&self, entry: &QueueEntry) -> bool {
         lock(&self.held)[class_slot(entry.class)]
             .as_ref()
-            .is_some_and(|h| Instant::now() < h.retry_at)
+            .is_some_and(|h| self.clock.now() < h.retry_at)
     }
 
     /// Whether shipping is fenced.
@@ -1894,12 +1937,19 @@ impl Shipper {
         let halt = AtomicBool::new(false);
         let stopped: Mutex<Option<Stop>> = Mutex::new(None);
         let failed: Mutex<Option<ShipError>> = Mutex::new(None);
+        // Workers done, counted as each returns (or unwinds); the owner waits for them through
+        // the clock, which counts each of them until it returns, and then the scope joins them.
+        let done = (Mutex::new(0usize), Condvar::new());
         // The owner only waits while the workers run: its CPU clock stands still.
         let own_cpu = thread_cpu();
         let cycle = Mutex::new(cycle);
         thread::scope(|scope| {
             for _ in 0..workers {
-                scope.spawn(|| {
+                self.clock.spawn_scoped(scope, || {
+                    let _done = Done {
+                        done: &done,
+                        clock: &self.clock,
+                    };
                     while !halt.load(Ordering::SeqCst) {
                         if let Some(why) = stop() {
                             lock(&stopped).get_or_insert(why);
@@ -1931,6 +1981,10 @@ impl Shipper {
                         }
                     }
                 });
+            }
+            let mut finished = lock(&done.0);
+            while *finished < workers {
+                finished = self.clock.wait_until(&done.1, finished, None);
             }
         });
         if let Some(error) = lock(&failed).take() {
@@ -2080,6 +2134,7 @@ impl Shipper {
     /// capture's objects go up unclaimed: when a capture is staged ahead of it meanwhile, the
     /// pass ships that one first and then resumes the bulk upload where it stopped.
     pub fn ship_pending(&self) -> Result<usize, ShipError> {
+        let _entered = self.clock.enter();
         Ok(self.pass(Scope::All, None, false)?.shipped)
     }
 
@@ -2110,6 +2165,29 @@ impl Shipper {
         result
     }
 
+    /// Take the pass lock, waiting through the clock. `flushing`: counted as waiting meanwhile.
+    ///
+    /// A waiting flush takes the lock first. The worker's bulk upload yields to it and comes
+    /// straight back for the lock, and the lock is not fair: the worker, still on its core, took
+    /// it again before the woken flush ran, yielded again, and so on — a thousand times in half a
+    /// second here, and on arm64 CI a suspend flush beside a 5 s bulk upload waited 5 to 19 s. The
+    /// flush counts itself out of `waiting` once it holds the lock; the worker waits while a flush
+    /// waits, and then behind it.
+    fn take_pass(&self, flushing: bool) -> PassGuard<'_> {
+        if flushing {
+            self.waiting.fetch_add(1, Ordering::SeqCst);
+        }
+        let mut held = lock(&self.pass.held);
+        while *held || (!flushing && self.waiting.load(Ordering::SeqCst) > 0) {
+            held = self.clock.wait_until(&self.pass.freed, held, None);
+        }
+        *held = true;
+        if flushing {
+            self.waiting.fetch_sub(1, Ordering::SeqCst);
+        }
+        PassGuard { shipper: self }
+    }
+
     /// [`Self::pass`] itself.
     fn pass_once(
         &self,
@@ -2117,24 +2195,7 @@ impl Shipper {
         deadline: Option<Instant>,
         flushing: bool,
     ) -> Result<Pass, ShipError> {
-        let guard = if flushing {
-            self.waiting.fetch_add(1, Ordering::SeqCst);
-            let guard = self.pass.lock();
-            self.waiting.fetch_sub(1, Ordering::SeqCst);
-            guard
-        } else {
-            // A waiting flush takes the lock first. The worker's bulk upload yields to it and
-            // comes straight back for the lock, and the lock is not fair: the worker, still on
-            // its core, took it again before the woken flush ran, yielded again, and so on — a
-            // thousand times in half a second here, and on arm64 CI a suspend flush beside a
-            // 5 s bulk upload waited 5 to 19 s. The flush counts itself out of `waiting` once
-            // it holds the lock; the worker then waits on the lock behind it.
-            while self.waiting.load(Ordering::SeqCst) > 0 {
-                thread::sleep(Duration::from_millis(1));
-            }
-            self.pass.lock()
-        };
-        let _pass = guard.unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _pass = self.take_pass(flushing);
         let mut pass = Pass::default();
         if self.is_fenced() {
             pass.done = true;
@@ -2155,7 +2216,7 @@ impl Shipper {
             return Ok(pass);
         }
         let past =
-            |deadline: Option<Instant>| self.bound(deadline).is_some_and(|d| Instant::now() >= d);
+            |deadline: Option<Instant>| self.bound(deadline).is_some_and(|d| self.clock.now() >= d);
         let mut cycle = DutyCycle::new(self.cpu_fraction);
         loop {
             let pending = self.staging.pending()?;
@@ -2340,7 +2401,7 @@ impl Shipper {
             used,
             requested,
             refusals,
-            retry_at: Instant::now() + wait,
+            retry_at: self.clock.now() + wait,
         });
         drop(held);
         self.status
@@ -2392,11 +2453,12 @@ impl Shipper {
     /// # Errors
     /// See above.
     pub fn flush_final(&self, deadline: Option<Duration>) -> Result<usize, ShipError> {
-        let until = deadline.map(|d| Instant::now() + d);
-        let past = || self.bound(until).is_some_and(|u| Instant::now() >= u);
+        let _entered = self.clock.enter();
+        let until = deadline.map(|d| self.clock.now() + d);
+        let past = || self.bound(until).is_some_and(|u| self.clock.now() >= u);
         let left = || {
             self.bound(until).map_or(Duration::MAX, |u| {
-                u.saturating_duration_since(Instant::now())
+                u.saturating_duration_since(self.clock.now())
             })
         };
         let pending = || {
@@ -2432,7 +2494,7 @@ impl Shipper {
                     // Held for the byte quota, paused on a lost lease, or a claim lost to a
                     // coalescing snap: wait for the nearest backoff (a second at a time, so a
                     // snap staged meanwhile ships).
-                    thread::sleep(self.idle_wait().min(left()));
+                    self.clock.sleep(self.idle_wait().min(left()));
                 }
                 Err(e @ (ShipError::Fenced(_) | ShipError::Conflict(_))) => return Err(e),
                 Err(error) => {
@@ -2445,7 +2507,7 @@ impl Shipper {
                     failures += 1;
                     let wait = self.backoff(failures.min(10));
                     tracing::warn!(%error, failures, "final flush: shipping failed; retrying");
-                    thread::sleep(wait.min(left()));
+                    self.clock.sleep(wait.min(left()));
                 }
             }
         }
@@ -2454,7 +2516,7 @@ impl Shipper {
     /// How long a flush waits when a pass moved nothing: until the nearest held capture or
     /// lease-lost backoff runs out, a second at most, 10 ms at least.
     fn idle_wait(&self) -> Duration {
-        let now = Instant::now();
+        let now = self.clock.now();
         self.held()
             .iter()
             .map(|h| h.retry_at)
@@ -2467,11 +2529,12 @@ impl Shipper {
     }
 
     fn flush_scope(&self, scope: Scope, deadline: Option<Duration>) -> Result<usize, ShipError> {
-        let until = deadline.map(|d| Instant::now() + d);
-        let past = || self.bound(until).is_some_and(|u| Instant::now() >= u);
+        let _entered = self.clock.enter();
+        let until = deadline.map(|d| self.clock.now() + d);
+        let past = || self.bound(until).is_some_and(|u| self.clock.now() >= u);
         let left = || {
             self.bound(until).map_or(Duration::MAX, |u| {
-                u.saturating_duration_since(Instant::now())
+                u.saturating_duration_since(self.clock.now())
             })
         };
         let mut total = 0;
@@ -2485,7 +2548,7 @@ impl Shipper {
                     if pass.shipped == 0 && !past() {
                         // Nothing moved (a claim lost to a coalescing snap, a held capture, a
                         // lost lease): not a hot loop.
-                        thread::sleep(self.idle_wait().min(left()));
+                        self.clock.sleep(self.idle_wait().min(left()));
                     }
                 }
                 Err(ShipError::Fenced(e)) => return Err(ShipError::Fenced(e)),
@@ -2494,7 +2557,7 @@ impl Shipper {
                     if past() {
                         return Err(e);
                     }
-                    thread::sleep(self.retry.backoff.min(left()));
+                    self.clock.sleep(self.retry.backoff.min(left()));
                 }
             }
             if past() {
@@ -2574,6 +2637,20 @@ impl Drop for ShipWorker {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         self.wake();
+    }
+}
+
+/// Counts an upload worker done when it drops, as it returns or unwinds, and wakes the thread
+/// waiting for the batch ([`Shipper::upload_batch`]).
+struct Done<'a> {
+    done: &'a (Mutex<usize>, Condvar),
+    clock: &'a Clock,
+}
+
+impl Drop for Done<'_> {
+    fn drop(&mut self) {
+        *lock(&self.done.0) += 1;
+        self.clock.notify_all(&self.done.1);
     }
 }
 

@@ -181,8 +181,9 @@ pub struct CaptureConfig {
     pub cadence: Cadence,
     /// How the cadence learns about changes.
     pub watch: WatchPolicy,
-    /// Where the cadence's timers and the ship worker's tick read the time: real by default;
-    /// a test's [`crate::clock::ManualClock`] holds each timer to its period in virtual time.
+    /// Where the cadence's timers, the ship worker's tick, a flush's deadline and the shipper's
+    /// backoffs read the time: real by default; a test's [`crate::clock::ManualClock`] holds
+    /// each to its length in virtual time.
     /// Test support only: without the feature there is no field, and the clock is real.
     #[cfg(feature = "test-support")]
     pub clock: crate::clock::Clock,
@@ -245,15 +246,15 @@ pub struct CaptureConfig {
 pub const PER_REPOSITORY_FEATURES: [&str; 3] = ["object_format", "ref_format", "wide_times"];
 
 impl CaptureConfig {
-    /// The clock the cadence and the ship worker read: the one a test set in the `clock`
-    /// field (`test-support`).
+    /// The clock the cadence, its flushes and the shipper read: the one a test set in the
+    /// `clock` field (`test-support`).
     #[cfg(feature = "test-support")]
     pub(crate) fn clock(&self) -> crate::clock::Clock {
         self.clock.clone()
     }
 
-    /// The clock the cadence and the ship worker read: the real one, the only one without
-    /// `test-support`.
+    /// The clock the cadence, its flushes and the shipper read: the real one, the only one
+    /// without `test-support`.
     #[cfg(not(feature = "test-support"))]
     #[allow(clippy::unused_self)]
     pub(crate) fn clock(&self) -> crate::clock::Clock {
@@ -1536,6 +1537,7 @@ impl CaptureEngine {
     #[must_use]
     pub fn shipper(&self, sink: Arc<dyn BlobSink>, registrar: Arc<dyn Registrar>) -> Shipper {
         Shipper::new(self.staging(), sink, registrar)
+            .with_clock(self.config.clock())
             .with_cpu_fraction(self.config.cpu_fraction)
             .with_multipart(self.config.multipart)
             .with_uploads_in_flight(self.config.uploads_in_flight)
