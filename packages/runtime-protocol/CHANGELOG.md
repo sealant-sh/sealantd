@@ -1,5 +1,15 @@
 # @sealant/runtime-protocol
 
+## Unreleased
+
+<!-- Written by hand, with no changeset: `changeset version` puts the next release's section
+above this one, so the Version PR moves these lines into it. -->
+
+- The capture ship worker no longer runs a pass when its wait returns spuriously. It ships when a
+  snap, a repair, a final flush or `stop` wakes it, or when its 5 s tick comes, as before. A pass
+  is never later than it could be before (at most one tick after the previous one ends, with
+  nothing waking it); only passes nothing asked for are gone (#182).
+
 ## 0.19.0
 
 ### Minor Changes
