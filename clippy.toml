@@ -1,0 +1,12 @@
+# Every process sealantd starts goes through the spawn gate (crates/sealant-process/src/spawn.rs):
+# the orphan reaper reaps any exited child whose pid the gate does not hold, so an ungated child's
+# own wait() fails with ECHILD (sealantd#178). A `Child` only comes from `spawn`, so banning the
+# three terminators bans every ungated child; its `wait` needs no ban of its own.
+disallowed-methods = [
+  { path = "std::process::Command::spawn", reason = "spawn through sealant_process::spawn (CommandGateExt::spawn_gated, spawn_std): the orphan reaper steals ungated children's exit status (spawn.rs, sealantd#178)" },
+  { path = "std::process::Command::output", reason = "spawn through sealant_process::spawn (CommandGateExt::output_gated): the orphan reaper steals ungated children's exit status (spawn.rs, sealantd#178)" },
+  { path = "std::process::Command::status", reason = "spawn through sealant_process::spawn (CommandGateExt::status_gated): the orphan reaper steals ungated children's exit status (spawn.rs, sealantd#178)" },
+  { path = "tokio::process::Command::spawn", reason = "spawn through sealant_process::spawn::spawn_tokio: the orphan reaper steals ungated children's exit status (spawn.rs, sealantd#178)" },
+  { path = "tokio::process::Command::output", reason = "spawn through sealant_process::spawn::spawn_tokio: the orphan reaper steals ungated children's exit status (spawn.rs, sealantd#178)" },
+  { path = "tokio::process::Command::status", reason = "spawn through sealant_process::spawn::spawn_tokio: the orphan reaper steals ungated children's exit status (spawn.rs, sealantd#178)" },
+]

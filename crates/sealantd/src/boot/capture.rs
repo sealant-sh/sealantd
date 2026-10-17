@@ -638,6 +638,7 @@ pub(crate) fn prepare_shared_group(
 
 #[cfg(test)]
 mod tests {
+    use sealant_process::CommandGateExt;
     use std::path::Path;
     use std::process::Command as Proc;
 
@@ -657,7 +658,8 @@ mod tests {
             .current_dir(root)
             .env("GIT_OPTIONAL_LOCKS", "0")
             .args(args)
-            .output()
+            .stdin(std::process::Stdio::null())
+            .output_gated()
             .expect("git");
         assert!(out.status.success(), "git {args:?}");
     }
@@ -1066,7 +1068,8 @@ mod tests {
             .arg("-C")
             .arg(&tree)
             .arg(".")
-            .output()
+            .stdin(std::process::Stdio::null())
+            .output_gated()
             .expect("tar -czf");
         assert!(out.status.success(), "tar -czf");
         let bytes = std::fs::read(&archive).unwrap();
@@ -1291,7 +1294,8 @@ mod tests {
         let out = Proc::new("git")
             .current_dir(dir)
             .args(["remote", "get-url", "origin"])
-            .output()
+            .stdin(std::process::Stdio::null())
+            .output_gated()
             .unwrap();
         String::from_utf8(out.stdout).unwrap().trim().to_owned()
     }
@@ -1406,7 +1410,8 @@ mod tests {
             !Proc::new("git")
                 .current_dir(&ws)
                 .args(["remote", "get-url", "upstream"])
-                .output()
+                .stdin(std::process::Stdio::null())
+                .output_gated()
                 .unwrap()
                 .status
                 .success()
@@ -1428,7 +1433,8 @@ mod tests {
             !Proc::new("git")
                 .current_dir(&fresh)
                 .args(["remote", "get-url", "upstream"])
-                .output()
+                .stdin(std::process::Stdio::null())
+                .output_gated()
                 .unwrap()
                 .status
                 .success(),
@@ -1454,7 +1460,8 @@ mod tests {
             Proc::new("git")
                 .current_dir(dir)
                 .args(["remote", "get-url", "origin"])
-                .output()
+                .stdin(std::process::Stdio::null())
+                .output_gated()
                 .unwrap()
                 .status
                 .success()

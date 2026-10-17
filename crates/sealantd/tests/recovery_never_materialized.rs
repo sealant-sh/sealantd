@@ -6,8 +6,9 @@
 //! run). A disk with anything on it still exits 75: the recovery goes on, and here cannot save
 //! it (no session token).
 
+use sealant_process::CommandGateExt;
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 
 fn recover(base: &Path, disk: &Path) -> Output {
     Command::new(env!("CARGO_BIN_EXE_sealantd"))
@@ -25,7 +26,8 @@ fn recover(base: &Path, disk: &Path) -> Output {
             "echo harness > harness-ran.txt",
         )
         .env("PATH", std::env::var("PATH").unwrap_or_default())
-        .output()
+        .stdin(Stdio::null())
+        .output_gated()
         .expect("sealantd boot --recovery")
 }
 

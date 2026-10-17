@@ -11,7 +11,7 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 
 use sealant_capture::gitpack::{self, GitRepo};
@@ -27,13 +27,15 @@ use sealant_capture::{
     CaptureConfig, CaptureEngine, Class, InMemoryRegistrar, LocalDir, MaterializeClass,
     MaterializeTargets, Materializer, SnapRequest,
 };
+use sealant_process::CommandGateExt;
 
 fn git(root: &Path, args: &[&str]) -> String {
     let out = Command::new("git")
         .current_dir(root)
         .env("GIT_OPTIONAL_LOCKS", "0")
         .args(args)
-        .output()
+        .stdin(Stdio::null())
+        .output_gated()
         .expect("git");
     assert!(
         out.status.success(),
@@ -48,7 +50,8 @@ fn git_ok(root: &Path, args: &[&str]) -> bool {
         .current_dir(root)
         .env("GIT_OPTIONAL_LOCKS", "0")
         .args(args)
-        .output()
+        .stdin(Stdio::null())
+        .output_gated()
         .is_ok_and(|o| o.status.success())
 }
 

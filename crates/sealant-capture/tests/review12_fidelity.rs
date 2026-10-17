@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -27,6 +27,7 @@ use sealant_capture::{
     CadenceRunner, CaptureConfig, CaptureEngine, InMemoryRegistrar, LocalDir, MaterializeClass,
     MaterializeTargets, Materializer, Registrar,
 };
+use sealant_process::CommandGateExt;
 
 const EXECUTOR: &str = "exec-r12";
 
@@ -35,7 +36,8 @@ fn git_out(root: &Path, args: &[&str]) -> Output {
         .current_dir(root)
         .env("GIT_OPTIONAL_LOCKS", "0")
         .args(args)
-        .output()
+        .stdin(Stdio::null())
+        .output_gated()
         .expect("git")
 }
 
@@ -361,7 +363,8 @@ fn pnpm_available() -> bool {
     ["node", "pnpm"].iter().all(|tool| {
         Command::new(tool)
             .arg("--version")
-            .output()
+            .stdin(Stdio::null())
+            .output_gated()
             .is_ok_and(|o| o.status.success())
     })
 }
@@ -372,7 +375,8 @@ fn run_at(root: &Path, home: &Path, program: &str, args: &[&str]) -> Output {
         .args(args)
         .env("HOME", home)
         .env("npm_config_update_notifier", "false")
-        .output()
+        .stdin(Stdio::null())
+        .output_gated()
         .unwrap();
     assert!(
         output.status.success(),

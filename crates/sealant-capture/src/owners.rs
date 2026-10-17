@@ -31,7 +31,9 @@ use std::collections::BTreeMap;
 use std::io;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
+
+use sealant_process::CommandGateExt;
 
 use serde::{Deserialize, Serialize};
 
@@ -204,7 +206,8 @@ pub fn apply_default_acl(dirs: &[&Path], gid: u32) -> io::Result<()> {
         .arg("-m")
         .arg(format!("u::rwx,g::rwx,g:{gid}:rwx,m::rwx,o::rx"))
         .args(&present)
-        .output()?;
+        .stdin(Stdio::null())
+        .output_gated()?;
     if out.status.success() {
         Ok(())
     } else {

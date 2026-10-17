@@ -20,7 +20,7 @@ use std::fs;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, symlink};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -28,6 +28,7 @@ use sealant_capture::{
     CadenceRunner, CaptureConfig, CaptureEngine, CaptureKind, Class, InMemoryRegistrar, LocalDir,
     MaterializeClass, MaterializeReport, MaterializeTargets, Materializer, SnapRequest,
 };
+use sealant_process::CommandGateExt;
 
 const EXECUTOR: &str = "exec-r15";
 
@@ -40,7 +41,8 @@ fn git(root: &Path, args: &[&str]) -> String {
         .current_dir(root)
         .env("GIT_OPTIONAL_LOCKS", "0")
         .args(args)
-        .output()
+        .stdin(Stdio::null())
+        .output_gated()
         .expect("git");
     assert!(
         out.status.success(),
@@ -222,7 +224,8 @@ fn pnpm_available() -> bool {
     ["node", "pnpm"].iter().all(|tool| {
         Command::new(tool)
             .arg("--version")
-            .output()
+            .stdin(Stdio::null())
+            .output_gated()
             .is_ok_and(|o| o.status.success())
     })
 }
@@ -233,7 +236,8 @@ fn run_at(root: &Path, home: &Path, program: &str, args: &[&str]) -> Output {
         .args(args)
         .env("HOME", home)
         .env("npm_config_update_notifier", "false")
-        .output()
+        .stdin(Stdio::null())
+        .output_gated()
         .unwrap();
     assert!(
         output.status.success(),

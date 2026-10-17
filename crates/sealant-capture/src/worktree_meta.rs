@@ -1600,13 +1600,15 @@ pub fn set_mtime_nofollow(abs: &Path, mtime_ns: i128) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sealant_process::CommandGateExt;
 
     fn git(root: &Path, args: &[&str]) {
         let out = std::process::Command::new("git")
             .current_dir(root)
             .env("GIT_OPTIONAL_LOCKS", "0")
             .args(args)
-            .output()
+            .stdin(std::process::Stdio::null())
+            .output_gated()
             .unwrap();
         assert!(out.status.success(), "git {args:?}");
     }

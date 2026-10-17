@@ -848,6 +848,7 @@ impl CaptureRuntime {
 
 #[cfg(test)]
 mod tests {
+    use sealant_process::CommandGateExt;
     use std::path::Path;
     use std::process::Command as Proc;
     use std::time::Instant;
@@ -874,7 +875,8 @@ mod tests {
             .current_dir(root)
             .env("GIT_OPTIONAL_LOCKS", "0")
             .args(args)
-            .output()
+            .stdin(std::process::Stdio::null())
+            .output_gated()
             .expect("git");
         assert!(out.status.success(), "git {args:?}");
     }
@@ -1477,7 +1479,8 @@ mod tests {
         let out = Proc::new("git")
             .current_dir(&root)
             .args(["cat-file", "-p", &format!("{tree}:fresh.md")])
-            .output()
+            .stdin(std::process::Stdio::null())
+            .output_gated()
             .unwrap();
         assert_eq!(
             String::from_utf8_lossy(&out.stdout),
@@ -2197,7 +2200,8 @@ mod tests {
                     tree.as_os_str(),
                     ".".as_ref()
                 ])
-                .output()
+                .stdin(std::process::Stdio::null())
+                .output_gated()
                 .expect("tar -czf")
                 .status
                 .success()
@@ -2268,7 +2272,8 @@ mod tests {
             .arg("-C")
             .arg(&ws)
             .args(["remote", "get-url", "origin"])
-            .output()
+            .stdin(std::process::Stdio::null())
+            .output_gated()
             .expect("git remote get-url");
         assert_eq!(
             String::from_utf8_lossy(&origin.stdout).trim(),

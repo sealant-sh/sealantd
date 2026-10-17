@@ -16,7 +16,8 @@
 //! (or a dropped child that nobody will wait for) hands the pid back to the reaper.
 //!
 //! Spawning a child outside this gate is a bug: the reaper will eventually steal its exit status
-//! and the spawner's own `wait()` fails with `ECHILD` ("No child process").
+//! and the spawner's own `wait()` fails with `ECHILD` ("No child process"). The workspace's
+//! `clippy.toml` makes the bare `spawn`/`output`/`status` of both `Command`s a lint error.
 
 use std::collections::HashSet;
 use std::io::{self, Read, Write};
@@ -120,6 +121,10 @@ fn refuse_on_fs_user_thread() -> io::Result<()> {
 pub fn spawn_std(command: &mut Command) -> io::Result<(Child, SpawnedPid)> {
     refuse_on_fs_user_thread()?;
     let mut gate = lock_gate();
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the gate itself: the pid is registered under the lock it is spawned under"
+    )]
     let child = command.spawn()?;
     let guard = SpawnedPid::register(&mut gate, child.id() as i32);
     drop(gate);
@@ -137,6 +142,10 @@ pub fn spawn_tokio(
 ) -> io::Result<(tokio::process::Child, SpawnedPid)> {
     refuse_on_fs_user_thread()?;
     let mut gate = lock_gate();
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the gate itself: the pid is registered under the lock it is spawned under"
+    )]
     let child = command.spawn()?;
     let pid = child.id().map_or(-1, |p| p as i32);
     let guard = SpawnedPid::register(&mut gate, pid);

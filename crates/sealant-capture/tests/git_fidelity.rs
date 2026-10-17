@@ -10,20 +10,22 @@ use std::ffi::OsStr;
 use std::fs;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::sync::Arc;
 
 use sealant_capture::{
     CadenceRunner, CaptureConfig, CaptureEngine, InMemoryRegistrar, LocalDir, MaterializeClass,
     MaterializeTargets, Materializer,
 };
+use sealant_process::CommandGateExt;
 
 fn git_raw(root: &Path, args: &[&OsStr]) -> Output {
     let out = Command::new("git")
         .current_dir(root)
         .env("GIT_OPTIONAL_LOCKS", "0")
         .args(args)
-        .output()
+        .stdin(Stdio::null())
+        .output_gated()
         .expect("git");
     assert!(
         out.status.success(),
@@ -44,7 +46,8 @@ fn git_ok(root: &Path, args: &[&str]) -> bool {
         .current_dir(root)
         .env("GIT_OPTIONAL_LOCKS", "0")
         .args(args)
-        .output()
+        .stdin(Stdio::null())
+        .output_gated()
         .expect("git")
         .status
         .success()
@@ -601,16 +604,9 @@ fn ambiguous_prefix(root: &Path) -> String {
         .args(["hash-object", "-w", "--stdin-paths"])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .spawn()
-        .and_then(|mut child| {
-            use std::io::Write;
-            // From another thread: the ids fill the pipe before the paths are all written.
-            let mut stdin = child.stdin.take().unwrap();
-            let writer = std::thread::spawn(move || stdin.write_all(paths.as_bytes()));
-            let out = child.wait_with_output();
-            writer.join().unwrap()?;
-            out
-        })
+        .spawn_gated()
+        // Written from another thread: the ids fill the pipe before the paths are all written.
+        .and_then(|child| child.communicate(Some(paths.into_bytes())))
         .unwrap();
     fs::remove_dir_all(&dir).unwrap();
     let mut seen = std::collections::HashSet::new();

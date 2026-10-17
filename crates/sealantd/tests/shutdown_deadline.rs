@@ -21,6 +21,7 @@ use sealant_capture::sink::{BlobSource, PutOutcome, SinkError};
 use sealant_capture::{
     BlobSink, CaptureConfig, CaptureEngine, InMemoryRegistrar, LocalDir, Registrar,
 };
+use sealant_process::CommandGateExt;
 use sealantd::boot::capture::{CaptureBoot, SourceLayout};
 use sealantd::boot::config::{BootConfig, EnvSource};
 
@@ -40,7 +41,8 @@ fn git(root: &Path, args: &[&str]) {
         .current_dir(root)
         .env("GIT_OPTIONAL_LOCKS", "0")
         .args(args)
-        .output()
+        .stdin(std::process::Stdio::null())
+        .output_gated()
         .expect("git");
     assert!(out.status.success(), "git {args:?}");
 }

@@ -11,7 +11,7 @@ use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 
 use sealant_capture::owners::OwnerMap;
@@ -19,6 +19,7 @@ use sealant_capture::{
     CaptureConfig, CaptureEngine, CaptureKind, Class, InMemoryRegistrar, LocalDir,
     MaterializeClass, MaterializeReport, MaterializeTargets, Materializer, SnapRequest,
 };
+use sealant_process::CommandGateExt;
 
 const GID: u32 = 40000;
 const ALICE: u32 = 40012;
@@ -54,7 +55,8 @@ fn git(root: &Path, args: &[&str]) {
         .current_dir(root)
         .env("GIT_OPTIONAL_LOCKS", "0")
         .args(args)
-        .output()
+        .stdin(Stdio::null())
+        .output_gated()
         .expect("git");
     assert!(
         out.status.success(),
@@ -82,7 +84,7 @@ fn as_user(uid: u32, script: &str) -> bool {
         .gid(GID)
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
-        .status()
+        .status_gated()
         .unwrap()
         .success()
 }
@@ -376,7 +378,12 @@ fn the_default_acl_makes_new_files_group_writable() {
     if !root() {
         return;
     }
-    if Command::new("setfacl").arg("--version").output().is_err() {
+    if Command::new("setfacl")
+        .arg("--version")
+        .stdin(Stdio::null())
+        .output_gated()
+        .is_err()
+    {
         assert!(
             std::env::var("SEALANTD_REQUIRE_ROOT_TESTS").as_deref() != Ok("1"),
             "setfacl is required"
@@ -395,7 +402,7 @@ fn the_default_acl_makes_new_files_group_writable() {
             "umask 022 && mkdir {0}/d && echo x > {0}/d/f",
             root.display()
         ))
-        .status()
+        .status_gated()
         .unwrap();
     assert!(made.success());
     assert_eq!(stat(&root.join("d")).1, GID);
@@ -467,14 +474,16 @@ fn install_after_a_lockfile_change_as_a_person() {
                 bob_command(&format!("umask 0002; {script}"))
                     .env_clear()
                     .env("PATH", "/usr/local/bin:/usr/bin:/bin")
-                    .output()
+                    .stdin(Stdio::null())
+                    .output_gated()
                     .unwrap()
             } else {
                 Command::new("sh")
                     .arg("-c")
                     .arg(format!("umask 022; {script}"))
                     .env("PATH", "/usr/local/bin:/usr/bin:/bin")
-                    .output()
+                    .stdin(Stdio::null())
+                    .output_gated()
                     .unwrap()
             };
             let text = String::from_utf8_lossy(&out.stdout).into_owned();
@@ -517,7 +526,8 @@ fn install_after_a_lockfile_change_as_a_person() {
         ))
         .env_clear()
         .env("PATH", "/usr/local/bin:/usr/bin:/bin")
-        .output()
+        .stdin(Stdio::null())
+        .output_gated()
         .unwrap();
         let forced = String::from_utf8_lossy(&forced.stdout).into_owned();
         eprintln!("== {pm} forced, as a person:\n{forced}");
@@ -526,7 +536,8 @@ fn install_after_a_lockfile_change_as_a_person() {
             "{pm}: node_modules/.bin/semver runs: {}",
             Command::new(&bin)
                 .arg("--help")
-                .output()
+                .stdin(Stdio::null())
+                .output_gated()
                 .is_ok_and(|o| o.status.success())
         );
         let passed = ok && forced.trim_end().ends_with("exit=0");
@@ -552,14 +563,15 @@ fn person_user() {
         let has = |db: &str, key: u32| {
             Command::new("getent")
                 .args([db, &key.to_string()])
-                .output()
+                .stdin(Stdio::null())
+                .output_gated()
                 .is_ok_and(|o| o.status.success())
         };
         if !has("group", GID) {
             assert!(
                 Command::new("groupadd")
                     .args(["-g", &GID.to_string(), "mtestmend"])
-                    .status()
+                    .status_gated()
                     .unwrap()
                     .success()
             );
@@ -575,7 +587,7 @@ fn person_user() {
                         &GID.to_string(),
                         "mtestperson"
                     ])
-                    .status()
+                    .status_gated()
                     .unwrap()
                     .success()
             );

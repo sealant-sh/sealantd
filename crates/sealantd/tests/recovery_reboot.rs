@@ -41,7 +41,8 @@ fn git(root: &Path, args: &[&str]) {
         .current_dir(root)
         .env("GIT_OPTIONAL_LOCKS", "0")
         .args(args)
-        .output()
+        .stdin(Stdio::null())
+        .output_gated()
         .expect("git");
     assert!(out.status.success(), "git {args:?}");
 }

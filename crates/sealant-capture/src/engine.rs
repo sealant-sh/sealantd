@@ -147,10 +147,11 @@ fn musl_loader(root: &Path) -> bool {
 
 /// What `ldd --version` prints, both streams (musl's `ldd` prints its banner on stderr).
 fn ldd_version() -> Option<String> {
+    use sealant_process::CommandGateExt;
     let out = std::process::Command::new("ldd")
         .arg("--version")
         .stdin(std::process::Stdio::null())
-        .output()
+        .output_gated()
         .ok()?;
     let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
     text.push_str(&String::from_utf8_lossy(&out.stderr));
@@ -3572,13 +3573,15 @@ impl CaptureEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sealant_process::CommandGateExt;
 
     fn git(root: &Path, args: &[&str]) {
         let out = std::process::Command::new("git")
             .current_dir(root)
             .env("GIT_OPTIONAL_LOCKS", "0")
             .args(args)
-            .output()
+            .stdin(std::process::Stdio::null())
+            .output_gated()
             .unwrap();
         assert!(out.status.success(), "git {args:?}");
     }

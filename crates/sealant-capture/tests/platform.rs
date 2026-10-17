@@ -7,6 +7,7 @@ use std::fs;
 use std::path::Path;
 
 use sealant_capture::engine::{default_platform, platform_of};
+use sealant_process::CommandGateExt;
 
 fn host(libc: &str) -> String {
     format!("{}-{}-{libc}", std::env::consts::OS, std::env::consts::ARCH)
@@ -52,7 +53,8 @@ fn the_daemon_key_is_the_userland_of_its_root() {
     let expected = platform_of(Path::new("/"), || {
         std::process::Command::new("ldd")
             .arg("--version")
-            .output()
+            .stdin(std::process::Stdio::null())
+            .output_gated()
             .ok()
             .map(|o| {
                 let mut s = String::from_utf8_lossy(&o.stdout).into_owned();

@@ -1334,6 +1334,7 @@ fn run_checked(command: &mut Command, label: &str) -> Result<(), BootError> {
 
 #[cfg(test)]
 mod tests {
+    use sealant_process::CommandGateExt;
     use std::io::Write as _;
 
     use super::*;
@@ -1417,7 +1418,7 @@ mod tests {
                 .arg("-C")
                 .arg(source)
                 .arg(".")
-                .status()
+                .status_gated()
                 .expect("tar available");
             assert!(status.success());
         }
@@ -1679,7 +1680,7 @@ mod tests {
             .arg("-C")
             .arg(source.path())
             .arg(".")
-            .status()
+            .status_gated()
             .expect("tar available");
         assert!(status.success());
 
@@ -1694,7 +1695,7 @@ mod tests {
         let status = Command::new("tar")
             .args(args)
             .current_dir(dir)
-            .status()
+            .status_gated()
             .expect("tar available");
         assert!(status.success(), "tar {args:?}");
     }
@@ -1967,7 +1968,7 @@ mod tests {
             .arg("-c")
             .arg(&plain)
             .stdout(gz)
-            .status()
+            .status_gated()
             .expect("gzip");
         assert!(status.success());
         let err = unpack(&through, &work.path().join("into1"), &LIMITS).expect_err("refused");
@@ -1978,7 +1979,7 @@ mod tests {
         std::fs::create_dir_all(&fifo_src).expect("mkdir");
         let status = Command::new("mkfifo")
             .arg(fifo_src.join("pipe"))
-            .status()
+            .status_gated()
             .expect("mkfifo");
         assert!(status.success());
         let fifo = work.path().join("fifo.tar.gz");

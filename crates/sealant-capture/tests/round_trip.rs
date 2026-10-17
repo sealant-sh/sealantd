@@ -5,7 +5,7 @@ use std::fs;
 use std::io::Write;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -18,6 +18,7 @@ use sealant_capture::{
     CaptureConfig, CaptureEngine, CaptureKind, Class, InMemoryRegistrar, LocalDir,
     MaterializeClass, MaterializeTargets, Materializer, SnapRequest,
 };
+use sealant_process::CommandGateExt;
 
 /// `git status --porcelain` without the daemon directory (untracked in the fixture, and the
 /// materializer's cache lands there too).
@@ -34,7 +35,8 @@ fn git(root: &Path, args: &[&str]) -> String {
         .current_dir(root)
         .env("GIT_OPTIONAL_LOCKS", "0")
         .args(args)
-        .output()
+        .stdin(Stdio::null())
+        .output_gated()
         .expect("git");
     assert!(
         out.status.success(),
@@ -240,7 +242,12 @@ fn diff_r(a: &Path, b: &Path, excludes: &[&str]) -> String {
     for e in excludes {
         cmd.arg(format!("--exclude={e}"));
     }
-    let out = cmd.arg(a).arg(b).output().expect("diff");
+    let out = cmd
+        .arg(a)
+        .arg(b)
+        .stdin(Stdio::null())
+        .output_gated()
+        .expect("diff");
     String::from_utf8_lossy(&out.stdout).to_string()
 }
 
@@ -482,11 +489,13 @@ fn torn_writes_never_break_a_capture() {
                 let _ = Command::new("git")
                     .current_dir(&root)
                     .args(["add", "log.txt"])
-                    .output();
+                    .stdin(Stdio::null())
+                    .output_gated();
                 let _ = Command::new("git")
                     .current_dir(&root)
                     .args(["commit", "-q", "-m", &format!("c{i}")])
-                    .output();
+                    .stdin(Stdio::null())
+                    .output_gated();
                 i += 1;
                 std::thread::sleep(Duration::from_millis(3));
             }

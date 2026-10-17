@@ -19,6 +19,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use sealant_control::{handle_connection, read_frame, write_frame};
+use sealant_process::CommandGateExt;
 use sealant_protocol::{
     ClientMessage, Command, CommandResult, ControlRequest, ControlResponse, DotfilesApplyArgs,
     ExecArgs, OpenSessionArgs, OpenSftpArgs, RequestId, ResponseOutcome, ServerMessage,
@@ -73,7 +74,11 @@ fn ready() -> bool {
     USERS.call_once(|| {
         SudoersEntry::sweep();
         let run = |args: &[&str]| {
-            let out = Std::new(args[0]).args(&args[1..]).output().unwrap();
+            let out = Std::new(args[0])
+                .args(&args[1..])
+                .stdin(std::process::Stdio::null())
+                .output_gated()
+                .unwrap();
             let err = String::from_utf8_lossy(&out.stderr);
             assert!(
                 out.status.success() || err.contains("already exists"),
@@ -108,7 +113,8 @@ fn ready() -> bool {
         ]);
         let has_group = Std::new("getent")
             .args(["group", &PERSON_GID.to_string()])
-            .output()
+            .stdin(std::process::Stdio::null())
+            .output_gated()
             .is_ok_and(|o| o.status.success());
         if !has_group {
             run(&["groupadd", "-g", &PERSON_GID.to_string(), "mtestmend"]);
@@ -829,7 +835,7 @@ async fn dotfiles_apply_as_the_user_and_answer_before_install_sh_ends() {
             .arg("-C")
             .arg(&tree)
             .arg(".")
-            .status()
+            .status_gated()
             .unwrap()
             .success()
     );
@@ -957,7 +963,7 @@ fn pack_one(tree: &Path, archives: &Path, manager: &str, flags: &[&str], members
             .arg("-C")
             .arg(tree)
             .args(members)
-            .status()
+            .status_gated()
             .unwrap()
             .success()
     );
@@ -1066,7 +1072,7 @@ async fn a_person_s_link_into_another_home_takes_none_of_their_dotfiles() {
             .args(["-R", &format!("{CAT}:{GROUP}")])
             .arg(cat.join(".config"))
             .arg(cat.join(".local"))
-            .status()
+            .status_gated()
             .unwrap()
             .success()
     );
@@ -1141,7 +1147,8 @@ async fn a_person_s_stow_tree_links_from_their_own_tree() {
     }
     let stow = Std::new("sh")
         .args(["-c", "command -v stow"])
-        .output()
+        .stdin(std::process::Stdio::null())
+        .output_gated()
         .unwrap();
     if !stow.status.success() {
         eprintln!("SKIPPED: stow is not on PATH");
@@ -1497,7 +1504,7 @@ async fn a_person_s_dotfiles_commands_get_a_clean_environment() {
             .arg("-C")
             .arg(&tree)
             .arg(".")
-            .status()
+            .status_gated()
             .unwrap()
             .success()
     );
@@ -1623,7 +1630,12 @@ async fn pnpm_installs_as_a_second_person_in_a_restored_worktree() {
     if !ready() {
         return;
     }
-    if Std::new("pnpm").arg("--version").output().is_err() {
+    if Std::new("pnpm")
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .output_gated()
+        .is_err()
+    {
         panic!("pnpm is required for this test (scripts/ci-root-tests.sh installs it)");
     }
     let dir = scratch();
@@ -1632,7 +1644,8 @@ async fn pnpm_installs_as_a_second_person_in_a_restored_worktree() {
         let out = Std::new("git")
             .current_dir(root)
             .args(args)
-            .output()
+            .stdin(std::process::Stdio::null())
+            .output_gated()
             .unwrap();
         assert!(out.status.success(), "git {args:?}");
     };
@@ -1664,7 +1677,8 @@ async fn pnpm_installs_as_a_second_person_in_a_restored_worktree() {
     let root_install = Std::new("sh")
         .arg("-c")
         .arg(format!("umask 022; cd {} && {}", src.display(), pnpm("")))
-        .output()
+        .stdin(std::process::Stdio::null())
+        .output_gated()
         .unwrap();
     assert!(
         root_install.status.success(),
@@ -1896,7 +1910,7 @@ async fn the_image_s_person_environment_reaches_every_person_s_process_and_not_r
             .arg("-C")
             .arg(&tree)
             .arg(".")
-            .status()
+            .status_gated()
             .unwrap()
             .success()
     );

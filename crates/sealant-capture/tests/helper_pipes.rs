@@ -12,12 +12,13 @@
 
 use std::fs;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
 
 use sealant_capture::gitpack::GitRepo;
 use sealant_capture::{CaptureConfig, CaptureEngine, CaptureKind, Class, SnapRequest};
+use sealant_process::CommandGateExt;
 
 /// Far longer than any of these takes when git is read while it is fed.
 const BOUND: Duration = Duration::from_secs(120);
@@ -27,7 +28,8 @@ fn git(root: &Path, args: &[&str]) {
         .current_dir(root)
         .env("GIT_OPTIONAL_LOCKS", "0")
         .args(args)
-        .output()
+        .stdin(Stdio::null())
+        .output_gated()
         .expect("git");
     assert!(
         out.status.success(),
@@ -67,7 +69,8 @@ fn a_batch_check_larger_than_any_pipe_is_answered() {
         Command::new("git")
             .current_dir(&root)
             .args(["rev-parse", "HEAD"])
-            .output()
+            .stdin(Stdio::null())
+            .output_gated()
             .unwrap()
             .stdout,
     )

@@ -13,7 +13,7 @@ mod common;
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -25,13 +25,15 @@ use sealant_capture::{
     BlobSink, CaptureConfig, CaptureEngine, CaptureKind, Class, InMemoryRegistrar, LocalDir,
     MaterializeClass, MaterializeTargets, Materializer, PresignedHttp, Registrar, SnapRequest,
 };
+use sealant_process::CommandGateExt;
 
 fn git(root: &Path, args: &[&str]) {
     let out = Command::new("git")
         .current_dir(root)
         .env("GIT_OPTIONAL_LOCKS", "0")
         .args(args)
-        .output()
+        .stdin(Stdio::null())
+        .output_gated()
         .expect("git");
     assert!(
         out.status.success(),

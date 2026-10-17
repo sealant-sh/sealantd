@@ -23,6 +23,7 @@ use sealant_capture::{
     BlobSink, CaptureConfig, CaptureEngine, InMemoryRegistrar, LocalDir, Registrar,
 };
 use sealant_control::{read_frame, write_frame};
+use sealant_process::CommandGateExt;
 use sealant_protocol::{
     CaptureFlushKind, ClientMessage, Command, CommandResult, ControlRequest, EnvVar, ExecArgs,
     RequestId, ResponseOutcome, ServerMessage, decode_server, encode_client,
@@ -42,7 +43,8 @@ fn git(root: &Path, args: &[&str]) {
         .current_dir(root)
         .env("GIT_OPTIONAL_LOCKS", "0")
         .args(args)
-        .output()
+        .stdin(std::process::Stdio::null())
+        .output_gated()
         .expect("git");
     assert!(out.status.success(), "git {args:?}");
 }
@@ -119,7 +121,7 @@ impl Drop for Reap {
             let _ = Proc::new("kill")
                 .args(["-9", &pid.to_string()])
                 .stderr(std::process::Stdio::null())
-                .status();
+                .status_gated();
         }
     }
 }
@@ -155,7 +157,7 @@ fn orphan(script: &str, args: &[&Path], env: &[(&str, String)], pid_file: &Path)
     for (key, value) in env {
         cmd.env(key, value);
     }
-    assert!(cmd.status().unwrap().success());
+    assert!(cmd.status_gated().unwrap().success());
     std::fs::read_to_string(pid_file)
         .unwrap()
         .trim()

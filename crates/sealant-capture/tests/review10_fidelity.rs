@@ -25,27 +25,23 @@ use sealant_capture::{
     CadenceRunner, CaptureConfig, CaptureEngine, CaptureKind, Class, InMemoryRegistrar, LocalDir,
     MaterializeClass, MaterializeTargets, Materializer, SnapRequest,
 };
+use sealant_process::CommandGateExt;
 
 const EXECUTOR: &str = "exec-r10";
 
 fn git_out(root: &Path, args: &[&str], input: Option<&[u8]>) -> Output {
-    use std::io::Write;
     use std::process::Stdio;
-    let mut child = Command::new("git")
+    Command::new("git")
         .current_dir(root)
         .env("GIT_OPTIONAL_LOCKS", "0")
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
-        .expect("git");
-    let mut stdin = child.stdin.take().unwrap();
-    if let Some(input) = input {
-        stdin.write_all(input).unwrap();
-    }
-    drop(stdin);
-    child.wait_with_output().unwrap()
+        .spawn_gated()
+        .expect("git")
+        .communicate(input.map(<[u8]>::to_vec))
+        .unwrap()
 }
 
 fn git(root: &Path, args: &[&str]) -> String {
