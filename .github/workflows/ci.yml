@@ -127,8 +127,13 @@ jobs:
           node-version: 24
       # --ignore-scripts: never run dependency lifecycle scripts (untrusted on fork PRs).
       - run: pnpm install --frozen-lockfile --ignore-scripts
-      # The prerelease version next.yml publishes; the same script lives in Core and Mend.
-      - run: node --test scripts/next-version.test.mjs scripts/check-tarball.test.mjs scripts/republish.test.mjs scripts/next-tag.test.mjs scripts/ci-docs-only.test.mjs scripts/workflow-runners.test.mjs
+      # The prerelease version next.yml publishes (the same script lives in Core and Mend), and the
+      # steps release.yml and next.yml publish with, run against stand-ins.
+      - run: >-
+          node --test scripts/next-version.test.mjs scripts/check-tarball.test.mjs
+          scripts/republish.test.mjs scripts/next-tag.test.mjs scripts/ci-docs-only.test.mjs
+          scripts/workflow-runners.test.mjs scripts/release-manifest.test.mjs
+          scripts/release-publication.test.mjs scripts/release-overrides.test.mjs
       - run: pnpm -r build
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo build --locked -p sealantd # the TypeScript e2e spawns the daemon binary
