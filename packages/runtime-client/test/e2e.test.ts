@@ -9,11 +9,14 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { rmSync } from "node:fs";
 import { Buffer } from "node:buffer";
+import net from "node:net";
+import type { AddressInfo } from "node:net";
 import type { ChildProcess } from "node:child_process";
+import { setTimeout as delay } from "node:timers/promises";
 
 import { toJson } from "@bufbuild/protobuf";
 
-import { SealantClient, SealantError } from "@sealant/runtime-client";
+import { SealantClient, SealantError, openForwardConnection } from "@sealant/runtime-client";
 import {
   ControlErrorCode,
   EventEnvelopeSchema,
@@ -175,6 +178,123 @@ test("returns a typed control error for an unknown executable", async () => {
     );
     await client.shutdown(200);
   } finally {
+    client.close();
+    await waitExit(child);
+    rmSync(socketPath, { force: true });
+  }
+});
+
+async function producer(): Promise<{
+  port: number;
+  written: () => number;
+  closed: Promise<void>;
+  server: net.Server;
+}> {
+  let written = 0;
+  let onClosed!: () => void;
+  const closed = new Promise<void>((resolveClosed) => {
+    onClosed = resolveClosed;
+  });
+  const block = Buffer.alloc(64 * 1024, 0x5a);
+  const server = net.createServer((socket) => {
+    socket.on("error", () => {});
+    socket.on("close", onClosed);
+    const pump = () => {
+      let room = true;
+      while (room && !socket.destroyed) {
+        room = socket.write(block);
+        written += block.length;
+      }
+    };
+    socket.on("drain", pump);
+    pump();
+  });
+  await new Promise<void>((resolveListen) => server.listen(0, "127.0.0.1", resolveListen));
+  return {
+    port: (server.address() as AddressInfo).port,
+    written: () => written,
+    closed,
+    server,
+  };
+}
+
+async function plateau(read: () => number): Promise<number> {
+  let last = -1;
+  for (let steady = 0; steady < 4; ) {
+    await delay(250);
+    const now = read();
+    steady = now === last ? steady + 1 : 0;
+    last = now;
+  }
+  return last;
+}
+
+test("a forward connection holds back the target, and closes while paused", { timeout: 60000 }, async () => {
+  const socketPath = uniqueSocket();
+  const { client, child } = await SealantClient.spawn({ binPath, socketPath, workspace: tmpdir() });
+  const target = await producer();
+  const conn = net.createConnection(socketPath);
+  try {
+    const { channel } = await openForwardConnection(conn, {
+      host: "127.0.0.1",
+      port: target.port,
+      protocol: "tcp",
+      highWaterMarkBytes: 256 * 1024,
+    });
+
+    const stalled = await plateau(target.written);
+    assert.ok(stalled < 64 * 1024 * 1024, `the target wrote ${stalled} bytes with nothing read`);
+
+    let read = 0;
+    const iterator = channel[Symbol.asyncIterator]();
+    while (read < 8 * 1024 * 1024) {
+      const { value, done } = await iterator.next();
+      assert.equal(done, false);
+      read += value.byteLength;
+    }
+    const resumed = await plateau(target.written);
+    assert.ok(resumed > stalled, `the target wrote on once read (${stalled} then ${resumed})`);
+
+    channel.destroy();
+    assert.deepEqual(await channel.closed, { kind: "local" });
+    await Promise.race([
+      target.closed,
+      delay(5000).then(() => assert.fail("sealantd closed the target once the connection closed")),
+    ]);
+    assert.ok(conn.destroyed, "the connection is closed");
+
+    await client.shutdown(200);
+  } finally {
+    conn.destroy();
+    target.server.close();
+    client.close();
+    await waitExit(child);
+    rmSync(socketPath, { force: true });
+  }
+});
+
+test("a forward connection to nothing rejects with the daemon's error", { timeout: 20000 }, async () => {
+  const socketPath = uniqueSocket();
+  const { client, child } = await SealantClient.spawn({ binPath, socketPath, workspace: tmpdir() });
+  const reserved = net.createServer();
+  await new Promise<void>((resolveListen) => reserved.listen(0, "127.0.0.1", resolveListen));
+  const port = (reserved.address() as AddressInfo).port;
+  await new Promise<void>((resolveClose) => reserved.close(() => resolveClose()));
+  const conn = net.createConnection(socketPath);
+  try {
+    await assert.rejects(
+      openForwardConnection(conn, {
+        host: "127.0.0.1",
+        port,
+        protocol: "tcp",
+        highWaterMarkBytes: 64 * 1024,
+      }),
+      SealantError,
+    );
+    assert.ok(conn.destroyed, "the connection is closed");
+    await client.shutdown(200);
+  } finally {
+    conn.destroy();
     client.close();
     await waitExit(child);
     rmSync(socketPath, { force: true });

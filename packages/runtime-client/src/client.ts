@@ -11,23 +11,12 @@ import type { ChildProcess } from "node:child_process";
 import { Buffer } from "node:buffer";
 import { setTimeout as delay } from "node:timers/promises";
 import type { Duplex } from "node:stream";
-import type { MessageInitShape } from "@bufbuild/protobuf";
 
 import {
-  create,
-  encodeClient,
-  encodeFrame,
   FrameDecoder,
-  SCHEMA_VERSION,
-  ClientMessageSchema,
-  CommandSchema,
-  StreamFrameSchema,
-  ControlErrorCode,
   AttachMode,
   SessionMode,
-  type CommandResult,
   type Capabilities,
-  type ControlError,
   type ControlResponse,
   type EventEnvelope,
   type ExecAccepted,
@@ -47,56 +36,26 @@ import {
 } from "@sealant/runtime-protocol";
 
 import { Channel, type ChannelTransport } from "./channel.js";
+import { Drain } from "./drain.js";
+import {
+  okResult,
+  openForwardCommand,
+  requestFrame,
+  resultValue,
+  streamFrame,
+  type CommandInit,
+  type OpenForwardOptions,
+  type StreamPayload,
+} from "./wire.js";
 
 export { Channel } from "./channel.js";
 export type { ChannelTransport, ChannelClose } from "./channel.js";
-
-/** Error raised when the daemon returns a typed control error. */
-export class SealantError extends Error {
-  /** Stable error code (e.g. `ControlErrorCode.PROCESS_START_FAILED`). */
-  readonly code: ControlErrorCode;
-  /** Optional machine-readable detail JSON. */
-  readonly detailJson?: string;
-  constructor(error: ControlError) {
-    super(error.message || "control error");
-    this.name = "SealantError";
-    this.code = error.code;
-    this.detailJson = error.detailJson;
-  }
-}
+export { SealantError, type OpenForwardOptions } from "./wire.js";
 
 type Pending = {
   resolve: (response: ControlResponse) => void;
   reject: (error: Error) => void;
 };
-
-/** The init shape of the `Command` oneof (what callers pass to {@link SealantClient.request}). */
-type CommandInit = MessageInitShape<typeof CommandSchema>["command"];
-
-/** The init shape of the `StreamFrame.payload` oneof (what {@link SealantClient} muxes outbound). */
-type StreamPayloadInit = MessageInitShape<typeof StreamFrameSchema>["payload"];
-
-/** Throw on an error outcome; otherwise return the `CommandResult`. */
-function okResult(response: ControlResponse): CommandResult {
-  // ControlResponse.outcome is a ResponseOutcome message whose `outcome` oneof is ok | error.
-  const outcome = response.outcome?.outcome;
-  if (outcome?.case === "error") {
-    throw new SealantError(outcome.value);
-  }
-  if (outcome?.case === "ok") {
-    return outcome.value;
-  }
-  throw new Error("response had no outcome");
-}
-
-/** Assert the `CommandResult` is a specific result case and return its (untyped) value. The caller
- * casts to the exact result type — the public method signatures are the typed contract. */
-function resultValue(result: CommandResult, kase: CommandResult["result"]["case"]): unknown {
-  if (result.result.case !== kase) {
-    throw new Error(`expected result ${kase}, got ${String(result.result.case)}`);
-  }
-  return (result.result as { value: unknown }).value;
-}
 
 /** Options for {@link SealantClient.openSession} (a subset of the wire `OpenSessionArgs`). */
 export interface OpenSessionOptions {
@@ -169,16 +128,22 @@ export class SealantClient {
    */
   #pendingFrames: Map<string, StreamFrame[]> = new Map();
   #transport: ChannelTransport;
+  #drain: Drain;
 
   constructor(stream: Duplex) {
     this.#stream = stream;
+    this.#drain = new Drain(stream);
     // The transport every Channel uses to mux outbound frames back over this one connection.
     this.#transport = {
       sendData: (channelId, data) => this.#sendStream(channelId, { case: "data", value: data }),
-      sendWindowUpdate: (channelId, credits) =>
-        this.#sendStream(channelId, { case: "windowUpdate", value: { credits } }),
-      sendEnd: (channelId, end) =>
-        this.#sendStream(channelId, { case: "end", value: end ?? {} }),
+      sendWindowUpdate: (channelId, credits) => {
+        this.#sendStream(channelId, { case: "windowUpdate", value: { credits } });
+      },
+      sendEnd: (channelId, end) => {
+        this.#sendStream(channelId, { case: "end", value: end ?? {} });
+      },
+      drained: () => this.#drain.wait(),
+      inboundQueued: () => {},
       release: (channelId) => this.#channels.delete(channelId),
     };
     this.#attach(stream);
@@ -253,16 +218,9 @@ export class SealantClient {
       return Promise.reject(new Error("client is closed"));
     }
     const requestId = `req_client_${++this.#counter}`;
-    const message = create(ClientMessageSchema, {
-      message: {
-        case: "request",
-        value: { schemaVersion: SCHEMA_VERSION, requestId, command: { command } },
-      },
-    });
-    const body = encodeClient(message);
     return new Promise((resolve, reject) => {
       this.#pending.set(requestId, { resolve, reject });
-      this.#stream.write(encodeFrame(body), (error) => {
+      this.#stream.write(requestFrame(requestId, command), (error) => {
         if (error) {
           this.#pending.delete(requestId);
           reject(error);
@@ -272,12 +230,9 @@ export class SealantClient {
   }
 
   /** Mux one outbound `ClientMessage::Stream` frame onto the shared connection. */
-  #sendStream(channelId: string, payload: StreamPayloadInit): void {
+  #sendStream(channelId: string, payload: StreamPayload): boolean {
     if (this.#closed) throw new Error("client is closed");
-    const message = create(ClientMessageSchema, {
-      message: { case: "stream", value: { channelId, seq: 0n, payload } },
-    });
-    this.#stream.write(encodeFrame(encodeClient(message)));
+    return this.#stream.write(streamFrame(channelId, payload));
   }
 
   /**
@@ -508,25 +463,13 @@ export class SealantClient {
     this.#channels.get(channelId)?.destroy();
   }
 
-  /**
-   * Open a direct forward to `host:port` as a multiplexed channel. TCP (the
-   * default) is a byte stream; `protocol: "udp"` opens a connected UDP socket
-   * where one channel frame is exactly one datagram, both directions.
-   */
+  /** Open a direct forward to `host:port` as a multiplexed channel on this connection. For a
+   * forward that holds back its producer, use {@link openForwardConnection} instead. */
   async openForward(
-    host: string,
-    port: number,
-    executionId?: string,
-    protocol?: "tcp" | "udp",
+    options: OpenForwardOptions,
   ): Promise<{ result: ForwardOpened; channel: Channel }> {
     const result = resultValue(
-      okResult(
-        await this.request({
-          case: "openForward",
-          // Omit tcp on the wire — the field's absence is the old default.
-          value: { host, port, executionId, protocol: protocol === "udp" ? "udp" : undefined },
-        }),
-      ),
+      okResult(await this.request(openForwardCommand(options))),
       "forwardOpened",
     ) as ForwardOpened;
     return { result, channel: this.openChannel(result.channelId) };
@@ -621,6 +564,7 @@ export class SealantClient {
   }
 
   close(): void {
+    this.#drain.fail(new Error("client is closed"));
     this.#stream.end();
   }
 
@@ -694,6 +638,7 @@ export class SealantClient {
 
   #onClose(): void {
     this.#closed = true;
+    this.#drain.fail(new Error("connection closed"));
     for (const waiter of this.#eventWaiters.splice(0)) {
       waiter({ value: undefined, done: true });
     }

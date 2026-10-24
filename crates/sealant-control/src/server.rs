@@ -10,14 +10,14 @@ use sealant_protocol::{
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::UnixListener;
-use tokio::sync::{Mutex, broadcast, mpsc, watch};
+use tokio::sync::{Mutex, Notify, broadcast, mpsc, watch};
 use tokio::task::JoinSet;
 
 use crate::frame::{FrameError, read_frame, write_frame};
 use crate::service::{ChannelRegistry, CloserRegistry, ConnHandle, ControlService};
 
 /// Per-connection outbound queue capacity (responses + forwarded events).
-const OUTBOUND_CAPACITY: usize = 256;
+pub const OUTBOUND_CAPACITY: usize = 256;
 
 /// Errors that terminate a connection.
 #[derive(Debug, thiserror::Error)]
@@ -122,6 +122,7 @@ pub async fn handle_connection<S, R, W>(
         channels: channels.clone(),
         closers: closers.clone(),
         shutdown: shutdown.clone(),
+        stop_events: Arc::new(Notify::new()),
     };
 
     // Writer task: the single owner of the write half; drains responses and forwarded events.
@@ -138,9 +139,15 @@ pub async fn handle_connection<S, R, W>(
     // Forwarder task: fan telemetry events into the outbound queue for this connection.
     let mut events = service.subscribe_events();
     let event_tx = out_tx.clone();
+    let stop_events = conn.stop_events.clone();
     let forwarder = tokio::spawn(async move {
         loop {
-            match events.recv().await {
+            let received = tokio::select! {
+                biased;
+                () = stop_events.notified() => break,
+                received = events.recv() => received,
+            };
+            match received {
                 Ok(envelope) => {
                     if event_tx.send(ServerMessage::Event(envelope)).await.is_err() {
                         break;

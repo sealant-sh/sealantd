@@ -911,6 +911,7 @@ impl From<OpenForwardArgs> for wire::OpenForwardArgs {
                 ForwardProtocol::Tcp => None,
                 ForwardProtocol::Udp => Some("udp".to_owned()),
             },
+            dedicated: a.dedicated.then_some(true),
         }
     }
 }
@@ -926,6 +927,7 @@ impl From<wire::OpenForwardArgs> for OpenForwardArgs {
                 Some("udp") => ForwardProtocol::Udp,
                 _ => ForwardProtocol::Tcp,
             },
+            dedicated: a.dedicated.unwrap_or(false),
         }
     }
 }
@@ -2413,6 +2415,7 @@ mod tests {
                 port: 8000,
                 execution_id: Some(ExecutionId::new("run-1")),
                 protocol: ForwardProtocol::Udp,
+                dedicated: true,
             }),
         ));
         let bytes = encode_client(&msg);

@@ -24,7 +24,7 @@ use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::mpsc;
 
 /// Read-buffer size for the socket→gateway pump (raw conduit; not a recorded stream).
-const READ_BUF: usize = 64 * 1024;
+pub const READ_BUF: usize = 64 * 1024;
 
 /// One datagram is at most 65_507 payload bytes; a 64 KiB + header buffer never truncates.
 const UDP_BUF: usize = 65_536;

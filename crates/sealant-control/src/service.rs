@@ -6,7 +6,7 @@ use std::sync::Arc;
 use sealant_protocol::{
     ChannelId, ControlRequest, ControlResponse, EventEnvelope, ServerMessage, StreamPayload,
 };
-use tokio::sync::{Mutex, broadcast, mpsc, watch};
+use tokio::sync::{Mutex, Notify, broadcast, mpsc, watch};
 
 /// The per-connection registry of open byte conduits.
 ///
@@ -49,6 +49,8 @@ pub struct ConnHandle {
     pub closers: CloserRegistry,
     /// Observes daemon shutdown so per-channel pump tasks can exit promptly.
     pub shutdown: watch::Receiver<bool>,
+    /// Stops the connection's event subscription; see [`ConnHandle::stop_events`].
+    pub stop_events: Arc<Notify>,
 }
 
 impl std::fmt::Debug for ConnHandle {
@@ -58,6 +60,12 @@ impl std::fmt::Debug for ConnHandle {
 }
 
 impl ConnHandle {
+    /// Send this connection no more events: it carries a dedicated forward, and nothing on it
+    /// reads them.
+    pub fn stop_events(&self) {
+        self.stop_events.notify_one();
+    }
+
     /// Register a freshly opened channel's inbound sink so reader-routed `Stream` frames reach it.
     pub async fn register_channel(
         &self,
