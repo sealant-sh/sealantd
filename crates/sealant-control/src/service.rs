@@ -7,6 +7,7 @@ use sealant_protocol::{
     ChannelId, ControlRequest, ControlResponse, EventEnvelope, ServerMessage, StreamPayload,
 };
 use tokio::sync::{Mutex, Notify, broadcast, mpsc, watch};
+use tokio_util::sync::CancellationToken;
 
 /// The per-connection registry of open byte conduits.
 ///
@@ -51,6 +52,9 @@ pub struct ConnHandle {
     pub shutdown: watch::Receiver<bool>,
     /// Stops the connection's event subscription; see [`ConnHandle::stop_events`].
     pub stop_events: Arc<Notify>,
+    /// Cancelled once the connection's reader stops, so a request still running for it (a
+    /// forward's dial) gives up instead of finishing for a peer that is gone.
+    pub closed: CancellationToken,
 }
 
 impl std::fmt::Debug for ConnHandle {

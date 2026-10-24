@@ -20,6 +20,7 @@ pub mod event;
 pub mod frame;
 pub mod ids;
 pub mod message;
+pub mod reason;
 pub mod stream;
 
 /// Generated Protobuf wire types (ADR-0012). The hand-written domain types above convert to/from
@@ -40,6 +41,7 @@ pub use event::*;
 pub use frame::{DEFAULT_MAX_FRAME_BYTES, LENGTH_PREFIX_BYTES, MIN_MAX_FRAME_BYTES};
 pub use ids::*;
 pub use message::*;
+pub use reason::ForwardConnectReason;
 pub use stream::{StreamEnd, StreamFrame, StreamPayload};
 
 /// Current wire schema version. Bumped on any breaking change to the framed JSON contract.
