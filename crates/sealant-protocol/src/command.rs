@@ -321,6 +321,10 @@ pub struct OpenForwardArgs {
     /// Forward transport; omitted means TCP (the wire default predates UDP).
     #[serde(default)]
     pub protocol: ForwardProtocol,
+    /// The connection carries this forward and nothing else, so the daemon stops sending it
+    /// events, which nothing on it reads. A daemon that predates the field ignores it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub dedicated: bool,
 }
 
 /// Arguments to `openSftp`: spawn an in-container `sftp-server` bound to a reliable channel.

@@ -11,8 +11,13 @@ import type { StreamEnd, StreamWindowUpdate } from "@sealant/runtime-protocol";
 /** How a `Channel` writes a frame back to the daemon over the shared connection. The client wires
  * this to its framed-socket writer; the channel never touches the socket directly. */
 export interface ChannelTransport {
-  /** Send a `StreamFrame::Data` for this channel. */
-  sendData(channelId: string, data: Uint8Array): void;
+  /** Send a `StreamFrame::Data` for this channel. Returns the connection's `write()` result: `false`
+   * once its outbound buffer is above its high-water mark. */
+  sendData(channelId: string, data: Uint8Array): boolean;
+  /** Resolves when the connection's outbound buffer has drained (at once if it is not full). */
+  drained(): Promise<void>;
+  /** The bytes queued in a channel's inbound buffer changed by `delta`. */
+  inboundQueued(delta: number): void;
   /** Send a `StreamFrame::WindowUpdate` (flow-control credits) for this channel. */
   sendWindowUpdate(channelId: string, credits: bigint): void;
   /** Send a `StreamFrame::End` for this channel (half-close from the client side). */
@@ -33,7 +38,8 @@ export type ChannelClose =
  * One demultiplexed byte channel. It is an async-iterable of inbound `Uint8Array` chunks (the bytes
  * the daemon wrote on this `channelId`) and exposes `write`/`windowUpdate`/`end` for outbound bytes.
  *
- * Backpressure-friendly: inbound chunks queue until consumed; `closed` resolves with the close cause.
+ * Inbound chunks queue until consumed, and a forward connection counts them against its high-water
+ * mark; `closed` resolves with the close cause.
  */
 export class Channel implements AsyncIterable<Uint8Array> {
   /** The daemon-assigned channel id this conduit is bound to. */
@@ -90,6 +96,7 @@ export class Channel implements AsyncIterable<Uint8Array> {
       waiter({ value: data, done: false });
     } else {
       this.#inbound.push(data);
+      this.#transport.inboundQueued(data.byteLength);
     }
   }
 
@@ -112,10 +119,19 @@ export class Channel implements AsyncIterable<Uint8Array> {
   // --- outbound (mux source; called by the consumer) ------------------------------------------
 
   /** Write bytes to the daemon as a `StreamFrame::Data` on this channel. Throws once the outbound
-   * half has been closed (via `end()`/`destroy()`) or the channel is fully closed. */
-  write(data: Uint8Array): void {
+   * half has been closed (via `end()`/`destroy()`) or the channel is fully closed.
+   *
+   * Returns `false` when the connection's outbound buffer is full, as Node's `write()` does: the
+   * bytes are queued, and a writer that respects backpressure awaits {@link Channel.drained}. */
+  write(data: Uint8Array): boolean {
     if (this.#outboundClosed) throw new Error(`channel ${this.channelId} outbound is closed`);
-    this.#transport.sendData(this.channelId, data);
+    return this.#transport.sendData(this.channelId, data);
+  }
+
+  /** Resolves once the connection's outbound buffer has drained; at once if it is not full.
+   * Rejects once the connection can take no more writes: a write error, a close, or `end()`. */
+  drained(): Promise<void> {
+    return this.#transport.drained();
   }
 
   /** Grant the daemon `credits` more bytes of send window (`StreamFrame::WindowUpdate`). Throws once
@@ -151,14 +167,21 @@ export class Channel implements AsyncIterable<Uint8Array> {
    * too and resolve `closed` as `local`. Use this for a real abort/teardown where you do not intend
    * to keep reading the daemon's remaining output. For normal completion prefer `end()` and let the
    * remote `StreamEnd` close the channel.
+   *
+   * Inbound bytes still queued are dropped, also on a channel the remote end already closed, so
+   * they no longer count against a forward connection's high-water mark.
    */
   destroy(end?: StreamEnd): void {
-    if (this.#closed) return;
-    if (!this.#outboundClosed) {
-      this.#outboundClosed = true;
-      this.#transport.sendEnd(this.channelId, end);
+    if (!this.#closed) {
+      if (!this.#outboundClosed) {
+        this.#outboundClosed = true;
+        this.#transport.sendEnd(this.channelId, end);
+      }
+      this.#finish({ kind: "local" });
     }
-    this.#finish({ kind: "local" });
+    const dropped = this.#inbound.splice(0);
+    const bytes = dropped.reduce((sum, chunk) => sum + chunk.byteLength, 0);
+    if (bytes > 0) this.#transport.inboundQueued(-bytes);
   }
 
   // --- async iteration --------------------------------------------------------------------------
@@ -167,7 +190,10 @@ export class Channel implements AsyncIterable<Uint8Array> {
     return {
       next: (): Promise<IteratorResult<Uint8Array>> => {
         const queued = this.#inbound.shift();
-        if (queued !== undefined) return Promise.resolve({ value: queued, done: false });
+        if (queued !== undefined) {
+          this.#transport.inboundQueued(-queued.byteLength);
+          return Promise.resolve({ value: queued, done: false });
+        }
         if (this.#closed) return Promise.resolve({ value: undefined, done: true });
         return new Promise((resolve) => this.#waiters.push(resolve));
       },

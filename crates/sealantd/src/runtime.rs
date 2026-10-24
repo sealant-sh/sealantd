@@ -1612,6 +1612,9 @@ impl Runtime {
             // forward is a connection-scoped channel with its own eager teardown; it carries bytes,
             // it does not capture them.
             Command::OpenForward(args) => {
+                if args.dedicated {
+                    conn.stop_events();
+                }
                 let channel_id = self.idgen.channel_id();
                 match self
                     .forwards

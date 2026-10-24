@@ -547,6 +547,7 @@ async fn in_process_open_forward_loopback_echo() {
                 port: addr.port(),
                 execution_id: None,
                 protocol: ForwardProtocol::default(),
+                dedicated: false,
             }),
         ),
     )
@@ -602,6 +603,184 @@ async fn in_process_open_forward_loopback_echo() {
     let _ = tokio::time::timeout(Duration::from_secs(5), conn).await;
 }
 
+#[tokio::test]
+async fn in_process_forward_stops_reading_the_target_when_the_client_stops() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use tokio::io::AsyncWriteExt;
+
+    const DAEMON_QUEUE: u64 =
+        (sealant_control::OUTBOUND_CAPACITY * sealant_network::forward::READ_BUF) as u64;
+    const TRANSPORT: u64 = 1 << 20;
+    const SOCKET_BUFFERS: u64 = 16 * 1024 * 1024;
+    const CEILING: u64 = DAEMON_QUEUE + TRANSPORT + SOCKET_BUFFERS;
+
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("bind producer");
+    let addr = listener.local_addr().expect("addr");
+    let written = Arc::new(AtomicU64::new(0));
+    let producer_written = written.clone();
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("accept");
+        let chunk = vec![0x5a_u8; 64 * 1024];
+        while socket.write_all(&chunk).await.is_ok() {
+            producer_written.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+        }
+    });
+
+    let mut config = RuntimeConfig::new(new_runtime_id());
+    config.workspace_root = std::env::temp_dir();
+    let runtime = Runtime::new(config, Arc::new(ShutdownSignal::new(1000)));
+    runtime.mark_healthy();
+    let (mut client, conn) = wire_runtime(runtime.clone());
+    send_request(
+        &mut client,
+        ControlRequest::new(
+            RequestId::new("bp1"),
+            Command::OpenForward(OpenForwardArgs {
+                host: "127.0.0.1".to_owned(),
+                port: addr.port(),
+                execution_id: None,
+                protocol: ForwardProtocol::default(),
+                dedicated: false,
+            }),
+        ),
+    )
+    .await;
+    let find = async {
+        loop {
+            if let ServerMessage::Response(r) = recv_message(&mut client).await
+                && r.request_id == RequestId::new("bp1")
+            {
+                assert!(r.is_ok(), "forward opened: {r:?}");
+                return;
+            }
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(5), find)
+        .await
+        .expect("forward opened");
+
+    let plateau = async {
+        let mut last = u64::MAX;
+        let mut steady = 0;
+        loop {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let now = written.load(Ordering::Relaxed);
+            steady = if now == last { steady + 1 } else { 0 };
+            last = now;
+            if steady == 5 {
+                return now;
+            }
+        }
+    };
+    let stalled_at = tokio::time::timeout(Duration::from_secs(30), plateau)
+        .await
+        .expect("the producer stalls while the client reads nothing");
+    assert!(
+        stalled_at <= CEILING,
+        "stalled at {stalled_at} bytes, above the {CEILING} byte ceiling"
+    );
+
+    let reader = tokio::spawn(async move {
+        loop {
+            recv_message(&mut client).await;
+        }
+    });
+    let resumed = async {
+        while written.load(Ordering::Relaxed) < stalled_at + DAEMON_QUEUE {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(20), resumed)
+        .await
+        .expect("the producer resumes once the client reads");
+    reader.abort();
+    let _ = tokio::time::timeout(Duration::from_secs(5), conn).await;
+}
+
+async fn open_forward_on(
+    client: &mut tokio::io::DuplexStream,
+    id: &str,
+    port: u16,
+    dedicated: bool,
+) {
+    send_request(
+        client,
+        ControlRequest::new(
+            RequestId::new(id),
+            Command::OpenForward(OpenForwardArgs {
+                host: "127.0.0.1".to_owned(),
+                port,
+                execution_id: None,
+                protocol: ForwardProtocol::default(),
+                dedicated,
+            }),
+        ),
+    )
+    .await;
+    let opened = async {
+        loop {
+            if let ServerMessage::Response(r) = recv_message(client).await
+                && r.request_id == RequestId::new(id)
+            {
+                assert!(r.is_ok(), "forward opened: {r:?}");
+                return;
+            }
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(5), opened)
+        .await
+        .expect("forward opened");
+}
+
+#[tokio::test]
+async fn in_process_a_dedicated_forward_connection_gets_no_events() {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("bind target");
+    let port = listener.local_addr().expect("addr").port();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((socket, _)) = listener.accept().await {
+            held.push(socket);
+        }
+    });
+
+    let mut config = RuntimeConfig::new(new_runtime_id());
+    config.workspace_root = std::env::temp_dir();
+    let runtime = Runtime::new(config, Arc::new(ShutdownSignal::new(1000)));
+    runtime.mark_healthy();
+    let (mut dedicated, _dedicated_conn) = wire_runtime(runtime.clone());
+    let (mut shared, _shared_conn) = wire_runtime(runtime.clone());
+    open_forward_on(&mut dedicated, "d1", port, true).await;
+    open_forward_on(&mut shared, "s1", port, false).await;
+
+    send_request(
+        &mut shared,
+        ControlRequest::new(
+            RequestId::new("x1"),
+            Command::Exec(exec_args("/bin/echo", &["hello"])),
+        ),
+    )
+    .await;
+    let exited = async {
+        loop {
+            if let ServerMessage::Event(event) = recv_message(&mut shared).await
+                && matches!(event.payload, EventPayload::ProcessExited(_))
+            {
+                return;
+            }
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(5), exited)
+        .await
+        .expect("the shared connection gets the exec's events");
+
+    let any = tokio::time::timeout(Duration::from_millis(500), recv_message(&mut dedicated)).await;
+    assert!(any.is_err(), "the dedicated connection got {any:?}");
+}
+
 /// §1.B transport/telemetry decoupling: openForward must be ALLOWED even with the networkCollection
 /// telemetry feature off (the default). Forwarding is the gateway's direct-tcpip substrate, not a
 /// network-capture concern — so a tunnel may be opened regardless of that kill switch.
@@ -635,6 +814,7 @@ async fn in_process_open_forward_allowed_when_feature_off() {
                 port: addr.port(),
                 execution_id: None,
                 protocol: ForwardProtocol::default(),
+                dedicated: false,
             }),
         ),
     )
@@ -830,6 +1010,7 @@ async fn in_process_idle_forward_torn_down_on_connection_drop() {
                 port: addr.port(),
                 execution_id: None,
                 protocol: ForwardProtocol::default(),
+                dedicated: false,
             }),
         ),
     )
