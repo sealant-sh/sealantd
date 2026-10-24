@@ -16,16 +16,19 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 
+use sealant_process::SessionMark;
 use sealant_protocol::{
-    ChannelId, ControlError, ControlErrorCode, ExecutionId, ForwardConnectReason, ForwardProtocol,
-    ServerMessage, StreamEnd, StreamFrame, StreamPayload,
+    ChannelId, ControlError, ControlErrorCode, ForwardBindingRefusal, ForwardConnectReason,
+    ForwardProtocol, ServerMessage, SessionId, StreamEnd, StreamFrame, StreamPayload,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::OwnedReadHalf;
 use tokio::net::{TcpStream, UdpSocket};
-use tokio::sync::mpsc;
-use tokio::task::JoinSet;
+use tokio::sync::{mpsc, watch};
+use tokio::task::{AbortHandle, JoinSet};
 use tokio::time::Instant;
+
+use crate::owner::{Connection, LiveProcFs, Owner, refusal_error, verify};
 
 /// Read-buffer size for the socket→gateway pump (raw conduit; not a recorded stream).
 pub const READ_BUF: usize = 64 * 1024;
@@ -42,22 +45,51 @@ pub const CONNECT_DEADLINE: Duration = Duration::from_secs(5);
 /// cannot use up the deadline its host's other addresses need (RFC 8305's default delay).
 const ATTEMPT_DELAY: Duration = Duration::from_millis(250);
 
-/// A failed dial: the reason a caller branches on, when the failure is one of those kinds, and
-/// what failed, for people.
+/// A failed dial.
 #[derive(Debug, PartialEq, Eq)]
-pub struct DialError {
-    pub reason: Option<ForwardConnectReason>,
-    pub message: String,
+pub enum DialError {
+    /// The connect failed: the reason a caller branches on, when the failure is one of those
+    /// kinds, and what failed, for people.
+    Connect {
+        reason: Option<ForwardConnectReason>,
+        message: String,
+    },
+    /// The host resolved to an address a bound forward may not reach.
+    NotLoopback(String),
+}
+
+impl DialError {
+    #[must_use]
+    pub fn reason(&self) -> Option<ForwardConnectReason> {
+        match self {
+            Self::Connect { reason, .. } => *reason,
+            Self::NotLoopback(_) => None,
+        }
+    }
 }
 
 impl From<DialError> for ControlError {
     fn from(error: DialError) -> Self {
-        let control = Self::new(ControlErrorCode::InternalError, error.message);
-        match error.reason {
-            Some(reason) => control.with_detail(reason.detail()),
-            None => control,
+        match error {
+            DialError::Connect {
+                reason: Some(reason),
+                message,
+            } => Self::new(ControlErrorCode::InternalError, message).with_detail(reason.detail()),
+            DialError::Connect {
+                reason: None,
+                message,
+            } => Self::new(ControlErrorCode::InternalError, message),
+            DialError::NotLoopback(message) => Self::invalid_argument(message),
         }
     }
+}
+
+/// Which addresses a forward may connect to: a bound forward reaches only this machine, where
+/// sealantd can see who holds the far end.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Reach {
+    Any,
+    Loopback,
 }
 
 fn connect_reason(kind: io::ErrorKind) -> Option<ForwardConnectReason> {
@@ -86,23 +118,29 @@ fn telling(reason: Option<ForwardConnectReason>) -> u8 {
 ///
 /// # Errors
 /// A [`DialError`] naming why, when the failure is one of the [`ForwardConnectReason`] kinds.
-pub async fn dial(host: &str, port: u16, deadline: Instant) -> Result<TcpStream, DialError> {
+pub async fn dial(
+    host: &str,
+    port: u16,
+    reach: Reach,
+    deadline: Instant,
+) -> Result<TcpStream, DialError> {
     let lookup = async {
         tokio::net::lookup_host((host, port))
             .await
             .map(Iterator::collect)
     };
-    dial_resolved(host, port, lookup, deadline).await
+    dial_resolved(host, port, reach, lookup, deadline).await
 }
 
 /// [`dial`] with the lookup supplied, so a test can resolve without the host's resolver.
 async fn dial_resolved(
     host: &str,
     port: u16,
+    reach: Reach,
     lookup: impl Future<Output = io::Result<Vec<SocketAddr>>>,
     deadline: Instant,
 ) -> Result<TcpStream, DialError> {
-    let failed = |reason, cause: &dyn std::fmt::Display| DialError {
+    let failed = |reason, cause: &dyn std::fmt::Display| DialError::Connect {
         reason,
         message: format!("forward connect to {host}:{port} failed: {cause}"),
     };
@@ -114,6 +152,11 @@ async fn dial_resolved(
     };
     if addrs.is_empty() {
         return Err(failed(unresolved, &"the name has no address"));
+    }
+    if reach == Reach::Loopback && !addrs.iter().all(|addr| addr.ip().is_loopback()) {
+        return Err(DialError::NotLoopback(format!(
+            "a bound forward reaches loopback only; {host} resolves to {addrs:?}"
+        )));
     }
 
     let mut queue = addrs.into_iter();
@@ -192,33 +235,50 @@ impl ForwardRuntime {
     /// connection's channel registry so reader-routed `Stream` frames reach the socket. On connect
     /// failure returns a [`ControlError`] (the caller may also emit a `StreamFrame::End{error}`).
     ///
+    /// With an `owner`, the forward opens only once the session's processes, and no other, hold
+    /// the connection's far end ([`crate::owner`]); no byte crosses before. The dial and the check
+    /// share one [`CONNECT_DEADLINE`]. The forward ends, with an `End` whose error is
+    /// `owner-exited`, when the session's leader exits.
+    ///
     /// # Errors
-    /// Returns the [`dial`] error, as a [`ControlError`], when the TCP connect fails.
+    /// Returns the [`dial`] error, as a [`ControlError`], when the TCP connect fails, an
+    /// invalid-argument error for a bound UDP forward, and the refusal when the binding is
+    /// refused ([`crate::owner::refusal_error`]).
     pub async fn open(
         &self,
         channel_id: ChannelId,
         host: &str,
         port: u16,
-        _execution_id: Option<ExecutionId>,
         protocol: ForwardProtocol,
+        owner: Option<ForwardOwner>,
         out_tx: mpsc::Sender<ServerMessage>,
     ) -> Result<mpsc::Sender<StreamPayload>, ControlError> {
         if protocol == ForwardProtocol::Udp {
+            if owner.is_some() {
+                return Err(ControlError::invalid_argument(
+                    "a bound forward is TCP only".to_owned(),
+                ));
+            }
             return self.open_udp(channel_id, host, port, out_tx).await;
         }
-        let stream = dial(host, port, Instant::now() + CONNECT_DEADLINE).await?;
+        let deadline = Instant::now() + CONNECT_DEADLINE;
+        let stream = match &owner {
+            None => dial(host, port, Reach::Any, deadline).await?,
+            Some(owner) => {
+                if *owner.exited.borrow() {
+                    let refusal = ForwardBindingRefusal::OwnerExited;
+                    return Err(refusal_error(refusal, owner.session_id.as_str()));
+                }
+                let stream = dial(host, port, Reach::Loopback, deadline).await?;
+                verify_owner(&stream, owner, deadline).await?;
+                stream
+            }
+        };
         let _ = stream.set_nodelay(true);
         let (read_half, mut write_half) = stream.into_split();
 
         // Inbound (gateway → socket): bounded so a slow socket backpressures the gateway.
         let (inbound_tx, mut inbound_rx) = mpsc::channel::<StreamPayload>(64);
-
-        // socket → gateway: read raw bytes, push StreamFrame::Data (awaited = backpressure).
-        let s2g_channel = channel_id.clone();
-        let s2g_out = out_tx.clone();
-        let socket_to_gateway = tokio::spawn(async move {
-            pump_socket_to_gateway(read_half, s2g_channel, s2g_out).await;
-        });
 
         // gateway → socket: write inbound Data; an inbound End half-closes the write side.
         let gateway_to_socket = tokio::spawn(async move {
@@ -238,6 +298,14 @@ impl ForwardRuntime {
                 }
             }
             let _ = write_half.shutdown().await;
+        });
+
+        // socket → gateway: read raw bytes, push StreamFrame::Data (awaited = backpressure).
+        let s2g_channel = channel_id.clone();
+        let owner_exit = owner.map(|owner| owner.exited);
+        let write_pump = gateway_to_socket.abort_handle();
+        let socket_to_gateway = tokio::spawn(async move {
+            pump_socket_to_gateway(read_half, s2g_channel, out_tx, owner_exit, write_pump).await;
         });
 
         self.inner.lock().unwrap_or_else(|e| e.into_inner()).insert(
@@ -359,32 +427,112 @@ impl ForwardRuntime {
     }
 }
 
-/// Pump the socket read half to the gateway. On EOF/error, emit a final `StreamFrame::End` so the
-/// gateway half-closes its SSH channel; on error the `End` carries the message.
+/// The session a bound forward belongs to, as the runtime found it running.
+#[derive(Debug)]
+pub struct ForwardOwner {
+    pub session_id: SessionId,
+    /// Its leader's pid, which is also its Linux session id.
+    pub leader_pid: i32,
+    /// Who the leader runs as, and the marker its processes carry.
+    pub mark: SessionMark,
+    /// True once the leader has exited.
+    pub exited: watch::Receiver<bool>,
+}
+
+/// Run the binding check off the async runtime, bounded by the dial's `deadline`.
+async fn verify_owner(
+    stream: &TcpStream,
+    owner: &ForwardOwner,
+    deadline: Instant,
+) -> Result<(), ControlError> {
+    let address = |a: io::Result<SocketAddr>| {
+        a.map_err(|e| ControlError::internal(format!("forward address: {e}")))
+    };
+    let connection = Connection {
+        local: address(stream.local_addr())?,
+        peer: address(stream.peer_addr())?,
+    };
+    let (leader_pid, mark) = (owner.leader_pid, owner.mark.clone());
+    let check = tokio::task::spawn_blocking(move || {
+        let owner = Owner {
+            leader_pid,
+            uid: mark.uid,
+            gid: mark.gid,
+            marker: &mark.marker,
+        };
+        verify(&LiveProcFs, connection, owner, deadline.into_std())
+    });
+    let verdict = match tokio::time::timeout_at(deadline, check).await {
+        Ok(Ok(verdict)) => verdict,
+        Ok(Err(_)) | Err(_) => Err(ForwardBindingRefusal::Unverifiable),
+    };
+    let verdict = if *owner.exited.borrow() {
+        Err(ForwardBindingRefusal::OwnerExited)
+    } else {
+        verdict
+    };
+    verdict.map_err(|refusal| refusal_error(refusal, owner.session_id.as_str()))
+}
+
+/// Resolves once a bound forward's owner has exited; never for a forward bound to nothing.
+async fn owner_gone(exited: &mut Option<watch::Receiver<bool>>) {
+    match exited {
+        Some(exited) => {
+            let _ = exited.wait_for(|exited| *exited).await;
+        }
+        None => std::future::pending().await,
+    }
+}
+
+/// Why the socket pump stopped.
+enum PumpEnd {
+    Eof,
+    ReadFailed(io::Error),
+    OwnerExited,
+}
+
+/// Pump the socket read half to the gateway, and send the forward's one final
+/// `StreamFrame::End`: clean at EOF, with the error on a read error, and with `owner-exited`
+/// when a bound forward's owner exits, which also stops `write_pump` writing to the target.
 async fn pump_socket_to_gateway(
     mut read_half: OwnedReadHalf,
     channel_id: ChannelId,
     out_tx: mpsc::Sender<ServerMessage>,
+    mut owner_exit: Option<watch::Receiver<bool>>,
+    write_pump: AbortHandle,
 ) {
     let mut buf = vec![0u8; READ_BUF];
     let mut seq: u64 = 0;
-    let mut error: Option<String> = None;
-    loop {
-        match read_half.read(&mut buf).await {
-            Ok(0) => break, // clean EOF / half-close from the far end
-            Ok(n) => {
-                let frame = StreamFrame::data(channel_id.clone(), seq, &buf[..n]);
-                seq = seq.wrapping_add(1);
-                if out_tx.send(ServerMessage::Stream(frame)).await.is_err() {
-                    return; // connection gone; no point emitting End
-                }
-            }
-            Err(e) => {
-                error = Some(e.to_string());
-                break;
-            }
+    let end = loop {
+        let read = tokio::select! {
+            biased;
+            () = owner_gone(&mut owner_exit) => break PumpEnd::OwnerExited,
+            read = read_half.read(&mut buf) => read,
+        };
+        let n = match read {
+            Ok(0) => break PumpEnd::Eof,
+            Ok(n) => n,
+            Err(e) => break PumpEnd::ReadFailed(e),
+        };
+        let frame = StreamFrame::data(channel_id.clone(), seq, &buf[..n]);
+        seq = seq.wrapping_add(1);
+        let sent = tokio::select! {
+            biased;
+            () = owner_gone(&mut owner_exit) => break PumpEnd::OwnerExited,
+            sent = out_tx.send(ServerMessage::Stream(frame)) => sent,
+        };
+        if sent.is_err() {
+            return;
         }
-    }
+    };
+    let error = match end {
+        PumpEnd::Eof => None,
+        PumpEnd::ReadFailed(e) => Some(e.to_string()),
+        PumpEnd::OwnerExited => {
+            write_pump.abort();
+            Some(ForwardBindingRefusal::OwnerExited.reason().to_owned())
+        }
+    };
     let end = StreamFrame::end(
         channel_id,
         u64::MAX,
@@ -433,8 +581,8 @@ mod tests {
                 channel.clone(),
                 "127.0.0.1",
                 addr.port(),
-                None,
                 ForwardProtocol::Tcp,
+                None,
                 out_tx,
             )
             .await
@@ -515,8 +663,8 @@ mod tests {
                 channel.clone(),
                 "127.0.0.1",
                 addr.port(),
-                None,
                 ForwardProtocol::Tcp,
+                None,
                 out_tx,
             )
             .await
@@ -562,8 +710,8 @@ mod tests {
                 channel.clone(),
                 "127.0.0.1",
                 addr.port(),
-                None,
                 ForwardProtocol::Udp,
+                None,
                 out_tx,
             )
             .await
@@ -638,8 +786,8 @@ mod tests {
                 ChannelId::new("chan_x"),
                 "127.0.0.1",
                 addr.port(),
-                None,
                 ForwardProtocol::Tcp,
+                None,
                 out_tx,
             )
             .await
@@ -655,28 +803,34 @@ mod tests {
     #[tokio::test]
     async fn a_name_that_does_not_resolve_says_so() {
         let lookup = async { Err(io::Error::other("no such host")) };
-        let error = dial_resolved("nowhere", 80, lookup, soon(1000))
+        let error = dial_resolved("nowhere", 80, Reach::Any, lookup, soon(1000))
             .await
             .expect_err("no such host");
-        assert_eq!(error.reason, Some(ForwardConnectReason::NameUnresolved));
+        assert_eq!(error.reason(), Some(ForwardConnectReason::NameUnresolved));
     }
 
     #[tokio::test]
     async fn a_lookup_that_runs_out_of_time_is_unresolved_not_a_dial_timeout() {
         let lookup = std::future::pending();
-        let error = dial_resolved("slow-dns", 80, lookup, soon(100))
+        let error = dial_resolved("slow-dns", 80, Reach::Any, lookup, soon(100))
             .await
             .expect_err("the lookup never answers");
-        assert_eq!(error.reason, Some(ForwardConnectReason::NameUnresolved));
+        assert_eq!(error.reason(), Some(ForwardConnectReason::NameUnresolved));
     }
 
     #[tokio::test]
     async fn a_target_that_never_answers_times_out() {
         let (_listener, _queued, addr) = stalling().await;
-        let error = dial_resolved("stalled", addr.port(), resolved(vec![addr]), soon(300))
-            .await
-            .expect_err("the accept queue is full");
-        assert_eq!(error.reason, Some(ForwardConnectReason::DialTimeout));
+        let error = dial_resolved(
+            "stalled",
+            addr.port(),
+            Reach::Any,
+            resolved(vec![addr]),
+            soon(300),
+        )
+        .await
+        .expect_err("the accept queue is full");
+        assert_eq!(error.reason(), Some(ForwardConnectReason::DialTimeout));
     }
 
     #[tokio::test]
@@ -684,9 +838,15 @@ mod tests {
         let (_listener, _queued, stalled) = stalling().await;
         let working = TcpListener::bind(("127.0.0.1", 0)).await.expect("bind");
         let addr = working.local_addr().expect("addr");
-        let stream = dial_resolved("two", 0, resolved(vec![stalled, addr]), soon(2000))
-            .await
-            .expect("the second address answers");
+        let stream = dial_resolved(
+            "two",
+            0,
+            Reach::Any,
+            resolved(vec![stalled, addr]),
+            soon(2000),
+        )
+        .await
+        .expect("the second address answers");
         assert_eq!(stream.peer_addr().expect("peer"), addr);
     }
 
@@ -695,10 +855,13 @@ mod tests {
         let (_listener, _queued, stalled) = stalling().await;
         let (_reserved, refused) = refusing();
         for addrs in [vec![stalled, refused], vec![refused, stalled]] {
-            let error = dial_resolved("both", 0, resolved(addrs), soon(600))
+            let error = dial_resolved("both", 0, Reach::Any, resolved(addrs), soon(600))
                 .await
                 .expect_err("neither address connects");
-            assert_eq!(error.reason, Some(ForwardConnectReason::ConnectionRefused));
+            assert_eq!(
+                error.reason(),
+                Some(ForwardConnectReason::ConnectionRefused)
+            );
         }
     }
 
@@ -715,7 +878,7 @@ mod tests {
 
     #[test]
     fn a_dial_error_becomes_an_internal_error_with_its_reason() {
-        let error = ControlError::from(DialError {
+        let error = ControlError::from(DialError::Connect {
             reason: Some(ForwardConnectReason::DialTimeout),
             message: "forward connect to x:1 failed".to_owned(),
         });
@@ -724,10 +887,12 @@ mod tests {
             error.detail,
             Some(serde_json::json!({ "reason": "dial-timeout" }))
         );
-        let bare = ControlError::from(DialError {
+        let bare = ControlError::from(DialError::Connect {
             reason: None,
             message: String::new(),
         });
         assert_eq!(bare.detail, None);
+        let elsewhere = ControlError::from(DialError::NotLoopback(String::new()));
+        assert_eq!(elsewhere.code, ControlErrorCode::InvalidArgument);
     }
 }

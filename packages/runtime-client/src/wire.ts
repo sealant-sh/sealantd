@@ -83,10 +83,17 @@ export interface OpenForwardOptions {
   protocol: "tcp" | "udp";
   /** Execution to correlate the forward with (a label; the daemon checks nothing about it). */
   executionId?: string;
+  /**
+   * Bind the forward to this session: it opens only once a process of the session holds the
+   * connection's far end, and ends when the session's leader exits. TCP to loopback only. A
+   * daemon whose capabilities lack `forward.owner` ignores it, so check that the result's
+   * `boundSessionId` echoes it before relying on the binding.
+   */
+  ownerSessionId?: string;
 }
 
 export function openForwardCommand(options: OpenForwardOptions, dedicated = false): CommandInit {
-  const { host, port, executionId, protocol } = options;
+  const { host, port, executionId, protocol, ownerSessionId } = options;
   return {
     case: "openForward",
     // Omit tcp on the wire: the field's absence is the old default.
@@ -96,6 +103,7 @@ export function openForwardCommand(options: OpenForwardOptions, dedicated = fals
       executionId,
       protocol: protocol === "udp" ? "udp" : undefined,
       dedicated: dedicated || undefined,
+      ownerSessionId,
     },
   };
 }

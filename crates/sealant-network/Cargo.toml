@@ -10,6 +10,8 @@ description = "Network telemetry: explicit egress proxy, capability detection, s
 workspace = true
 
 [dependencies]
+nix = { workspace = true }
+sealant-process = { workspace = true }
 sealant-protocol = { workspace = true }
 sealant-telemetry = { workspace = true }
 tokio = { workspace = true }

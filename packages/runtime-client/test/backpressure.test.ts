@@ -94,7 +94,12 @@ class Daemon extends Duplex {
             outcome: {
               outcome: {
                 case: "ok",
-                value: { result: { case: "forwardOpened", value: { channelId: CHANNEL } } },
+                value: {
+                  result: {
+                    case: "forwardOpened",
+                    value: { channelId: CHANNEL, boundSessionId: this.args?.ownerSessionId },
+                  },
+                },
               },
             },
           },
@@ -335,5 +340,22 @@ test("openForward sends its object's fields, leaving tcp off the wire", { timeou
   await client.openForward({ host: "docker", port: 53, protocol: "udp", executionId: "exe_1" });
   assert.equal(conn.args?.protocol, "udp");
   assert.equal(conn.args?.executionId, "exe_1");
+  assert.equal(conn.args?.ownerSessionId, undefined);
+
+  const bound = await client.openForward({ ...TCP, ownerSessionId: "sess_1" });
+  assert.equal(conn.args?.ownerSessionId, "sess_1");
+  assert.equal(bound.result.boundSessionId, "sess_1");
   client.close();
+});
+
+test("a forward connection can be bound to a session", { timeout: 5000 }, async () => {
+  const daemon = new Daemon();
+  const { result, channel } = await openForwardConnection(daemon, {
+    ...TCP,
+    ownerSessionId: "sess_1",
+    highWaterMarkBytes: CHUNK,
+  });
+  assert.equal(daemon.args?.ownerSessionId, "sess_1");
+  assert.equal(result.boundSessionId, "sess_1");
+  channel.destroy();
 });

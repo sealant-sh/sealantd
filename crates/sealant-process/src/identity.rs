@@ -385,24 +385,73 @@ impl RunAs {
     /// `work` does not run.
     pub fn as_fs_user<T: Send>(&self, work: impl FnOnce() -> T + Send) -> io::Result<T> {
         let (groups, uid, gid) = (&self.groups, self.uid, self.gid);
-        let dumpable = process_dumpable();
-        let joined = std::thread::scope(|scope| {
-            scope
-                .spawn(move || {
-                    ON_FS_USER_THREAD.with(|on| on.set(true));
-                    become_fs_user(groups, uid, gid)?;
-                    Ok(work())
-                })
-                .join()
-        });
-        if dumpable == 1 {
-            // SAFETY: as above.
+        on_fs_thread(move || become_fs_user(groups, uid, gid), work)
+    }
+}
+
+/// Run `work` on a thread of its own whose filesystem uid and gid are `uid` and `gid`, to read
+/// another process's `/proc/<pid>/fd` and `environ`: the kernel lets a reader whose filesystem
+/// ids match the process's do that without `CAP_SYS_PTRACE`, the capability a container's
+/// default set leaves out. It also asks that the reader's effective capabilities cover the
+/// process's permitted ones (a person's process may hold `CAP_FOWNER`), so the thread puts back
+/// the effective set it had before the switch, which dropped the filesystem capabilities from
+/// it, and raises nothing else. The same rule as [`RunAs::as_fs_user`] holds: **`work` must never start
+/// a process**, and should only read.
+///
+/// # Errors
+/// The thread could not take the ids: `work` does not run.
+pub fn as_proc_reader<T: Send>(
+    uid: u32,
+    gid: u32,
+    work: impl FnOnce() -> T + Send,
+) -> io::Result<T> {
+    on_fs_thread(move || become_proc_reader(uid, gid), work)
+}
+
+/// Each switch marks the process non-dumpable, so a thread that read the state while another held
+/// an identity would put back the wrong one: the first thread in records it, the last one out
+/// puts it back.
+struct BorrowedIdentities {
+    threads: usize,
+    dumpable_before: i32,
+}
+
+static BORROWED: std::sync::Mutex<BorrowedIdentities> = std::sync::Mutex::new(BorrowedIdentities {
+    threads: 0,
+    dumpable_before: 0,
+});
+
+fn on_fs_thread<T: Send>(
+    become_user: impl FnOnce() -> io::Result<()> + Send,
+    work: impl FnOnce() -> T + Send,
+) -> io::Result<T> {
+    {
+        let mut borrowed = BORROWED.lock().unwrap_or_else(|e| e.into_inner());
+        if borrowed.threads == 0 {
+            borrowed.dumpable_before = process_dumpable();
+        }
+        borrowed.threads += 1;
+    }
+    let joined = std::thread::scope(|scope| {
+        scope
+            .spawn(move || {
+                ON_FS_USER_THREAD.with(|on| on.set(true));
+                become_user()?;
+                Ok(work())
+            })
+            .join()
+    });
+    {
+        let mut borrowed = BORROWED.lock().unwrap_or_else(|e| e.into_inner());
+        borrowed.threads -= 1;
+        if borrowed.threads == 0 && borrowed.dumpable_before == 1 {
+            // SAFETY: prctl takes integer arguments only.
             unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 1, 0, 0, 0) };
         }
-        match joined {
-            Ok(result) => result,
-            Err(panic) => std::panic::resume_unwind(panic),
-        }
+    }
+    match joined {
+        Ok(result) => result,
+        Err(panic) => std::panic::resume_unwind(panic),
     }
 }
 
@@ -437,11 +486,55 @@ fn become_fs_user(groups: &[u32], uid: u32, gid: u32) -> io::Result<()> {
         if libc::syscall(libc::SYS_setgroups, groups.len(), groups.as_ptr()) == -1 {
             return Err(io::Error::last_os_error());
         }
+    }
+    set_fs_ids(uid, gid)?;
+    let none = CapData {
+        effective: 0,
+        permitted: 0,
+        inheritable: 0,
+    };
+    if capset([none, none]) == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+fn become_proc_reader(uid: u32, gid: u32) -> io::Result<()> {
+    let before = capget()?;
+    set_fs_ids(uid, gid)?;
+    if capset(before) == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+/// The calling thread's capability sets.
+fn capget() -> io::Result<[CapData; 2]> {
+    let mut header = CapHeader {
+        version: CAPABILITY_VERSION_3,
+        pid: 0,
+    };
+    let mut data = [CapData {
+        effective: 0,
+        permitted: 0,
+        inheritable: 0,
+    }; 2];
+    // SAFETY: capget writes the header and two data words into valid, live memory.
+    if unsafe { libc::syscall(libc::SYS_capget, &raw mut header, data.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(data)
+}
+
+fn set_fs_ids(uid: u32, gid: u32) -> io::Result<()> {
+    // SAFETY: raw system calls on integers; each changes the calling thread's credentials only.
+    unsafe {
         libc::syscall(libc::SYS_setfsgid, gid);
         libc::syscall(libc::SYS_setfsuid, uid);
     }
-    // `setfsuid` and `setfsgid` report no failure: an invalid id (-1) changes nothing and
-    // answers the current one, which must be the user's now.
+    // An invalid id (-1) changes nothing and answers the current one, which must be the new one.
     // SAFETY: as above.
     let (fsuid, fsgid) = unsafe {
         (
@@ -455,16 +548,7 @@ fn become_fs_user(groups: &[u32], uid: u32, gid: u32) -> io::Result<()> {
             format!("the thread could not take uid {uid} and gid {gid} (it has {fsuid}:{fsgid})"),
         ));
     }
-    let none = CapData {
-        effective: 0,
-        permitted: 0,
-        inheritable: 0,
-    };
-    if capset([none, none]) == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
+    Ok(())
 }
 
 /// `capset` on the calling thread.

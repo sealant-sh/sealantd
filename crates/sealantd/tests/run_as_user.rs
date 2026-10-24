@@ -22,8 +22,8 @@ use sealant_control::{handle_connection, read_frame, write_frame};
 use sealant_process::CommandGateExt;
 use sealant_protocol::{
     ClientMessage, Command, CommandResult, ControlRequest, ControlResponse, DotfilesApplyArgs,
-    ExecArgs, OpenSessionArgs, OpenSftpArgs, RequestId, ResponseOutcome, ServerMessage,
-    SessionMode, StreamFrame, StreamPayload,
+    ExecArgs, ForwardProtocol, OpenForwardArgs, OpenSessionArgs, OpenSftpArgs, RequestId,
+    ResponseOutcome, ServerMessage, SessionMode, StreamFrame, StreamPayload,
 };
 use sealant_runtime_core::{PERSON_GID, People, RuntimeConfig, new_runtime_id};
 use sealantd::Runtime;
@@ -2760,4 +2760,214 @@ fn elsewhere_no_new_privileges_stays_and_sudo_is_refused() {
     assert!(seen.contains("no new privileges"), "{seen}");
     assert_eq!(caps.no_new_privileges, Some(true), "{caps:?}");
     assert!(caps.person_capabilities.is_empty(), "{caps:?}");
+}
+
+/// The capability root needs to read another user's `/proc/<pid>/fd` directly, and the one
+/// Docker's and Kubernetes' default sets leave out.
+const CAP_SYS_PTRACE: u32 = 19;
+
+#[repr(C)]
+struct CapHeader {
+    version: u32,
+    pid: i32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CapData {
+    effective: u32,
+    permitted: u32,
+    inheritable: u32,
+}
+
+fn capget() -> (CapHeader, [CapData; 2]) {
+    let mut header = CapHeader {
+        version: 0x2008_0522,
+        pid: 0,
+    };
+    let mut data = [CapData {
+        effective: 0,
+        permitted: 0,
+        inheritable: 0,
+    }; 2];
+    // SAFETY: capget writes a header and two data words into live memory.
+    let got = unsafe { libc::syscall(libc::SYS_capget, &raw mut header, data.as_mut_ptr()) };
+    assert_eq!(got, 0);
+    (header, data)
+}
+
+/// The calling thread's effective capabilities, as `/proc` reports them.
+fn effective_capabilities() -> u64 {
+    let status = std::fs::read_to_string("/proc/thread-self/status").unwrap();
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("CapEff:"))
+        .map(|hex| u64::from_str_radix(hex.trim(), 16).unwrap())
+        .unwrap()
+}
+
+/// `CAP_KILL`, which Docker's default set keeps and a filesystem-id switch leaves alone.
+const CAP_KILL: u32 = 5;
+
+#[test]
+fn a_proc_reader_puts_back_the_capabilities_it_had_and_raises_none() {
+    if !ready() {
+        return;
+    }
+    std::thread::spawn(|| {
+        let (mut header, mut data) = capget();
+        assert_ne!(data[0].permitted & (1 << CAP_KILL), 0, "root may kill");
+        data[0].effective &= !(1 << CAP_KILL);
+        // SAFETY: capset reads a header and two data words from live memory and changes only
+        // this thread's capabilities.
+        let set = unsafe { libc::syscall(libc::SYS_capset, &raw mut header, data.as_ptr()) };
+        assert_eq!(set, 0);
+        let before = effective_capabilities();
+        let during =
+            sealant_process::identity::as_proc_reader(BOB_UID, GID, effective_capabilities)
+                .expect("the reader takes Bob's filesystem ids");
+        assert_eq!(
+            during & (1 << CAP_KILL),
+            0,
+            "CAP_KILL stays off: {during:x}"
+        );
+        assert_eq!(during, before, "{during:x} against {before:x}");
+    })
+    .join()
+    .unwrap();
+}
+
+fn drop_sys_ptrace() {
+    #[repr(C)]
+    struct Header {
+        version: u32,
+        pid: i32,
+    }
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct Data {
+        effective: u32,
+        permitted: u32,
+        inheritable: u32,
+    }
+    const VERSION_3: u32 = 0x2008_0522;
+    let mut header = Header {
+        version: VERSION_3,
+        pid: 0,
+    };
+    let mut data = [Data {
+        effective: 0,
+        permitted: 0,
+        inheritable: 0,
+    }; 2];
+    // SAFETY: capget and capset read and write a header and two data words in live memory, and
+    // change only the calling thread's capabilities.
+    unsafe {
+        assert_eq!(
+            libc::syscall(libc::SYS_capget, &raw mut header, data.as_mut_ptr()),
+            0
+        );
+        data[0].effective &= !(1 << CAP_SYS_PTRACE);
+        data[0].permitted &= !(1 << CAP_SYS_PTRACE);
+        assert_eq!(
+            libc::syscall(libc::SYS_capset, &raw mut header, data.as_ptr()),
+            0
+        );
+    }
+    let status = std::fs::read_to_string("/proc/thread-self/status").unwrap();
+    let effective = status
+        .lines()
+        .find_map(|line| line.strip_prefix("CapEff:"))
+        .map(|hex| u64::from_str_radix(hex.trim(), 16).unwrap())
+        .unwrap();
+    assert_eq!(
+        effective & (1 << CAP_SYS_PTRACE),
+        0,
+        "CAP_SYS_PTRACE dropped"
+    );
+}
+
+#[test]
+fn a_forward_binds_to_a_person_s_session_without_sys_ptrace() {
+    if !ready() {
+        return;
+    }
+    std::thread::spawn(|| {
+        drop_sys_ptrace();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(bound_to_bob());
+    })
+    .join()
+    .unwrap();
+}
+
+async fn bound_to_bob() {
+    let python = ["/usr/bin/python3", "/usr/local/bin/python3"]
+        .into_iter()
+        .find(|path| Path::new(path).is_file())
+        .expect("python3");
+    let port = std::net::TcpListener::bind(("127.0.0.1", 0))
+        .and_then(|l| l.local_addr())
+        .unwrap()
+        .port();
+    let dir = scratch();
+    let mut client = Client::start(dir.path());
+    let server = "import socket, sys\n\
+                  s = socket.socket()\n\
+                  s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n\
+                  s.bind(('127.0.0.1', int(sys.argv[1])))\n\
+                  s.listen()\n\
+                  held = []\n\
+                  while True:\n    held.append(s.accept()[0])\n";
+    let Some(CommandResult::SessionOpened(opened)) = ok(client
+        .request(Command::OpenSession(OpenSessionArgs {
+            user: Some(BOB.to_owned()),
+            execution_id: None,
+            shell: Some(python.to_owned()),
+            args: vec!["-c".to_owned(), server.to_owned(), port.to_string()],
+            cwd: None,
+            env: vec![],
+            cols: 80,
+            rows: 24,
+            term: None,
+            mode: SessionMode::Pipe,
+        }))
+        .await)
+    else {
+        panic!("session opened");
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+        assert!(Instant::now() < deadline, "Bob's server listens");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let direct = std::fs::read_link(format!("/proc/{}/fd/0", opened.pid));
+    assert_eq!(
+        direct.map_err(|e| e.kind()),
+        Err(std::io::ErrorKind::PermissionDenied),
+        "root without CAP_SYS_PTRACE cannot read Bob's fds itself"
+    );
+
+    let response = client
+        .request(Command::OpenForward(OpenForwardArgs {
+            host: "127.0.0.1".to_owned(),
+            port,
+            execution_id: None,
+            protocol: ForwardProtocol::Tcp,
+            dedicated: false,
+            owner_session_id: Some(opened.session_id.clone()),
+        }))
+        .await;
+    let Some(CommandResult::ForwardOpened(forward)) = ok(response) else {
+        panic!("forward opened");
+    };
+    assert_eq!(forward.bound_session_id, Some(opened.session_id.clone()));
+    ok(client
+        .request(Command::CloseSession {
+            session_id: opened.session_id,
+        })
+        .await);
 }

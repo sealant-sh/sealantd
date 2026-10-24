@@ -1141,6 +1141,8 @@ dependencies = [
 name = "sealant-network"
 version = "0.0.0"
 dependencies = [
+ "nix",
+ "sealant-process",
  "sealant-protocol",
  "sealant-runtime-core",
  "sealant-telemetry",
@@ -1237,6 +1239,7 @@ dependencies = [
  "base64 0.22.1",
  "clap",
  "futures",
+ "libc",
  "nix",
  "rcgen",
  "rustls",

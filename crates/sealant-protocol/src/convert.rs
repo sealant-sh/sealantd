@@ -912,6 +912,7 @@ impl From<OpenForwardArgs> for wire::OpenForwardArgs {
                 ForwardProtocol::Udp => Some("udp".to_owned()),
             },
             dedicated: a.dedicated.then_some(true),
+            owner_session_id: opt_id(a.owner_session_id),
         }
     }
 }
@@ -928,6 +929,7 @@ impl From<wire::OpenForwardArgs> for OpenForwardArgs {
                 _ => ForwardProtocol::Tcp,
             },
             dedicated: a.dedicated.unwrap_or(false),
+            owner_session_id: a.owner_session_id.map(SessionId::new),
         }
     }
 }
@@ -1524,6 +1526,7 @@ impl From<CommandResult> for wire::command_result::Result {
             }),
             CommandResult::ForwardOpened(f) => W::ForwardOpened(wire::ForwardOpened {
                 channel_id: f.channel_id.into_inner(),
+                bound_session_id: opt_id(f.bound_session_id),
             }),
             CommandResult::SftpOpened(s) => W::SftpOpened(wire::SftpOpened {
                 channel_id: s.channel_id.into_inner(),
@@ -1676,6 +1679,7 @@ impl TryFrom<wire::command_result::Result> for CommandResult {
             }),
             W::ForwardOpened(f) => CommandResult::ForwardOpened(ForwardOpened {
                 channel_id: ChannelId::new(f.channel_id),
+                bound_session_id: f.bound_session_id.map(SessionId::new),
             }),
             W::SftpOpened(s) => CommandResult::SftpOpened(SftpOpened {
                 channel_id: ChannelId::new(s.channel_id),
@@ -2416,6 +2420,7 @@ mod tests {
                 execution_id: Some(ExecutionId::new("run-1")),
                 protocol: ForwardProtocol::Udp,
                 dedicated: true,
+                owner_session_id: Some(SessionId::new("sess_1")),
             }),
         ));
         let bytes = encode_client(&msg);
@@ -2425,6 +2430,7 @@ mod tests {
             RequestId::new("req_f"),
             CommandResult::ForwardOpened(ForwardOpened {
                 channel_id: ChannelId::new("chan_f"),
+                bound_session_id: Some(SessionId::new("sess_1")),
             }),
         ));
         let rbytes = encode_server(&result);

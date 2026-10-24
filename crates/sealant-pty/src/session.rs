@@ -11,6 +11,8 @@ use std::time::{Duration, Instant};
 
 use nix::sys::signal::Signal as NixSignal;
 use nix::unistd::Pid;
+use sealant_process::SessionMark;
+use sealant_protocol::SESSION_ENV;
 use sealant_protocol::{
     Base64Bytes, CaptureMethod, ChannelId, Confidence, ControlError, Encoding, EventPayload,
     ExecutionId, ExitReason, IoChunk, OpenSessionArgs, ProcessExited, ProcessId, ProcessStarted,
@@ -18,7 +20,9 @@ use sealant_protocol::{
     SessionOutputChunk, SessionState, SessionSummary, Signal, StreamEnd, StreamFrame, StreamKind,
     StreamOffset, TransformMeta,
 };
-use sealant_runtime_core::{Clock, IdGenerator, Redactor, RuntimeConfig, RuntimeStatus};
+use sealant_runtime_core::{
+    Clock, IdGenerator, Redactor, RuntimeConfig, RuntimeStatus, new_secret,
+};
 use sealant_telemetry::{Correlation, EventBus};
 use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -93,6 +97,10 @@ pub struct SessionEntry {
     pub started_at_micros: i64,
     /// `Some((exit_code, signal))` once the leader has exited.
     exit: Mutex<Option<(Option<i32>, Option<i32>)>>,
+    /// True from the moment the leader is reaped, before its output has drained.
+    exited: watch::Sender<bool>,
+    /// Who the leader runs as, and the secret its processes carry in [`SESSION_ENV`].
+    mark: SessionMark,
     cols: AtomicU16,
     rows: AtomicU16,
 }
@@ -106,6 +114,20 @@ impl SessionEntry {
 
     fn mark_exited(&self, exit_code: Option<i32>, signal: Option<i32>) {
         *self.exit.lock().unwrap_or_else(|e| e.into_inner()) = Some((exit_code, signal));
+        self.exited.send_replace(true);
+    }
+
+    /// Whether the leader has exited: true as soon as it is reaped, which can be well before
+    /// [`SessionEntry::exit_status`] says so, once its output has drained.
+    #[must_use]
+    pub fn exit_watch(&self) -> watch::Receiver<bool> {
+        self.exited.subscribe()
+    }
+
+    /// Who the leader runs as and the marker its processes carry.
+    #[must_use]
+    pub fn mark(&self) -> SessionMark {
+        self.mark.clone()
     }
 
     /// A summary of this session.
@@ -373,6 +395,20 @@ impl SessionRuntime {
                 .filter(|(key, _)| inherited(key))
                 .cloned(),
         );
+        let marker = new_secret().map_err(|e| {
+            ControlError::internal(format!("no secret for the session's marker: {e}"))
+        })?;
+        env.retain(|(key, _)| key != SESSION_ENV);
+        env.push((SESSION_ENV.to_owned(), marker.clone()));
+        let (uid, gid) = run_as.as_ref().map_or_else(
+            || {
+                (
+                    nix::unistd::geteuid().as_raw(),
+                    nix::unistd::getegid().as_raw(),
+                )
+            },
+            |user| (user.uid, user.gid),
+        );
 
         // Spawn the leader in the requested shape. Both shapes yield a child to wait on, an input
         // handle for `write_input`, and an output source for the single capture reader.
@@ -473,6 +509,8 @@ impl SessionRuntime {
             journal: Arc::new(Mutex::new(journal)),
             started_at_micros: self.clock.wall_now().get(),
             exit: Mutex::new(None),
+            exited: watch::Sender::new(false),
+            mark: SessionMark { uid, gid, marker },
             cols: AtomicU16::new(args.cols),
             rows: AtomicU16::new(args.rows),
         });
@@ -550,10 +588,14 @@ impl SessionRuntime {
         let waiter_registry = self.registry.clone();
         let waiter_status = self.status.clone();
         let waiter_session = session_id.clone();
+        let waiter_entry = entry.clone();
         let mut child = child;
         tokio::spawn(async move {
             let start = Instant::now();
             let status_result = child.wait().await;
+            // Forwards bound to the session end now, not once its output has drained, which an
+            // attached client that stopped reading can hold up indefinitely.
+            waiter_entry.exited.send_replace(true);
             // Reaped: hand the pid back to the orphan reaper before anything slower runs.
             drop(spawned_pid);
             let _ = leader_exited_tx.send(());
@@ -1976,6 +2018,7 @@ mod tests {
                     graceful_signal: None,
                     user: None,
                 },
+                None,
                 None,
             )
             .expect("exec a command");
