@@ -2,18 +2,20 @@
 //! registrar and a `LocalDir` sink: real files, the real watcher, and timers on the wall clock
 //! or, where a test says so, on a [`ManualClock`] (sealantd#167).
 
+use std::cell::RefCell;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use sealant_capture::cadence::SHIP_TICK;
 use sealant_capture::manifest::CaptureKind;
 use sealant_capture::registrar::HeadInfo;
 use sealant_capture::{
-    Cadence, CadenceRunner, CaptureConfig, CaptureEngine, ChangeSignal, InMemoryRegistrar,
-    LocalDir, ManualClock, WatchMode,
+    Cadence, CadenceRunner, CaptureConfig, CaptureEngine, ChangeSignal, Class, InMemoryRegistrar,
+    LocalDir, ManualClock, SnapOutcome, SnapRequest, WatchMode,
 };
 use sealant_process::CommandGateExt;
 
@@ -690,5 +692,113 @@ fn a_due_small_snap_is_not_delayed_by_a_bulk_build() {
     assert_eq!(chain[1].manifest.kind, CaptureKind::Turn);
     let snap = runner.snapshot();
     assert!(!snap.bulk_in_progress);
+    runner.stop();
+}
+
+/// sealantd#195: whether a bulk build is paused mid-way, as the runner reads it without the
+/// engine (`capture.status`, a final flush's currency check), is what the engine answers after
+/// every transition: the build yields, resumes and finishes. Another holder of the engine does
+/// not hide a paused build.
+#[test]
+fn a_paused_bulk_build_reads_as_paused_whoever_holds_the_engine() {
+    let fx = Fixture::build();
+    let mut engine = CaptureEngine::open(fx.config(Cadence::default()), None).unwrap();
+    let bulk = |seq| SnapRequest {
+        kind: CaptureKind::Auto,
+        class: Class::Bulk,
+        seq,
+    };
+    let yielded = engine.snap_preemptible(bulk(1), &|| true).unwrap();
+    assert!(
+        matches!(yielded, SnapOutcome::Preempted),
+        "the build yields at its first read"
+    );
+    let sink = Arc::new(LocalDir::new(&fx.base.join("store")).unwrap());
+    let registrar: Arc<dyn sealant_capture::Registrar> = fx.registrar.clone();
+    let shipper = Arc::new(engine.shipper(sink, registrar));
+    let runner = CadenceRunner::new(engine, shipper);
+    let paused = |runner: &CadenceRunner| {
+        (
+            runner.with_engine(CaptureEngine::bulk_in_progress),
+            runner.snapshot().bulk_in_progress,
+        )
+    };
+    assert_eq!(paused(&runner), (true, true), "paused");
+    assert!(
+        runner.with_engine(|_| runner.snapshot().bulk_in_progress),
+        "paused while another holds the engine"
+    );
+
+    let seen = RefCell::new(Vec::new());
+    let resumed = runner
+        .with_engine_mut(|engine| {
+            engine.snap_preemptible(bulk(2), &|| {
+                seen.borrow_mut().push(runner.snapshot().bulk_in_progress);
+                false
+            })
+        })
+        .unwrap();
+    assert!(
+        matches!(resumed, SnapOutcome::Staged(_)),
+        "the build resumes and stages"
+    );
+    let seen = seen.into_inner();
+    assert!(
+        !seen.is_empty() && seen.iter().all(|paused| !paused),
+        "running, not paused, while it resumes: {seen:?}"
+    );
+    assert_eq!(paused(&runner), (false, false), "finished");
+}
+
+/// sealantd#195, the other way round: a bulk build paused after a complete final flush (the
+/// bulk class had a file to read again) is never read as the disk the flush captured, whoever
+/// holds the engine. A failed try at the engine's lock must not pass for an idle bulk class.
+#[test]
+fn a_bulk_build_paused_after_a_final_flush_is_never_current() {
+    let fx = Fixture::build();
+    let sink = Arc::new(LocalDir::new(&fx.base.join("store")).unwrap());
+    let engine = CaptureEngine::open(fx.config(Cadence::default()), None).unwrap();
+    let registrar: Arc<dyn sealant_capture::Registrar> = fx.registrar.clone();
+    let shipper = Arc::new(engine.shipper(sink, registrar));
+    let runner = CadenceRunner::new(engine, shipper);
+    let allowed = Arc::new(AtomicBool::new(true));
+    let hook = Arc::clone(&allowed);
+    runner.start(Some(Arc::new(move || hook.load(Ordering::SeqCst))));
+    // The writers stop, then the final flush.
+    allowed.store(false, Ordering::SeqCst);
+    let flushed = runner.flush_final(Some(Duration::from_secs(60)));
+    assert!(flushed.incomplete.is_none(), "{:?}", flushed.incomplete);
+    assert!(
+        runner.final_is_current_as_snapped(),
+        "current after the flush"
+    );
+
+    let yielded = runner
+        .with_engine_mut(|engine| {
+            engine
+                .invalidations()
+                .note(Class::Bulk, &fx.root.join("node_modules/pkg/lib/index.js"));
+            engine.snap_preemptible(
+                SnapRequest {
+                    kind: CaptureKind::Auto,
+                    class: Class::Bulk,
+                    seq: 1_000,
+                },
+                &|| true,
+            )
+        })
+        .unwrap();
+    assert!(
+        matches!(yielded, SnapOutcome::Preempted),
+        "the build yields at its read"
+    );
+    assert!(
+        !runner.final_is_current_as_snapped(),
+        "a paused bulk build is not current"
+    );
+    assert!(
+        !runner.with_engine(|_| runner.final_is_current_as_snapped()),
+        "a paused bulk build is not current while another holds the engine"
+    );
     runner.stop();
 }

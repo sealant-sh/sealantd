@@ -5,6 +5,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -836,6 +837,50 @@ struct ClassWork {
     suspects: Suspects,
 }
 
+/// The bulk class's working set across yields ([`ClassWork`]) and whether one is paused, kept
+/// in step: every change to it goes through here, under the engine's owner.
+#[derive(Debug, Default)]
+struct BulkWork {
+    paused: Option<ClassWork>,
+    flag: BulkPaused,
+}
+
+impl BulkWork {
+    /// The paused build, to resume it: none is paused after.
+    fn take(&mut self) -> Option<ClassWork> {
+        let work = self.paused.take();
+        self.flag.0.store(false, Ordering::SeqCst);
+        work
+    }
+
+    /// A build yielded: its progress waits for the next attempt.
+    fn pause(&mut self, work: ClassWork) {
+        self.paused = Some(work);
+        self.flag.0.store(true, Ordering::SeqCst);
+    }
+
+    /// The paused build's progress is dropped (a rebase, a repair).
+    fn abandon(&mut self) {
+        self.take();
+    }
+}
+
+/// Whether a bulk build is paused mid-way ([`CaptureEngine::bulk_in_progress`]), read without
+/// the engine: `capture.status` and a final flush's currency check never wait for it, and
+/// another holder of the engine does not read as a paused build. Written only by [`BulkWork`],
+/// beside the field it mirrors, while the engine is held, so after every transition it answers
+/// what `bulk_in_progress` answers. `SeqCst`, as the change and staged counters the same
+/// currency check reads beside it.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct BulkPaused(Arc<AtomicBool>);
+
+impl BulkPaused {
+    #[must_use]
+    pub(crate) fn get(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
 /// The outcome of a preemptible snap.
 #[derive(Debug, Clone)]
 pub enum SnapOutcome {
@@ -853,7 +898,7 @@ pub struct CaptureEngine {
     previous: Option<EncodedManifest>,
     workspace_index: TreeIndex,
     bulk_index: TreeIndex,
-    bulk_work: Option<ClassWork>,
+    bulk_work: BulkWork,
     chunks: ChunkMap,
     /// Format 2: where this epoch's dir objects are.
     dirs: DirMap,
@@ -1075,7 +1120,7 @@ impl CaptureEngine {
             previous,
             workspace_index,
             bulk_index,
-            bulk_work: None,
+            bulk_work: BulkWork::default(),
             chunks,
             dirs,
             last_tips,
@@ -1341,7 +1386,7 @@ impl CaptureEngine {
             .retain(|_, k| k.starts_with(&base) || chain.contains(k));
         self.dirs
             .retain(|k| k.starts_with(&base) || chain.contains(k));
-        self.bulk_work = None;
+        self.bulk_work.abandon();
         let seeded = previous.is_some();
         self.previous = previous;
         self.seed_from_chain()?;
@@ -1957,7 +2002,7 @@ impl CaptureEngine {
                 return Err(io::Error::other("small-class build yielded").into());
             }
             // Yielded: keep the progress for the next attempt; nothing is committed.
-            self.bulk_work = Some(work);
+            self.bulk_work.pause(work);
             return Ok(None);
         };
         // Commit: the index, the chunk map and the pack uploads. A suspect the build did not
@@ -2122,7 +2167,13 @@ impl CaptureEngine {
     /// Whether a bulk build is paused mid-way (it yielded to a small-class snap).
     #[must_use]
     pub fn bulk_in_progress(&self) -> bool {
-        self.bulk_work.is_some()
+        self.bulk_work.paused.is_some()
+    }
+
+    /// [`Self::bulk_in_progress`], readable without the engine.
+    #[must_use]
+    pub(crate) fn bulk_paused(&self) -> BulkPaused {
+        self.bulk_work.flag.clone()
     }
 
     /// Rebuild the capture the registrar refused ([`crate::ship::RepairRequest`], asked for by the shipper)
@@ -2251,7 +2302,7 @@ impl CaptureEngine {
             );
         }
         if bulk {
-            self.bulk_work = None;
+            self.bulk_work.abandon();
         }
         self.persist()?;
 
