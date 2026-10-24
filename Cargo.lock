@@ -1144,6 +1144,7 @@ dependencies = [
  "sealant-protocol",
  "sealant-runtime-core",
  "sealant-telemetry",
+ "serde_json",
  "tokio",
  "tracing",
 ]

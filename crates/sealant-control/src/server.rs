@@ -5,13 +5,14 @@ use std::path::Path;
 use std::sync::Arc;
 
 use sealant_protocol::{
-    ClientMessage, ControlError, ControlResponse, RequestId, SCHEMA_VERSION, ServerMessage,
-    StreamFrame, decode_client, encode_server,
+    ClientMessage, Command, ControlError, ControlResponse, RequestId, SCHEMA_VERSION,
+    ServerMessage, StreamFrame, decode_client, encode_server,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::UnixListener;
 use tokio::sync::{Mutex, Notify, broadcast, mpsc, watch};
 use tokio::task::JoinSet;
+use tokio_util::sync::CancellationToken;
 
 use crate::frame::{FrameError, read_frame, write_frame};
 use crate::service::{ChannelRegistry, CloserRegistry, ConnHandle, ControlService};
@@ -123,6 +124,7 @@ pub async fn handle_connection<S, R, W>(
         closers: closers.clone(),
         shutdown: shutdown.clone(),
         stop_events: Arc::new(Notify::new()),
+        closed: CancellationToken::new(),
     };
 
     // Writer task: the single owner of the write half; drains responses and forwarded events.
@@ -162,9 +164,12 @@ pub async fn handle_connection<S, R, W>(
         }
     });
 
-    // Reader loop runs in the current task.
+    // Reader loop runs in the current task. A forward's open can wait on a dial for seconds, so
+    // it runs beside the loop, which keeps reading the connection's other frames and its close.
+    let mut beside = JoinSet::new();
     loop {
         tokio::select! {
+            Some(_) = beside.join_next(), if !beside.is_empty() => {}
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
                     break;
@@ -174,6 +179,16 @@ pub async fn handle_connection<S, R, W>(
                 match frame {
                     Ok(Some(body)) => {
                         match decode_inbound(&body) {
+                            Inbound::Request(request)
+                                if matches!(request.command, Command::OpenForward(_)) =>
+                            {
+                                let (service, conn) = (service.clone(), conn.clone());
+                                beside.spawn(async move {
+                                    let response =
+                                        service.handle_on_connection(request, &conn).await;
+                                    let _ = conn.out_tx.send(ServerMessage::Response(response)).await;
+                                });
+                            }
                             Inbound::Request(request) => {
                                 let response = service.handle_on_connection(request, &conn).await;
                                 if out_tx.send(ServerMessage::Response(response)).await.is_err() {
@@ -220,6 +235,10 @@ pub async fn handle_connection<S, R, W>(
     // closers before clearing the inbound-sink registry; clearing the latter then ends any inbound
     // pump that the closer did not already abort. Dropping out_tx + aborting the forwarder closes the
     // outbound queue so the writer drains and exits.
+    // Requests still running give up first, so one that opened a channel has registered its
+    // closer before the closers run.
+    conn.closed.cancel();
+    while beside.join_next().await.is_some() {}
     let drained: Vec<_> = closers.lock().await.drain().map(|(_, c)| c).collect();
     for closer in drained {
         closer();

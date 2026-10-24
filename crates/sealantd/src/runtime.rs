@@ -1616,18 +1616,23 @@ impl Runtime {
                     conn.stop_events();
                 }
                 let channel_id = self.idgen.channel_id();
-                match self
-                    .forwards
-                    .open(
-                        channel_id.clone(),
-                        &args.host,
-                        args.port,
-                        args.execution_id,
-                        args.protocol,
-                        conn.out_tx.clone(),
-                    )
-                    .await
-                {
+                let open = self.forwards.open(
+                    channel_id.clone(),
+                    &args.host,
+                    args.port,
+                    args.execution_id,
+                    args.protocol,
+                    conn.out_tx.clone(),
+                );
+                // A closed connection drops the open where it waits (the dial), which closes
+                // its socket; nothing has started yet that a closer would have to reap.
+                let opened = tokio::select! {
+                    opened = open => opened,
+                    () = conn.closed.cancelled() => Err(ControlError::internal(
+                        "the connection closed before the forward opened".to_owned(),
+                    )),
+                };
+                match opened {
                     Ok(inbound) => {
                         conn.register_channel(channel_id.clone(), inbound).await;
                         // Eager closer: on connection drop, abort BOTH pumps and reap the

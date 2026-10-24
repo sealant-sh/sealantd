@@ -10,24 +10,153 @@
 //! side's EOF/half-close maps to a [`StreamFrame::End`], mirroring `copy_bidirectional` semantics.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
-
+use std::io;
+use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::time::Duration;
 
 use sealant_protocol::{
-    ChannelId, ControlError, ControlErrorCode, ExecutionId, ForwardProtocol, ServerMessage,
-    StreamEnd, StreamFrame, StreamPayload,
+    ChannelId, ControlError, ControlErrorCode, ExecutionId, ForwardConnectReason, ForwardProtocol,
+    ServerMessage, StreamEnd, StreamFrame, StreamPayload,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::OwnedReadHalf;
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::mpsc;
+use tokio::task::JoinSet;
+use tokio::time::Instant;
 
 /// Read-buffer size for the socket→gateway pump (raw conduit; not a recorded stream).
 pub const READ_BUF: usize = 64 * 1024;
 
 /// One datagram is at most 65_507 payload bytes; a 64 KiB + header buffer never truncates.
 const UDP_BUF: usize = 65_536;
+
+/// How long a TCP forward's connect may take, name resolution included. The control server runs
+/// a forward's open beside its reader and drops it when the connection closes, so this bounds
+/// only how long the open's own response waits.
+pub const CONNECT_DEADLINE: Duration = Duration::from_secs(5);
+
+/// How long one address gets before the next one starts alongside it, so a stalled address
+/// cannot use up the deadline its host's other addresses need (RFC 8305's default delay).
+const ATTEMPT_DELAY: Duration = Duration::from_millis(250);
+
+/// A failed dial: the reason a caller branches on, when the failure is one of those kinds, and
+/// what failed, for people.
+#[derive(Debug, PartialEq, Eq)]
+pub struct DialError {
+    pub reason: Option<ForwardConnectReason>,
+    pub message: String,
+}
+
+impl From<DialError> for ControlError {
+    fn from(error: DialError) -> Self {
+        let control = Self::new(ControlErrorCode::InternalError, error.message);
+        match error.reason {
+            Some(reason) => control.with_detail(reason.detail()),
+            None => control,
+        }
+    }
+}
+
+fn connect_reason(kind: io::ErrorKind) -> Option<ForwardConnectReason> {
+    match kind {
+        io::ErrorKind::ConnectionRefused => Some(ForwardConnectReason::ConnectionRefused),
+        io::ErrorKind::NetworkUnreachable | io::ErrorKind::HostUnreachable => {
+            Some(ForwardConnectReason::NetworkUnreachable)
+        }
+        io::ErrorKind::TimedOut => Some(ForwardConnectReason::DialTimeout),
+        _ => None,
+    }
+}
+
+/// How much a connect failure tells a caller, so the dial reports the most telling one across
+/// a host's addresses: a refusal names the port, a timeout the host, unreachable the network.
+fn telling(reason: Option<ForwardConnectReason>) -> u8 {
+    match reason {
+        Some(ForwardConnectReason::ConnectionRefused) => 3,
+        Some(ForwardConnectReason::DialTimeout) => 2,
+        Some(ForwardConnectReason::NetworkUnreachable) => 1,
+        Some(ForwardConnectReason::NameUnresolved) | None => 0,
+    }
+}
+
+/// Resolve `host` inside the container and connect to it by `deadline`.
+///
+/// # Errors
+/// A [`DialError`] naming why, when the failure is one of the [`ForwardConnectReason`] kinds.
+pub async fn dial(host: &str, port: u16, deadline: Instant) -> Result<TcpStream, DialError> {
+    let lookup = async {
+        tokio::net::lookup_host((host, port))
+            .await
+            .map(Iterator::collect)
+    };
+    dial_resolved(host, port, lookup, deadline).await
+}
+
+/// [`dial`] with the lookup supplied, so a test can resolve without the host's resolver.
+async fn dial_resolved(
+    host: &str,
+    port: u16,
+    lookup: impl Future<Output = io::Result<Vec<SocketAddr>>>,
+    deadline: Instant,
+) -> Result<TcpStream, DialError> {
+    let failed = |reason, cause: &dyn std::fmt::Display| DialError {
+        reason,
+        message: format!("forward connect to {host}:{port} failed: {cause}"),
+    };
+    let unresolved = Some(ForwardConnectReason::NameUnresolved);
+    let addrs = match tokio::time::timeout_at(deadline, lookup).await {
+        Ok(Ok(addrs)) => addrs,
+        Ok(Err(e)) => return Err(failed(unresolved, &e)),
+        Err(_) => return Err(failed(unresolved, &"the name did not resolve in time")),
+    };
+    if addrs.is_empty() {
+        return Err(failed(unresolved, &"the name has no address"));
+    }
+
+    let mut queue = addrs.into_iter();
+    let mut attempts = JoinSet::new();
+    let mut best: Option<io::Error> = None;
+    let keep = |e: io::Error, best: &mut Option<io::Error>| {
+        let better = best
+            .as_ref()
+            .is_none_or(|b| telling(connect_reason(e.kind())) > telling(connect_reason(b.kind())));
+        if better {
+            *best = Some(e);
+        }
+    };
+    let mut start_next = true;
+    loop {
+        if start_next && let Some(addr) = queue.next() {
+            attempts.spawn(TcpStream::connect(addr));
+        }
+        let more = queue.len() > 0;
+        start_next = tokio::select! {
+            joined = attempts.join_next() => match joined {
+                Some(Ok(Ok(stream))) => return Ok(stream),
+                Some(Ok(Err(e))) => {
+                    keep(e, &mut best);
+                    true
+                }
+                Some(Err(e)) => {
+                    keep(io::Error::other(e), &mut best);
+                    true
+                }
+                None if more => true,
+                None => break,
+            },
+            () = tokio::time::sleep(ATTEMPT_DELAY), if more => true,
+            () = tokio::time::sleep_until(deadline) => {
+                keep(io::Error::from(io::ErrorKind::TimedOut), &mut best);
+                break;
+            }
+        };
+    }
+    let error = best.unwrap_or_else(|| io::Error::from(io::ErrorKind::TimedOut));
+    Err(failed(connect_reason(error.kind()), &error))
+}
 
 /// A live forward: the two pump tasks driving one TCP connection.
 #[derive(Debug)]
@@ -64,8 +193,7 @@ impl ForwardRuntime {
     /// failure returns a [`ControlError`] (the caller may also emit a `StreamFrame::End{error}`).
     ///
     /// # Errors
-    /// Returns a [`ControlError`] with [`ControlErrorCode::InternalError`] when the TCP connect
-    /// fails.
+    /// Returns the [`dial`] error, as a [`ControlError`], when the TCP connect fails.
     pub async fn open(
         &self,
         channel_id: ChannelId,
@@ -78,13 +206,7 @@ impl ForwardRuntime {
         if protocol == ForwardProtocol::Udp {
             return self.open_udp(channel_id, host, port, out_tx).await;
         }
-        // The exact connect used by the egress proxy (proxy.rs); resolves inside the container.
-        let stream = TcpStream::connect((host, port)).await.map_err(|e| {
-            ControlError::new(
-                ControlErrorCode::InternalError,
-                format!("forward connect to {host}:{port} failed: {e}"),
-            )
-        })?;
+        let stream = dial(host, port, Instant::now() + CONNECT_DEADLINE).await?;
         let _ = stream.set_nodelay(true);
         let (read_half, mut write_half) = stream.into_split();
 
@@ -471,22 +593,141 @@ mod tests {
         assert!(rt.is_empty());
     }
 
+    /// A loopback port bound but not listening, held for the test: a connect to it is refused,
+    /// and nothing else can take the port meanwhile.
+    fn refusing() -> (tokio::net::TcpSocket, SocketAddr) {
+        let socket = tokio::net::TcpSocket::new_v4().expect("socket");
+        socket.bind(([127, 0, 0, 1], 0).into()).expect("bind");
+        let addr = socket.local_addr().expect("addr");
+        (socket, addr)
+    }
+
+    /// A loopback listener whose accept queue is full: it drops SYNs, so a connect to it waits
+    /// for an answer that does not come.
+    async fn stalling() -> (TcpListener, Vec<TcpStream>, SocketAddr) {
+        let socket = tokio::net::TcpSocket::new_v4().expect("socket");
+        socket.bind(([127, 0, 0, 1], 0).into()).expect("bind");
+        let addr = socket.local_addr().expect("addr");
+        let listener = socket.listen(1).expect("listen");
+        let mut queued = Vec::new();
+        for _ in 0..16 {
+            let connect = TcpStream::connect(addr);
+            match tokio::time::timeout(Duration::from_millis(300), connect).await {
+                Ok(Ok(stream)) => queued.push(stream),
+                _ => break,
+            }
+        }
+        (listener, queued, addr)
+    }
+
+    fn soon(ms: u64) -> Instant {
+        Instant::now() + Duration::from_millis(ms)
+    }
+
+    async fn resolved(addrs: Vec<SocketAddr>) -> io::Result<Vec<SocketAddr>> {
+        Ok(addrs)
+    }
+
     #[tokio::test]
-    async fn forward_connect_failure_is_an_error() {
+    async fn a_refused_forward_says_nothing_listens_there() {
         let (out_tx, _out_rx) = mpsc::channel::<ServerMessage>(8);
         let rt = ForwardRuntime::new();
-        // Port 1 on loopback should refuse.
-        let result = rt
+        let (_reserved, addr) = refusing();
+        let error = rt
             .open(
                 ChannelId::new("chan_x"),
                 "127.0.0.1",
-                1,
+                addr.port(),
                 None,
                 ForwardProtocol::Tcp,
                 out_tx,
             )
-            .await;
-        assert!(result.is_err(), "connect to 127.0.0.1:1 should fail");
+            .await
+            .expect_err("nothing listens on a bound port");
+        assert_eq!(error.code, ControlErrorCode::InternalError);
+        assert_eq!(
+            error.detail,
+            Some(ForwardConnectReason::ConnectionRefused.detail())
+        );
         assert!(rt.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_name_that_does_not_resolve_says_so() {
+        let lookup = async { Err(io::Error::other("no such host")) };
+        let error = dial_resolved("nowhere", 80, lookup, soon(1000))
+            .await
+            .expect_err("no such host");
+        assert_eq!(error.reason, Some(ForwardConnectReason::NameUnresolved));
+    }
+
+    #[tokio::test]
+    async fn a_lookup_that_runs_out_of_time_is_unresolved_not_a_dial_timeout() {
+        let lookup = std::future::pending();
+        let error = dial_resolved("slow-dns", 80, lookup, soon(100))
+            .await
+            .expect_err("the lookup never answers");
+        assert_eq!(error.reason, Some(ForwardConnectReason::NameUnresolved));
+    }
+
+    #[tokio::test]
+    async fn a_target_that_never_answers_times_out() {
+        let (_listener, _queued, addr) = stalling().await;
+        let error = dial_resolved("stalled", addr.port(), resolved(vec![addr]), soon(300))
+            .await
+            .expect_err("the accept queue is full");
+        assert_eq!(error.reason, Some(ForwardConnectReason::DialTimeout));
+    }
+
+    #[tokio::test]
+    async fn a_stalled_first_address_does_not_block_a_working_one() {
+        let (_listener, _queued, stalled) = stalling().await;
+        let working = TcpListener::bind(("127.0.0.1", 0)).await.expect("bind");
+        let addr = working.local_addr().expect("addr");
+        let stream = dial_resolved("two", 0, resolved(vec![stalled, addr]), soon(2000))
+            .await
+            .expect("the second address answers");
+        assert_eq!(stream.peer_addr().expect("peer"), addr);
+    }
+
+    #[tokio::test]
+    async fn a_refusal_outranks_a_timeout_on_another_address() {
+        let (_listener, _queued, stalled) = stalling().await;
+        let (_reserved, refused) = refusing();
+        for addrs in [vec![stalled, refused], vec![refused, stalled]] {
+            let error = dial_resolved("both", 0, resolved(addrs), soon(600))
+                .await
+                .expect_err("neither address connects");
+            assert_eq!(error.reason, Some(ForwardConnectReason::ConnectionRefused));
+        }
+    }
+
+    #[test]
+    fn a_refusal_tells_more_than_a_timeout_which_tells_more_than_unreachable() {
+        let order = [
+            Some(ForwardConnectReason::ConnectionRefused),
+            Some(ForwardConnectReason::DialTimeout),
+            Some(ForwardConnectReason::NetworkUnreachable),
+            None,
+        ];
+        assert!(order.windows(2).all(|w| telling(w[0]) > telling(w[1])));
+    }
+
+    #[test]
+    fn a_dial_error_becomes_an_internal_error_with_its_reason() {
+        let error = ControlError::from(DialError {
+            reason: Some(ForwardConnectReason::DialTimeout),
+            message: "forward connect to x:1 failed".to_owned(),
+        });
+        assert_eq!(error.code, ControlErrorCode::InternalError);
+        assert_eq!(
+            error.detail,
+            Some(serde_json::json!({ "reason": "dial-timeout" }))
+        );
+        let bare = ControlError::from(DialError {
+            reason: None,
+            message: String::new(),
+        });
+        assert_eq!(bare.detail, None);
     }
 }

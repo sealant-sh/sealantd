@@ -23,6 +23,7 @@ import {
 
 // Re-export the full generated surface (types, enums, schemas) plus protobuf-es `create`.
 export * from "./gen/sealant_pb.js";
+export * from "./reason.js";
 export { create } from "@bufbuild/protobuf";
 
 // Explicit named re-exports of the channel-multiplexing surface (ADR-0012 byte conduits). These all

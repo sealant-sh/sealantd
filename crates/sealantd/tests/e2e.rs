@@ -781,6 +781,94 @@ async fn in_process_a_dedicated_forward_connection_gets_no_events() {
     assert!(any.is_err(), "the dedicated connection got {any:?}");
 }
 
+/// The sockets in this network namespace still dialing `port` (`SYN_SENT` in `/proc/net/tcp`).
+fn dialing(port: u16) -> usize {
+    const SYN_SENT: &str = "02";
+    ["/proc/net/tcp", "/proc/net/tcp6"]
+        .iter()
+        .filter_map(|table| std::fs::read_to_string(table).ok())
+        .flat_map(|table| table.lines().skip(1).map(str::to_owned).collect::<Vec<_>>())
+        .filter(|row| {
+            let fields: Vec<&str> = row.split_whitespace().collect();
+            let remote_port = fields
+                .get(2)
+                .and_then(|remote| remote.rsplit(':').next())
+                .and_then(|hex| u16::from_str_radix(hex, 16).ok());
+            fields.get(3) == Some(&SYN_SENT) && remote_port == Some(port)
+        })
+        .count()
+}
+
+async fn eventually(what: &str, check: impl Fn() -> bool) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    while !check() {
+        assert!(tokio::time::Instant::now() < deadline, "{what} within 1 s");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test]
+async fn in_process_closing_the_connection_cancels_a_hanging_dial() {
+    // A listener whose accept queue is full drops SYNs, so a dial to it hangs.
+    let socket = tokio::net::TcpSocket::new_v4().expect("socket");
+    socket.bind(([127, 0, 0, 1], 0).into()).expect("bind");
+    let port = socket.local_addr().expect("addr").port();
+    let _listener = socket.listen(1).expect("listen");
+    let mut queued = Vec::new();
+    for _ in 0..16 {
+        let connect = tokio::net::TcpStream::connect(("127.0.0.1", port));
+        match tokio::time::timeout(Duration::from_millis(300), connect).await {
+            Ok(Ok(stream)) => queued.push(stream),
+            _ => break,
+        }
+    }
+
+    let mut config = RuntimeConfig::new(new_runtime_id());
+    config.workspace_root = std::env::temp_dir();
+    let runtime = Runtime::new(config, Arc::new(ShutdownSignal::new(1000)));
+    runtime.mark_healthy();
+    let (mut client, conn) = wire_runtime(runtime.clone());
+    send_request(
+        &mut client,
+        ControlRequest::new(
+            RequestId::new("hang"),
+            Command::OpenForward(OpenForwardArgs {
+                host: "127.0.0.1".to_owned(),
+                port,
+                execution_id: None,
+                protocol: ForwardProtocol::default(),
+                dedicated: true,
+            }),
+        ),
+    )
+    .await;
+    eventually("the dial starts", || dialing(port) == 1).await;
+
+    send_request(
+        &mut client,
+        ControlRequest::new(RequestId::new("health"), Command::RuntimeHealth),
+    )
+    .await;
+    let answered = async {
+        loop {
+            if let ServerMessage::Response(r) = recv_message(&mut client).await {
+                return r.request_id;
+            }
+        }
+    };
+    let first = tokio::time::timeout(Duration::from_secs(1), answered)
+        .await
+        .expect("the reader answers beside the hanging dial");
+    assert_eq!(first, RequestId::new("health"));
+
+    drop(client);
+    eventually("the dial's socket is closed", || dialing(port) == 0).await;
+    tokio::time::timeout(Duration::from_secs(1), conn)
+        .await
+        .expect("the connection ends")
+        .expect("cleanly");
+}
+
 /// §1.B transport/telemetry decoupling: openForward must be ALLOWED even with the networkCollection
 /// telemetry feature off (the default). Forwarding is the gateway's direct-tcpip substrate, not a
 /// network-capture concern — so a tunnel may be opened regardless of that kill switch.
