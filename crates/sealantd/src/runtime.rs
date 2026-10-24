@@ -384,7 +384,10 @@ impl Runtime {
         let _one = self.final_lock.lock().await;
         // `capture.status` reads `in-progress` from here until the report (not `not-final`).
         capture.begin_final();
-        let start = Instant::now();
+        // The deadline is on the capture engine's clock, as the flush's own is: the real clock
+        // (a test's manual one moves only while the flush waits on it).
+        let clock = capture.clock().clone();
+        let start = clock.now();
         let deadline = deadline_ms.map(Duration::from_millis);
         let grace = Duration::from_millis(grace_ms.unwrap_or_else(|| self.shutdown.grace_ms()));
         let grace = deadline.map_or(grace, |d| grace.min(d));
@@ -398,7 +401,7 @@ impl Runtime {
                 quiesced
             }
         };
-        let left = deadline.map(|d| d.saturating_sub(start.elapsed()));
+        let left = deadline.map(|d| d.saturating_sub(clock.now() - start));
         let flushing = Arc::clone(&capture);
         let report =
             match tokio::task::spawn_blocking(move || flushing.flush_final(left, quiesced)).await {
@@ -422,7 +425,7 @@ impl Runtime {
         if report.complete {
             tracing::info!(
                 head_n = ?report.head_n,
-                took_ms = start.elapsed().as_millis() as u64,
+                took_ms = (clock.now() - start).as_millis() as u64,
                 "final capture complete: everything on this disk is registered"
             );
         } else {
