@@ -62,7 +62,7 @@ ureq = { version = "3", default-features = false, features = ["rustls"] }
 notify = "8"
 walkdir = "2"
 # linux syscalls (prefer rustix/nix over raw libc)
-nix = { version = "0.31", features = ["process", "signal", "term", "fs", "user", "poll", "ioctl", "socket", "resource"] }
+nix = { version = "0.31", features = ["process", "signal", "term", "fs", "dir", "user", "poll", "ioctl", "socket", "resource"] }
 rustix = { version = "0.38", features = ["process", "fs", "termios", "pipe", "stdio"] }
 libc = "0.2"
 # protobuf wire format (ADR-0012)

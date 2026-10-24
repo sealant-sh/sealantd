@@ -10,8 +10,9 @@
 
 pub mod capability;
 pub mod forward;
+pub mod owner;
 pub mod proxy;
 pub mod runtime;
 
-pub use forward::ForwardRuntime;
+pub use forward::{ForwardOwner, ForwardRuntime};
 pub use runtime::{NetworkConfig, NetworkRuntime};

@@ -99,6 +99,7 @@ pub(crate) async fn apply(
                 user: Some(run_as.name.clone()),
             },
             Some(request_id),
+            None,
         )?),
     };
     Ok(DotfilesApplied {

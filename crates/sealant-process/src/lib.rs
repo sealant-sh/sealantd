@@ -19,6 +19,16 @@ pub mod signals;
 pub mod spawn;
 
 pub use registry::{ProcessEntry, ProcessRegistry};
+
+/// A running session as an `exec` that names it sees it: who its leader runs as, and the marker
+/// ([`sealant_protocol::SESSION_ENV`]) its processes carry. The `exec` carries the marker only
+/// when it runs as that same user and group.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionMark {
+    pub uid: u32,
+    pub gid: u32,
+    pub marker: String,
+}
 pub use runtime::ProcessRuntime;
 pub use sftp::SftpRuntime;
 pub use spawn::{Bound, CommandGateExt, GatedChild, SpawnedPid};

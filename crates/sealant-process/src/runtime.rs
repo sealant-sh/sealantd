@@ -7,8 +7,8 @@ use std::time::{Duration, Instant};
 use sealant_protocol::{
     CaptureMethod, CaptureMode, ChannelId, Confidence, ControlError, ControlErrorCode, Encoding,
     EventPayload, ExecAccepted, ExecArgs, ExitReason, IoChunk, ProcessExited, ProcessId,
-    ProcessStarted, ProcessState, ProcessSummary, RequestId, ServerMessage, Signal, StreamEnd,
-    StreamFrame, StreamKind, StreamOffset, TransformMeta,
+    ProcessStarted, ProcessState, ProcessSummary, RequestId, SESSION_ENV, ServerMessage, Signal,
+    StreamEnd, StreamFrame, StreamKind, StreamOffset, TransformMeta,
 };
 use sealant_runtime_core::{Clock, IdGenerator, Redactor, RuntimeConfig, RuntimeStatus};
 use sealant_telemetry::{Correlation, EventBus};
@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::sync::mpsc;
 
+use crate::SessionMark;
 use crate::registry::{ProcessEntry, ProcessRegistry};
 use crate::signals;
 
@@ -107,12 +108,16 @@ impl ProcessRuntime {
     ///
     /// # Errors
     /// Returns a [`ControlError`] if arguments are invalid or the process cannot be spawned.
+    ///
+    /// `session` is the running session `args.session_id` names, when there is one: the process
+    /// carries its marker only when it runs as the session's user and group.
     pub fn exec(
         &self,
         args: ExecArgs,
         request_id: Option<RequestId>,
+        session: Option<SessionMark>,
     ) -> Result<ExecAccepted, ControlError> {
-        self.exec_inner(args, request_id, None)
+        self.exec_inner(args, request_id, session, None)
     }
 
     /// Spawn a non-interactive process with its stdout/stderr additionally bound to a reliable
@@ -127,17 +132,19 @@ impl ProcessRuntime {
         &self,
         args: ExecArgs,
         request_id: Option<RequestId>,
+        session: Option<SessionMark>,
         channel_id: ChannelId,
         out_tx: mpsc::Sender<ServerMessage>,
     ) -> Result<ExecAccepted, ControlError> {
         let sink = AttachSink::new(channel_id, out_tx);
-        self.exec_inner(args, request_id, Some(sink))
+        self.exec_inner(args, request_id, session, Some(sink))
     }
 
     fn exec_inner(
         &self,
         args: ExecArgs,
         request_id: Option<RequestId>,
+        session: Option<SessionMark>,
         attach: Option<AttachSink>,
     ) -> Result<ExecAccepted, ControlError> {
         if args.executable.trim().is_empty() {
@@ -223,6 +230,19 @@ impl ProcessRuntime {
         {
             command.env(key, value);
         }
+        let runs_as = run_as.as_ref().map_or_else(
+            || {
+                (
+                    nix::unistd::geteuid().as_raw(),
+                    nix::unistd::getegid().as_raw(),
+                )
+            },
+            |user| (user.uid, user.gid),
+        );
+        match session.filter(|mark| (mark.uid, mark.gid) == runs_as) {
+            Some(mark) => command.env(SESSION_ENV, mark.marker),
+            None => command.env_remove(SESSION_ENV),
+        };
         command.current_dir(&cwd);
         command.stdin(if args.stdin {
             Stdio::piped()
@@ -711,7 +731,7 @@ mod tests {
         let rt = runtime();
         let mut rx = rt.bus.subscribe();
         let accepted = rt
-            .exec(exec_args("/bin/echo", &["hello"]), None)
+            .exec(exec_args("/bin/echo", &["hello"]), None, None)
             .expect("spawn");
         assert!(accepted.process_id.as_str().starts_with("proc_"));
 
@@ -755,6 +775,7 @@ mod tests {
                 &["-c", "printf 'KEY=sk-abcdef012345678901234567'"],
             ),
             None,
+            None,
         )
         .expect("spawn");
         let payloads = collect_until_exit(&mut rx).await;
@@ -792,7 +813,7 @@ mod tests {
             rt.status.inc_processes();
         }
         let error = rt
-            .exec(exec_args("/bin/echo", &["x"]), None)
+            .exec(exec_args("/bin/echo", &["x"]), None, None)
             .expect_err("limit should reject");
         assert_eq!(error.code(), ControlErrorCode::PolicyDenied);
     }
@@ -802,8 +823,12 @@ mod tests {
         let rt = runtime();
         let mut rx = rt.bus.subscribe();
         // Emit bytes including NUL and a high byte via printf.
-        rt.exec(exec_args("/bin/sh", &["-c", r"printf 'a\000b\377c'"]), None)
-            .expect("spawn");
+        rt.exec(
+            exec_args("/bin/sh", &["-c", r"printf 'a\000b\377c'"]),
+            None,
+            None,
+        )
+        .expect("spawn");
         let payloads = collect_until_exit(&mut rx).await;
         let stdout: Vec<u8> = payloads
             .iter()
@@ -822,7 +847,7 @@ mod tests {
     async fn nonzero_exit_code_is_reported() {
         let rt = runtime();
         let mut rx = rt.bus.subscribe();
-        rt.exec(exec_args("/bin/sh", &["-c", "exit 42"]), None)
+        rt.exec(exec_args("/bin/sh", &["-c", "exit 42"]), None, None)
             .expect("spawn");
         let payloads = collect_until_exit(&mut rx).await;
         match payloads.last() {
@@ -837,7 +862,7 @@ mod tests {
         let mut rx = rt.bus.subscribe();
         let mut args = exec_args("/bin/sh", &["-c", "sleep 30"]);
         args.timeout_millis = Some(150);
-        rt.exec(args, None).expect("spawn");
+        rt.exec(args, None, None).expect("spawn");
         let payloads = collect_until_exit(&mut rx).await;
         match payloads.last() {
             Some(EventPayload::ProcessExited(e)) => {
@@ -852,7 +877,7 @@ mod tests {
     async fn command_not_found_is_reported() {
         let rt = runtime();
         let err = rt
-            .exec(exec_args("/nonexistent/binary-xyz", &[]), None)
+            .exec(exec_args("/nonexistent/binary-xyz", &[]), None, None)
             .unwrap_err();
         assert_eq!(
             err.code(),
@@ -879,7 +904,7 @@ mod tests {
         let mut rx = rt.bus.subscribe();
         let mut args = exec_args("/bin/cat", &[]);
         args.stdin = true;
-        let accepted = rt.exec(args, None).expect("spawn");
+        let accepted = rt.exec(args, None, None).expect("spawn");
         rt.write_stdin(&accepted.process_id, b"hello stdin\n")
             .await
             .expect("write");
@@ -930,6 +955,7 @@ mod tests {
         let accepted = rt
             .exec(
                 exec_args("/bin/sh", &["-c", "sleep 30 & echo $!; wait"]),
+                None,
                 None,
             )
             .expect("spawn");
@@ -993,7 +1019,7 @@ mod tests {
         // Ignore SIGTERM and spin; the timeout path must escalate to an untrappable SIGKILL.
         let mut args = exec_args("/bin/sh", &["-c", "trap '' TERM; while true; do :; done"]);
         args.timeout_millis = Some(150);
-        rt.exec(args, None).expect("spawn");
+        rt.exec(args, None, None).expect("spawn");
         let payloads = collect_until_exit(&mut rx).await;
         match payloads.last() {
             Some(EventPayload::ProcessExited(e)) => {
@@ -1011,6 +1037,7 @@ mod tests {
         rt.exec(
             exec_args("/bin/sh", &["-c", "printf out >&1; printf err >&2"]),
             None,
+            None,
         )
         .expect("spawn");
         let payloads = collect_until_exit(&mut rx).await;
@@ -1027,6 +1054,7 @@ mod tests {
                 "/bin/sh",
                 &["-c", "head -c 1000000 /dev/zero | tr '\\0' 'A'"],
             ),
+            None,
             None,
         )
         .expect("spawn");

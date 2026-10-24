@@ -66,6 +66,7 @@ async fn reaper_never_steals_fast_exiting_owned_children() {
                     graceful_signal: None,
                 },
                 None,
+                None,
             )
             .expect("exec /bin/true");
         let exited = tokio::time::timeout(Duration::from_secs(5), async {

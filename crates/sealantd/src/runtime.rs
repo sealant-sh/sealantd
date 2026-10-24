@@ -10,14 +10,16 @@ use sealant_control::{ConnHandle, ControlService};
 use sealant_eventlog::{FsyncPolicy, Spool, SpoolConfig};
 use sealant_fs::snapshot::SnapshotConfig;
 use sealant_fs::{FilesystemConfig, FilesystemRuntime};
-use sealant_network::{ForwardRuntime, NetworkConfig, NetworkRuntime};
+use sealant_network::owner::refusal_error;
+use sealant_network::{ForwardOwner, ForwardRuntime, NetworkConfig, NetworkRuntime};
 use sealant_process::{ProcessRegistry, ProcessRuntime, SftpRuntime};
 use sealant_protocol::{
     Capabilities, Command, CommandResult, Confidence, ControlError, ControlRequest,
     ControlResponse, EventEnvelope, EventPayload, ExecutionId, Feature, FeatureMatrix,
-    FeatureState, ForwardOpened, HealthReport, NetworkMode, ProcessAttached, ProcessId,
-    ProcessList, ProcessState, RuntimeHeartbeat, RuntimeMetrics, RuntimeState, RuntimeStateChanged,
-    SCHEMA_VERSION, SftpOpened, ShutdownAccepted, Signal, StreamAttached,
+    FeatureState, ForwardBindingRefusal, ForwardOpened, ForwardProtocol, HealthReport, NetworkMode,
+    ProcessAttached, ProcessId, ProcessList, ProcessState, RuntimeHeartbeat, RuntimeMetrics,
+    RuntimeState, RuntimeStateChanged, SCHEMA_VERSION, SftpOpened, ShutdownAccepted, Signal,
+    StreamAttached,
 };
 use sealant_pty::{SessionRegistry, SessionRuntime};
 use sealant_runtime_core::{Clock, IdGenerator, Redactor, RuntimeConfig, RuntimeStatus};
@@ -35,6 +37,11 @@ pub const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
 ///   `dotfiles.apply`, which answers once the files are applied and runs `./install.sh` after
 ///   them as a managed process of that user.
 /// - `exec.user`: `exec` and `openSession` take a `user` ([`sealant_process::identity`]).
+/// - `forward.owner`: `openForward` takes `ownerSessionId` and opens only once that session's
+///   processes, and no other, hold the connection's far end ([`sealant_network::owner`]),
+///   echoing the session in `boundSessionId`. Every session leader, and every `exec` that names
+///   a running session it runs as the same user as, carries the session's secret marker in
+///   `SEALANT_SESSION_MARKER`.
 /// - `sftp.user`: `openSftp` takes a `user` too: the `sftp-server` runs as them, admitted as for
 ///   `exec`.
 /// - `restore.owner_map`: a capture restore takes an owner map (`SEALANT_CAPTURE_OWNER_MAP`),
@@ -45,6 +52,7 @@ pub const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const SUPPORTS: &[&str] = &[
     "dotfiles.user",
     "exec.user",
+    "forward.owner",
     "restore.owner_map",
     "sftp.user",
 ];
@@ -940,7 +948,8 @@ impl Runtime {
         if self.admission_is_closed() {
             return Err(Self::admission_closed_error());
         }
-        self.processes.exec(args, None)
+        let session = self.session_mark(&args);
+        self.processes.exec(args, None, session)
     }
 
     /// Subscribe to the telemetry event bus (used by the boot supervisor to await a managed
@@ -1262,7 +1271,8 @@ impl Runtime {
             }
             Command::Exec(args) => {
                 self.note_execution(args.execution_id.as_ref());
-                match self.processes.exec(args, Some(rid.clone())) {
+                let session = self.session_mark(&args);
+                match self.processes.exec(args, Some(rid.clone()), session) {
                     Ok(accepted) => {
                         ControlResponse::ok_with(rid, CommandResult::ExecAccepted(accepted))
                     }
@@ -1470,6 +1480,18 @@ impl Runtime {
         }
     }
 
+    /// The running session an `exec` names, whose marker it may carry.
+    fn session_mark(
+        &self,
+        args: &sealant_protocol::ExecArgs,
+    ) -> Option<sealant_process::SessionMark> {
+        let session = self
+            .sessions
+            .registry
+            .get_running(args.session_id.as_ref()?)?;
+        (!*session.exit_watch().borrow()).then(|| session.mark())
+    }
+
     /// Note that work is running under `execution_id`: filesystem events observed from now on are
     /// stamped with it (last-started wins; workspaces run one harness/run at a time in practice).
     fn note_execution(&self, execution_id: Option<&ExecutionId>) {
@@ -1530,9 +1552,11 @@ impl Runtime {
             Command::Exec(args) => {
                 self.note_execution(args.execution_id.as_ref());
                 let channel_id = self.idgen.channel_id();
+                let session = self.session_mark(&args);
                 match self.processes.exec_attached(
                     args,
                     Some(rid.clone()),
+                    session,
                     channel_id.clone(),
                     conn.out_tx.clone(),
                 ) {
@@ -1616,16 +1640,41 @@ impl Runtime {
                     conn.stop_events();
                 }
                 let channel_id = self.idgen.channel_id();
+                let owner = match &args.owner_session_id {
+                    None => None,
+                    Some(_) if args.protocol == ForwardProtocol::Udp => {
+                        let error = ControlError::invalid_argument(
+                            "a bound forward is TCP only".to_owned(),
+                        );
+                        return ControlResponse::error(rid, error);
+                    }
+                    Some(session_id) => match self.sessions.registry.get_running(session_id) {
+                        Some(leader) if !*leader.exit_watch().borrow() => Some(ForwardOwner {
+                            session_id: session_id.clone(),
+                            leader_pid: leader.pid,
+                            mark: leader.mark(),
+                            exited: leader.exit_watch(),
+                        }),
+                        _ => {
+                            let refusal = refusal_error(
+                                ForwardBindingRefusal::OwnerExited,
+                                session_id.as_str(),
+                            );
+                            return ControlResponse::error(rid, refusal);
+                        }
+                    },
+                };
                 let open = self.forwards.open(
                     channel_id.clone(),
                     &args.host,
                     args.port,
-                    args.execution_id,
                     args.protocol,
+                    owner,
                     conn.out_tx.clone(),
                 );
-                // A closed connection drops the open where it waits (the dial), which closes
-                // its socket; nothing has started yet that a closer would have to reap.
+                // A closed connection drops the open where it waits (the dial or the binding
+                // check), which closes its socket; nothing has started yet that a closer would
+                // have to reap.
                 let opened = tokio::select! {
                     opened = open => opened,
                     () = conn.closed.cancelled() => Err(ControlError::internal(
@@ -1648,7 +1697,10 @@ impl Runtime {
                         .await;
                         ControlResponse::ok_with(
                             rid,
-                            CommandResult::ForwardOpened(ForwardOpened { channel_id }),
+                            CommandResult::ForwardOpened(ForwardOpened {
+                                channel_id,
+                                bound_session_id: args.owner_session_id,
+                            }),
                         )
                     }
                     Err(error) => ControlResponse::error(rid, error),

@@ -14,6 +14,17 @@ pub fn new_runtime_id() -> RuntimeId {
     RuntimeId::new(format!("{}_{}", RuntimeId::PREFIX, random_token()))
 }
 
+/// A fresh secret: 128 random bits as hex. Unlike an id, it has no fallback: without the
+/// system's randomness there is no secret.
+///
+/// # Errors
+/// The system's random source failed.
+pub fn new_secret() -> std::io::Result<String> {
+    let mut buf = [0u8; 16];
+    getrandom::getrandom(&mut buf).map_err(|e| std::io::Error::other(e.to_string()))?;
+    Ok(hex::encode(buf))
+}
+
 fn random_token() -> String {
     let mut buf = [0u8; 8];
     match getrandom::getrandom(&mut buf) {

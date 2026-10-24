@@ -42,6 +42,7 @@ test-support = []
 
 [dev-dependencies]
 sealantd = { path = ".", features = ["test-support"] }
+libc = { workspace = true }
 sealant-protocol = { workspace = true }
 sealant-control = { workspace = true }
 sealant-runtime-core = { workspace = true }

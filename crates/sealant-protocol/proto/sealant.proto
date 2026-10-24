@@ -470,8 +470,9 @@ message ReadSessionOutputArgs {
 }
 message DetachSessionArgs { string channel_id = 1; }
 // `dedicated`: the connection carries this forward and nothing else, so the daemon stops sending
-// it events.
-message OpenForwardArgs { string host = 1; uint32 port = 2; optional string execution_id = 3; optional string protocol = 4; optional bool dedicated = 5; }
+// it events. `owner_session_id`: the forward opens only when a process of that session holds the
+// connection's far end, and `ForwardOpened.bound_session_id` echoes it.
+message OpenForwardArgs { string host = 1; uint32 port = 2; optional string execution_id = 3; optional string protocol = 4; optional bool dedicated = 5; optional string owner_session_id = 6; }
 message CloseForwardArgs { string channel_id = 1; }
 message OpenSftpArgs {
   optional string execution_id = 1;
@@ -654,7 +655,7 @@ message RuntimeMetrics {
 
 message ShutdownAccepted { uint64 grace_millis = 1; }
 message StreamAttached { string channel_id = 1; }
-message ForwardOpened { string channel_id = 1; }
+message ForwardOpened { string channel_id = 1; optional string bound_session_id = 2; }
 message SftpOpened { string channel_id = 1; }
 message ProcessAttached { string process_id = 1; int32 pid = 2; int32 pgid = 3; string channel_id = 4; }
 message CaptureStaged { uint64 n = 1; string capture_id = 2; CaptureKind kind = 3; bool unchanged = 4; }

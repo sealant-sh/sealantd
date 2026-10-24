@@ -548,6 +548,7 @@ async fn in_process_open_forward_loopback_echo() {
                 execution_id: None,
                 protocol: ForwardProtocol::default(),
                 dedicated: false,
+                owner_session_id: None,
             }),
         ),
     )
@@ -643,6 +644,7 @@ async fn in_process_forward_stops_reading_the_target_when_the_client_stops() {
                 execution_id: None,
                 protocol: ForwardProtocol::default(),
                 dedicated: false,
+                owner_session_id: None,
             }),
         ),
     )
@@ -715,6 +717,7 @@ async fn open_forward_on(
                 execution_id: None,
                 protocol: ForwardProtocol::default(),
                 dedicated,
+                owner_session_id: None,
             }),
         ),
     )
@@ -838,6 +841,7 @@ async fn in_process_closing_the_connection_cancels_a_hanging_dial() {
                 execution_id: None,
                 protocol: ForwardProtocol::default(),
                 dedicated: true,
+                owner_session_id: None,
             }),
         ),
     )
@@ -903,6 +907,7 @@ async fn in_process_open_forward_allowed_when_feature_off() {
                 execution_id: None,
                 protocol: ForwardProtocol::default(),
                 dedicated: false,
+                owner_session_id: None,
             }),
         ),
     )
@@ -1099,6 +1104,7 @@ async fn in_process_idle_forward_torn_down_on_connection_drop() {
                 execution_id: None,
                 protocol: ForwardProtocol::default(),
                 dedicated: false,
+                owner_session_id: None,
             }),
         ),
     )

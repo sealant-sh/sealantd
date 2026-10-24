@@ -18,6 +18,6 @@ pub use config::{
     Bind, BindableMount, PERSON_GID, PERSON_UID_MAX, PERSON_UID_MIN, People, RuntimeConfig,
 };
 pub use error::ConfigError;
-pub use idgen::{IdGenerator, new_runtime_id};
+pub use idgen::{IdGenerator, new_runtime_id, new_secret};
 pub use redact::Redactor;
 pub use status::RuntimeStatus;

@@ -325,6 +325,12 @@ pub struct OpenForwardArgs {
     /// events, which nothing on it reads. A daemon that predates the field ignores it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub dedicated: bool,
+    /// Bind the forward to this session: it opens only when a process of the session holds the
+    /// connection's far end. TCP to a loopback address only. A daemon that predates the field
+    /// ignores it, and a bound forward's result echoes the session
+    /// ([`ForwardOpened::bound_session_id`]), so a caller checks the echo.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_session_id: Option<SessionId>,
 }
 
 /// Arguments to `openSftp`: spawn an in-container `sftp-server` bound to a reliable channel.
@@ -1035,6 +1041,9 @@ pub struct ProcessAttached {
 pub struct ForwardOpened {
     /// The newly minted forward channel.
     pub channel_id: ChannelId,
+    /// The session the forward was verified against, for a forward that asked to be bound.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bound_session_id: Option<SessionId>,
 }
 
 /// Result of `openSftp`: the channel the sftp-server stdio is bridged over.
