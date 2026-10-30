@@ -25,7 +25,7 @@ use sealant_runtime_core::{
 };
 use sealant_telemetry::{Correlation, EventBus, StreamRecorder};
 use tokio::io::unix::AsyncFd;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::{ChildStderr, ChildStdin, ChildStdout};
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -587,23 +587,13 @@ impl SessionRuntime {
                 )
                 .await;
             }),
-            LeaderOutputs::Pipe { stdout, stderr } => {
-                let stderr_fanout = fanout.clone();
-                tokio::spawn(async move {
-                    capture_stderr(stderr, chunk_size, stderr_fanout).await;
-                });
-                tokio::spawn(async move {
-                    capture_pipe_output(
-                        stdout,
-                        chunk_size,
-                        CaptureContext {
-                            fanout,
-                            leader_exited_rx,
-                        },
-                    )
-                    .await;
-                })
-            }
+            // Stdout and stderr drain side by side, and both end before the exit is published.
+            LeaderOutputs::Pipe { stdout, stderr } => tokio::spawn(async move {
+                tokio::join!(
+                    capture_pipe_output(stdout, chunk_size, fanout.clone()),
+                    capture_stderr(stderr, chunk_size, fanout),
+                );
+            }),
         };
 
         // Wait for the leader to exit, then publish the final result.
@@ -1260,53 +1250,78 @@ async fn capture_output(master: Arc<AsyncFd<OwnedFd>>, chunk_size: usize, contex
     fanout.finish(&mut recorder, end).await;
 }
 
-/// After the leader exits, how long a quiet stdout pipe is given before the drain ends. Pipes
-/// have no flip-buffer race like the PTY, but a helper that inherited stdout may still be writing;
-/// one quiet window this long is treated as drained (the byte budget bounds a chatty helper).
+/// After the leader exits, how long a quiet pipe is given before the drain ends. Pipes have no
+/// flip-buffer race like the PTY, but a helper that inherited stdout or stderr may still be
+/// writing; one quiet window this long is treated as drained (the byte budget bounds a chatty
+/// helper).
 const POST_EXIT_PIPE_QUIET: Duration = Duration::from_millis(20);
 
-/// Pipe-mode stdout reader: the same single-reader fan-out as the PTY path, reading the stdout
-/// pipe. Ends at EOF, or — once the leader has exited — after a quiet window or the drain budget.
-async fn capture_pipe_output(mut stdout: ChildStdout, chunk_size: usize, context: CaptureContext) {
-    let CaptureContext {
-        fanout,
-        mut leader_exited_rx,
-    } = context;
-    let mut recorder = fanout.recorder(CaptureMethod::Pipe, StreamKind::Stdout);
-    let mut buf = vec![0u8; chunk_size.max(1)];
-    let mut post_exit: Option<usize> = None;
-    let end = loop {
-        let read_result = match post_exit {
-            Some(budget) => {
-                if budget == 0 {
-                    break FinishReason::Cutoff;
+/// Reads one of a pipe-mode leader's output pipes until it ends: at EOF, or, once the leader has
+/// exited, after a quiet window or the drain budget, which are cutoffs (a helper may still hold
+/// the pipe). Stdout and stderr each drain through one, so both end before the exit is published.
+struct PipeDrain<R> {
+    reader: R,
+    exited: watch::Receiver<bool>,
+    budget: Option<usize>,
+}
+
+impl<R: AsyncRead + Unpin> PipeDrain<R> {
+    fn new(reader: R, entry: &SessionEntry) -> Self {
+        Self {
+            reader,
+            exited: entry.exit_watch(),
+            budget: None,
+        }
+    }
+
+    /// The next read's length, or how the pipe ended.
+    async fn read(&mut self, buf: &mut [u8]) -> Result<usize, FinishReason> {
+        let read = loop {
+            match self.budget {
+                Some(0) => return Err(FinishReason::Cutoff),
+                Some(budget) => {
+                    let read_size = budget.min(buf.len());
+                    let read = tokio::time::timeout(
+                        POST_EXIT_PIPE_QUIET,
+                        self.reader.read(&mut buf[..read_size]),
+                    );
+                    match read.await {
+                        Ok(read) => break read,
+                        Err(_quiet) => return Err(FinishReason::Cutoff),
+                    }
                 }
-                let read_size = budget.min(buf.len());
-                match tokio::time::timeout(POST_EXIT_PIPE_QUIET, stdout.read(&mut buf[..read_size]))
-                    .await
-                {
-                    Ok(result) => result,
-                    Err(_quiet) => break FinishReason::Cutoff,
-                }
+                None => tokio::select! {
+                    biased;
+                    _ = self.exited.wait_for(|exited| *exited) => {
+                        self.budget = Some(POST_EXIT_DRAIN_BUDGET);
+                    }
+                    read = self.reader.read(buf) => break read,
+                },
             }
-            None => tokio::select! {
-                biased;
-                _ = &mut leader_exited_rx => {
-                    post_exit = Some(POST_EXIT_DRAIN_BUDGET);
-                    continue;
-                }
-                result = stdout.read(&mut buf) => result,
-            },
         };
-        match read_result {
-            Ok(0) => break FinishReason::Eof,
+        match read {
+            Ok(0) => Err(FinishReason::Eof),
             Ok(n) => {
-                if let Some(budget) = &mut post_exit {
+                if let Some(budget) = &mut self.budget {
                     *budget = budget.saturating_sub(n);
                 }
-                fanout.deliver(&mut recorder, &buf[..n]).await;
+                Ok(n)
             }
-            Err(_) => break FinishReason::Cutoff,
+            Err(_) => Err(FinishReason::Cutoff),
+        }
+    }
+}
+
+/// Pipe-mode stdout reader: the same single-reader fan-out as the PTY path, reading the stdout
+/// pipe.
+async fn capture_pipe_output(stdout: ChildStdout, chunk_size: usize, fanout: Fanout) {
+    let mut recorder = fanout.recorder(CaptureMethod::Pipe, StreamKind::Stdout);
+    let mut drain = PipeDrain::new(stdout, &fanout.entry);
+    let mut buf = vec![0u8; chunk_size.max(1)];
+    let end = loop {
+        match drain.read(&mut buf).await {
+            Ok(n) => fanout.deliver(&mut recorder, &buf[..n]).await,
+            Err(end) => break end,
         }
     };
     fanout.finish(&mut recorder, end).await;
@@ -1315,16 +1330,14 @@ async fn capture_pipe_output(mut stdout: ChildStdout, chunk_size: usize, context
 /// Pipe-mode stderr reader: telemetry only. Diagnostics are recorded (redacted) as `stderr`
 /// `IoChunk`s so the record keeps them, but they never enter the journal or the attach channel —
 /// those carry the protocol stream alone.
-async fn capture_stderr(mut stderr: ChildStderr, chunk_size: usize, fanout: Fanout) {
+async fn capture_stderr(stderr: ChildStderr, chunk_size: usize, fanout: Fanout) {
     let mut recorder = fanout.recorder(CaptureMethod::Pipe, StreamKind::Stderr);
+    let mut drain = PipeDrain::new(stderr, &fanout.entry);
     let mut buf = vec![0u8; chunk_size.max(1)];
     let end = loop {
-        match stderr.read(&mut buf).await {
-            Ok(0) => break FinishReason::Eof,
-            Err(_) => break FinishReason::Cutoff,
-            Ok(n) => {
-                recorder.read(&buf[..n]);
-            }
+        match drain.read(&mut buf).await {
+            Ok(n) => recorder.read(&buf[..n]),
+            Err(end) => break end,
         }
     };
     recorder.end(end);
@@ -2640,19 +2653,7 @@ mod tests {
                  printf 'et-value-42\n' >&2; printf 'out-b'",
             ]))
             .expect("open");
-        // Stderr is not joined before the exit: wait for both.
-        let (mut stderr, mut exited) = (Vec::new(), false);
-        while !exited || recorded(&stderr) != "***REDACTED***\n" {
-            let env = tokio::time::timeout(Duration::from_secs(5), rx.recv())
-                .await
-                .expect("the exit and the masked stderr arrive")
-                .expect("event");
-            match env.payload {
-                EventPayload::IoChunk(c) if c.stream == StreamKind::Stderr => stderr.push(c),
-                EventPayload::ProcessExited(_) => exited = true,
-                _ => {}
-            }
-        }
+        let stderr = chunks_until_exit(&mut rx, StreamKind::Stderr).await;
         assert_eq!(recorded(&stderr), "***REDACTED***\n");
         let journal: String = rt
             .read_output(&opened.session_id, 0, None)
@@ -2662,6 +2663,21 @@ mod tests {
             .map(|c| String::from_utf8_lossy(c.data.as_slice()).into_owned())
             .collect();
         assert_eq!(journal, "out-a out-b");
+    }
+
+    /// Pipe stderr ends before the exit is published, even while a helper holds it open: its
+    /// drain is bounded like stdout's, and a held prefix of a secret at that cutoff is masked.
+    #[tokio::test]
+    async fn pipe_stderr_ends_before_the_exit_while_a_helper_holds_it() {
+        let rt = masking_runtime();
+        let mut rx = rt.bus.subscribe();
+        rt.open(pipe_args(&[
+            "-c",
+            "printf 'split-secr' >&2; sleep 0.1; sleep 2 &",
+        ]))
+        .expect("open");
+        let stderr = chunks_until_exit(&mut rx, StreamKind::Stderr).await;
+        assert_eq!(recorded(&stderr), "***REDACTED***");
     }
 
     /// Input is forwarded as it comes, and its record masks a secret typed across writes. The
