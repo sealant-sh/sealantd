@@ -1115,20 +1115,17 @@ impl Fanout {
     /// Append a masked chunk to the durable journal; the sequence minted here is the wire
     /// sequence for both live frames and replays. A chunk that records nothing mints none.
     fn journal(&self, chunk: &MaskedChunk) -> Option<u64> {
-        if chunk.recorded().is_empty() {
-            return None;
-        }
         let entry = &self.entry;
         let seq = {
             let mut journal = entry.journal.lock().unwrap_or_else(|e| e.into_inner());
-            journal.append(chunk.recorded())
+            journal.append(chunk)
         };
-        Some(seq.unwrap_or_else(|error| {
+        seq.unwrap_or_else(|error| {
             tracing::error!(%error, session = %entry.session_id,
                 "session journal append failed; output recording degraded");
             self.status.add_degradation("session-journal-append-failed");
-            u64::MAX
-        }))
+            Some(u64::MAX)
+        })
     }
 
     async fn attach(&self, chunk: &MaskedChunk, seq: Option<u64>) {
@@ -1377,6 +1374,7 @@ async fn replay_journal_until(
 
 #[cfg(test)]
 mod tests {
+    #![expect(clippy::disallowed_types, reason = "the tests read io.chunk events")]
     use super::*;
     use sealant_protocol::{EventEnvelope, EventPayload, IoChunk};
     use sealant_runtime_core::new_runtime_id;

@@ -4,6 +4,10 @@
 # three terminators bans every ungated `Command` child; its `wait` needs no ban of its own. The
 # raw primitives (fork, vfork, posix_spawn) make a child with no `Command` at all, so they are
 # banned too, under nix's names and libc's (`nix::libc::…` is the same function as `libc::…`).
+# An io.chunk's content is a recorded stream's bytes, so only a masked chunk may become one.
+disallowed-types = [
+  { path = "sealant_protocol::event::IoChunk", reason = "record a stream through sealant_telemetry::StreamRecorder (masked content) or EventBus::publish_metadata (no content); an IoChunk built anywhere else skips masking" },
+]
 disallowed-methods = [
   { path = "std::process::Command::spawn", reason = "spawn through sealant_process::spawn (CommandGateExt::spawn_gated, spawn_std): the orphan reaper steals ungated children's exit status (spawn.rs, sealantd#178)" },
   { path = "std::process::Command::output", reason = "spawn through sealant_process::spawn (CommandGateExt::output_gated): the orphan reaper steals ungated children's exit status (spawn.rs, sealantd#178)" },

@@ -10,7 +10,7 @@
 use std::fmt;
 use std::sync::Arc;
 
-use sealant_protocol::{Base64Bytes, Encoding, IoChunk, StreamKind, StreamOffset, TransformMeta};
+use sealant_protocol::{Base64Bytes, Encoding, StreamKind, StreamOffset, TransformMeta};
 
 const REDACTED: &[u8] = b"***REDACTED***";
 
@@ -345,10 +345,18 @@ impl MaskedChunk {
     }
 
     /// The telemetry chunk recording it at raw position `offset` of `stream`; `None` when it
-    /// stands for no raw byte yet.
+    /// stands for no raw byte yet. The one place an `io.chunk` gets content.
     #[must_use]
-    pub fn io_chunk(&self, stream: StreamKind, offset: StreamOffset) -> Option<IoChunk> {
-        (self.consumed > 0).then(|| IoChunk {
+    #[expect(
+        clippy::disallowed_types,
+        reason = "a masked chunk is what an io.chunk's content may be"
+    )]
+    pub fn io_chunk(
+        &self,
+        stream: StreamKind,
+        offset: StreamOffset,
+    ) -> Option<sealant_protocol::IoChunk> {
+        (self.consumed > 0).then(|| sealant_protocol::IoChunk {
             stream,
             encoding: Encoding::Base64,
             byte_count: self.recorded.len() as u64,

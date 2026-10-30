@@ -11,6 +11,8 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
+use sealant_runtime_core::MaskedChunk;
+
 /// One replayable record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JournalChunk {
@@ -162,11 +164,16 @@ impl SessionJournal {
         })
     }
 
-    /// Append one output chunk, returning its journal sequence.
+    /// Append one masked output chunk, returning its journal sequence: `None` for a chunk that
+    /// records no bytes, which mints none. Only masked bytes reach the journal.
     ///
     /// # Errors
     /// Returns an I/O error if the write fails (the sequence is not consumed).
-    pub fn append(&mut self, payload: &[u8]) -> std::io::Result<u64> {
+    pub fn append(&mut self, chunk: &MaskedChunk) -> std::io::Result<Option<u64>> {
+        let payload = chunk.recorded();
+        if payload.is_empty() {
+            return Ok(None);
+        }
         if self.current.bytes > 0
             && self.current.bytes + record_len(payload.len()) > self.segment_limit
         {
@@ -174,7 +181,7 @@ impl SessionJournal {
         }
         let seq = self.current.end_seq();
         self.current.append(seq, payload)?;
-        Ok(seq)
+        Ok(Some(seq))
     }
 
     fn rotate(&mut self) -> std::io::Result<()> {
@@ -235,6 +242,26 @@ fn segment_path(dir: &Path, session: &str, generation: u64) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sealant_runtime_core::Redactor;
+    use std::sync::Arc;
+
+    /// `bytes` as a masked chunk with nothing to mask.
+    fn masked(bytes: &[u8]) -> MaskedChunk {
+        let chunk = Arc::new(Redactor::default()).stream().push(bytes);
+        assert_eq!(chunk.recorded(), bytes);
+        chunk
+    }
+
+    /// A chunk that records nothing (the masker held all of it) mints no sequence.
+    #[test]
+    fn a_chunk_that_records_nothing_mints_no_sequence() {
+        let (_dir, mut j) = journal(1 << 20);
+        let redactor = Arc::new(Redactor::new(vec!["split-secret-value-42".to_owned()]));
+        let held = redactor.stream().push(b"split-secr");
+        assert_eq!(j.append(&held).expect("append"), None);
+        assert_eq!(j.append(&masked(b"next")).expect("append"), Some(0));
+        assert_eq!(j.next_seq(), 1);
+    }
 
     fn journal(limit: u64) -> (tempfile::TempDir, SessionJournal) {
         let dir = tempfile::tempdir().expect("tmp");
@@ -246,8 +273,10 @@ mod tests {
     fn appends_are_contiguous_and_replayable_from_zero() {
         let (_dir, mut j) = journal(1 << 20);
         for i in 0..10u32 {
-            let seq = j.append(format!("chunk-{i}\n").as_bytes()).expect("append");
-            assert_eq!(seq, u64::from(i));
+            let seq = j
+                .append(&masked(format!("chunk-{i}\n").as_bytes()))
+                .expect("append");
+            assert_eq!(seq, Some(u64::from(i)));
         }
         let chunks = j.read_from(0, u64::MAX);
         assert_eq!(chunks.len(), 10);
@@ -263,7 +292,8 @@ mod tests {
     fn read_from_middle_and_bounded_by_max_bytes() {
         let (_dir, mut j) = journal(1 << 20);
         for i in 0..20u32 {
-            j.append(format!("{i:04}").as_bytes()).expect("append");
+            j.append(&masked(format!("{i:04}").as_bytes()))
+                .expect("append");
         }
         let tail = j.read_from(15, u64::MAX);
         assert_eq!(tail.first().map(|c| c.sequence), Some(15));
@@ -281,7 +311,7 @@ mod tests {
     fn rotation_bounds_disk_and_keeps_contiguous_tail() {
         // Tiny segments force rotation. The floor is 64 KiB, so write big payloads.
         let (dir, mut j) = journal(1);
-        let payload = vec![b'x'; 40 * 1024];
+        let payload = masked(&vec![b'x'; 40 * 1024]);
         for _ in 0..6 {
             j.append(&payload).expect("append");
         }
@@ -314,7 +344,7 @@ mod tests {
     fn binary_payloads_round_trip() {
         let (_dir, mut j) = journal(1 << 20);
         let payload = [0x00u8, 0xff, 0x1b, b'[', b'3', b'1', b'm'];
-        j.append(&payload).expect("append");
+        j.append(&masked(&payload)).expect("append");
         let chunks = j.read_from(0, u64::MAX);
         assert_eq!(chunks[0].data, payload);
     }
@@ -322,7 +352,7 @@ mod tests {
     #[test]
     fn remove_files_deletes_segments() {
         let (dir, mut j) = journal(1 << 20);
-        j.append(b"data").expect("append");
+        j.append(&masked(b"data")).expect("append");
         j.remove_files();
         let files: Vec<_> = std::fs::read_dir(dir.path())
             .expect("readdir")

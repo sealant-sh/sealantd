@@ -91,7 +91,7 @@ impl StreamRecorder {
     fn publish(&mut self, chunk: &MaskedChunk) {
         self.status.add_redacted(chunk.redactions());
         if let Some(io) = chunk.io_chunk(self.stream, self.offset) {
-            self.bus.publish(
+            self.bus.publish_recorded(
                 &self.correlation,
                 self.method,
                 Confidence::Observed,
@@ -104,6 +104,7 @@ impl StreamRecorder {
 
 #[cfg(test)]
 mod tests {
+    #![expect(clippy::disallowed_types, reason = "the tests read io.chunk events")]
     use super::*;
     use sealant_protocol::{EventEnvelope, IoChunk};
     use sealant_runtime_core::{Clock, IdGenerator, Redactor, new_runtime_id};
@@ -137,6 +138,23 @@ mod tests {
             EventPayload::IoChunk(chunk) => Some(chunk),
             _ => None,
         }
+    }
+
+    /// An io.chunk with content published past the recorder is refused.
+    #[test]
+    #[should_panic(expected = "io.chunk content is published through StreamRecorder")]
+    fn the_bus_refuses_io_chunk_content_from_anywhere_else() {
+        let (recorder, _rx) = recorder(&[]);
+        let masked = Arc::new(Redactor::default()).stream().push(b"raw");
+        let chunk = masked
+            .io_chunk(StreamKind::Stdout, StreamOffset::ZERO)
+            .expect("a chunk");
+        recorder.bus.publish(
+            &Correlation::new(),
+            CaptureMethod::Pipe,
+            Confidence::Observed,
+            EventPayload::IoChunk(chunk),
+        );
     }
 
     /// A journal sees each chunk before its event is published.

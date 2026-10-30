@@ -5,10 +5,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use sealant_protocol::{
-    CaptureMethod, CaptureMode, ChannelId, Confidence, ControlError, ControlErrorCode, Encoding,
-    EventPayload, ExecAccepted, ExecArgs, ExitReason, IoChunk, ProcessExited, ProcessId,
-    ProcessStarted, ProcessState, ProcessSummary, RequestId, SESSION_ENV, ServerMessage, Signal,
-    StreamEnd, StreamFrame, StreamKind, StreamOffset,
+    CaptureMethod, CaptureMode, ChannelId, Confidence, ControlError, ControlErrorCode,
+    EventPayload, ExecAccepted, ExecArgs, ExitReason, ProcessExited, ProcessId, ProcessStarted,
+    ProcessState, ProcessSummary, RequestId, SESSION_ENV, ServerMessage, Signal, StreamEnd,
+    StreamFrame, StreamKind, StreamOffset,
 };
 use sealant_runtime_core::{
     Clock, FinishReason, IdGenerator, Redactor, RuntimeConfig, RuntimeStatus,
@@ -629,20 +629,7 @@ async fn capture_stream<R: AsyncRead + Unpin>(
             continue;
         }
         if matches!(mode, CaptureMode::MetadataOnly) {
-            bus.publish(
-                &correlation,
-                CaptureMethod::Pipe,
-                Confidence::Observed,
-                EventPayload::IoChunk(IoChunk {
-                    stream,
-                    encoding: Encoding::Base64,
-                    byte_count: n as u64,
-                    stream_offset: offset,
-                    content: None,
-                    artifact: None,
-                    transform: None,
-                }),
-            );
+            bus.publish_metadata(&correlation, CaptureMethod::Pipe, stream, offset, n as u64);
         }
         offset = offset.advance(n as u64);
     };
@@ -653,8 +640,10 @@ async fn capture_stream<R: AsyncRead + Unpin>(
 
 #[cfg(test)]
 mod tests {
+    #![expect(clippy::disallowed_types, reason = "the tests read io.chunk events")]
     use super::*;
     use sealant_protocol::EventPayload;
+    use sealant_protocol::IoChunk;
     use sealant_runtime_core::new_runtime_id;
     use std::time::Duration;
     use tokio::sync::broadcast::Receiver;
