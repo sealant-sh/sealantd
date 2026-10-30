@@ -10,5 +10,7 @@
 #![forbid(unsafe_code)]
 
 pub mod bus;
+pub mod recorder;
 
 pub use bus::{Correlation, EventBus};
+pub use recorder::StreamRecorder;

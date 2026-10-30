@@ -17,13 +17,13 @@ use sealant_protocol::{
     Base64Bytes, CaptureMethod, ChannelId, Confidence, ControlError, EventPayload, ExecutionId,
     ExitReason, OpenSessionArgs, ProcessExited, ProcessId, ProcessStarted, ServerMessage,
     SessionId, SessionList, SessionMode, SessionOpened, SessionOutput, SessionOutputChunk,
-    SessionState, SessionSummary, Signal, StreamEnd, StreamFrame, StreamKind, StreamOffset,
+    SessionState, SessionSummary, Signal, StreamEnd, StreamFrame, StreamKind,
 };
 use sealant_runtime_core::{
     Clock, FinishReason, IdGenerator, MaskedChunk, Redactor, RuntimeConfig, RuntimeStatus,
-    StreamRedactor, new_secret,
+    new_secret,
 };
-use sealant_telemetry::{Correlation, EventBus};
+use sealant_telemetry::{Correlation, EventBus, StreamRecorder};
 use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{ChildStderr, ChildStdin, ChildStdout};
@@ -103,39 +103,12 @@ pub struct SessionEntry {
     mark: SessionMark,
     /// The masked record of forwarded input. Held across each write and its record, so the record
     /// keeps the order the leader got the bytes in; `None` once the leader exited.
-    input: tokio::sync::Mutex<Option<InputEvidence>>,
+    input: tokio::sync::Mutex<Option<StreamRecorder>>,
     cols: AtomicU16,
     rows: AtomicU16,
 }
 
-/// A session's input stream as recorded: its masking state and raw offset.
-#[derive(Debug)]
-struct InputEvidence {
-    masker: StreamRedactor,
-    offset: StreamOffset,
-}
-
 impl SessionEntry {
-    /// Publish one masked chunk of this session's input and advance its offset.
-    fn record_input(
-        &self,
-        bus: &EventBus,
-        status: &RuntimeStatus,
-        offset: &mut StreamOffset,
-        chunk: &MaskedChunk,
-    ) {
-        let (method, stream) = match self.mode {
-            SessionMode::Pty => (CaptureMethod::Pty, StreamKind::PtyInput),
-            SessionMode::Pipe => (CaptureMethod::Pipe, StreamKind::Stdin),
-        };
-        let correlation = Correlation::new()
-            .execution(self.execution_id.clone())
-            .session(Some(self.session_id.clone()))
-            .process(self.process_id.clone());
-        status.add_redacted(chunk.redactions());
-        bus.publish_masked(&correlation, method, stream, offset, chunk);
-    }
-
     /// Lifecycle state plus exit codes, when exited.
     #[must_use]
     pub fn exit_status(&self) -> Option<(Option<i32>, Option<i32>)> {
@@ -537,6 +510,14 @@ impl SessionRuntime {
             ),
             SessionMode::Pipe => (self.redactor.clone(), self.redactor.clone()),
         };
+        let correlation = Correlation::new()
+            .execution(execution_id.clone())
+            .session(Some(session_id.clone()))
+            .process(process_id.clone());
+        let (input_method, input_stream) = match args.mode {
+            SessionMode::Pty => (CaptureMethod::Pty, StreamKind::PtyInput),
+            SessionMode::Pipe => (CaptureMethod::Pipe, StreamKind::Stdin),
+        };
         let entry = Arc::new(SessionEntry {
             session_id: session_id.clone(),
             process_id: process_id.clone(),
@@ -550,20 +531,19 @@ impl SessionRuntime {
             exit: Mutex::new(None),
             exited: watch::Sender::new(false),
             mark: SessionMark { uid, gid, marker },
-            input: tokio::sync::Mutex::new(Some(InputEvidence {
-                masker: input_patterns.stream(),
-                offset: StreamOffset::ZERO,
-            })),
+            input: tokio::sync::Mutex::new(Some(StreamRecorder::new(
+                self.bus.clone(),
+                self.status.clone(),
+                correlation.clone(),
+                input_method,
+                input_stream,
+                input_patterns.stream(),
+            ))),
             cols: AtomicU16::new(args.cols),
             rows: AtomicU16::new(args.rows),
         });
         self.registry.insert(entry.clone());
         self.status.inc_sessions();
-
-        let correlation = Correlation::new()
-            .execution(execution_id)
-            .session(Some(session_id.clone()))
-            .process(process_id.clone());
 
         self.bus.publish(
             &correlation,
@@ -646,13 +626,8 @@ impl SessionRuntime {
             // No input is forwarded once the leader exited; what the record still holds is
             // settled before the exit, and no tombstone keeps the mask patterns.
             let input = waiter_entry.input.lock().await.take();
-            if let Some(InputEvidence {
-                mut masker,
-                mut offset,
-            }) = input
-            {
-                let chunk = masker.finish(FinishReason::Eof);
-                waiter_entry.record_input(&waiter_bus, &waiter_status, &mut offset, &chunk);
+            if let Some(mut recorder) = input {
+                recorder.end(FinishReason::Eof);
             }
             let (exit_code, signal, reason) = classify(&status_result);
             waiter_bus.publish(
@@ -720,7 +695,7 @@ impl SessionRuntime {
             .get_running(session_id)
             .ok_or_else(|| ControlError::session_not_found(session_id.to_string()))?;
         let mut input = entry.input.lock().await;
-        let Some(evidence) = input.as_mut() else {
+        let Some(recorder) = input.as_mut() else {
             return Err(ControlError::session_not_found(session_id.to_string()));
         };
         // A write the leader's exit leaves blocked (a helper holds the input and never reads) is
@@ -734,8 +709,7 @@ impl SessionRuntime {
             }
         }
         // Record the forwarded input as evidence, masked before it becomes readable.
-        let chunk = evidence.masker.push(data);
-        entry.record_input(&self.bus, &self.status, &mut evidence.offset, &chunk);
+        recorder.read(data);
         Ok(())
     }
 
@@ -1113,44 +1087,55 @@ struct CaptureContext {
 }
 
 impl Fanout {
-    /// Deliver one masked output chunk: journal it (minting the wire sequence), publish the lossy
-    /// telemetry tap, and forward to the attach sink with backpressure. A chunk that records no
-    /// bytes mints no sequence; one that stands for no raw byte publishes nothing.
-    async fn deliver(
-        &self,
-        chunk: &MaskedChunk,
-        offset: &mut StreamOffset,
-        stream: StreamKind,
-        method: CaptureMethod,
-    ) {
-        let entry = &self.entry;
-        // (a) every downstream consumer (journal, telemetry, sink) sees the same masked bytes —
-        // the journal is the product read surface and must never hold raw secrets.
-        let recorded = chunk.recorded();
-        self.status.add_redacted(chunk.redactions());
-        self.bus
-            .publish_masked(&self.correlation, method, stream, offset, chunk);
-        if recorded.is_empty() {
-            return;
-        }
+    /// A recorder for one of the session's output streams, masking with its own state.
+    fn recorder(&self, method: CaptureMethod, stream: StreamKind) -> StreamRecorder {
+        StreamRecorder::new(
+            self.bus.clone(),
+            self.status.clone(),
+            self.correlation.clone(),
+            method,
+            stream,
+            self.redactor.stream(),
+        )
+    }
 
-        // (b) durable journal append — the sequence minted here is the wire sequence for both
-        // live frames and replays.
+    /// Deliver the next raw output bytes: masked once, journaled (minting the wire sequence), then
+    /// published as telemetry, then forwarded to the attach sink with backpressure.
+    async fn deliver(&self, recorder: &mut StreamRecorder, raw: &[u8]) {
+        let (chunk, seq) = recorder.read_journaled(raw, |chunk| self.journal(chunk));
+        self.attach(&chunk, seq).await;
+    }
+
+    /// Deliver what the output's masker still holds at its end, the same way.
+    async fn finish(&self, recorder: &mut StreamRecorder, end: FinishReason) {
+        let (chunk, seq) = recorder.end_journaled(end, |chunk| self.journal(chunk));
+        self.attach(&chunk, seq).await;
+    }
+
+    /// Append a masked chunk to the durable journal; the sequence minted here is the wire
+    /// sequence for both live frames and replays. A chunk that records nothing mints none.
+    fn journal(&self, chunk: &MaskedChunk) -> Option<u64> {
+        if chunk.recorded().is_empty() {
+            return None;
+        }
+        let entry = &self.entry;
         let seq = {
             let mut journal = entry.journal.lock().unwrap_or_else(|e| e.into_inner());
-            journal.append(recorded)
+            journal.append(chunk.recorded())
         };
-        let seq = match seq {
-            Ok(seq) => seq,
-            Err(error) => {
-                tracing::error!(%error, session = %entry.session_id,
-                    "session journal append failed; output recording degraded");
-                self.status.add_degradation("session-journal-append-failed");
-                u64::MAX
-            }
-        };
+        Some(seq.unwrap_or_else(|error| {
+            tracing::error!(%error, session = %entry.session_id,
+                "session journal append failed; output recording degraded");
+            self.status.add_degradation("session-journal-append-failed");
+            u64::MAX
+        }))
+    }
 
-        // (c) reliable attach fan-out (backpressured). Snapshot the sink under the lock, then send
+    async fn attach(&self, chunk: &MaskedChunk, seq: Option<u64>) {
+        let Some(seq) = seq else { return };
+        let entry = &self.entry;
+        let recorded = chunk.recorded();
+        // Reliable attach fan-out (backpressured). Snapshot the sink under the lock, then send
         // outside it. A replaying attach holds the gate closed; chunks below its start_seq are
         // covered by the replay and skipped here. If the gateway queue is closed (connection
         // gone), clear the stale attachment so we stop trying.
@@ -1209,8 +1194,7 @@ async fn capture_output(master: Arc<AsyncFd<OwnedFd>>, chunk_size: usize, contex
         fanout,
         mut leader_exited_rx,
     } = context;
-    let mut offset = StreamOffset::ZERO;
-    let mut masker = fanout.redactor.stream();
+    let mut recorder = fanout.recorder(CaptureMethod::Pty, StreamKind::PtyOutput);
     let mut buf = vec![0u8; chunk_size.max(1)];
     let mut post_exit: Option<PostExitDrain> = None;
     // The terminal's own end (EOF, or EIO once it hangs up) is the stream's end; a drain that
@@ -1255,15 +1239,7 @@ async fn capture_output(master: Arc<AsyncFd<OwnedFd>>, chunk_size: usize, contex
                 if let Some(drain) = &mut post_exit {
                     drain.budget = drain.budget.saturating_sub(n);
                 }
-                let chunk = masker.push(&buf[..n]);
-                fanout
-                    .deliver(
-                        &chunk,
-                        &mut offset,
-                        StreamKind::PtyOutput,
-                        CaptureMethod::Pty,
-                    )
-                    .await;
+                fanout.deliver(&mut recorder, &buf[..n]).await;
             }
             // Post-exit WouldBlock never reaches here — the drain arm handles it with a quiet
             // re-check above.
@@ -1271,15 +1247,7 @@ async fn capture_output(master: Arc<AsyncFd<OwnedFd>>, chunk_size: usize, contex
             Err(_) => break FinishReason::Cutoff,
         }
     };
-    let chunk = masker.finish(end);
-    fanout
-        .deliver(
-            &chunk,
-            &mut offset,
-            StreamKind::PtyOutput,
-            CaptureMethod::Pty,
-        )
-        .await;
+    fanout.finish(&mut recorder, end).await;
 }
 
 /// After the leader exits, how long a quiet stdout pipe is given before the drain ends. Pipes
@@ -1294,8 +1262,7 @@ async fn capture_pipe_output(mut stdout: ChildStdout, chunk_size: usize, context
         fanout,
         mut leader_exited_rx,
     } = context;
-    let mut offset = StreamOffset::ZERO;
-    let mut masker = fanout.redactor.stream();
+    let mut recorder = fanout.recorder(CaptureMethod::Pipe, StreamKind::Stdout);
     let mut buf = vec![0u8; chunk_size.max(1)];
     let mut post_exit: Option<usize> = None;
     let end = loop {
@@ -1327,45 +1294,30 @@ async fn capture_pipe_output(mut stdout: ChildStdout, chunk_size: usize, context
                 if let Some(budget) = &mut post_exit {
                     *budget = budget.saturating_sub(n);
                 }
-                let chunk = masker.push(&buf[..n]);
-                fanout
-                    .deliver(&chunk, &mut offset, StreamKind::Stdout, CaptureMethod::Pipe)
-                    .await;
+                fanout.deliver(&mut recorder, &buf[..n]).await;
             }
             Err(_) => break FinishReason::Cutoff,
         }
     };
-    let chunk = masker.finish(end);
-    fanout
-        .deliver(&chunk, &mut offset, StreamKind::Stdout, CaptureMethod::Pipe)
-        .await;
+    fanout.finish(&mut recorder, end).await;
 }
 
 /// Pipe-mode stderr reader: telemetry only. Diagnostics are recorded (redacted) as `stderr`
 /// `IoChunk`s so the record keeps them, but they never enter the journal or the attach channel —
 /// those carry the protocol stream alone.
 async fn capture_stderr(mut stderr: ChildStderr, chunk_size: usize, fanout: Fanout) {
-    let publish = |chunk: MaskedChunk, offset: &mut StreamOffset| {
-        fanout.status.add_redacted(chunk.redactions());
-        fanout.bus.publish_masked(
-            &fanout.correlation,
-            CaptureMethod::Pipe,
-            StreamKind::Stderr,
-            offset,
-            &chunk,
-        );
-    };
-    let mut offset = StreamOffset::ZERO;
-    let mut masker = fanout.redactor.stream();
+    let mut recorder = fanout.recorder(CaptureMethod::Pipe, StreamKind::Stderr);
     let mut buf = vec![0u8; chunk_size.max(1)];
     let end = loop {
         match stderr.read(&mut buf).await {
             Ok(0) => break FinishReason::Eof,
             Err(_) => break FinishReason::Cutoff,
-            Ok(n) => publish(masker.push(&buf[..n]), &mut offset),
+            Ok(n) => {
+                recorder.read(&buf[..n]);
+            }
         }
     };
-    publish(masker.finish(end), &mut offset);
+    recorder.end(end);
 }
 
 /// Replay a session's journal from `from` to its current end over `out_tx` (used for attaches to

@@ -13,7 +13,7 @@ use sealant_protocol::{
 use sealant_runtime_core::{
     Clock, FinishReason, IdGenerator, Redactor, RuntimeConfig, RuntimeStatus,
 };
-use sealant_telemetry::{Correlation, EventBus};
+use sealant_telemetry::{Correlation, EventBus, StreamRecorder};
 use std::os::unix::process::ExitStatusExt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -594,7 +594,16 @@ async fn capture_stream<R: AsyncRead + Unpin>(
     let mut attach = attach;
     // Full capture masks through this stream's own state: a suffix that could still begin a
     // secret waits for a later read, or the end, to decide it.
-    let mut masker = matches!(mode, CaptureMode::Full).then(|| redactor.stream());
+    let mut recorder = matches!(mode, CaptureMode::Full).then(|| {
+        StreamRecorder::new(
+            bus.clone(),
+            status.clone(),
+            correlation.clone(),
+            CaptureMethod::Pipe,
+            stream,
+            redactor.stream(),
+        )
+    });
     let end = loop {
         let n = match reader.read(&mut buf).await {
             Ok(0) => break FinishReason::Eof,
@@ -615,16 +624,8 @@ async fn capture_stream<R: AsyncRead + Unpin>(
 
         // (a) lossy telemetry tap (always on, redaction applies here only). Metadata-only capture
         // counts the bytes; disabled capture only reads to feed the attach.
-        if let Some(masker) = &mut masker {
-            let chunk = masker.push(&buf[..n]);
-            status.add_redacted(chunk.redactions());
-            bus.publish_masked(
-                &correlation,
-                CaptureMethod::Pipe,
-                stream,
-                &mut offset,
-                &chunk,
-            );
+        if let Some(recorder) = &mut recorder {
+            recorder.read(&buf[..n]);
             continue;
         }
         if matches!(mode, CaptureMode::MetadataOnly) {
@@ -645,16 +646,8 @@ async fn capture_stream<R: AsyncRead + Unpin>(
         }
         offset = offset.advance(n as u64);
     };
-    if let Some(mut masker) = masker {
-        let chunk = masker.finish(end);
-        status.add_redacted(chunk.redactions());
-        bus.publish_masked(
-            &correlation,
-            CaptureMethod::Pipe,
-            stream,
-            &mut offset,
-            &chunk,
-        );
+    if let Some(recorder) = &mut recorder {
+        recorder.end(end);
     }
 }
 

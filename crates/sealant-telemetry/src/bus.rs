@@ -19,10 +19,9 @@ use std::time::Duration;
 use sealant_eventlog::Spool;
 use sealant_protocol::{
     CaptureMethod, Confidence, EventEnvelope, EventId, EventPayload, EventPriority, ExecutionId,
-    ProcessId, RequestId, RuntimeId, SCHEMA_VERSION, Sequence, SessionId, StreamKind, StreamOffset,
-    TelemetryDropped,
+    ProcessId, RequestId, RuntimeId, SCHEMA_VERSION, Sequence, SessionId, TelemetryDropped,
 };
-use sealant_runtime_core::{Clock, IdGenerator, MaskedChunk};
+use sealant_runtime_core::{Clock, IdGenerator};
 use tokio::sync::{broadcast, mpsc};
 
 /// The payload to store instead of a spooled event that carries process argument text, or `None`
@@ -334,27 +333,6 @@ impl EventBus {
             confidence,
             payload,
         }
-    }
-
-    /// Publish one masked chunk of `stream` as an `io.chunk` at raw position `offset`, then advance
-    /// `offset` by the raw bytes the chunk stands for.
-    pub fn publish_masked(
-        &self,
-        correlation: &Correlation,
-        capture_method: CaptureMethod,
-        stream: StreamKind,
-        offset: &mut StreamOffset,
-        chunk: &MaskedChunk,
-    ) {
-        if let Some(io) = chunk.io_chunk(stream, *offset) {
-            self.publish(
-                correlation,
-                capture_method,
-                Confidence::Observed,
-                EventPayload::IoChunk(io),
-            );
-        }
-        *offset = offset.advance(chunk.consumed());
     }
 
     /// Publish a payload. This is the single deterministic point where `sequence`, `eventId`, and
