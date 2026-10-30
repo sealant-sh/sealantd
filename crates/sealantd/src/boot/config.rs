@@ -1270,21 +1270,14 @@ fn passthrough_env(env: &dyn EnvSource) -> Vec<(String, String)> {
 /// Maximum number of secret environment entries the daemon accepts from the launcher.
 const MAX_SECRET_ENV_ENTRIES: usize = 256;
 
-/// Whether `name` is a well-formed, non-platform environment variable name: `[A-Za-z_][A-Za-z0-9_]*`,
-/// at most 128 bytes, and not in the daemon's own `SEALANT_` namespace — except the capture
-/// token, which the launcher seals into this very file under the daemon's own name
-/// (`SEALANT_CAPTURE_TOKEN`) and which is stripped from the harness environment before launch.
+/// Whether `name` is a well-formed, non-platform environment variable name
+/// ([`sealant_process::secret_env::is_env_name`], outside the daemon's own `SEALANT_` namespace)
+/// — except the capture token, which the launcher seals into this very file under the daemon's
+/// own name (`SEALANT_CAPTURE_TOKEN`) and which is stripped from the harness environment before
+/// launch.
 fn is_acceptable_secret_env_name(name: &str) -> bool {
-    let mut chars = name.chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
-    if !(first == '_' || first.is_ascii_alphabetic()) {
-        return false;
-    }
-    name.len() <= 128
-        && chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
-        && (name == super::capture::TOKEN_KEY || !name.to_ascii_uppercase().starts_with("SEALANT_"))
+    use sealant_process::secret_env::{is_env_name, is_platform_name};
+    is_env_name(name) && (name == super::capture::TOKEN_KEY || !is_platform_name(name))
 }
 
 /// Read the launcher-provided secret environment: a JSON object mapping variable names to string

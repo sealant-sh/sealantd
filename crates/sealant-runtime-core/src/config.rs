@@ -48,6 +48,10 @@ pub const PERSON_UID_MIN: u32 = 40_001;
 /// The highest uid of Mend's reserved range for its people.
 pub const PERSON_UID_MAX: u32 = 49_999;
 
+/// The variables the egress proxy sets on every child, pointing at its address
+/// (`sealant_network`). A process's secret env may not name one.
+pub const PROXY_ENV_KEYS: &[&str] = &["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"];
+
 /// Which users a process may run as when a request names one (`exec`, `openSession` and
 /// `dotfiles.apply` take `user`). The daemon decides from the resolved passwd entry, never from
 /// what the caller checked: a person with `sudo` in the executor can edit `/etc/passwd`, so a

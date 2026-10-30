@@ -121,12 +121,10 @@ impl NetworkRuntime {
             return Vec::new();
         };
         let url = format!("http://{addr}");
-        vec![
-            ("HTTP_PROXY".to_owned(), url.clone()),
-            ("HTTPS_PROXY".to_owned(), url.clone()),
-            ("http_proxy".to_owned(), url.clone()),
-            ("https_proxy".to_owned(), url),
-        ]
+        sealant_runtime_core::PROXY_ENV_KEYS
+            .iter()
+            .map(|key| ((*key).to_owned(), url.clone()))
+            .collect()
     }
 
     /// Stop the proxy task.
@@ -170,6 +168,32 @@ mod tests {
                 _ => return None,
             }
         }
+    }
+
+    /// No process's secret env may name a variable the proxy sets on it, so none replaces the
+    /// proxy's routing or loses to it.
+    #[tokio::test]
+    async fn a_secret_env_may_name_no_proxy_variable() {
+        use sealant_process::secret_env::{Rule, SecretEnv};
+        let net = NetworkRuntime::new(
+            bus(),
+            NetworkConfig {
+                mode: NetworkMode::Proxy,
+                execution_id: None,
+            },
+        );
+        assert_eq!(net.start().await, NetworkMode::Proxy);
+        let set = net.proxy_env();
+        assert!(!set.is_empty());
+        for (key, _) in set {
+            let secret = sealant_protocol::SecretEnvVar {
+                key: key.clone(),
+                value: "fake-pg-password-5d1e".to_owned(),
+            };
+            let refused = SecretEnv::parse(vec![secret], &[]).err();
+            assert_eq!(refused.map(|r| r.rule), Some(Rule::NameProxy), "{key}");
+        }
+        net.shutdown();
     }
 
     #[tokio::test]

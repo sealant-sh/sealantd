@@ -14,6 +14,7 @@ pub mod identity;
 pub mod platform;
 pub mod registry;
 pub mod runtime;
+pub mod secret_env;
 pub mod sftp;
 pub mod signals;
 pub mod spawn;
