@@ -18,8 +18,9 @@ use std::time::Duration;
 
 use sealant_eventlog::Spool;
 use sealant_protocol::{
-    CaptureMethod, Confidence, EventEnvelope, EventId, EventPayload, EventPriority, ExecutionId,
-    ProcessId, RequestId, RuntimeId, SCHEMA_VERSION, Sequence, SessionId, TelemetryDropped,
+    CaptureMethod, Confidence, Encoding, EventEnvelope, EventId, EventPayload, EventPriority,
+    ExecutionId, ProcessId, RequestId, RuntimeId, SCHEMA_VERSION, Sequence, SessionId, StreamKind,
+    StreamOffset, TelemetryDropped,
 };
 use sealant_runtime_core::{Clock, IdGenerator};
 use tokio::sync::{broadcast, mpsc};
@@ -335,9 +336,59 @@ impl EventBus {
         }
     }
 
+    /// Publish an `io.chunk` that counts `byte_count` raw bytes of `stream` at `offset` and
+    /// carries none of them (metadata-only capture).
+    pub fn publish_metadata(
+        &self,
+        correlation: &Correlation,
+        capture_method: CaptureMethod,
+        stream: StreamKind,
+        offset: StreamOffset,
+        byte_count: u64,
+    ) {
+        self.publish(
+            correlation,
+            capture_method,
+            Confidence::Observed,
+            EventPayload::IoChunk(sealant_protocol::IoChunk {
+                stream,
+                encoding: Encoding::Base64,
+                byte_count,
+                stream_offset: offset,
+                content: None,
+                artifact: None,
+                transform: None,
+            }),
+        );
+    }
+
     /// Publish a payload. This is the single deterministic point where `sequence`, `eventId`, and
     /// timestamps are assigned. Returns the minted event id.
+    ///
+    /// An `io.chunk` with content is refused here: recorded bytes reach the bus only masked,
+    /// through [`crate::StreamRecorder`]. A debug build panics; a release build drops the content
+    /// and says so.
     pub fn publish(
+        &self,
+        correlation: &Correlation,
+        capture_method: CaptureMethod,
+        confidence: Confidence,
+        mut payload: EventPayload,
+    ) -> EventId {
+        if let EventPayload::IoChunk(chunk) = &mut payload
+            && chunk.content.take().is_some()
+        {
+            debug_assert!(
+                false,
+                "io.chunk content is published through StreamRecorder"
+            );
+            tracing::error!("an io.chunk carried content past masking; the content is dropped");
+        }
+        self.publish_recorded(correlation, capture_method, confidence, payload)
+    }
+
+    /// [`EventBus::publish`] without the `io.chunk` check, for [`crate::StreamRecorder`].
+    pub(crate) fn publish_recorded(
         &self,
         correlation: &Correlation,
         capture_method: CaptureMethod,

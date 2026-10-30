@@ -11,6 +11,9 @@
 //! ([`Base64Bytes`]) with an explicit original byte count.
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 #![forbid(unsafe_code)]
+// The ban on `IoChunk` (clippy.toml) keeps an io.chunk's content to masked bytes; this crate
+// defines the type and converts it to and from the wire.
+#![allow(clippy::disallowed_types)]
 
 pub mod bytes;
 pub mod command;

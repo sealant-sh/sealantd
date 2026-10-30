@@ -5,13 +5,15 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use sealant_protocol::{
-    CaptureMethod, CaptureMode, ChannelId, Confidence, ControlError, ControlErrorCode, Encoding,
-    EventPayload, ExecAccepted, ExecArgs, ExitReason, IoChunk, ProcessExited, ProcessId,
-    ProcessStarted, ProcessState, ProcessSummary, RequestId, SESSION_ENV, ServerMessage, Signal,
-    StreamEnd, StreamFrame, StreamKind, StreamOffset, TransformMeta,
+    CaptureMethod, CaptureMode, ChannelId, Confidence, ControlError, ControlErrorCode,
+    EventPayload, ExecAccepted, ExecArgs, ExitReason, ProcessExited, ProcessId, ProcessStarted,
+    ProcessState, ProcessSummary, RequestId, SESSION_ENV, ServerMessage, Signal, StreamEnd,
+    StreamFrame, StreamKind, StreamOffset,
 };
-use sealant_runtime_core::{Clock, IdGenerator, Redactor, RuntimeConfig, RuntimeStatus};
-use sealant_telemetry::{Correlation, EventBus};
+use sealant_runtime_core::{
+    Clock, FinishReason, IdGenerator, Redactor, RuntimeConfig, RuntimeStatus,
+};
+use sealant_telemetry::{Correlation, EventBus, StreamRecorder};
 use std::os::unix::process::ExitStatusExt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -590,11 +592,23 @@ async fn capture_stream<R: AsyncRead + Unpin>(
     let mut offset = StreamOffset::ZERO;
     let mut buf = vec![0u8; chunk_size.max(1)];
     let mut attach = attach;
-    loop {
+    // Full capture masks through this stream's own state: a suffix that could still begin a
+    // secret waits for a later read, or the end, to decide it.
+    let mut recorder = matches!(mode, CaptureMode::Full).then(|| {
+        StreamRecorder::new(
+            bus.clone(),
+            status.clone(),
+            correlation.clone(),
+            CaptureMethod::Pipe,
+            stream,
+            redactor.stream(),
+        )
+    });
+    let end = loop {
         let n = match reader.read(&mut buf).await {
-            Ok(0) => break,
+            Ok(0) => break FinishReason::Eof,
             Ok(n) => n,
-            Err(_) => break,
+            Err(_) => break FinishReason::Cutoff,
         };
 
         // (b) reliable exec-attach fan-out (backpressured, RAW bytes, never redacted). Sharing this
@@ -608,59 +622,28 @@ async fn capture_stream<R: AsyncRead + Unpin>(
             attach = None;
         }
 
-        // (a) lossy telemetry tap (always on, redaction applies here only). When capture is disabled
-        // but we are attached, skip emitting a telemetry chunk (we only read to feed the attach).
-        if matches!(mode, CaptureMode::Disabled) {
-            offset = offset.advance(n as u64);
+        // (a) lossy telemetry tap (always on, redaction applies here only). Metadata-only capture
+        // counts the bytes; disabled capture only reads to feed the attach.
+        if let Some(recorder) = &mut recorder {
+            recorder.read(&buf[..n]);
             continue;
         }
-        let (content, byte_count, transform) = if matches!(mode, CaptureMode::Full) {
-            let (data, redacted) = redactor.redact(&buf[..n]);
-            if redacted > 0 {
-                status.add_redacted(redacted);
-                let len = data.len() as u64;
-                (
-                    Some(sealant_protocol::Base64Bytes::new(data)),
-                    len,
-                    Some(TransformMeta {
-                        redacted: true,
-                        truncated: false,
-                        coalesced: false,
-                        original_byte_count: Some(n as u64),
-                    }),
-                )
-            } else {
-                (
-                    Some(sealant_protocol::Base64Bytes::new(&buf[..n])),
-                    n as u64,
-                    None,
-                )
-            }
-        } else {
-            (None, n as u64, None)
-        };
-        bus.publish(
-            &correlation,
-            CaptureMethod::Pipe,
-            Confidence::Observed,
-            EventPayload::IoChunk(IoChunk {
-                stream,
-                encoding: Encoding::Base64,
-                byte_count,
-                stream_offset: offset,
-                content,
-                artifact: None,
-                transform,
-            }),
-        );
+        if matches!(mode, CaptureMode::MetadataOnly) {
+            bus.publish_metadata(&correlation, CaptureMethod::Pipe, stream, offset, n as u64);
+        }
         offset = offset.advance(n as u64);
+    };
+    if let Some(recorder) = &mut recorder {
+        recorder.end(end);
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #![expect(clippy::disallowed_types, reason = "the tests read io.chunk events")]
     use super::*;
     use sealant_protocol::EventPayload;
+    use sealant_protocol::IoChunk;
     use sealant_runtime_core::new_runtime_id;
     use std::time::Duration;
     use tokio::sync::broadcast::Receiver;
@@ -803,6 +786,105 @@ mod tests {
                 .any(|c| c.transform.as_ref().is_some_and(|t| t.redacted))
         );
         assert!(rt.status.redacted() >= 1);
+    }
+
+    /// A secret written in two parts is recorded masked on stdout and on stderr. The process
+    /// writes the second part only once the first was captured on both streams, so the split is
+    /// real. Each chunk starts at the raw offset of the bytes it stands for, and its byte count is
+    /// what it records.
+    #[tokio::test]
+    async fn a_secret_split_across_writes_is_masked_and_offsets_count_raw_bytes() {
+        let mut rt = runtime();
+        rt.redactor = Arc::new(Redactor::new(vec!["split-secret-value-42".to_owned()]));
+        let mut rx = rt.bus.subscribe();
+        let script = "printf 'pw=split-secr'; printf 'pw=split-secr' >&2; read -r go; \
+                      printf 'et-value-42 end'; printf 'et-value-42 end' >&2";
+        let accepted = rt
+            .exec(
+                ExecArgs {
+                    stdin: true,
+                    ..exec_args("/bin/sh", &["-c", script])
+                },
+                None,
+                None,
+            )
+            .expect("spawn");
+        let mut payloads = Vec::new();
+        let first_parts = |payloads: &[EventPayload]| {
+            payloads
+                .iter()
+                .filter(|p| matches!(p, EventPayload::IoChunk(_)))
+                .count()
+        };
+        while first_parts(&payloads) < 2 {
+            let env = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("the first part is captured")
+                .expect("event");
+            payloads.push(env.payload);
+        }
+        rt.write_stdin(&accepted.process_id, b"\n")
+            .await
+            .expect("go");
+        payloads.extend(collect_until_exit(&mut rx).await);
+        for stream in [StreamKind::Stdout, StreamKind::Stderr] {
+            let chunks: Vec<&IoChunk> = payloads
+                .iter()
+                .filter_map(|p| match p {
+                    EventPayload::IoChunk(c) if c.stream == stream => Some(c),
+                    _ => None,
+                })
+                .collect();
+            let recorded: Vec<u8> = chunks
+                .iter()
+                .flat_map(|c| c.content.as_ref().expect("content").as_slice().to_vec())
+                .collect();
+            assert_eq!(
+                String::from_utf8_lossy(&recorded),
+                "pw=***REDACTED*** end",
+                "{stream:?}"
+            );
+            let offsets: Vec<u64> = chunks.iter().map(|c| c.stream_offset.get()).collect();
+            assert_eq!(
+                offsets,
+                [0, 3],
+                "{stream:?}: the held part starts at raw offset 3"
+            );
+            assert_eq!(chunks[1].byte_count, 18, "{stream:?}: the recorded bytes");
+            assert_eq!(
+                chunks[1]
+                    .transform
+                    .as_ref()
+                    .and_then(|t| t.original_byte_count),
+                Some(25),
+                "{stream:?}: the raw bytes it stands for"
+            );
+        }
+    }
+
+    /// Output that ends in what could have begun a secret is recorded, as written, before the
+    /// exit: at the end of the stream it was not one.
+    #[tokio::test]
+    async fn a_held_suffix_is_recorded_before_the_exit() {
+        let mut rt = runtime();
+        rt.redactor = Arc::new(Redactor::new(vec!["split-secret-value-42".to_owned()]));
+        let mut rx = rt.bus.subscribe();
+        rt.exec(
+            exec_args("/bin/sh", &["-c", "printf 'tail split-secr'"]),
+            None,
+            None,
+        )
+        .expect("spawn");
+        let recorded: Vec<u8> = collect_until_exit(&mut rx)
+            .await
+            .iter()
+            .filter_map(|p| match p {
+                EventPayload::IoChunk(c) if c.stream == StreamKind::Stdout => c.content.as_ref(),
+                _ => None,
+            })
+            .flat_map(|content| content.as_slice().to_vec())
+            .collect();
+        assert_eq!(String::from_utf8_lossy(&recorded), "tail split-secr");
     }
 
     #[tokio::test]
