@@ -14,14 +14,14 @@ use nix::unistd::Pid;
 use sealant_process::SessionMark;
 use sealant_protocol::SESSION_ENV;
 use sealant_protocol::{
-    Base64Bytes, CaptureMethod, ChannelId, Confidence, ControlError, Encoding, EventPayload,
-    ExecutionId, ExitReason, IoChunk, OpenSessionArgs, ProcessExited, ProcessId, ProcessStarted,
-    ServerMessage, SessionId, SessionList, SessionMode, SessionOpened, SessionOutput,
-    SessionOutputChunk, SessionState, SessionSummary, Signal, StreamEnd, StreamFrame, StreamKind,
-    StreamOffset, TransformMeta,
+    Base64Bytes, CaptureMethod, ChannelId, Confidence, ControlError, EventPayload, ExecutionId,
+    ExitReason, OpenSessionArgs, ProcessExited, ProcessId, ProcessStarted, ServerMessage,
+    SessionId, SessionList, SessionMode, SessionOpened, SessionOutput, SessionOutputChunk,
+    SessionState, SessionSummary, Signal, StreamEnd, StreamFrame, StreamKind, StreamOffset,
 };
 use sealant_runtime_core::{
-    Clock, IdGenerator, Redactor, RuntimeConfig, RuntimeStatus, new_secret,
+    Clock, FinishReason, IdGenerator, MaskedChunk, Redactor, RuntimeConfig, RuntimeStatus,
+    StreamRedactor, new_secret,
 };
 use sealant_telemetry::{Correlation, EventBus};
 use tokio::io::unix::AsyncFd;
@@ -101,11 +101,41 @@ pub struct SessionEntry {
     exited: watch::Sender<bool>,
     /// Who the leader runs as, and the secret its processes carry in [`SESSION_ENV`].
     mark: SessionMark,
+    /// The masked record of forwarded input. Held across each write and its record, so the record
+    /// keeps the order the leader got the bytes in; `None` once the leader exited.
+    input: tokio::sync::Mutex<Option<InputEvidence>>,
     cols: AtomicU16,
     rows: AtomicU16,
 }
 
+/// A session's input stream as recorded: its masking state and raw offset.
+#[derive(Debug)]
+struct InputEvidence {
+    masker: StreamRedactor,
+    offset: StreamOffset,
+}
+
 impl SessionEntry {
+    /// Publish one masked chunk of this session's input and advance its offset.
+    fn record_input(
+        &self,
+        bus: &EventBus,
+        status: &RuntimeStatus,
+        offset: &mut StreamOffset,
+        chunk: &MaskedChunk,
+    ) {
+        let (method, stream) = match self.mode {
+            SessionMode::Pty => (CaptureMethod::Pty, StreamKind::PtyInput),
+            SessionMode::Pipe => (CaptureMethod::Pipe, StreamKind::Stdin),
+        };
+        let correlation = Correlation::new()
+            .execution(self.execution_id.clone())
+            .session(Some(self.session_id.clone()))
+            .process(self.process_id.clone());
+        status.add_redacted(chunk.redactions());
+        bus.publish_masked(&correlation, method, stream, offset, chunk);
+    }
+
     /// Lifecycle state plus exit codes, when exited.
     #[must_use]
     pub fn exit_status(&self) -> Option<(Option<i32>, Option<i32>)> {
@@ -498,6 +528,12 @@ impl SessionRuntime {
             ))
         })?;
 
+        // A PTY echoes a multi-line secret with CRLF line ends. Output, pipe stderr and input each
+        // mask through their own state over these patterns.
+        let patterns = match args.mode {
+            SessionMode::Pty => Arc::new(self.redactor.for_pty()),
+            SessionMode::Pipe => self.redactor.clone(),
+        };
         let entry = Arc::new(SessionEntry {
             session_id: session_id.clone(),
             process_id: process_id.clone(),
@@ -511,6 +547,10 @@ impl SessionRuntime {
             exit: Mutex::new(None),
             exited: watch::Sender::new(false),
             mark: SessionMark { uid, gid, marker },
+            input: tokio::sync::Mutex::new(Some(InputEvidence {
+                masker: patterns.stream(),
+                offset: StreamOffset::ZERO,
+            })),
             cols: AtomicU16::new(args.cols),
             rows: AtomicU16::new(args.rows),
         });
@@ -547,7 +587,7 @@ impl SessionRuntime {
             bus: self.bus.clone(),
             correlation: correlation.clone(),
             entry: entry.clone(),
-            redactor: self.redactor.clone(),
+            redactor: patterns,
             status: self.status.clone(),
         };
         let chunk_size = self.config.io_chunk_bytes;
@@ -600,6 +640,13 @@ impl SessionRuntime {
             drop(spawned_pid);
             let _ = leader_exited_tx.send(());
             let _ = capture.await;
+            // No input is forwarded once the leader exited; what the record still holds is
+            // settled before the exit, and no tombstone keeps the mask patterns.
+            let input = waiter_entry.input.lock().await.take();
+            if let Some(InputEvidence { masker, mut offset }) = input {
+                let chunk = masker.finish(FinishReason::Eof);
+                waiter_entry.record_input(&waiter_bus, &waiter_status, &mut offset, &chunk);
+            }
             let (exit_code, signal, reason) = classify(&status_result);
             waiter_bus.publish(
                 &correlation,
@@ -655,7 +702,7 @@ impl SessionRuntime {
     /// Write bytes to a session's input: the PTY master, or the leader's stdin pipe.
     ///
     /// # Errors
-    /// Returns a [`ControlError`] if the session is unknown or the write fails.
+    /// Returns a [`ControlError`] if the session is unknown, its leader exited, or the write fails.
     pub async fn write_input(
         &self,
         session_id: &SessionId,
@@ -665,70 +712,23 @@ impl SessionRuntime {
             .registry
             .get_running(session_id)
             .ok_or_else(|| ControlError::session_not_found(session_id.to_string()))?;
-        let (method, stream) = match &entry.io {
-            LeaderIo::Pty { master } => {
-                let master = master
-                    .upgrade()
-                    .ok_or_else(|| ControlError::session_not_found(session_id.to_string()))?;
-                pty::write_all(&master, data).await.map_err(|e| {
-                    ControlError::invalid_argument(format!("pty input write failed: {e}"))
-                })?;
-                (CaptureMethod::Pty, StreamKind::PtyInput)
-            }
-            LeaderIo::Pipe { stdin } => {
-                let mut guard = stdin.lock().await;
-                let Some(pipe) = guard.as_mut() else {
-                    return Err(ControlError::invalid_argument(
-                        "session stdin is closed".to_owned(),
-                    ));
-                };
-                let written = async {
-                    pipe.write_all(data).await?;
-                    pipe.flush().await
-                }
-                .await;
-                if let Err(e) = written {
-                    // A broken pipe means the leader stopped reading; drop our end so the next
-                    // write fails fast instead of blocking on a dead reader.
-                    if e.kind() == io::ErrorKind::BrokenPipe {
-                        *guard = None;
-                    }
-                    return Err(ControlError::invalid_argument(format!(
-                        "stdin write failed: {e}"
-                    )));
-                }
-                (CaptureMethod::Pipe, StreamKind::Stdin)
-            }
+        let mut input = entry.input.lock().await;
+        let Some(evidence) = input.as_mut() else {
+            return Err(ControlError::session_not_found(session_id.to_string()));
         };
-
-        // Record the forwarded input as evidence, redacted before it becomes readable.
-        let (recorded, masked) = self.redactor.redact(data);
-        if masked > 0 {
-            self.status.add_redacted(masked);
+        // A write the leader's exit leaves blocked (a helper holds the input and never reads) is
+        // abandoned, so it cannot hold the input record open past the exit.
+        let mut exited = entry.exit_watch();
+        tokio::select! {
+            biased;
+            written = forward_input(&entry, session_id, data) => written?,
+            _ = exited.wait_for(|exited| *exited) => {
+                return Err(ControlError::session_not_found(session_id.to_string()));
+            }
         }
-        let correlation = Correlation::new()
-            .execution(entry.execution_id.clone())
-            .session(Some(session_id.clone()))
-            .process(entry.process_id.clone());
-        self.bus.publish(
-            &correlation,
-            method,
-            Confidence::Observed,
-            EventPayload::IoChunk(IoChunk {
-                stream,
-                encoding: Encoding::Base64,
-                byte_count: recorded.len() as u64,
-                stream_offset: StreamOffset::ZERO,
-                content: Some(Base64Bytes::new(recorded.as_slice())),
-                artifact: None,
-                transform: (masked > 0).then_some(TransformMeta {
-                    redacted: true,
-                    truncated: false,
-                    coalesced: false,
-                    original_byte_count: Some(data.len() as u64),
-                }),
-            }),
-        );
+        // Record the forwarded input as evidence, masked before it becomes readable.
+        let chunk = evidence.masker.push(data);
+        entry.record_input(&self.bus, &self.status, &mut evidence.offset, &chunk);
         Ok(())
     }
 
@@ -1025,6 +1025,48 @@ fn classify(
     }
 }
 
+/// Write `data` to the leader: the PTY master, or its stdin pipe.
+async fn forward_input(
+    entry: &SessionEntry,
+    session_id: &SessionId,
+    data: &[u8],
+) -> Result<(), ControlError> {
+    match &entry.io {
+        LeaderIo::Pty { master } => {
+            let master = master
+                .upgrade()
+                .ok_or_else(|| ControlError::session_not_found(session_id.to_string()))?;
+            pty::write_all(&master, data)
+                .await
+                .map_err(|e| ControlError::invalid_argument(format!("pty input write failed: {e}")))
+        }
+        LeaderIo::Pipe { stdin } => {
+            let mut guard = stdin.lock().await;
+            let Some(pipe) = guard.as_mut() else {
+                return Err(ControlError::invalid_argument(
+                    "session stdin is closed".to_owned(),
+                ));
+            };
+            let written = async {
+                pipe.write_all(data).await?;
+                pipe.flush().await
+            }
+            .await;
+            if let Err(e) = written {
+                // A broken pipe means the leader stopped reading; drop our end so the next
+                // write fails fast instead of blocking on a dead reader.
+                if e.kind() == io::ErrorKind::BrokenPipe {
+                    *guard = None;
+                }
+                return Err(ControlError::invalid_argument(format!(
+                    "stdin write failed: {e}"
+                )));
+            }
+            Ok(())
+        }
+    }
+}
+
 /// The single PTY reader for a session. Reads `pty.output` until the slave closes or the session
 /// leader exits and, for each chunk, (a) publishes a lossy `IoChunk` telemetry event
 /// (recording/redaction path) and (b), when a gateway is attached, forwards the same bytes to the
@@ -1046,9 +1088,9 @@ enum LeaderOutputs {
     },
 }
 
-/// Everything a captured chunk fans out to: redaction, the durable journal, the telemetry tap,
-/// and the reliable attach sink. Shared by the PTY and pipe readers so both modes have exactly the
-/// same delivery guarantees.
+/// Everything a captured chunk fans out to: the durable journal, the telemetry tap, and the
+/// reliable attach sink, plus the patterns each reader masks its own stream with. Shared by the
+/// PTY and pipe readers so both modes have exactly the same delivery guarantees.
 #[derive(Clone)]
 struct Fanout {
     bus: Arc<EventBus>,
@@ -1064,29 +1106,32 @@ struct CaptureContext {
 }
 
 impl Fanout {
-    /// Deliver one raw output chunk: redact once, journal (minting the wire sequence), publish the
-    /// lossy telemetry tap, and forward to the attach sink with backpressure.
+    /// Deliver one masked output chunk: journal it (minting the wire sequence), publish the lossy
+    /// telemetry tap, and forward to the attach sink with backpressure. A chunk that records no
+    /// bytes mints no sequence; one that stands for no raw byte publishes nothing.
     async fn deliver(
         &self,
-        raw: &[u8],
+        chunk: &MaskedChunk,
         offset: &mut StreamOffset,
         stream: StreamKind,
         method: CaptureMethod,
     ) {
         let entry = &self.entry;
-        // (a) redact once; every downstream consumer (journal, telemetry, sink) sees the same
-        // redacted bytes — the journal is the product read surface and must never hold raw
-        // secrets.
-        let (recorded, masked) = self.redactor.redact(raw);
-        if masked > 0 {
-            self.status.add_redacted(masked);
+        // (a) every downstream consumer (journal, telemetry, sink) sees the same masked bytes —
+        // the journal is the product read surface and must never hold raw secrets.
+        let recorded = chunk.recorded();
+        self.status.add_redacted(chunk.redactions());
+        self.bus
+            .publish_masked(&self.correlation, method, stream, offset, chunk);
+        if recorded.is_empty() {
+            return;
         }
 
         // (b) durable journal append — the sequence minted here is the wire sequence for both
         // live frames and replays.
         let seq = {
             let mut journal = entry.journal.lock().unwrap_or_else(|e| e.into_inner());
-            journal.append(&recorded)
+            journal.append(recorded)
         };
         let seq = match seq {
             Ok(seq) => seq,
@@ -1098,29 +1143,7 @@ impl Fanout {
             }
         };
 
-        // (c) lossy telemetry tap (always on).
-        self.bus.publish(
-            &self.correlation,
-            method,
-            Confidence::Observed,
-            EventPayload::IoChunk(IoChunk {
-                stream,
-                encoding: Encoding::Base64,
-                byte_count: recorded.len() as u64,
-                stream_offset: *offset,
-                content: Some(Base64Bytes::new(recorded.as_slice())),
-                artifact: None,
-                transform: (masked > 0).then_some(TransformMeta {
-                    redacted: true,
-                    truncated: false,
-                    coalesced: false,
-                    original_byte_count: Some(raw.len() as u64),
-                }),
-            }),
-        );
-        *offset = offset.advance(raw.len() as u64);
-
-        // (d) reliable attach fan-out (backpressured). Snapshot the sink under the lock, then send
+        // (c) reliable attach fan-out (backpressured). Snapshot the sink under the lock, then send
         // outside it. A replaying attach holds the gate closed; chunks below its start_seq are
         // covered by the replay and skipped here. If the gateway queue is closed (connection
         // gone), clear the stale attachment so we stop trying.
@@ -1136,7 +1159,7 @@ impl Fanout {
             let gate_open = ready.wait_for(|open| *open).await.is_ok();
             let wanted = gate_open && seq >= sink.start_seq.load(Ordering::SeqCst);
             let delivered = if wanted {
-                let frame = StreamFrame::data(sink.channel_id.clone(), seq, recorded.as_slice());
+                let frame = StreamFrame::data(sink.channel_id.clone(), seq, recorded);
                 sink.out_tx.send(ServerMessage::Stream(frame)).await.is_ok()
             } else {
                 gate_open
@@ -1180,19 +1203,22 @@ async fn capture_output(master: Arc<AsyncFd<OwnedFd>>, chunk_size: usize, contex
         mut leader_exited_rx,
     } = context;
     let mut offset = StreamOffset::ZERO;
+    let mut masker = fanout.redactor.stream();
     let mut buf = vec![0u8; chunk_size.max(1)];
     let mut post_exit: Option<PostExitDrain> = None;
-    loop {
+    // The terminal's own end (EOF, or EIO once it hangs up) is the stream's end; a drain that
+    // stops before it (the byte budget, two quiet polls) is a cutoff.
+    let end = loop {
         let read_result = match &mut post_exit {
             Some(drain) => {
                 if drain.budget == 0 {
-                    break;
+                    break FinishReason::Cutoff;
                 }
                 let read_size = drain.budget.min(buf.len());
                 match pty::try_read(&master, &mut buf[..read_size]) {
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                         if drain.saw_quiet {
-                            break;
+                            break FinishReason::Cutoff;
                         }
                         drain.saw_quiet = true;
                         tokio::time::sleep(POST_EXIT_QUIET_RECHECK).await;
@@ -1217,14 +1243,15 @@ async fn capture_output(master: Arc<AsyncFd<OwnedFd>>, chunk_size: usize, contex
             },
         };
         match read_result {
-            Ok(0) => break,
+            Ok(0) => break FinishReason::Eof,
             Ok(n) => {
                 if let Some(drain) = &mut post_exit {
                     drain.budget = drain.budget.saturating_sub(n);
                 }
+                let chunk = masker.push(&buf[..n]);
                 fanout
                     .deliver(
-                        &buf[..n],
+                        &chunk,
                         &mut offset,
                         StreamKind::PtyOutput,
                         CaptureMethod::Pty,
@@ -1233,10 +1260,19 @@ async fn capture_output(master: Arc<AsyncFd<OwnedFd>>, chunk_size: usize, contex
             }
             // Post-exit WouldBlock never reaches here — the drain arm handles it with a quiet
             // re-check above.
-            Err(e) if pty::is_eof_error(&e) => break,
-            Err(_) => break,
+            Err(e) if pty::is_eof_error(&e) => break FinishReason::Eof,
+            Err(_) => break FinishReason::Cutoff,
         }
-    }
+    };
+    let chunk = masker.finish(end);
+    fanout
+        .deliver(
+            &chunk,
+            &mut offset,
+            StreamKind::PtyOutput,
+            CaptureMethod::Pty,
+        )
+        .await;
 }
 
 /// After the leader exits, how long a quiet stdout pipe is given before the drain ends. Pipes
@@ -1252,20 +1288,21 @@ async fn capture_pipe_output(mut stdout: ChildStdout, chunk_size: usize, context
         mut leader_exited_rx,
     } = context;
     let mut offset = StreamOffset::ZERO;
+    let mut masker = fanout.redactor.stream();
     let mut buf = vec![0u8; chunk_size.max(1)];
     let mut post_exit: Option<usize> = None;
-    loop {
+    let end = loop {
         let read_result = match post_exit {
             Some(budget) => {
                 if budget == 0 {
-                    break;
+                    break FinishReason::Cutoff;
                 }
                 let read_size = budget.min(buf.len());
                 match tokio::time::timeout(POST_EXIT_PIPE_QUIET, stdout.read(&mut buf[..read_size]))
                     .await
                 {
                     Ok(result) => result,
-                    Err(_quiet) => break,
+                    Err(_quiet) => break FinishReason::Cutoff,
                 }
             }
             None => tokio::select! {
@@ -1278,62 +1315,50 @@ async fn capture_pipe_output(mut stdout: ChildStdout, chunk_size: usize, context
             },
         };
         match read_result {
-            Ok(0) => break,
+            Ok(0) => break FinishReason::Eof,
             Ok(n) => {
                 if let Some(budget) = &mut post_exit {
                     *budget = budget.saturating_sub(n);
                 }
+                let chunk = masker.push(&buf[..n]);
                 fanout
-                    .deliver(
-                        &buf[..n],
-                        &mut offset,
-                        StreamKind::Stdout,
-                        CaptureMethod::Pipe,
-                    )
+                    .deliver(&chunk, &mut offset, StreamKind::Stdout, CaptureMethod::Pipe)
                     .await;
             }
-            Err(_) => break,
+            Err(_) => break FinishReason::Cutoff,
         }
-    }
+    };
+    let chunk = masker.finish(end);
+    fanout
+        .deliver(&chunk, &mut offset, StreamKind::Stdout, CaptureMethod::Pipe)
+        .await;
 }
 
 /// Pipe-mode stderr reader: telemetry only. Diagnostics are recorded (redacted) as `stderr`
 /// `IoChunk`s so the record keeps them, but they never enter the journal or the attach channel —
 /// those carry the protocol stream alone.
 async fn capture_stderr(mut stderr: ChildStderr, chunk_size: usize, fanout: Fanout) {
+    let publish = |chunk: MaskedChunk, offset: &mut StreamOffset| {
+        fanout.status.add_redacted(chunk.redactions());
+        fanout.bus.publish_masked(
+            &fanout.correlation,
+            CaptureMethod::Pipe,
+            StreamKind::Stderr,
+            offset,
+            &chunk,
+        );
+    };
     let mut offset = StreamOffset::ZERO;
+    let mut masker = fanout.redactor.stream();
     let mut buf = vec![0u8; chunk_size.max(1)];
-    loop {
+    let end = loop {
         match stderr.read(&mut buf).await {
-            Ok(0) | Err(_) => break,
-            Ok(n) => {
-                let (recorded, masked) = fanout.redactor.redact(&buf[..n]);
-                if masked > 0 {
-                    fanout.status.add_redacted(masked);
-                }
-                fanout.bus.publish(
-                    &fanout.correlation,
-                    CaptureMethod::Pipe,
-                    Confidence::Observed,
-                    EventPayload::IoChunk(IoChunk {
-                        stream: StreamKind::Stderr,
-                        encoding: Encoding::Base64,
-                        byte_count: recorded.len() as u64,
-                        stream_offset: offset,
-                        content: Some(Base64Bytes::new(recorded.as_slice())),
-                        artifact: None,
-                        transform: (masked > 0).then_some(TransformMeta {
-                            redacted: true,
-                            truncated: false,
-                            coalesced: false,
-                            original_byte_count: Some(n as u64),
-                        }),
-                    }),
-                );
-                offset = offset.advance(n as u64);
-            }
+            Ok(0) => break FinishReason::Eof,
+            Err(_) => break FinishReason::Cutoff,
+            Ok(n) => publish(masker.push(&buf[..n]), &mut offset),
         }
-    }
+    };
+    publish(masker.finish(end), &mut offset);
 }
 
 /// Replay a session's journal from `from` to its current end over `out_tx` (used for attaches to
@@ -1394,7 +1419,7 @@ async fn replay_journal_until(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sealant_protocol::{EventEnvelope, EventPayload};
+    use sealant_protocol::{EventEnvelope, EventPayload, IoChunk};
     use sealant_runtime_core::new_runtime_id;
     use tokio::sync::broadcast::Receiver;
 
@@ -2453,6 +2478,211 @@ mod tests {
             journal_text.contains("***REDACTED***"),
             "journal should carry the mask: {journal_text:?}"
         );
+    }
+
+    const SPLIT_SECRET: &str = "split-secret-value-42";
+
+    fn masking_runtime() -> SessionRuntime {
+        let mut rt = runtime();
+        rt.redactor = Arc::new(Redactor::new(vec![SPLIT_SECRET.to_owned()]));
+        rt
+    }
+
+    /// Every `io.chunk` of `stream` published before the leader's exit.
+    async fn chunks_until_exit(
+        rx: &mut Receiver<EventEnvelope>,
+        stream: StreamKind,
+    ) -> Vec<IoChunk> {
+        let mut chunks = Vec::new();
+        loop {
+            let env = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("no timeout")
+                .expect("event");
+            match env.payload {
+                EventPayload::IoChunk(c) if c.stream == stream => chunks.push(c),
+                EventPayload::ProcessExited(_) => return chunks,
+                _ => {}
+            }
+        }
+    }
+
+    fn recorded(chunks: &[IoChunk]) -> String {
+        chunks
+            .iter()
+            .map(|c| String::from_utf8_lossy(c.content.as_ref().expect("content").as_slice()))
+            .collect()
+    }
+
+    /// A secret the leader writes in two parts, a read apart, reaches neither the journal nor the
+    /// telemetry. The first read is held whole: it mints no journal sequence and no chunk.
+    #[tokio::test]
+    async fn a_secret_split_across_reads_never_reaches_the_journal() {
+        let rt = masking_runtime();
+        let mut rx = rt.bus.subscribe();
+        let opened = rt
+            .open(session_args(
+                &[
+                    "-c",
+                    "printf 'split-secr'; sleep 0.2; printf 'et-value-42 end'",
+                ],
+                80,
+                24,
+            ))
+            .expect("open");
+        let chunks = chunks_until_exit(&mut rx, StreamKind::PtyOutput).await;
+        assert_eq!(recorded(&chunks), "***REDACTED*** end");
+        let offsets: Vec<u64> = chunks.iter().map(|c| c.stream_offset.get()).collect();
+        assert_eq!(offsets, [0]);
+        let journal = rt
+            .read_output(&opened.session_id, 0, None)
+            .expect("read journal");
+        let records: Vec<(u64, String)> = journal
+            .chunks
+            .iter()
+            .map(|c| {
+                (
+                    c.sequence,
+                    String::from_utf8_lossy(c.data.as_slice()).into_owned(),
+                )
+            })
+            .collect();
+        assert_eq!(records, [(0, "***REDACTED*** end".to_owned())]);
+    }
+
+    /// A PTY writes a multi-line secret's line ends as CRLF; the record masks it as written.
+    #[tokio::test]
+    async fn a_multiline_secret_is_masked_as_the_terminal_writes_it() {
+        let mut rt = runtime();
+        rt.redactor = Arc::new(Redactor::new(vec!["line-one\nline-two".to_owned()]));
+        let mut rx = rt.bus.subscribe();
+        rt.open(session_args(
+            &["-c", "printf 'pw=line-one\nline-two end'"],
+            80,
+            24,
+        ))
+        .expect("open");
+        let chunks = chunks_until_exit(&mut rx, StreamKind::PtyOutput).await;
+        assert_eq!(recorded(&chunks), "pw=***REDACTED*** end");
+    }
+
+    /// The drain after the leader's exit stops while a helper still holds stdout: what could
+    /// still begin a secret is masked, not recorded as written.
+    #[tokio::test]
+    async fn a_drain_cutoff_masks_a_held_prefix_of_a_secret() {
+        let rt = masking_runtime();
+        let mut rx = rt.bus.subscribe();
+        rt.open(pipe_args(&["-c", "sleep 2 & printf 'pw=split-secr'"]))
+            .expect("open");
+        let chunks = chunks_until_exit(&mut rx, StreamKind::Stdout).await;
+        assert_eq!(recorded(&chunks), "pw=***REDACTED***");
+    }
+
+    /// Pipe stderr masks through its own state: a secret split across its writes is masked, and
+    /// neither it nor its marker enters the stdout journal.
+    #[tokio::test]
+    async fn pipe_stderr_masks_its_own_stream_and_stays_out_of_the_journal() {
+        let rt = masking_runtime();
+        let mut rx = rt.bus.subscribe();
+        let opened = rt
+            .open(pipe_args(&[
+                "-c",
+                "printf 'split-secr' >&2; printf 'out-a '; sleep 0.2; \
+                 printf 'et-value-42\n' >&2; printf 'out-b'",
+            ]))
+            .expect("open");
+        // Stderr is not joined before the exit: wait for both.
+        let (mut stderr, mut exited) = (Vec::new(), false);
+        while !exited || recorded(&stderr) != "***REDACTED***\n" {
+            let env = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("the exit and the masked stderr arrive")
+                .expect("event");
+            match env.payload {
+                EventPayload::IoChunk(c) if c.stream == StreamKind::Stderr => stderr.push(c),
+                EventPayload::ProcessExited(_) => exited = true,
+                _ => {}
+            }
+        }
+        assert_eq!(recorded(&stderr), "***REDACTED***\n");
+        let journal: String = rt
+            .read_output(&opened.session_id, 0, None)
+            .expect("read journal")
+            .chunks
+            .iter()
+            .map(|c| String::from_utf8_lossy(c.data.as_slice()).into_owned())
+            .collect();
+        assert_eq!(journal, "out-a out-b");
+    }
+
+    /// Input is forwarded as it comes, and its record masks a secret typed across writes. The
+    /// leader got the secret whole: its echo is masked in the output.
+    #[tokio::test]
+    async fn input_evidence_masks_a_secret_typed_across_writes() {
+        let rt = masking_runtime();
+        let mut rx = rt.bus.subscribe();
+        let opened = rt.open(pipe_args(&["-c", ECHO_LOOP])).expect("open");
+        rt.write_input(&opened.session_id, b"split-secr")
+            .await
+            .expect("first write");
+        rt.write_input(&opened.session_id, b"et-value-42\n")
+            .await
+            .expect("second write");
+        let mut input = Vec::new();
+        let mut echoed = false;
+        while !echoed {
+            let env = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("no timeout")
+                .expect("event");
+            match env.payload {
+                EventPayload::IoChunk(c) if c.stream == StreamKind::Stdin => input.push(c),
+                EventPayload::IoChunk(c) if c.stream == StreamKind::Stdout => {
+                    let content = c.content.expect("content");
+                    echoed = String::from_utf8_lossy(content.as_slice()).contains("***REDACTED***");
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(recorded(&input), "***REDACTED***\n");
+        let offsets: Vec<u64> = input.iter().map(|c| c.stream_offset.get()).collect();
+        assert_eq!(offsets, [0]);
+        assert_eq!(
+            input[0]
+                .transform
+                .as_ref()
+                .and_then(|t| t.original_byte_count),
+            Some(22)
+        );
+        rt.close(&opened.session_id).expect("close");
+    }
+
+    /// Input the record still holds when the leader exits is recorded before the exit, and the
+    /// session takes no input after it.
+    #[tokio::test]
+    async fn held_input_is_recorded_before_the_exit() {
+        let rt = masking_runtime();
+        let mut rx = rt.bus.subscribe();
+        let opened = rt.open(pipe_args(&["-c", "sleep 0.3"])).expect("open");
+        rt.write_input(&opened.session_id, b"hello split-secr")
+            .await
+            .expect("write");
+        let input = chunks_until_exit(&mut rx, StreamKind::Stdin).await;
+        let records: Vec<(u64, String)> = input
+            .iter()
+            .map(|c| {
+                let content = c.content.as_ref().expect("content");
+                (
+                    c.stream_offset.get(),
+                    String::from_utf8_lossy(content.as_slice()).into_owned(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            records,
+            [(0, "hello ".to_owned()), (6, "split-secr".to_owned())]
+        );
+        assert!(rt.write_input(&opened.session_id, b"late").await.is_err());
     }
 
     // ---------- pipe mode ----------

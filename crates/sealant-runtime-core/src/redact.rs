@@ -65,42 +65,6 @@ impl Redactor {
         Self { literals }
     }
 
-    /// Redact secrets in `input`. Returns the (possibly unchanged) bytes and the number of masked
-    /// spans.
-    #[must_use]
-    pub fn redact(&self, input: &[u8]) -> (Vec<u8>, u32) {
-        let mut out = Vec::with_capacity(input.len());
-        let mut count = 0u32;
-        let mut i = 0;
-        'outer: while i < input.len() {
-            for literal in &self.literals {
-                if input[i..].starts_with(literal) {
-                    out.extend_from_slice(REDACTED);
-                    i += literal.len();
-                    count += 1;
-                    continue 'outer;
-                }
-            }
-            for prefix in TOKEN_PREFIXES {
-                if input[i..].starts_with(prefix) {
-                    let mut end = i + prefix.len();
-                    while end < input.len() && is_token_char(input[end]) {
-                        end += 1;
-                    }
-                    if end - i >= MIN_TOKEN_LEN {
-                        out.extend_from_slice(REDACTED);
-                        i = end;
-                        count += 1;
-                        continue 'outer;
-                    }
-                }
-            }
-            out.push(input[i]);
-            i += 1;
-        }
-        (out, count)
-    }
-
     /// The same patterns plus each multi-line literal as a terminal echoes it: a PTY's output
     /// discipline (ONLCR) writes every LF as CRLF.
     #[must_use]
