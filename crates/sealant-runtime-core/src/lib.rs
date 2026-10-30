@@ -19,5 +19,5 @@ pub use config::{
 };
 pub use error::ConfigError;
 pub use idgen::{IdGenerator, new_runtime_id, new_secret};
-pub use redact::Redactor;
+pub use redact::{FinishReason, MaskedChunk, Redactor, StreamRedactor};
 pub use status::RuntimeStatus;
