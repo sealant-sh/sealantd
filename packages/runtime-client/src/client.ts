@@ -13,6 +13,8 @@ import { setTimeout as delay } from "node:timers/promises";
 import type { Duplex } from "node:stream";
 
 import {
+  CommandSchema,
+  create,
   FrameDecoder,
   AttachMode,
   SessionMode,
@@ -67,6 +69,8 @@ export interface OpenSessionOptions {
   cwd?: string;
   /** Environment overlay entries. */
   env?: Array<{ key: string; value: string }>;
+  /** Variables for the leader only, as {@link ExecOptions.secretEnv}. */
+  secretEnv?: Array<{ key: string; value: string }>;
   /** Initial terminal columns. */
   cols: number;
   /** Initial terminal rows. */
@@ -106,7 +110,17 @@ export interface ExecOptions {
   stdin?: boolean;
   timeoutMillis?: number;
   background?: boolean;
+  /**
+   * Variables for this process only, each value masked in everything the daemon records of it.
+   * Sent only to a daemon that names {@link SECRET_ENV_CAPABILITY} on this connection (an older
+   * one would ignore the field): otherwise the call throws and nothing is sent. {@link
+   * SealantClient.request} applies the same check to any `exec` or `openSession` it sends.
+   */
+  secretEnv?: Array<{ key: string; value: string }>;
 }
+
+/** The capability a daemon names when it honours `secretEnv` on exec and both session shapes. */
+export const SECRET_ENV_CAPABILITY = "process.secret-env.v1";
 
 /** A connected, typed control client for one sealantd instance. */
 export class SealantClient {
@@ -218,9 +232,26 @@ export class SealantClient {
       return Promise.reject(new Error("client is closed"));
     }
     const requestId = `req_client_${++this.#counter}`;
+    // Encoded now, so the command sent is the one asked for, whatever its options become.
+    const frame = requestFrame(requestId, command);
+    const sent = create(CommandSchema, { command }).command;
+    const secret =
+      (sent.case === "exec" || sent.case === "openSession") && sent.value.secretEnv.length > 0;
+    if (!secret) return this.#send(requestId, frame);
+    // A daemon without the capability would drop `secretEnv` and start the process without it.
+    return this.getCapabilities().then(({ supports }) => {
+      if (!supports.includes(SECRET_ENV_CAPABILITY)) {
+        throw new Error(`the daemon does not support ${SECRET_ENV_CAPABILITY}: secretEnv not sent`);
+      }
+      if (this.#closed) throw new Error("client is closed");
+      return this.#send(requestId, frame);
+    });
+  }
+
+  #send(requestId: string, frame: Uint8Array): Promise<ControlResponse> {
     return new Promise((resolve, reject) => {
       this.#pending.set(requestId, { resolve, reject });
-      this.#stream.write(requestFrame(requestId, command), (error) => {
+      this.#stream.write(frame, (error) => {
         if (error) {
           this.#pending.delete(requestId);
           reject(error);
@@ -291,6 +322,7 @@ export class SealantClient {
           timeoutMillis:
             options.timeoutMillis === undefined ? undefined : BigInt(options.timeoutMillis),
           background: options.background ?? false,
+          secretEnv: options.secretEnv ?? [],
         },
       }),
     );
@@ -370,6 +402,7 @@ export class SealantClient {
             term: options.term,
             executionId: options.executionId,
             mode: options.mode ?? SessionMode.PTY,
+            secretEnv: options.secretEnv ?? [],
           },
         }),
       ),
@@ -532,6 +565,7 @@ export class SealantClient {
               options.timeoutMillis === undefined ? undefined : BigInt(options.timeoutMillis),
             background: options.background ?? false,
             attach: true,
+            secretEnv: options.secretEnv ?? [],
           },
         }),
       ),
