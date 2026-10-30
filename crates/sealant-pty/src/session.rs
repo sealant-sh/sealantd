@@ -528,11 +528,14 @@ impl SessionRuntime {
             ))
         })?;
 
-        // A PTY echoes a multi-line secret with CRLF line ends. Output, pipe stderr and input each
-        // mask through their own state over these patterns.
-        let patterns = match args.mode {
-            SessionMode::Pty => Arc::new(self.redactor.with_line_ends(b"\r\n")),
-            SessionMode::Pipe => self.redactor.clone(),
+        // A PTY echoes a multi-line secret with CRLF line ends, and a terminal sends one typed or
+        // pasted with CR. Output, pipe stderr and input each mask through their own state.
+        let (patterns, input_patterns) = match args.mode {
+            SessionMode::Pty => (
+                Arc::new(self.redactor.with_line_ends(b"\r\n")),
+                Arc::new(self.redactor.with_line_ends(b"\r")),
+            ),
+            SessionMode::Pipe => (self.redactor.clone(), self.redactor.clone()),
         };
         let entry = Arc::new(SessionEntry {
             session_id: session_id.clone(),
@@ -548,7 +551,7 @@ impl SessionRuntime {
             exited: watch::Sender::new(false),
             mark: SessionMark { uid, gid, marker },
             input: tokio::sync::Mutex::new(Some(InputEvidence {
-                masker: patterns.stream(),
+                masker: input_patterns.stream(),
                 offset: StreamOffset::ZERO,
             })),
             cols: AtomicU16::new(args.cols),
@@ -2614,6 +2617,23 @@ mod tests {
             );
         }
         rt.close(&opened.session_id).expect("close");
+    }
+
+    /// A terminal sends a multi-line secret's line ends as CR (Enter, a paste); the input record
+    /// masks it as sent.
+    #[tokio::test]
+    async fn pty_input_masks_a_multiline_secret_sent_with_cr() {
+        let mut rt = runtime();
+        rt.redactor = Arc::new(Redactor::new(vec!["line-one\nline-two".to_owned()]));
+        let mut rx = rt.bus.subscribe();
+        let opened = rt
+            .open(session_args(&["-c", "read -r a; read -r b"], 80, 24))
+            .expect("open");
+        rt.write_input(&opened.session_id, b"line-one\rline-two\r")
+            .await
+            .expect("type");
+        let input = chunks_until_exit(&mut rx, StreamKind::PtyInput).await;
+        assert_eq!(recorded(&input), "***REDACTED***\r");
     }
 
     /// A PTY writes a multi-line secret's line ends as CRLF; the record masks it as written.
