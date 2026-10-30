@@ -31,6 +31,18 @@ const TOKEN_PREFIXES: &[&[u8]] = &[
 
 const MIN_TOKEN_LEN: usize = 16;
 
+const LONGEST_PREFIX: usize = {
+    let mut longest = 0;
+    let mut i = 0;
+    while i < TOKEN_PREFIXES.len() {
+        if TOKEN_PREFIXES[i].len() > longest {
+            longest = TOKEN_PREFIXES[i].len();
+        }
+        i += 1;
+    }
+    longest
+};
+
 /// Literals shorter than this are ignored, to avoid masking common substrings.
 const MIN_LITERAL_LEN: usize = 6;
 
@@ -65,21 +77,23 @@ impl Redactor {
         Self { literals }
     }
 
-    /// The same patterns plus each multi-line literal as a terminal echoes it: a PTY's output
-    /// discipline (ONLCR) writes every LF as CRLF.
+    /// The same patterns plus each multi-line literal with its LFs written as `line_end`. A PTY
+    /// writes a line end to its output as CRLF (ONLCR); a terminal sends one as CR (Enter, a
+    /// paste).
     #[must_use]
-    pub fn for_pty(&self) -> Self {
+    pub fn with_line_ends(&self, line_end: &[u8]) -> Self {
         let mut literals = self.literals.clone();
         for literal in &self.literals {
             if literal.contains(&b'\n') {
-                let mut crlf = Vec::with_capacity(literal.len() + 8);
+                let mut variant = Vec::with_capacity(literal.len() + 8);
                 for &b in literal {
                     if b == b'\n' {
-                        crlf.push(b'\r');
+                        variant.extend_from_slice(line_end);
+                    } else {
+                        variant.push(b);
                     }
-                    crlf.push(b);
                 }
-                literals.push(crlf);
+                literals.push(variant);
             }
         }
         Self { literals }
@@ -93,6 +107,7 @@ impl Redactor {
             pending: Vec::new(),
             covered: Vec::new(),
             base: 0,
+            before: Vec::new(),
             literal_at: 0,
             token_at: 0,
             token: TokenScan::Searching,
@@ -101,13 +116,18 @@ impl Redactor {
     }
 }
 
-/// Where the token heuristic stands at the next byte it scans.
+/// Where the token heuristic stands at the next byte it scans. Nothing is held until a token's
+/// whole prefix (`sk-`, `ghp_`, …) has been seen; the prefix itself is never masked.
 #[derive(Clone, Copy)]
 enum TokenScan {
     Searching,
-    /// A token prefix starts at this stream position and its run is still under the minimum.
-    Candidate(u64),
-    /// The run reached the minimum: every token byte up to the next delimiter is masked.
+    /// A prefix starting at `start` is complete; the token's bytes from `body` are held while
+    /// its run is under the minimum.
+    Candidate {
+        start: u64,
+        body: u64,
+    },
+    /// The run reached the minimum: its bytes after the prefix are masked up to the delimiter.
     Masking,
 }
 
@@ -116,8 +136,8 @@ enum TokenScan {
 pub enum FinishReason {
     /// The writer closed: a suffix that could have begun a secret did not.
     Eof,
-    /// Reading stopped early (a drain cutoff, a read error): a suffix that could begin a literal
-    /// secret, or a token past its prefix, is masked.
+    /// Reading stopped early (a drain cutoff, a read error, an interrupted write): a suffix that
+    /// could begin a literal secret, or a token's held bytes, is masked.
     Cutoff,
 }
 
@@ -129,6 +149,8 @@ pub struct StreamRedactor {
     /// Per pending byte: already known to lie in a match.
     covered: Vec<bool>,
     base: u64,
+    /// The raw bytes just before `base`, as far back as a token prefix reaches.
+    before: Vec<u8>,
     /// The next position a literal match is looked for at.
     literal_at: u64,
     /// The next position the token heuristic scans.
@@ -153,19 +175,20 @@ impl StreamRedactor {
         self.covered.resize(self.pending.len(), false);
         self.scan(false);
         let token_hold = match self.token {
-            TokenScan::Candidate(start) => start,
+            TokenScan::Candidate { body, .. } => body,
             TokenScan::Searching | TokenScan::Masking => self.token_at,
         };
         self.emit_until(self.literal_at.min(token_hold))
     }
 
-    /// End the stream and record everything still held. Call before the stream's terminal event.
-    pub fn finish(mut self, reason: FinishReason) -> MaskedChunk {
+    /// End the stream, or cut it, and record everything still held. Call before the stream's
+    /// terminal event. Bytes pushed after it start a new stream.
+    pub fn finish(&mut self, reason: FinishReason) -> MaskedChunk {
         let end = self.end();
         if reason == FinishReason::Cutoff {
             let literal = (self.literal_at < end).then_some(self.literal_at);
             let token = match self.token {
-                TokenScan::Candidate(start) => Some(start),
+                TokenScan::Candidate { body, .. } => Some(body),
                 TokenScan::Searching | TokenScan::Masking => None,
             };
             if let Some(from) = literal.into_iter().chain(token).min() {
@@ -174,7 +197,9 @@ impl StreamRedactor {
             }
         }
         self.scan(true);
-        self.emit_until(end)
+        let chunk = self.emit_until(end);
+        *self = self.patterns.stream();
+        chunk
     }
 
     fn end(&self) -> u64 {
@@ -185,8 +210,8 @@ impl StreamRedactor {
         usize::try_from(position - self.base).unwrap_or(usize::MAX)
     }
 
-    /// Advance both scans over the pending bytes. A scan stops where more bytes could change its
-    /// answer, unless `at_end` says none will come.
+    /// Advance both scans over the pending bytes. The literal scan stops where more bytes could
+    /// change its answer, unless `at_end` says none will come.
     fn scan(&mut self, at_end: bool) {
         let end = self.end();
         while self.literal_at < end {
@@ -210,19 +235,18 @@ impl StreamRedactor {
             if !is_token_char(self.pending[i]) {
                 self.token = TokenScan::Searching;
             } else {
-                if let TokenScan::Searching = self.token {
-                    let rest = &self.pending[i..];
-                    if TOKEN_PREFIXES.iter().any(|p| rest.starts_with(p)) {
-                        self.token = TokenScan::Candidate(self.token_at);
-                    } else if !at_end && TOKEN_PREFIXES.iter().any(|p| p.starts_with(rest)) {
-                        break;
-                    }
-                }
                 match self.token {
-                    TokenScan::Searching => {}
-                    TokenScan::Candidate(start) => {
+                    TokenScan::Searching => {
+                        if let Some(len) = self.prefix_ending_at(self.token_at) {
+                            self.token = TokenScan::Candidate {
+                                start: self.token_at + 1 - len as u64,
+                                body: self.token_at + 1,
+                            };
+                        }
+                    }
+                    TokenScan::Candidate { start, body } => {
                         if self.token_at + 1 - start >= MIN_TOKEN_LEN as u64 {
-                            let from = self.index(start);
+                            let from = self.index(body);
                             self.covered[from..=i].fill(true);
                             self.token = TokenScan::Masking;
                         }
@@ -232,6 +256,27 @@ impl StreamRedactor {
             }
             self.token_at += 1;
         }
+    }
+
+    /// The length of a token prefix whose last byte is at `position`, looking back into bytes
+    /// already recorded.
+    fn prefix_ending_at(&self, position: u64) -> Option<usize> {
+        let earliest = self.base - self.before.len() as u64;
+        let byte_at = |p: u64| {
+            if p >= self.base {
+                self.pending[self.index(p)]
+            } else {
+                self.before[self.before.len() - (self.base - p) as usize]
+            }
+        };
+        TOKEN_PREFIXES
+            .iter()
+            .find(|prefix| {
+                let len = prefix.len() as u64;
+                position + 1 >= earliest + len
+                    && (0..len).all(|k| byte_at(position + 1 - len + k) == prefix[k as usize])
+            })
+            .map(|prefix| prefix.len())
     }
 
     /// Record the pending bytes before stream position `upto`: one marker per covered span.
@@ -249,6 +294,9 @@ impl StreamRedactor {
                 self.in_mask = true;
             }
         }
+        self.before.extend_from_slice(&self.pending[..n]);
+        let excess = self.before.len().saturating_sub(LONGEST_PREFIX - 1);
+        self.before.drain(..excess);
         self.pending.drain(..n);
         self.covered.drain(..n);
         self.base = upto;
@@ -367,8 +415,9 @@ mod tests {
     }
 
     /// The masking rules over a whole input, written apart from the streaming code: every byte of
-    /// every literal occurrence, and every token the original one-pass scan masked, with one
-    /// marker per covered span.
+    /// every literal occurrence, and in each run of token bytes, after the first complete token
+    /// prefix, the rest of the run when the run from the prefix reaches the minimum. One marker per
+    /// covered span.
     fn reference(literals: &[Vec<u8>], input: &[u8]) -> (Vec<u8>, u32) {
         let mut covered = vec![false; input.len()];
         for literal in literals {
@@ -378,20 +427,25 @@ mod tests {
                 }
             }
         }
-        let mut i = 0;
-        while i < input.len() {
-            if TOKEN_PREFIXES.iter().any(|p| input[i..].starts_with(p)) {
-                let mut end = i;
-                while end < input.len() && is_token_char(input[end]) {
-                    end += 1;
-                }
-                if end - i >= MIN_TOKEN_LEN {
-                    covered[i..end].fill(true);
-                    i = end;
-                    continue;
-                }
+        let mut run_start = 0;
+        while run_start < input.len() {
+            let mut run_end = run_start;
+            while run_end < input.len() && is_token_char(input[run_end]) {
+                run_end += 1;
             }
-            i += 1;
+            let run = &input[run_start..run_end];
+            let first_prefix_end = (1..=run.len()).find_map(|end| {
+                TOKEN_PREFIXES
+                    .iter()
+                    .find(|p| run[..end].ends_with(p))
+                    .map(|p| (end - p.len(), end))
+            });
+            if let Some((start, body)) = first_prefix_end
+                && run.len() - start >= MIN_TOKEN_LEN
+            {
+                covered[run_start + body..run_end].fill(true);
+            }
+            run_start = run_end + 1;
         }
         let mut out = Vec::new();
         let mut spans = 0;
@@ -425,7 +479,7 @@ mod tests {
             b"using sk-abcdef012345678901234567 now",
         );
         assert_eq!(n, 1);
-        assert_eq!(out, b"using ***REDACTED*** now");
+        assert_eq!(out, b"using sk-***REDACTED*** now");
     }
 
     #[test]
@@ -453,7 +507,7 @@ mod tests {
         assert_eq!(n, 3);
         assert_eq!(
             out,
-            b"\x00\xff***REDACTED*** ***REDACTED***\x00 ***REDACTED***"
+            b"\x00\xff***REDACTED*** AKIA***REDACTED***\x00 ghp_***REDACTED***"
         );
     }
 
@@ -479,17 +533,71 @@ mod tests {
     }
 
     #[test]
-    fn a_pty_patterns_mask_a_multiline_secret_as_the_terminal_echoes_it() {
+    fn pty_output_patterns_mask_a_multiline_secret_as_the_terminal_echoes_it() {
         let base = patterns(&["line-one\nline-two"]);
         let echoed: &[u8] = b"> line-one\r\nline-two\r\n";
         let (out, _) = whole(&base, echoed);
         assert!(contains(&out, b"line-one"), "pipe patterns keep LF only");
-        let pty = Arc::new(base.for_pty());
+        let pty = Arc::new(base.with_line_ends(b"\r\n"));
         let (out, n) = whole(&pty, echoed);
         assert_eq!(out, b"> ***REDACTED***\r\n");
         assert_eq!(n, 1);
         let (out, _) = whole(&pty, b"line-one\nline-two");
         assert_eq!(out, REDACTED, "the LF form still masks under a PTY");
+    }
+
+    #[test]
+    fn pty_input_patterns_mask_a_multiline_secret_entered_with_cr() {
+        let base = patterns(&["line-one\nline-two"]);
+        let typed: &[u8] = b"line-one\rline-two\r";
+        let (out, _) = whole(&Arc::new(base.with_line_ends(b"\r\n")), typed);
+        assert!(
+            contains(&out, b"line-one"),
+            "the output patterns miss what Enter sends"
+        );
+        let (out, n) = whole(&Arc::new(base.with_line_ends(b"\r")), typed);
+        assert_eq!(out, b"***REDACTED***\r");
+        assert_eq!(n, 1);
+    }
+
+    /// With no literal configured, every byte of a keystroke or a terminal frame is recorded as
+    /// it comes, bare token-prefix letters included; only a token's bytes after its complete
+    /// prefix wait.
+    #[test]
+    fn nothing_is_held_before_a_complete_token_prefix() {
+        let mut stream = Arc::new(Redactor::default()).stream();
+        for piece in [
+            &b"g"[..],
+            b"i",
+            b"t",
+            b" ",
+            b"l",
+            b"s",
+            b"\x1b[2A",
+            b"x",
+            b"AK",
+            b"gh",
+            b"github_pa",
+        ] {
+            let chunk = stream.push(piece);
+            assert_eq!(
+                chunk.recorded(),
+                piece,
+                "{:?}",
+                String::from_utf8_lossy(piece)
+            );
+            assert_eq!(chunk.consumed(), piece.len() as u64);
+        }
+        let chunk = stream.push(b"t_");
+        assert_eq!(chunk.recorded(), b"t_", "the completed prefix is recorded");
+        let chunk = stream.push(b"abc");
+        assert_eq!(chunk.consumed(), 0, "the token's own bytes wait");
+        let chunk = stream.push(b" ");
+        assert_eq!(
+            chunk.recorded(),
+            b"abc ",
+            "a short token is recorded at its delimiter"
+        );
     }
 
     #[test]
@@ -517,10 +625,11 @@ mod tests {
         let input: &[u8] = b"key ghp_0123456789abcdefghijklmnopqrstuvwxyz0123456789 end";
         let bytes: Vec<&[u8]> = input.chunks(1).collect();
         let run = masked(&redactor, &bytes, FinishReason::Eof);
-        assert_eq!(run.recorded, b"key ***REDACTED*** end");
+        assert_eq!(run.recorded, b"key ghp_***REDACTED*** end");
         assert_eq!(run.redactions, 1);
         let mut stream = redactor.stream();
-        let _ = stream.push(b"key ghp_0123456789abcdef");
+        let chunk = stream.push(b"key ghp_0123456789abcdef");
+        assert_eq!(chunk.recorded(), b"key ghp_***REDACTED***");
         let chunk = stream.push(b"ghijklmnopqrstuvwxyz");
         assert!(
             chunk.recorded().is_empty(),
@@ -548,7 +657,7 @@ mod tests {
         let tokens = Arc::new(Redactor::default());
         let run = masked(&tokens, &[b"auth sk-0123456"], FinishReason::Cutoff);
         assert_eq!(
-            run.recorded, b"auth ***REDACTED***",
+            run.recorded, b"auth sk-***REDACTED***",
             "a token past its prefix"
         );
         let run = masked(&tokens, &[b"a task"], FinishReason::Cutoff);
@@ -574,6 +683,9 @@ mod tests {
             b"line-one\nline-two",
             b"line-one\r\nline-two",
             b"line-one\r\n",
+            b"line-one\rline-two",
+            b"\x1b[2A",
+            b"git ls",
             b"ghp_0123456789abcdefghij",
             b"sk-short",
             b"sk-",
@@ -584,9 +696,14 @@ mod tests {
             b"\x00\xff",
             b"super-",
         ];
-        for redactor in [base.clone(), Arc::new(base.for_pty())] {
+        let shortest_prefix = TOKEN_PREFIXES.iter().map(|p| p.len()).min().unwrap_or(0);
+        for redactor in [
+            base.clone(),
+            Arc::new(base.with_line_ends(b"\r\n")),
+            Arc::new(base.with_line_ends(b"\r")),
+        ] {
             let longest = redactor.literals.iter().map(Vec::len).max().unwrap_or(0);
-            let bound = (longest - 1).max(MIN_TOKEN_LEN - 1) as u64;
+            let bound = (longest - 1).max(MIN_TOKEN_LEN - 1 - shortest_prefix) as u64;
             for seed in 1..=400u64 {
                 let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15));
                 let mut input = Vec::new();
@@ -628,6 +745,11 @@ mod tests {
                     );
                 }
                 let last = stream.finish(FinishReason::Eof);
+                assert_eq!(
+                    stream.push(b"after").recorded(),
+                    b"after",
+                    "seed {seed}: a finished stream starts over"
+                );
                 consumed += last.consumed();
                 redactions += last.redactions();
                 recorded.extend_from_slice(last.recorded());

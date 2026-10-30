@@ -531,7 +531,7 @@ impl SessionRuntime {
         // A PTY echoes a multi-line secret with CRLF line ends. Output, pipe stderr and input each
         // mask through their own state over these patterns.
         let patterns = match args.mode {
-            SessionMode::Pty => Arc::new(self.redactor.for_pty()),
+            SessionMode::Pty => Arc::new(self.redactor.with_line_ends(b"\r\n")),
             SessionMode::Pipe => self.redactor.clone(),
         };
         let entry = Arc::new(SessionEntry {
@@ -643,7 +643,11 @@ impl SessionRuntime {
             // No input is forwarded once the leader exited; what the record still holds is
             // settled before the exit, and no tombstone keeps the mask patterns.
             let input = waiter_entry.input.lock().await.take();
-            if let Some(InputEvidence { masker, mut offset }) = input {
+            if let Some(InputEvidence {
+                mut masker,
+                mut offset,
+            }) = input
+            {
                 let chunk = masker.finish(FinishReason::Eof);
                 waiter_entry.record_input(&waiter_bus, &waiter_status, &mut offset, &chunk);
             }
@@ -2548,6 +2552,68 @@ mod tests {
             })
             .collect();
         assert_eq!(records, [(0, "***REDACTED*** end".to_owned())]);
+    }
+
+    /// Read attach data frames into `shown` until it ends with `tail`, or two seconds pass.
+    async fn shown_until(
+        rx: &mut mpsc::Receiver<ServerMessage>,
+        shown: &mut Vec<u8>,
+        tail: &[u8],
+    ) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !shown.ends_with(tail) {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match tokio::time::timeout(remaining, rx.recv()).await {
+                Ok(Some(ServerMessage::Stream(frame))) => {
+                    if let sealant_protocol::StreamPayload::Data { data } = frame.payload {
+                        shown.extend_from_slice(data.as_slice());
+                    }
+                }
+                Ok(Some(_)) => {}
+                _ => return false,
+            }
+        }
+        true
+    }
+
+    /// The live terminal never waits on the token heuristic for bytes that are not yet a token:
+    /// a frame that ends in cursor-up shows its last byte, and `ls` typed a byte at a time shows
+    /// its `s` before the next keystroke.
+    #[tokio::test]
+    async fn the_live_terminal_shows_each_byte_without_waiting_for_the_next() {
+        let rt = runtime();
+        let (out_tx, mut out_rx) = mpsc::channel::<ServerMessage>(64);
+        let opened = rt
+            .open(session_args(
+                &["-c", "printf 'frame\\033[2A'; read -r line"],
+                80,
+                24,
+            ))
+            .expect("open");
+        rt.attach(
+            &opened.session_id,
+            ChannelId::new("chan_keys"),
+            out_tx,
+            Some(0),
+        )
+        .await
+        .expect("attach");
+        let mut shown = Vec::new();
+        assert!(
+            shown_until(&mut out_rx, &mut shown, b"frame\x1b[2A").await,
+            "the frame's last byte is shown: {:?}",
+            String::from_utf8_lossy(&shown)
+        );
+        for key in [&b"l"[..], b"s"] {
+            rt.write_input(&opened.session_id, key).await.expect("type");
+            assert!(
+                shown_until(&mut out_rx, &mut shown, key).await,
+                "{:?} is shown before the next keystroke: {:?}",
+                String::from_utf8_lossy(key),
+                String::from_utf8_lossy(&shown)
+            );
+        }
+        rt.close(&opened.session_id).expect("close");
     }
 
     /// A PTY writes a multi-line secret's line ends as CRLF; the record masks it as written.

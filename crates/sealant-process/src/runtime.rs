@@ -645,7 +645,7 @@ async fn capture_stream<R: AsyncRead + Unpin>(
         }
         offset = offset.advance(n as u64);
     };
-    if let Some(masker) = masker {
+    if let Some(mut masker) = masker {
         let chunk = masker.finish(end);
         status.add_redacted(chunk.redactions());
         bus.publish_masked(
