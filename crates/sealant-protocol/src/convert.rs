@@ -18,9 +18,9 @@ use crate::{
     FeatureState, ForwardOpened, ForwardProtocol, HealthReport, IoChunk, LeaseEpochReport, Limits,
     NetworkMode, OpenForwardArgs, OpenSessionArgs, OpenSftpArgs, ProcessAttached, ProcessExited,
     ProcessList, ProcessStarted, ProcessState, ProcessSummary, ResponseOutcome, RuntimeHeartbeat,
-    RuntimeMetrics, RuntimeState, RuntimeStateChanged, ServerMessage, SessionList, SessionOpened,
-    SessionSummary, SftpOpened, ShutdownAccepted, Signal, StreamAttached, StreamEnd, StreamFrame,
-    StreamKind, StreamPayload, TelemetryDropped, TransformMeta,
+    RuntimeMetrics, RuntimeState, RuntimeStateChanged, SecretEnvVar, ServerMessage, SessionList,
+    SessionOpened, SessionSummary, SftpOpened, ShutdownAccepted, Signal, StreamAttached, StreamEnd,
+    StreamFrame, StreamKind, StreamPayload, TelemetryDropped, TransformMeta,
 };
 use crate::{
     FileChange, FileChangeKind, FileDiffAvailable, FileEntry, FileSnapshotCompleted, FileType,
@@ -271,6 +271,28 @@ impl From<wire::EnvVar> for EnvVar {
             key: v.key,
             value: v.value,
         }
+    }
+}
+
+impl From<SecretEnvVar> for wire::SecretEnvVar {
+    fn from(v: SecretEnvVar) -> Self {
+        Self {
+            key: v.key,
+            value: v.value,
+        }
+    }
+}
+impl From<wire::SecretEnvVar> for SecretEnvVar {
+    fn from(v: wire::SecretEnvVar) -> Self {
+        Self {
+            key: v.key,
+            value: v.value,
+        }
+    }
+}
+impl std::fmt::Debug for wire::SecretEnvVar {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SecretEnvVar").finish_non_exhaustive()
     }
 }
 
@@ -796,6 +818,7 @@ impl From<ExecArgs> for wire::ExecArgs {
             args: a.args,
             cwd: a.cwd,
             env: a.env.into_iter().map(Into::into).collect(),
+            secret_env: a.secret_env.into_iter().map(Into::into).collect(),
             stdin: a.stdin,
             timeout_millis: a.timeout_millis,
             background: a.background,
@@ -816,6 +839,7 @@ impl TryFrom<wire::ExecArgs> for ExecArgs {
             args: a.args,
             cwd: a.cwd,
             env: a.env.into_iter().map(Into::into).collect(),
+            secret_env: a.secret_env.into_iter().map(Into::into).collect(),
             stdin: a.stdin,
             timeout_millis: a.timeout_millis,
             background: a.background,
@@ -835,6 +859,7 @@ impl From<OpenSessionArgs> for wire::OpenSessionArgs {
             args: a.args,
             cwd: a.cwd,
             env: a.env.into_iter().map(Into::into).collect(),
+            secret_env: a.secret_env.into_iter().map(Into::into).collect(),
             cols: u32::from(a.cols),
             rows: u32::from(a.rows),
             term: a.term,
@@ -852,6 +877,7 @@ impl TryFrom<wire::OpenSessionArgs> for OpenSessionArgs {
             args: a.args,
             cwd: a.cwd,
             env: a.env.into_iter().map(Into::into).collect(),
+            secret_env: a.secret_env.into_iter().map(Into::into).collect(),
             cols: a.cols as u16,
             rows: a.rows as u16,
             term: a.term,
@@ -1975,6 +2001,7 @@ mod tests {
                     key: "A".into(),
                     value: "b".into(),
                 }],
+                secret_env: vec![],
                 stdin: true,
                 attach: true,
                 timeout_millis: Some(5000),
@@ -1989,6 +2016,58 @@ mod tests {
     }
 
     #[test]
+    fn secret_env_round_trips_and_no_debug_of_a_request_prints_it() {
+        const VALUE: &str = "fake-secret-value-81c2";
+        const KEY: &str = "PGPASSWORD";
+        let secret_env = vec![SecretEnvVar {
+            key: KEY.to_owned(),
+            value: VALUE.to_owned(),
+        }];
+        let commands = [
+            Command::Exec(ExecArgs {
+                user: None,
+                execution_id: None,
+                session_id: None,
+                executable: "/bin/true".to_owned(),
+                args: vec![],
+                cwd: None,
+                env: vec![],
+                secret_env: secret_env.clone(),
+                stdin: false,
+                attach: false,
+                timeout_millis: None,
+                background: false,
+                capture: None,
+                graceful_signal: None,
+            }),
+            Command::OpenSession(OpenSessionArgs {
+                user: None,
+                execution_id: None,
+                shell: None,
+                args: vec![],
+                cwd: None,
+                env: vec![],
+                secret_env,
+                cols: 80,
+                rows: 24,
+                term: None,
+                mode: crate::SessionMode::Pipe,
+            }),
+        ];
+        for command in commands {
+            let msg = ClientMessage::Request(ControlRequest::new(RequestId::new("req_s"), command));
+            let bytes = encode_client(&msg);
+            assert_eq!(decode_client(&bytes).expect("decode"), msg);
+            let on_wire = wire::ClientMessage::decode(bytes.as_slice()).expect("wire decode");
+            for printed in [format!("{msg:?}"), format!("{on_wire:#?}")] {
+                assert!(printed.contains("SecretEnvVar"), "{printed}");
+                assert!(!printed.contains(VALUE), "Debug printed the value");
+                assert!(!printed.contains(KEY), "Debug printed the name");
+            }
+        }
+    }
+
+    #[test]
     fn open_session_pipe_mode_round_trips_and_unspecified_reads_as_pty() {
         let msg = ClientMessage::Request(ControlRequest::new(
             RequestId::new("req_2"),
@@ -1999,6 +2078,7 @@ mod tests {
                 args: vec!["app-server".to_owned()],
                 cwd: None,
                 env: vec![],
+                secret_env: vec![],
                 cols: 0,
                 rows: 0,
                 term: None,
@@ -2016,6 +2096,7 @@ mod tests {
             args: vec![],
             cwd: None,
             env: vec![],
+            secret_env: vec![],
             cols: 80,
             rows: 24,
             term: None,

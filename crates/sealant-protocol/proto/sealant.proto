@@ -351,6 +351,7 @@ message ExecArgs {
   bool attach = 12;
   // Run as this user: a login name or a decimal uid.
   optional string user = 13;
+  repeated SecretEnvVar secret_env = 14;
 }
 
 message ExecutionStartArgs {
@@ -389,6 +390,7 @@ message OpenSessionArgs {
   SessionMode mode = 9;
   // Run the leader as this user: a login name or a decimal uid.
   optional string user = 10;
+  repeated SecretEnvVar secret_env = 11;
 }
 
 message RuntimeGracefulShutdownArgs { optional uint64 grace_millis = 1; }
@@ -878,4 +880,12 @@ message ServerMessage {
     EventEnvelope event = 2;
     StreamFrame stream = 3;
   }
+}
+
+// One variable addressed to one process only, its value masked in everything recorded of it
+// (`process.secret-env.v1`). A daemon without that capability ignores the field, so a client
+// sends it only to one that names it.
+message SecretEnvVar {
+  string key = 1;
+  string value = 2;
 }

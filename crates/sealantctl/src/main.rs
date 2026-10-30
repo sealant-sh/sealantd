@@ -213,6 +213,7 @@ async fn main() -> ExitCode {
                 args,
                 cwd: None,
                 env: vec![],
+                secret_env: vec![],
                 stdin: false,
                 attach: false,
                 timeout_millis: None,

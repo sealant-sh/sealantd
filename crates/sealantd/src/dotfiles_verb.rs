@@ -90,6 +90,7 @@ pub(crate) async fn apply(
                 args: vec!["-c".to_owned(), script],
                 cwd: Some(home_dir.to_string_lossy().into_owned()),
                 env: Vec::new(),
+                secret_env: vec![],
                 stdin: false,
                 attach: false,
                 timeout_millis: None,

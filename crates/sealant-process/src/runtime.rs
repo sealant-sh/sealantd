@@ -700,6 +700,7 @@ mod tests {
             args: args.iter().map(|s| (*s).to_owned()).collect(),
             cwd: None,
             env: vec![],
+            secret_env: vec![],
             stdin: false,
             attach: false,
             timeout_millis: None,

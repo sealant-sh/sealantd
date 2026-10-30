@@ -87,6 +87,7 @@ fn sh(script: &str, cwd: &Path) -> ExecArgs {
                 value: pgid.to_string(),
             },
         ],
+        secret_env: vec![],
         stdin: false,
         attach: false,
         timeout_millis: None,
