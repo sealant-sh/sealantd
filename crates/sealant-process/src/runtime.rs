@@ -21,6 +21,7 @@ use tokio::sync::mpsc;
 
 use crate::SessionMark;
 use crate::registry::{ProcessEntry, ProcessRegistry};
+use crate::secret_env::SecretEnv;
 use crate::signals;
 
 /// A reliable exec-attach output sink: a non-PTY process's stdout/stderr is delivered over one
@@ -144,7 +145,7 @@ impl ProcessRuntime {
 
     fn exec_inner(
         &self,
-        args: ExecArgs,
+        mut args: ExecArgs,
         request_id: Option<RequestId>,
         session: Option<SessionMark>,
         attach: Option<AttachSink>,
@@ -155,6 +156,7 @@ impl ProcessRuntime {
             ));
         }
         validate_env(&args.env)?;
+        let secret_env = SecretEnv::parse(std::mem::take(&mut args.secret_env), &args.env)?;
 
         // Enforce the process limit before spawning; overflow is rejected cleanly, not crashed.
         let active = self.status.counts().0;
@@ -222,6 +224,10 @@ impl ProcessRuntime {
         }
         for var in &args.env {
             command.env(&var.key, &var.value);
+        }
+        // Addressed to this process, so set as given: a name the runtime sets was refused.
+        for (key, value) in secret_env.vars() {
+            command.env(key, value);
         }
         for (key, value) in self
             .extra_env
@@ -312,6 +318,9 @@ impl ProcessRuntime {
         );
 
         let chunk_size = self.config.io_chunk_bytes;
+        // This process's patterns live as long as its capture readers.
+        let redactor = secret_env.mask(&self.redactor);
+        drop(secret_env);
         // Both stdout and stderr fan into the SAME attach sink (shared seq) so the gateway sees one
         // ordered byte stream — exactly like a PTY attach.
         let stdout_handle = stdout.map(|s| {
@@ -324,7 +333,7 @@ impl ProcessRuntime {
                 chunk_size,
                 bus,
                 corr,
-                self.redactor.clone(),
+                redactor.clone(),
                 self.status.clone(),
                 attach.clone(),
             ))
@@ -339,7 +348,7 @@ impl ProcessRuntime {
                 chunk_size,
                 bus,
                 corr,
-                self.redactor.clone(),
+                redactor.clone(),
                 self.status.clone(),
                 attach.clone(),
             ))
@@ -747,6 +756,91 @@ mod tests {
         // Registry is cleaned up.
         assert_eq!(rt.registry.len(), 0);
         assert_eq!(rt.status.counts().0, 0);
+    }
+
+    fn recorded(payloads: &[EventPayload], stream: StreamKind) -> String {
+        let bytes: Vec<u8> = payloads
+            .iter()
+            .filter_map(|p| match p {
+                EventPayload::IoChunk(c) if c.stream == stream => {
+                    c.content.as_ref().map(|b| b.as_slice().to_vec())
+                }
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        String::from_utf8(bytes).expect("utf-8")
+    }
+
+    /// A secret env reaches exactly its process, which is recorded masked; another process that
+    /// prints the same value without it is recorded as it wrote it, so the daemon's patterns
+    /// never grew.
+    #[tokio::test]
+    async fn a_secret_env_reaches_its_process_and_masks_only_its_output() {
+        const VALUE: &str = "fake-pg-password-5d1e";
+        let rt = runtime();
+        let mut rx = rt.bus.subscribe();
+        let script = r#"printf 'len=%s pw=%s' "${#PGPASSWORD}" "$PGPASSWORD"; printf '%s' "$PGPASSWORD" >&2"#;
+        rt.exec(
+            ExecArgs {
+                secret_env: vec![sealant_protocol::SecretEnvVar {
+                    key: "PGPASSWORD".to_owned(),
+                    value: VALUE.to_owned(),
+                }],
+                ..exec_args("/bin/sh", &["-c", script])
+            },
+            None,
+            None,
+        )
+        .expect("spawn");
+        let payloads = collect_until_exit(&mut rx).await;
+        assert_eq!(
+            recorded(&payloads, StreamKind::Stdout),
+            "len=21 pw=***REDACTED***"
+        );
+        assert_eq!(recorded(&payloads, StreamKind::Stderr), "***REDACTED***");
+
+        rt.exec(
+            ExecArgs {
+                env: vec![sealant_protocol::EnvVar {
+                    key: "PGPASSWORD".to_owned(),
+                    value: VALUE.to_owned(),
+                }],
+                ..exec_args("/bin/sh", &["-c", r#"printf '%s' "$PGPASSWORD""#])
+            },
+            None,
+            None,
+        )
+        .expect("spawn");
+        let payloads = collect_until_exit(&mut rx).await;
+        assert_eq!(recorded(&payloads, StreamKind::Stdout), VALUE);
+    }
+
+    #[tokio::test]
+    async fn a_refused_secret_env_starts_nothing() {
+        let rt = runtime();
+        let mut rx = rt.bus.subscribe();
+        let error = rt
+            .exec(
+                ExecArgs {
+                    env: vec![sealant_protocol::EnvVar {
+                        key: "PGPASSWORD".to_owned(),
+                        value: "plain".to_owned(),
+                    }],
+                    secret_env: vec![sealant_protocol::SecretEnvVar {
+                        key: "PGPASSWORD".to_owned(),
+                        value: "fake-pg-password-5d1e".to_owned(),
+                    }],
+                    ..exec_args("/bin/true", &[])
+                },
+                None,
+                None,
+            )
+            .expect_err("refused");
+        assert_eq!(error.code, ControlErrorCode::InvalidArgument);
+        assert_eq!(error.message, "secretEnv entry 0 refused: name-in-env");
+        assert!(rx.try_recv().is_err(), "no process started");
+        assert_eq!(rt.registry.len(), 0);
     }
 
     #[tokio::test]

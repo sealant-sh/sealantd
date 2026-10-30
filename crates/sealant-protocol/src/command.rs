@@ -172,6 +172,10 @@ pub struct ExecArgs {
     /// minted channel (`ProcessAttached`) instead of the bare `ExecAccepted`. The lossy `IoChunk`
     /// telemetry tap stays on in parallel; the channel is the faithful path VSCode's non-PTY
     /// bootstrap reads from. Requires a connection-scoped writer (the request is routed accordingly).
+    ///
+    /// The channel is a live forward to the connection that asked for it and is never recorded:
+    /// a [`Self::secret_env`] value the process prints reaches it as written. What is recorded of
+    /// the process is the `IoChunk` tap, which masks it.
     #[serde(default)]
     pub attach: bool,
     /// Timeout after which the process is terminated.
