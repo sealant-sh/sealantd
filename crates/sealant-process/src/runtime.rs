@@ -788,19 +788,45 @@ mod tests {
         assert!(rt.status.redacted() >= 1);
     }
 
-    /// A secret written in two parts, a read apart, is recorded masked on stdout and on stderr.
-    /// Each chunk starts at the raw offset of the bytes it stands for, and its byte count is what
-    /// it records.
+    /// A secret written in two parts is recorded masked on stdout and on stderr. The process
+    /// writes the second part only once the first was captured on both streams, so the split is
+    /// real. Each chunk starts at the raw offset of the bytes it stands for, and its byte count is
+    /// what it records.
     #[tokio::test]
     async fn a_secret_split_across_writes_is_masked_and_offsets_count_raw_bytes() {
         let mut rt = runtime();
         rt.redactor = Arc::new(Redactor::new(vec!["split-secret-value-42".to_owned()]));
         let mut rx = rt.bus.subscribe();
-        let script = "printf 'pw=split-secr'; printf 'pw=split-secr' >&2; sleep 0.2; \
+        let script = "printf 'pw=split-secr'; printf 'pw=split-secr' >&2; read -r go; \
                       printf 'et-value-42 end'; printf 'et-value-42 end' >&2";
-        rt.exec(exec_args("/bin/sh", &["-c", script]), None, None)
+        let accepted = rt
+            .exec(
+                ExecArgs {
+                    stdin: true,
+                    ..exec_args("/bin/sh", &["-c", script])
+                },
+                None,
+                None,
+            )
             .expect("spawn");
-        let payloads = collect_until_exit(&mut rx).await;
+        let mut payloads = Vec::new();
+        let first_parts = |payloads: &[EventPayload]| {
+            payloads
+                .iter()
+                .filter(|p| matches!(p, EventPayload::IoChunk(_)))
+                .count()
+        };
+        while first_parts(&payloads) < 2 {
+            let env = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("the first part is captured")
+                .expect("event");
+            payloads.push(env.payload);
+        }
+        rt.write_stdin(&accepted.process_id, b"\n")
+            .await
+            .expect("go");
+        payloads.extend(collect_until_exit(&mut rx).await);
         for stream in [StreamKind::Stdout, StreamKind::Stderr] {
             let chunks: Vec<&IoChunk> = payloads
                 .iter()

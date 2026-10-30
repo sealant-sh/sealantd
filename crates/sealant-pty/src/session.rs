@@ -2490,6 +2490,27 @@ mod tests {
         }
     }
 
+    /// Every `io.chunk` of `stream` until what they record holds `needle`.
+    async fn chunks_until_recorded(
+        rx: &mut Receiver<EventEnvelope>,
+        stream: StreamKind,
+        needle: &str,
+    ) -> Vec<IoChunk> {
+        let mut chunks = Vec::new();
+        while !recorded(&chunks).contains(needle) {
+            let env = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("the chunk arrives")
+                .expect("event");
+            if let EventPayload::IoChunk(c) = env.payload
+                && c.stream == stream
+            {
+                chunks.push(c);
+            }
+        }
+        chunks
+    }
+
     fn recorded(chunks: &[IoChunk]) -> String {
         chunks
             .iter()
@@ -2497,8 +2518,8 @@ mod tests {
             .collect()
     }
 
-    /// A secret the leader writes in two parts, a read apart, reaches neither the journal nor the
-    /// telemetry. The first read is held whole: it mints no journal sequence and no chunk.
+    /// A secret the leader writes in two parts reaches neither the journal nor the telemetry.
+    /// The leader writes the second part only once the first was captured, so the split is real.
     #[tokio::test]
     async fn a_secret_split_across_reads_never_reaches_the_journal() {
         let rt = masking_runtime();
@@ -2507,16 +2528,18 @@ mod tests {
             .open(session_args(
                 &[
                     "-c",
-                    "printf 'split-secr'; sleep 0.2; printf 'et-value-42 end'",
+                    "stty -echo; printf 'pw=split-secr'; read -r go; printf 'et-value-42 end'",
                 ],
                 80,
                 24,
             ))
             .expect("open");
-        let chunks = chunks_until_exit(&mut rx, StreamKind::PtyOutput).await;
-        assert_eq!(recorded(&chunks), "***REDACTED*** end");
+        let mut chunks = chunks_until_recorded(&mut rx, StreamKind::PtyOutput, "pw=").await;
+        rt.write_input(&opened.session_id, b"\r").await.expect("go");
+        chunks.extend(chunks_until_exit(&mut rx, StreamKind::PtyOutput).await);
+        assert_eq!(recorded(&chunks), "pw=***REDACTED*** end");
         let offsets: Vec<u64> = chunks.iter().map(|c| c.stream_offset.get()).collect();
-        assert_eq!(offsets, [0]);
+        assert_eq!(offsets, [0, 3]);
         let journal = rt
             .read_output(&opened.session_id, 0, None)
             .expect("read journal");
@@ -2530,7 +2553,10 @@ mod tests {
                 )
             })
             .collect();
-        assert_eq!(records, [(0, "***REDACTED*** end".to_owned())]);
+        assert_eq!(
+            records,
+            [(0, "pw=".to_owned()), (1, "***REDACTED*** end".to_owned())]
+        );
     }
 
     /// Read attach data frames into `shown` until it ends with `tail`, or two seconds pass.
