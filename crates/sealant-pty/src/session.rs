@@ -696,21 +696,23 @@ impl SessionRuntime {
             .get_running(session_id)
             .ok_or_else(|| ControlError::session_not_found(session_id.to_string()))?;
         let mut input = entry.input.lock().await;
-        let Some(recorder) = input.as_mut() else {
+        let mut exited = entry.exit_watch();
+        // A leader that exited takes no input, even while its output still drains and a helper
+        // holds its input open.
+        let Some(recorder) = input.as_mut().filter(|_| !*exited.borrow()) else {
             return Err(ControlError::session_not_found(session_id.to_string()));
         };
         // Each part the leader accepts is recorded as it is written, so what was forwarded is in
         // the record even when the rest fails. A write the leader's exit leaves blocked (a helper
         // holds the input and never reads) is abandoned, so it cannot hold the record open.
-        let mut exited = entry.exit_watch();
         let mut rest = data;
         while !rest.is_empty() {
             let written = tokio::select! {
                 biased;
-                written = forward_input(&entry, session_id, rest) => written,
                 _ = exited.wait_for(|exited| *exited) => {
                     Err(ControlError::session_not_found(session_id.to_string()))
                 }
+                written = forward_input(&entry, session_id, rest) => written,
             };
             match written {
                 Ok(n) => {
@@ -2728,6 +2730,41 @@ mod tests {
             &input[..input.len().min(40)]
         );
         assert!(!input.contains("split"), "no raw part of the secret");
+    }
+
+    /// A leader that exited takes no input while its output still drains: here an attach that
+    /// stopped reading holds the drain open, and a helper holds the leader's stdin.
+    #[tokio::test]
+    async fn no_input_is_written_once_the_leader_exited() {
+        let rt = runtime();
+        let opened = rt
+            .open(pipe_args(&[
+                "-c",
+                "exec 3<&0; sleep 5 <&3 & printf one; sleep 0.1; printf two; sleep 0.1; printf three",
+            ]))
+            .expect("open");
+        let (out_tx, _out_rx) = mpsc::channel::<ServerMessage>(1);
+        rt.attach(
+            &opened.session_id,
+            ChannelId::new("chan_stalled"),
+            out_tx,
+            Some(0),
+        )
+        .await
+        .expect("attach");
+        let entry = rt
+            .registry
+            .get_running(&opened.session_id)
+            .expect("running");
+        tokio::time::timeout(Duration::from_secs(5), entry.exit_watch().wait_for(|e| *e))
+            .await
+            .expect("the leader exits")
+            .expect("exit watch");
+        assert!(
+            rt.registry.get_running(&opened.session_id).is_some(),
+            "the output still drains"
+        );
+        assert!(rt.write_input(&opened.session_id, b"late\n").await.is_err());
     }
 
     /// The leader's exit cuts the input stream: what the record still holds, a prefix of a
