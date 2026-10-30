@@ -623,11 +623,12 @@ impl SessionRuntime {
             drop(spawned_pid);
             let _ = leader_exited_tx.send(());
             let _ = capture.await;
-            // No input is forwarded once the leader exited; what the record still holds is
-            // settled before the exit, and no tombstone keeps the mask patterns.
+            // No input is forwarded once the leader exited: the input stream is cut, and what the
+            // record still holds is masked if it could begin a secret, before the exit. No
+            // tombstone keeps the mask patterns.
             let input = waiter_entry.input.lock().await.take();
             if let Some(mut recorder) = input {
-                recorder.end(FinishReason::Eof);
+                recorder.end(FinishReason::Cutoff);
             }
             let (exit_code, signal, reason) = classify(&status_result);
             waiter_bus.publish(
@@ -698,18 +699,31 @@ impl SessionRuntime {
         let Some(recorder) = input.as_mut() else {
             return Err(ControlError::session_not_found(session_id.to_string()));
         };
-        // A write the leader's exit leaves blocked (a helper holds the input and never reads) is
-        // abandoned, so it cannot hold the input record open past the exit.
+        // Each part the leader accepts is recorded as it is written, so what was forwarded is in
+        // the record even when the rest fails. A write the leader's exit leaves blocked (a helper
+        // holds the input and never reads) is abandoned, so it cannot hold the record open.
         let mut exited = entry.exit_watch();
-        tokio::select! {
-            biased;
-            written = forward_input(&entry, session_id, data) => written?,
-            _ = exited.wait_for(|exited| *exited) => {
-                return Err(ControlError::session_not_found(session_id.to_string()));
+        let mut rest = data;
+        while !rest.is_empty() {
+            let written = tokio::select! {
+                biased;
+                written = forward_input(&entry, session_id, rest) => written,
+                _ = exited.wait_for(|exited| *exited) => {
+                    Err(ControlError::session_not_found(session_id.to_string()))
+                }
+            };
+            match written {
+                Ok(n) => {
+                    recorder.read(&rest[..n]);
+                    rest = &rest[n..];
+                }
+                Err(error) => {
+                    // The input stream was cut: what the record holds could begin a secret.
+                    recorder.end(FinishReason::Cutoff);
+                    return Err(error);
+                }
             }
         }
-        // Record the forwarded input as evidence, masked before it becomes readable.
-        recorder.read(data);
         Ok(())
     }
 
@@ -1006,18 +1020,19 @@ fn classify(
     }
 }
 
-/// Write `data` to the leader: the PTY master, or its stdin pipe.
+/// Write a first part of `data` to the leader (the PTY master, or its stdin pipe), returning how
+/// many bytes it took.
 async fn forward_input(
     entry: &SessionEntry,
     session_id: &SessionId,
     data: &[u8],
-) -> Result<(), ControlError> {
+) -> Result<usize, ControlError> {
     match &entry.io {
         LeaderIo::Pty { master } => {
             let master = master
                 .upgrade()
                 .ok_or_else(|| ControlError::session_not_found(session_id.to_string()))?;
-            pty::write_all(&master, data)
+            pty::write(&master, data)
                 .await
                 .map_err(|e| ControlError::invalid_argument(format!("pty input write failed: {e}")))
         }
@@ -1028,22 +1043,18 @@ async fn forward_input(
                     "session stdin is closed".to_owned(),
                 ));
             };
-            let written = async {
-                pipe.write_all(data).await?;
-                pipe.flush().await
-            }
-            .await;
-            if let Err(e) = written {
+            let written = match pipe.write(data).await {
+                Ok(0) => Err(io::ErrorKind::WriteZero.into()),
+                written => written,
+            };
+            if let Err(e) = &written {
                 // A broken pipe means the leader stopped reading; drop our end so the next
                 // write fails fast instead of blocking on a dead reader.
                 if e.kind() == io::ErrorKind::BrokenPipe {
                     *guard = None;
                 }
-                return Err(ControlError::invalid_argument(format!(
-                    "stdin write failed: {e}"
-                )));
             }
-            Ok(())
+            written.map_err(|e| ControlError::invalid_argument(format!("stdin write failed: {e}")))
         }
     }
 }
@@ -2693,8 +2704,34 @@ mod tests {
         rt.close(&opened.session_id).expect("close");
     }
 
-    /// Input the record still holds when the leader exits is recorded before the exit, and the
-    /// session takes no input after it.
+    /// A write the leader cuts short records every part it took, masked, and never the part of a
+    /// secret written before it: the leader reads the secret's line and exits while the rest of
+    /// the write, more than a pipe holds, is still going in.
+    #[tokio::test]
+    async fn an_input_write_the_leader_cuts_short_records_no_raw_part_of_a_secret() {
+        let rt = masking_runtime();
+        let mut rx = rt.bus.subscribe();
+        let opened = rt.open(pipe_args(&["-c", "read -r line"])).expect("open");
+        rt.write_input(&opened.session_id, b"split-secr")
+            .await
+            .expect("first write");
+        let mut rest = b"et-value-42\n".to_vec();
+        rest.resize(rest.len() + 256 * 1024, b'x');
+        assert!(
+            rt.write_input(&opened.session_id, &rest).await.is_err(),
+            "the leader exits before taking it all"
+        );
+        let input = recorded(&chunks_until_exit(&mut rx, StreamKind::Stdin).await);
+        assert!(
+            input.starts_with("***REDACTED***\nx"),
+            "{:?}",
+            &input[..input.len().min(40)]
+        );
+        assert!(!input.contains("split"), "no raw part of the secret");
+    }
+
+    /// The leader's exit cuts the input stream: what the record still holds, a prefix of a
+    /// secret here, is masked before the exit, and the session takes no input after it.
     #[tokio::test]
     async fn held_input_is_recorded_before_the_exit() {
         let rt = masking_runtime();
@@ -2716,7 +2753,7 @@ mod tests {
             .collect();
         assert_eq!(
             records,
-            [(0, "hello ".to_owned()), (6, "split-secr".to_owned())]
+            [(0, "hello ".to_owned()), (6, "***REDACTED***".to_owned())]
         );
         assert!(rt.write_input(&opened.session_id, b"late").await.is_err());
     }

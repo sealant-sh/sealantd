@@ -200,12 +200,13 @@ pub fn readable_bytes(master: &AsyncFd<OwnedFd>) -> io::Result<usize> {
     }
 }
 
-/// Write all of `data` to the PTY master.
+/// Write a first part of `data` to the PTY master, waiting until it takes some, and return how
+/// many bytes it took.
 ///
 /// # Errors
 /// Returns an I/O error if the write fails.
-pub async fn write_all(master: &AsyncFd<OwnedFd>, mut data: &[u8]) -> io::Result<()> {
-    while !data.is_empty() {
+pub async fn write(master: &AsyncFd<OwnedFd>, data: &[u8]) -> io::Result<usize> {
+    loop {
         let mut guard = master.writable().await?;
         let result = guard.try_io(|inner| {
             let fd = inner.get_ref().as_raw_fd();
@@ -218,17 +219,11 @@ pub async fn write_all(master: &AsyncFd<OwnedFd>, mut data: &[u8]) -> io::Result
             }
         });
         match result {
-            Ok(io_result) => {
-                let written = io_result?;
-                if written == 0 {
-                    return Err(io::ErrorKind::WriteZero.into());
-                }
-                data = &data[written..];
-            }
-            Err(_would_block) => continue,
+            Ok(Ok(0)) if !data.is_empty() => return Err(io::ErrorKind::WriteZero.into()),
+            Ok(written) => return written,
+            Err(_would_block) => {}
         }
     }
-    Ok(())
 }
 
 /// Apply a new terminal window size to the PTY master (`TIOCSWINSZ`).
