@@ -58,6 +58,7 @@ async fn reaper_never_steals_fast_exiting_owned_children() {
                     args: vec![],
                     cwd: None,
                     env: vec![],
+                    secret_env: vec![],
                     stdin: false,
                     attach: false,
                     timeout_millis: None,

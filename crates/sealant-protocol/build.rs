@@ -11,6 +11,9 @@ fn main() {
         .boxed(".sealant.v1.CommandResult.result.capabilities")
         // A dotfiles repository carries several strings: boxed, it does not size every command.
         .boxed(".sealant.v1.Command.command.dotfiles_apply")
+        // A secret's value never reaches a log through the request that carries it: this Debug
+        // is written by hand (`convert.rs`).
+        .skip_debug([".sealant.v1.SecretEnvVar"])
         .compile_protos(&["proto/sealant.proto"], &["proto"])
         .expect("compile sealant.proto");
     println!("cargo:rerun-if-changed=proto/sealant.proto");

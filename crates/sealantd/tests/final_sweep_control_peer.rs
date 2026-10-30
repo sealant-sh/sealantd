@@ -224,6 +224,7 @@ async fn a_final_flush_sweeps_the_relay_and_the_final_flush_asked_again_answers_
                 key: "PATH".to_owned(),
                 value: std::env::var("PATH").unwrap_or_default(),
             }],
+            secret_env: vec![],
             stdin: false,
             attach: false,
             timeout_millis: None,

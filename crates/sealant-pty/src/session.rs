@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use nix::sys::signal::Signal as NixSignal;
 use nix::unistd::Pid;
 use sealant_process::SessionMark;
+use sealant_process::secret_env::SecretEnv;
 use sealant_protocol::SESSION_ENV;
 use sealant_protocol::{
     Base64Bytes, CaptureMethod, ChannelId, Confidence, ControlError, EventPayload, ExecutionId,
@@ -327,7 +328,7 @@ impl SessionRuntime {
     ///
     /// # Errors
     /// Returns a [`ControlError`] if the PTY cannot be allocated or the shell cannot start.
-    pub fn open(&self, args: OpenSessionArgs) -> Result<SessionOpened, ControlError> {
+    pub fn open(&self, mut args: OpenSessionArgs) -> Result<SessionOpened, ControlError> {
         // Enforce the session limit before allocating a PTY; overflow is rejected cleanly.
         let active = self.status.counts().1;
         if active >= self.config.limits.max_sessions {
@@ -339,6 +340,7 @@ impl SessionRuntime {
                 ),
             ));
         }
+        let secret_env = SecretEnv::parse(std::mem::take(&mut args.secret_env), &args.env)?;
         let shell = args
             .shell
             .clone()
@@ -390,6 +392,8 @@ impl SessionRuntime {
             env.extend(user.env());
         }
         env.extend(args.env.iter().map(|v| (v.key.clone(), v.value.clone())));
+        // Addressed to this leader, so set as given: a name the runtime sets was refused.
+        env.extend(secret_env.vars().map(|(k, v)| (k.to_owned(), v.to_owned())));
         env.extend(
             self.extra_env
                 .lock()
@@ -502,13 +506,16 @@ impl SessionRuntime {
         })?;
 
         // A PTY echoes a multi-line secret with CRLF line ends, and a terminal sends one typed or
-        // pasted with CR. Output, pipe stderr and input each mask through their own state.
+        // pasted with CR. Output, pipe stderr and input each mask through their own state, with
+        // this leader's patterns: the readers and the input record hold them until they end.
+        let redactor = secret_env.mask(&self.redactor);
+        drop(secret_env);
         let (patterns, input_patterns) = match args.mode {
             SessionMode::Pty => (
-                Arc::new(self.redactor.with_line_ends(b"\r\n")),
-                Arc::new(self.redactor.with_line_ends(b"\r")),
+                Arc::new(redactor.with_line_ends(b"\r\n")),
+                Arc::new(redactor.with_line_ends(b"\r")),
             ),
-            SessionMode::Pipe => (self.redactor.clone(), self.redactor.clone()),
+            SessionMode::Pipe => (redactor.clone(), redactor),
         };
         let correlation = Correlation::new()
             .execution(execution_id.clone())
@@ -1440,6 +1447,7 @@ mod tests {
             args: args.iter().map(|s| (*s).to_owned()).collect(),
             cwd: None,
             env: vec![],
+            secret_env: vec![],
             cols,
             rows,
             term: None,
@@ -2018,6 +2026,7 @@ mod tests {
                     args: vec!["30".to_owned()],
                     cwd: None,
                     env: vec![],
+                    secret_env: vec![],
                     stdin: false,
                     attach: false,
                     timeout_millis: None,
@@ -2423,6 +2432,38 @@ mod tests {
         rt.close(&opened.session_id).expect("close tombstone");
         assert!(rt.registry.get(&opened.session_id).is_none());
         assert!(rt.read_output(&opened.session_id, 0, None).is_err());
+    }
+
+    /// A secret env value of the parser's minimum length reaches the leader and is masked in
+    /// the journal.
+    #[tokio::test]
+    async fn a_secret_env_value_of_the_minimum_length_is_masked_in_the_journal() {
+        use sealant_process::secret_env::MIN_VALUE_BYTES;
+        let rt = runtime();
+        let mut rx = rt.bus.subscribe();
+        let value = "fk-pw-0123456789"[..MIN_VALUE_BYTES].to_owned();
+        let script = r#"printf 'len=%s pw=%s end' "${#PGPASSWORD}" "$PGPASSWORD""#;
+        let opened = rt
+            .open(OpenSessionArgs {
+                secret_env: vec![sealant_protocol::SecretEnvVar {
+                    key: "PGPASSWORD".to_owned(),
+                    value,
+                }],
+                ..session_args(&["-c", script], 80, 24)
+            })
+            .expect("open");
+        output_until_exit(&mut rx).await;
+        let journal: String = rt
+            .read_output(&opened.session_id, 0, None)
+            .expect("read journal")
+            .chunks
+            .iter()
+            .map(|c| String::from_utf8_lossy(c.data.as_slice()).into_owned())
+            .collect();
+        assert_eq!(
+            journal,
+            format!("len={MIN_VALUE_BYTES} pw=***REDACTED*** end")
+        );
     }
 
     /// Secrets are redacted before the journal (the readable surface), telemetry, and live sinks.

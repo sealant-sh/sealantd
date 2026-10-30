@@ -168,6 +168,7 @@ mod tests {
                 args: vec![],
                 cwd: None,
                 env: vec![],
+                secret_env: vec![],
                 stdin: false,
                 attach: false,
                 timeout_millis: None,

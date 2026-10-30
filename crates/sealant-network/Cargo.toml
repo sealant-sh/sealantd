@@ -13,10 +13,10 @@ workspace = true
 nix = { workspace = true }
 sealant-process = { workspace = true }
 sealant-protocol = { workspace = true }
+sealant-runtime-core = { workspace = true }
 sealant-telemetry = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
-sealant-runtime-core = { workspace = true }
 serde_json = { workspace = true }

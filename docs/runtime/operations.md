@@ -66,6 +66,12 @@ other languages from the same `.proto`.
 - `max_processes` / `max_sessions` are enforced; overflow is rejected with `policy-denied`.
 - Captured I/O is redacted for configured secret literals and high-confidence token shapes; masked
   spans set `transform.redacted` and increment `redactedEvents`.
+- A process started with `secretEnv` (`process.secret-env.v1`) is masked with its own patterns
+  too: the daemon's literals plus its secret values. Its output, a session's journal and input,
+  the events and the spool hold the values masked; another process that prints the same value is
+  recorded as it wrote it. The patterns live until the process's capture readers end, and an
+  exited session's tombstone holds none. The exec-attach channel is a live, unrecorded forward
+  and carries what the process wrote.
 
 ## Deploy (Docker)
 

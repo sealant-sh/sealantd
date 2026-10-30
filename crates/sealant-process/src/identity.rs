@@ -83,8 +83,9 @@ pub const PERSON_ENV_VERSION_LINE: &str = "# person-env 1";
 /// The `PATH` a person's process gets when the daemon's environment has none.
 pub const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
-/// Names the identity sets ([`RunAs::env`]); an image file never overrides them.
-const IDENTITY_KEYS: &[&str] = &[
+/// Names the identity sets ([`RunAs::env`]); an image file never overrides them, and a secret env
+/// may not name one.
+pub const IDENTITY_KEYS: &[&str] = &[
     "HOME",
     "USER",
     "LOGNAME",

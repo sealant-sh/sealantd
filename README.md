@@ -132,9 +132,13 @@ The daemon runs as root, and so does every process it starts, unless the request
 - `openSftp` takes a `user` too, admitted as for `exec`: the `sftp-server` runs as that user, with
   the environment an exec as them gets, so a person's SFTP session (an SSH gateway's) reads and
   writes as them and what it makes is theirs.
-- `runtime.getCapabilities` names `exec.user`, `dotfiles.user`, `restore.owner_map` and
-  `sftp.user` in `supports`. `sealantd capabilities --json` prints the same, with the version, without booting,
-  for an image build to record.
+- `exec` and `openSession` take `secretEnv`: variables for the process they start and no other,
+  each value masked in everything recorded of that process. A refused entry starts nothing, and
+  the error names its index and rule, never its name or value.
+- `runtime.getCapabilities` names `dotfiles.user`, `exec.user`, `forward.owner`,
+  `process.secret-env.v1`, `restore.owner_map` and `sftp.user` in `supports`.
+  `sealantd capabilities --json` prints the same, with the version, without booting, for an image
+  build to record.
 
 ## Capture store: what Core and Mend rely on
 

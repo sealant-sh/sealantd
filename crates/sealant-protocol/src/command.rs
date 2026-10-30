@@ -103,6 +103,22 @@ pub struct EnvVar {
     pub value: String,
 }
 
+/// A variable addressed to one process only (`process.secret-env.v1`): the daemon masks its
+/// value in everything it records of that process. `Debug` prints neither name nor value.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SecretEnvVar {
+    /// Variable name.
+    pub key: String,
+    /// Variable value.
+    pub value: String,
+}
+
+impl std::fmt::Debug for SecretEnvVar {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SecretEnvVar").finish_non_exhaustive()
+    }
+}
+
 /// Network observation mode reported in capabilities (plan §14).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -141,6 +157,10 @@ pub struct ExecArgs {
     /// Validated environment overlay applied over the child base environment.
     #[serde(default)]
     pub env: Vec<EnvVar>,
+    /// Variables for this process only, over `env`, their values masked in its recorded output
+    /// and input. A name in `env`, or one the runtime sets, is refused.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secret_env: Vec<SecretEnvVar>,
     /// Open a stdin pipe so the client can `writeStdin`.
     #[serde(default)]
     pub stdin: bool,
@@ -152,6 +172,10 @@ pub struct ExecArgs {
     /// minted channel (`ProcessAttached`) instead of the bare `ExecAccepted`. The lossy `IoChunk`
     /// telemetry tap stays on in parallel; the channel is the faithful path VSCode's non-PTY
     /// bootstrap reads from. Requires a connection-scoped writer (the request is routed accordingly).
+    ///
+    /// The channel is a live forward to the connection that asked for it and is never recorded:
+    /// a [`Self::secret_env`] value the process prints reaches it as written. What is recorded of
+    /// the process is the `IoChunk` tap, which masks it.
     #[serde(default)]
     pub attach: bool,
     /// Timeout after which the process is terminated.
@@ -221,6 +245,9 @@ pub struct OpenSessionArgs {
     /// Environment overlay.
     #[serde(default)]
     pub env: Vec<EnvVar>,
+    /// Variables for the leader only, as [`ExecArgs::secret_env`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secret_env: Vec<SecretEnvVar>,
     /// Initial terminal columns.
     pub cols: u16,
     /// Initial terminal rows.
@@ -1346,6 +1373,7 @@ mod tests {
             args: vec!["hi".to_owned()],
             cwd: None,
             env: vec![],
+            secret_env: vec![],
             stdin: false,
             attach: false,
             timeout_millis: None,

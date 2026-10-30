@@ -12,7 +12,8 @@ use std::sync::Arc;
 
 use sealant_protocol::{Base64Bytes, Encoding, StreamKind, StreamOffset, TransformMeta};
 
-const REDACTED: &[u8] = b"***REDACTED***";
+/// What a masked span is recorded as.
+pub const REDACTED: &[u8] = b"***REDACTED***";
 
 /// High-confidence secret token prefixes. A match is redacted only when the full token reaches
 /// [`MIN_TOKEN_LEN`], to avoid masking ordinary words.
@@ -74,6 +75,18 @@ impl Redactor {
             .filter(|l| l.len() >= MIN_LITERAL_LEN)
             .map(String::into_bytes)
             .collect();
+        Self { literals }
+    }
+
+    /// The same patterns plus `literals`: one process's own secrets over the daemon's. Every
+    /// literal is kept, whatever its length: its caller already decided it is a secret.
+    #[must_use]
+    pub fn with_literals<'a>(&self, literals: impl IntoIterator<Item = &'a str>) -> Self {
+        let mut literals: Vec<Vec<u8>> = literals
+            .into_iter()
+            .map(|l| l.as_bytes().to_vec())
+            .collect();
+        literals.extend(self.literals.iter().cloned());
         Self { literals }
     }
 

@@ -15,9 +15,10 @@ pub mod status;
 
 pub use clock::Clock;
 pub use config::{
-    Bind, BindableMount, PERSON_GID, PERSON_UID_MAX, PERSON_UID_MIN, People, RuntimeConfig,
+    Bind, BindableMount, PERSON_GID, PERSON_UID_MAX, PERSON_UID_MIN, PROXY_ENV_KEYS, People,
+    RuntimeConfig,
 };
 pub use error::ConfigError;
 pub use idgen::{IdGenerator, new_runtime_id, new_secret};
-pub use redact::{FinishReason, MaskedChunk, Redactor, StreamRedactor};
+pub use redact::{FinishReason, MaskedChunk, REDACTED, Redactor, StreamRedactor};
 pub use status::RuntimeStatus;

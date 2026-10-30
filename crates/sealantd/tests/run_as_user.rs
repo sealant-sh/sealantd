@@ -149,6 +149,8 @@ struct Client {
     next: u32,
     /// Processes whose `process.exited` passed while a response was awaited.
     exited: std::collections::HashSet<sealant_protocol::ProcessId>,
+    /// Each process's recorded output, as its `io.chunk`s carried it.
+    recorded: std::collections::HashMap<sealant_protocol::ProcessId, Vec<u8>>,
     _conn: tokio::task::JoinHandle<()>,
 }
 
@@ -203,6 +205,7 @@ impl Client {
             writer,
             next: 0,
             exited: std::collections::HashSet::new(),
+            recorded: std::collections::HashMap::new(),
             _conn: conn,
         }
     }
@@ -222,6 +225,7 @@ impl Client {
                 match sealant_protocol::decode_server(&body).unwrap() {
                     ServerMessage::Response(r) if r.request_id == id => return r,
                     ServerMessage::Event(e) => {
+                        self.record(&e);
                         if let (sealant_protocol::EventPayload::ProcessExited(_), Some(p)) =
                             (&e.payload, e.process_id)
                         {
@@ -246,12 +250,27 @@ impl Client {
         }
         loop {
             let body = read_frame(&mut self.reader, MAX).await.unwrap().unwrap();
-            if let ServerMessage::Event(e) = sealant_protocol::decode_server(&body).unwrap()
-                && let sealant_protocol::EventPayload::ProcessExited(_) = e.payload
-                && e.process_id.as_ref() == Some(process)
-            {
-                return;
+            if let ServerMessage::Event(e) = sealant_protocol::decode_server(&body).unwrap() {
+                self.record(&e);
+                if let (sealant_protocol::EventPayload::ProcessExited(_), Some(p)) =
+                    (e.payload, e.process_id)
+                {
+                    if &p == process {
+                        return;
+                    }
+                    self.exited.insert(p);
+                }
             }
+        }
+    }
+
+    fn record(&mut self, event: &sealant_protocol::EventEnvelope) {
+        if let (sealant_protocol::EventPayload::IoChunk(chunk), Some(process)) =
+            (&event.payload, &event.process_id)
+            && let Some(content) = &chunk.content
+        {
+            let recorded = self.recorded.entry(process.clone()).or_default();
+            recorded.extend_from_slice(content.as_slice());
         }
     }
 }
@@ -318,6 +337,7 @@ fn exec(script: String, user: Option<&str>) -> ExecArgs {
         args: vec!["-c".to_owned(), script],
         cwd: None,
         env: vec![],
+        secret_env: vec![],
         stdin: false,
         attach: false,
         timeout_millis: None,
@@ -518,6 +538,7 @@ async fn a_session_runs_as_the_user_it_names() {
                 args: vec!["-c".to_owned(), script],
                 cwd: None,
                 env: vec![],
+                secret_env: vec![],
                 cols: 80,
                 rows: 24,
                 term: None,
@@ -528,6 +549,62 @@ async fn a_session_runs_as_the_user_it_names() {
         if mode == SessionMode::Pty {
             assert_eq!(wait_for(&tty), format!("{BOB}\n"));
         }
+    }
+}
+
+/// A secret env reaches a person's exec and session leaders (pipe and PTY) as it reaches root's,
+/// and what is recorded of them masks it.
+#[tokio::test]
+async fn a_secret_env_reaches_a_person_s_processes_and_is_recorded_masked() {
+    if !ready() {
+        return;
+    }
+    let dir = scratch();
+    let mut client = Client::start(dir.path());
+    let script = r#"printf 'uid=%s len=%s pw=%s' "$(id -u)" "${#PGPASSWORD}" "$PGPASSWORD""#;
+    let secret_env = || {
+        vec![sealant_protocol::SecretEnvVar {
+            key: "PGPASSWORD".to_owned(),
+            value: "fake-pg-password-5d1e".to_owned(),
+        }]
+    };
+    let mut processes = Vec::new();
+    let exec = Command::Exec(ExecArgs {
+        secret_env: secret_env(),
+        ..exec(script.to_owned(), Some(BOB))
+    });
+    if let Some(CommandResult::ExecAccepted(accepted)) = ok(client.request(exec).await) {
+        processes.push(("exec", accepted.process_id));
+    }
+    for (name, mode) in [("pipe", SessionMode::Pipe), ("pty", SessionMode::Pty)] {
+        let open = Command::OpenSession(OpenSessionArgs {
+            user: Some(BOB.to_owned()),
+            execution_id: None,
+            shell: Some("/bin/sh".to_owned()),
+            args: vec!["-c".to_owned(), script.to_owned()],
+            cwd: None,
+            env: vec![],
+            secret_env: secret_env(),
+            cols: 80,
+            rows: 24,
+            term: None,
+            mode,
+        });
+        if let Some(CommandResult::SessionOpened(opened)) = ok(client.request(open).await) {
+            processes.push((name, opened.process_id));
+        }
+    }
+    assert_eq!(processes.len(), 3);
+    for (name, process) in processes {
+        tokio::time::timeout(Duration::from_secs(20), client.exited(&process))
+            .await
+            .expect("exited");
+        let recorded = client.recorded.get(&process).cloned().unwrap_or_default();
+        assert_eq!(
+            String::from_utf8_lossy(&recorded),
+            format!("uid={BOB_UID} len=21 pw=***REDACTED***"),
+            "{name}"
+        );
     }
 }
 
@@ -544,6 +621,7 @@ async fn refused_everywhere(client: &mut Client, user: &str, out: &Path) -> Vec<
             args: vec!["-c".to_owned(), script.clone()],
             cwd: None,
             env: vec![],
+            secret_env: vec![],
             cols: 80,
             rows: 24,
             term: None,
@@ -610,6 +688,7 @@ async fn runs_everywhere(client: &mut Client, user: &str, uid: u32, dir: &Path) 
             ],
             cwd: None,
             env: vec![],
+            secret_env: vec![],
             cols: 80,
             rows: 24,
             term: None,
@@ -731,6 +810,7 @@ async fn without_an_owner_map_only_mend_s_reserved_range_runs() {
             ],
             cwd: None,
             env: vec![],
+            secret_env: vec![],
             cols: 80,
             rows: 24,
             term: None,
@@ -2111,6 +2191,7 @@ async fn a_person_s_process_inherits_no_token_and_no_daemon_key() {
             args: vec!["-c".to_owned(), dump(&dir.path().join("session"))],
             cwd: None,
             env: vec![],
+            secret_env: vec![],
             cols: 80,
             rows: 24,
             term: None,
@@ -2513,6 +2594,7 @@ async fn the_image_s_person_environment_reaches_every_person_s_process_and_not_r
             args: vec!["-c".to_owned(), dump(&dir.path().join("session"))],
             cwd: None,
             env: vec![var("CALLER_WINS", "caller")],
+            secret_env: vec![],
             cols: 80,
             rows: 24,
             term: None,
@@ -2930,6 +3012,7 @@ async fn bound_to_bob() {
             args: vec!["-c".to_owned(), server.to_owned(), port.to_string()],
             cwd: None,
             env: vec![],
+            secret_env: vec![],
             cols: 80,
             rows: 24,
             term: None,
