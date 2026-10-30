@@ -42,6 +42,12 @@ pub const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
 ///   echoing the session in `boundSessionId`. Every session leader, and every `exec` that names
 ///   a running session it runs as the same user as, carries the session's secret marker in
 ///   `SEALANT_SESSION_MARKER`.
+/// - `process.secret-env.v1`: `exec` and `openSession` (PTY and pipe, as a person too) take
+///   `secretEnv`, variables for the process they start and no other
+///   ([`sealant_process::secret_env`]): each value is masked in everything recorded of that
+///   process (its output, a session's input and journal, the spool) until its readers end; a
+///   refused entry starts nothing. A daemon without it ignores the field, so a client sends it
+///   only to one that names it.
 /// - `sftp.user`: `openSftp` takes a `user` too: the `sftp-server` runs as them, admitted as for
 ///   `exec`.
 /// - `restore.owner_map`: a capture restore takes an owner map (`SEALANT_CAPTURE_OWNER_MAP`),
@@ -53,6 +59,7 @@ pub const SUPPORTS: &[&str] = &[
     "dotfiles.user",
     "exec.user",
     "forward.owner",
+    "process.secret-env.v1",
     "restore.owner_map",
     "sftp.user",
 ];
