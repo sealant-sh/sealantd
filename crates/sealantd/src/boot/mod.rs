@@ -413,8 +413,10 @@ fn find_nix_loader(store: &Path, file_name: &str) -> Option<PathBuf> {
     None
 }
 
-/// Build the `RuntimeConfig` from the boot config (the `into_runtime_config` of the spec).
-fn into_runtime_config(config: &BootConfig, secret_env: &[(String, String)]) -> RuntimeConfig {
+/// Build the `RuntimeConfig` from the boot config (the `into_runtime_config` of the spec):
+/// what the daemon a boot starts runs with, its secret environment's values seeding the redactor.
+#[must_use]
+pub fn into_runtime_config(config: &BootConfig, secret_env: &[(String, String)]) -> RuntimeConfig {
     let mut runtime_config = RuntimeConfig::new(new_runtime_id());
     runtime_config.socket_path = config.control.socket.clone();
     runtime_config.workspace_root = config.workspace.working_directory.clone();
