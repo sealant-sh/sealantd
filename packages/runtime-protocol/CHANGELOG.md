@@ -1,5 +1,140 @@
 # @sealant/runtime-protocol
 
+## 0.21.0
+
+### Minor Changes
+
+- 1c767a3: A forward can hold back what it reads instead of buffering it without bound.
+  `openForwardConnection(stream, { host, port, protocol, executionId?, highWaterMarkBytes })` opens
+  one forward on a connection that carries nothing else, and owns that connection from then on:
+
+  - It pauses reading the connection while the forward holds more than `highWaterMarkBytes` unread
+    bytes, and resumes once the consumer reads them back under. sealantd then stops reading the
+    forward's target, so a slow consumer holds back a fast producer. Each payload it holds is its own
+    copy, so the bytes held are the bytes counted.
+  - `channel.destroy()` closes the connection, also while it is paused, and sealantd reaps the
+    forward when the connection closes. The target's `End` ends the connection once queued writes
+    have flushed.
+  - It rejects when the forward does not open, when the connection closes first, or when more than
+    the mark arrives before sealantd confirms the forward. It never resolves with a channel that
+    lost bytes.
+  - The mark must be a positive integer; anything else is a `RangeError` before the connection is
+    touched.
+
+  `OpenForwardArgs.dedicated` (field 5) tells sealantd that the connection carries only this forward,
+  so it sends that connection no events. `openForwardConnection` sets it. A daemon that predates the
+  field keeps sending events, which the connection drops.
+
+  `Channel.write()` returns the connection's `write()` result (`false` once its outbound buffer is
+  full), and `Channel.drained()` resolves when that buffer drains. `drained()` rejects once the
+  connection can take no more writes: after a write error, a close, or `close()`. `Channel.destroy()`
+  also drops inbound bytes still queued on a channel the daemon already closed. The multiplexed
+  `SealantClient` keeps reading as before.
+
+  Breaking: `SealantClient.openForward` takes one object, `{ host, port, protocol, executionId? }`,
+  in place of positional arguments. `ChannelTransport` gains `drained` and `inboundQueued`, and its
+  `sendData` returns the `write()` result.
+
+- 0a46de1: A forward can be bound to a session. `openForward` and `openForwardConnection` take
+  `ownerSessionId` (`OpenForwardArgs.owner_session_id`, field 6): the forward opens only once the
+  session's processes, and no other process, hold the far end of the connection sealantd made, and
+  its result echoes the session in `boundSessionId` (`ForwardOpened.bound_session_id`, field 2).
+
+  A holder belongs to the session when it shares the leader's Linux session id, or when it runs as
+  the leader's user and group and the first `SEALANT_SESSION_MARKER` entry of its environment is the
+  session's marker. The marker is a secret sealantd mints per session, never the session id. Every
+  session leader carries it, and so does an `exec` that names a running session and runs as that
+  session's user and group; any other `exec` has the variable removed. A server that called
+  `setsid` or double-forked still counts this way. sealantd reads each process through one handle on
+  its `/proc/<pid>` directory, so a reused pid reads as gone, and reads another user's fds and
+  environment with that user's filesystem ids, so it needs no `CAP_SYS_PTRACE`. The whole check,
+  scans included, runs off the async runtime within the dial's 5 s deadline. No byte crosses before
+  the check passes. A bound forward ends when the session's leader exits, as soon as the leader is
+  reaped, with one `End` whose error is `owner-exited`.
+
+  A refusal carries `detail.reason`, which the package exports as `FORWARD_BINDING_REFUSALS`:
+  `owner-exited` (`session-not-found`: the session is not running), `peer-mismatch`
+  (`policy-denied`: a process outside the session holds the connection), or `binding-unverifiable`
+  (`policy-denied`: no holder could be found and checked in time, such as a server that never
+  accepts, or a holder whose membership could not be read). A bound forward is TCP to a loopback
+  address only (`invalid-argument` otherwise, checked before the session is looked up). `supports`
+  names `forward.owner`; a daemon without it ignores the field and opens the forward unbound, so a
+  caller checks the echo.
+
+  What the binding does not prove: a process of the session's own user can copy the marker into its
+  environment, a long-lived server the session started (a `tmux` server) passes the marker to what
+  it starts later from any session, and a holder of another uid than the listener's is not looked
+  for. A process whose fds cannot be read, such as a non-dumpable `ssh-agent`, does not stop a
+  member's holding from proving the binding. A cgroup per session would prove membership without
+  the marker; that is a follow-up.
+
+- 54c6e6c: A TCP forward that cannot connect says why. Its `internal-error` keeps its code and message and
+  gains `detail.reason`: `connection-refused` (nothing listens on that address and port),
+  `name-unresolved` (the host did not resolve, or not in time), `network-unreachable`, or
+  `dial-timeout`. A failure outside those kinds carries no reason. The reason comes from where and
+  how the connect failed, never from the error's text, and across a host's addresses it is the most
+  telling one: a refusal, then a timeout, then unreachable. The package exports the reasons as
+  `FORWARD_CONNECT_REASONS` and the `ForwardConnectReason` type, so a caller imports them rather than
+  retyping them.
+
+  A connect, name resolution included, gives up after 5 seconds instead of the kernel's own timeout.
+  A host's addresses are tried in turn, each starting 250 ms after the one before or as soon as it
+  fails, so one that does not answer leaves time for the others. sealantd runs a forward's open
+  beside the connection's reader, so a slow dial no longer holds up the connection's other requests
+  and channels, and closing the connection drops the dial and its socket at once.
+
+- 4dfe04f: `exec` and `openSession` take a secret env: variables for the process they start and no other.
+  The wire field is `ExecArgs.secret_env` (field 14) and `OpenSessionArgs.secret_env` (field 11), a
+  list of `SecretEnvVar { key, value }`. The client's `exec`, `execAttached` and `openSession` take
+  it as `secretEnv`.
+
+  The process gets each value exactly as sent, set over its `env`. sealantd masks the value in
+  everything it records of that process: stdout and stderr, a session's journal and input, the
+  events and the spool. The patterns are the process's own, so another process that prints the
+  same value is recorded as it wrote it. The exec-attach channel is a live forward that is never
+  recorded, and it carries the value as the process wrote it.
+
+  sealantd refuses a secret env with `invalid-argument`, and starts nothing, when an entry breaks a
+  rule. The error names the entry's index and the rule, never its name or value. Names follow
+  `[A-Za-z_][A-Za-z0-9_]*` and are at most 128 bytes. Values are 6 to 4096 bytes and hold no NUL. A
+  value that is part of `***REDACTED***`, starts with the marker's end or ends with its start is
+  refused, since a masked span beside it could complete it. A map holds at most 128 entries and
+  32 KiB. A duplicate name, a name also in `env`, a `SEALANT_` name, an identity name (`HOME`,
+  `USER`, `LOGNAME`, `SHELL`, `TMPDIR`, `XDG_RUNTIME_DIR`, `PATH`, `TERM`), or a proxy variable
+  sealantd sets (`HTTP_PROXY`, `HTTPS_PROXY`, in any case) is refused rather than replaced.
+
+  `supports` names `process.secret-env.v1`. A daemon without it ignores the field, so the client
+  asks the daemon on the same connection first and throws, sending nothing, when the daemon does not
+  name it. `request()` applies the same check to any `exec` or `openSession` that carries
+  `secretEnv`, and sends the command as it was when called. A call without `secretEnv` is sent at
+  once, as before. The package exports the name as `SECRET_ENV_CAPABILITY`.
+
+### Patch Changes
+
+- cc763c2: A secret sealantd masks in recorded output stays masked however the process's writes split it.
+  Before, sealantd masked each read on its own, so a workspace secret written in two parts reached
+  the session journal, the event spool and `io.chunk` events as two raw halves. Each recorded stream
+  (exec stdout and stderr, a session's output, pipe stderr and input) now holds back a short suffix
+  that could still begin a configured secret until a later read, or the stream's end, decides it.
+  Overlapping matches are masked as one span. A PTY session also masks a multi-line secret its
+  output writes with CRLF line ends, and one its input sends with CR.
+
+  The token shapes (`ghp_…`, `sk-…`, `AKIA…`) hold nothing until a token's whole prefix has been
+  seen, so a live terminal shows every keystroke and frame at once; a token's bytes after its
+  prefix wait until it is long enough to mask or ends. The prefix stays in the record:
+  `ghp_***REDACTED***` where it was `***REDACTED***`.
+
+  An `io.chunk`'s `streamOffset` is now the raw position of the bytes it stands for, and its
+  `transform.originalByteCount` the number of those raw bytes; `byteCount` stays the recorded
+  length. A chunk can stand for raw bytes and record none, when a masked span from the chunk before
+  covers them all. Session input chunks carry offsets too, where they were all 0. Every stream's
+  held suffix is recorded before the `process.exited` that ends it, pipe-session stderr included:
+  stderr now drains after the leader's exit within the same bounds as stdout. When reading stops
+  before the writer closed (a drain cut short after the leader exits), or input is cut off (the
+  leader exits, or a write fails part way), a held suffix that could begin a secret is masked.
+  Input is recorded part by part as the leader takes it. A session refuses input once its leader
+  has exited, and a write the exit leaves blocked fails instead of waiting.
+
 ## 0.20.0
 
 ### Minor Changes
@@ -321,11 +456,11 @@ rev-list --stdin` got their whole input before their answer was read: once the a
 standby no session claimed (…)` on stderr, which Core's recovery sweep already releases on
     (`nothing-to-save`). Once any claim or writer was admitted none of this applies again.
 
-        Before, a claimed standby whose re-plan failed kept its placeholder captures queued forever
-        (`lease-lost`). Its final flush never completed, and the launch waited 12 minutes, failed and
-        needed a discard. Mend binds a `complete` answer to the lease epoch its claim took, so to act
-        on the answer itself it must read a claimed standby's answer under the placeholder's epoch and
-        its `standby:<id>` launch as nothing to save. Until then it sees the executor end.
+            Before, a claimed standby whose re-plan failed kept its placeholder captures queued forever
+            (`lease-lost`). Its final flush never completed, and the launch waited 12 minutes, failed and
+            needed a discard. Mend binds a `complete` answer to the lease epoch its claim took, so to act
+            on the answer itself it must read a claimed standby's answer under the placeholder's epoch and
+            its `standby:<id>` launch as nothing to save. Until then it sees the executor end.
 
   - **A base restores in its own formats (F4b).** When the plan's workspace class carries no
     `.git/config` or reftable tables (Mend's capture 0), the workspace sweep now leaves the ones
