@@ -79,7 +79,7 @@ jobs:
       - run: scripts/ci-install-dotfiles-tools.sh
       # nextest runs the test binaries side by side, each test in its own process: cargo test ran
       # the 100 binaries one after another (~120 s of tests that take ~20 s side by side).
-      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
+      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: cargo-nextest@0.9.146
       # ubuntu-24.04 is Linux, so this also runs the Linux-only tests (inotify, peer-cred, reaper).
@@ -114,7 +114,7 @@ jobs:
       - run: scripts/ci-install-dotfiles-tools.sh
       # nextest runs the test binaries side by side, each test in its own process: cargo test ran
       # the 100 binaries one after another (~120 s of tests that take ~20 s side by side).
-      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
+      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: cargo-nextest@0.9.146
       - run: cargo nextest run --workspace --no-fail-fast
@@ -135,7 +135,7 @@ jobs:
         with:
           persist-credentials: false
       - run: corepack enable
-      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           # setup-node v6 restores a package-manager cache by itself when packageManager names npm.
           package-manager-cache: false
