@@ -37,29 +37,6 @@ use crate::pty::{self, PtyChild};
 /// Default terminal type advertised to the child when the caller does not specify one.
 const DEFAULT_TERM: &str = "xterm-256color";
 
-/// A reliable per-session output attachment: bytes from the PTY are pushed to one gateway
-/// connection's backpressured outbound queue (distinct from the lossy telemetry `IoChunk`
-/// broadcast). Awaiting `out_tx.send(...)` is the backpressure; the kernel PTY buffer throttles the
-/// shell when the gateway is slow.
-///
-/// There is exactly one PTY reader per session (the capture loop). It fans each chunk out to both
-/// the telemetry bus and, when an attachment is present, this sink — so attach and telemetry share a
-/// single `read()` and the attach stream is lossless (no second reader racing for the same bytes).
-#[derive(Debug, Clone)]
-pub struct ChannelSink {
-    /// The channel id the gateway attached.
-    pub channel_id: ChannelId,
-    /// The connection's backpressured outbound queue.
-    pub out_tx: mpsc::Sender<ServerMessage>,
-    /// Gate for live fan-out: held false while an attach is replaying journal history, so live
-    /// frames never interleave with replayed ones.
-    ready: watch::Receiver<bool>,
-    /// Keeps the gate's sender alive for the sink's lifetime (a dropped sender reads as open).
-    _ready_tx: Arc<watch::Sender<bool>>,
-    /// First journal sequence this sink should receive live (earlier ones were replayed).
-    start_seq: Arc<std::sync::atomic::AtomicU64>,
-}
-
 /// The leader's input side, by session mode. Output is owned by the capture task in both modes.
 #[derive(Debug)]
 pub enum LeaderIo {
@@ -90,8 +67,10 @@ pub struct SessionEntry {
     pub io: LeaderIo,
     /// Associated execution, when any.
     pub execution_id: Option<ExecutionId>,
-    /// The reliable output attachment, when a gateway has attached.
-    pub attached: Mutex<Option<ChannelSink>>,
+    /// Dropping a sender cancels only that channel's journal subscription, even during a send.
+    attached: Mutex<HashMap<ChannelId, oneshot::Sender<()>>>,
+    /// Wakes journal subscribers after an append or exit. A journal write failure is sticky.
+    output_changed: watch::Sender<Option<String>>,
     /// The durable, redacted output journal (the reattach/scrollback read surface).
     pub journal: Arc<Mutex<SessionJournal>>,
     /// Wall-clock start time (unix micros).
@@ -119,6 +98,7 @@ impl SessionEntry {
     fn mark_exited(&self, exit_code: Option<i32>, signal: Option<i32>) {
         *self.exit.lock().unwrap_or_else(|e| e.into_inner()) = Some((exit_code, signal));
         self.exited.send_replace(true);
+        self.output_changed.send_modify(|_| {});
     }
 
     /// Whether the leader has exited: true as soon as it is reaped, which can be well before
@@ -223,6 +203,11 @@ impl SessionRegistry {
         if finished.len() > MAX_FINISHED_SESSIONS {
             let evicted = finished.remove(0);
             evicted
+                .attached
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clear();
+            evicted
                 .journal
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -238,6 +223,11 @@ impl SessionRegistry {
             return false;
         };
         let removed = finished.remove(pos);
+        removed
+            .attached
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         removed
             .journal
             .lock()
@@ -532,7 +522,8 @@ impl SessionRuntime {
             mode: args.mode,
             io,
             execution_id: execution_id.clone(),
-            attached: Mutex::new(None),
+            attached: Mutex::new(HashMap::new()),
+            output_changed: watch::Sender::new(None),
             journal: Arc::new(Mutex::new(journal)),
             started_at_micros: self.clock.wall_now().get(),
             exit: Mutex::new(None),
@@ -569,10 +560,9 @@ impl SessionRuntime {
         );
 
         // Capture the leader's output until it closes or the leader exits. This is the SINGLE
-        // output reader per session: it publishes every chunk as `IoChunk` telemetry and, when a
-        // gateway is attached, also forwards the same chunk to the attach sink (sharing one read so
-        // the attach stream is lossless). PTY: the master. Pipe: stdout — stderr gets its own
-        // telemetry-only reader so diagnostics never interleave with the protocol stream.
+        // output reader per session: it records every chunk before waking the independent journal
+        // subscribers. A slow subscriber never holds up this reader. PTY: the master. Pipe:
+        // stdout — stderr gets its own telemetry-only reader so diagnostics never interleave.
         let fanout = Fanout {
             bus: self.bus.clone(),
             correlation: correlation.clone(),
@@ -613,8 +603,7 @@ impl SessionRuntime {
         tokio::spawn(async move {
             let start = Instant::now();
             let status_result = child.wait().await;
-            // Forwards bound to the session end now, not once its output has drained, which an
-            // attached client that stopped reading can hold up indefinitely.
+            // Forwards bound to the session end now, before its output has drained.
             waiter_entry.exited.send_replace(true);
             // Reaped: hand the pid back to the orphan reaper before anything slower runs.
             drop(spawned_pid);
@@ -639,36 +628,13 @@ impl SessionRuntime {
                     duration_micros: start.elapsed().as_micros() as u64,
                 }),
             );
-            // `capture.await` above drained all bytes available when the leader exited, fanning
-            // every chunk to both the telemetry bus AND the attach sink (single reader). Do not
-            // wait for helper processes that inherited the slave: the session belongs to its
-            // leader. Send a final End{exit_code, signal} and clear the attachment.
-            // The entry itself becomes an exited tombstone (state + exit code + journal) so
-            // clients can still observe the exit and replay the scrollback after the fact.
+            // Capture drained the leader's output into the journal. Each subscriber drains its
+            // own remaining bytes before sending End; none holds up session settlement.
             let entry = waiter_registry.get_running(&waiter_session);
             if let Some(entry) = &entry {
                 entry.mark_exited(exit_code, signal);
             }
             waiter_registry.finish(&waiter_session);
-            if let Some(entry) = entry {
-                let sink = entry
-                    .attached
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .take();
-                if let Some(sink) = sink {
-                    let frame = StreamFrame::end(
-                        sink.channel_id.clone(),
-                        u64::MAX,
-                        StreamEnd {
-                            exit_code,
-                            signal,
-                            error: None,
-                        },
-                    );
-                    let _ = sink.out_tx.send(ServerMessage::Stream(frame)).await;
-                }
-            }
             waiter_status.dec_sessions();
         });
 
@@ -726,21 +692,12 @@ impl SessionRuntime {
         Ok(())
     }
 
-    /// Attach a reliable output channel to a session's PTY.
+    /// Attach an independent reliable output channel to a session's PTY.
     ///
-    /// The single PTY reader (the capture loop, [`capture_output`]) fans each chunk out to both the
-    /// telemetry bus and this sink: instead of relying on the lossy `IoChunk` broadcast, the attach
-    /// sink receives each chunk as a [`StreamFrame::Data`] via an **awaited** `out_tx.send`. Awaiting
-    /// that send is the backpressure — the capture loop only issues its next `pty::read` once the
-    /// gateway has accepted the chunk, so a slow gateway throttles the PTY drain and the kernel PTY
-    /// buffer backpressures the shell. This is the exact inversion of the lossy `Lagged`-drop path.
-    ///
-    /// Re-attaching replaces the prior attachment (the old gateway simply stops receiving frames).
-    ///
-    /// With `from_sequence`, the durable journal is replayed first — data frames carry journal
-    /// sequences, so `[from, live)` is delivered exactly once and in order before live output.
-    /// Attaching to an *exited* session replays the retained scrollback and then sends the final
-    /// `End{exit_code, signal}` frame.
+    /// Each subscription reads the journal in sequence, replaying retained history when requested
+    /// and then following live appends. Its awaited outbound sends backpressure only that
+    /// subscription, never the PTY reader or another attachment. A subscriber that falls behind
+    /// the retained journal ends with an error instead of silently dropping output.
     ///
     /// # Errors
     /// Returns a [`ControlError`] if the session is unknown.
@@ -755,67 +712,43 @@ impl SessionRuntime {
             .registry
             .get(session_id)
             .ok_or_else(|| ControlError::session_not_found(session_id.to_string()))?;
-
-        if let Some((exit_code, signal)) = entry.exit_status() {
-            // Exited tombstone: replay-only, no live sink to install.
-            if let Some(from) = from_sequence {
-                replay_journal(&entry, &channel_id, &out_tx, from).await;
-            }
-            let frame = StreamFrame::end(
-                channel_id,
-                u64::MAX,
-                StreamEnd {
-                    exit_code,
-                    signal,
-                    error: None,
-                },
-            );
-            let _ = out_tx.send(ServerMessage::Stream(frame)).await;
-            return Ok(());
-        }
-
-        let Some(from) = from_sequence else {
-            // Live tail only: the sink is ready immediately and receives every chunk from now on.
-            let (ready_tx, ready_rx) = watch::channel(true);
-            *entry.attached.lock().unwrap_or_else(|e| e.into_inner()) = Some(ChannelSink {
-                channel_id,
-                out_tx,
-                ready: ready_rx,
-                _ready_tx: Arc::new(ready_tx),
-                start_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            });
-            return Ok(());
+        let changed = entry.output_changed.subscribe();
+        let cursor = {
+            let journal = entry.journal.lock().unwrap_or_else(|e| e.into_inner());
+            from_sequence.map_or_else(
+                || journal.next_seq(),
+                |from| from.clamp(journal.first_seq(), journal.next_seq()),
+            )
         };
-
-        // Replay + live: install the sink gated closed so the capture loop journals but does not
-        // fan out; snapshot the journal end (nothing at/after it has been sent — the gate was
-        // closed before the snapshot); replay [from, end); then open the gate. The capture loop
-        // skips live chunks below `start_seq` (they were part of the replayed range).
-        let (ready_tx, ready_rx) = watch::channel(false);
-        let ready_tx = Arc::new(ready_tx);
-        let start_seq = Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
-        *entry.attached.lock().unwrap_or_else(|e| e.into_inner()) = Some(ChannelSink {
-            channel_id: channel_id.clone(),
-            out_tx: out_tx.clone(),
-            ready: ready_rx,
-            _ready_tx: ready_tx.clone(),
-            start_seq: start_seq.clone(),
-        });
-        let upper = entry
-            .journal
+        let (cancel, mut cancelled) = oneshot::channel();
+        // Register before spawning so an immediate detach cannot miss its subscription.
+        entry
+            .attached
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .next_seq();
-        start_seq.store(upper, Ordering::SeqCst);
-        replay_journal_until(&entry, &channel_id, &out_tx, from, upper).await;
-        let _ = ready_tx.send(true);
+            .insert(channel_id.clone(), cancel);
+        tokio::spawn(async move {
+            tokio::select! {
+                biased;
+                _ = &mut cancelled => {}
+                _ = out_tx.closed() => {}
+                () = follow_journal(&entry, &channel_id, &out_tx, cursor, changed) => {}
+            }
+            drop(cancelled);
+            let mut attached = entry.attached.lock().unwrap_or_else(|e| e.into_inner());
+            // A reused channel id may already belong to a new subscription.
+            if attached
+                .get(&channel_id)
+                .is_some_and(oneshot::Sender::is_closed)
+            {
+                attached.remove(&channel_id);
+            }
+        });
         Ok(())
     }
 
-    /// Whether the session currently has no reliable output attachment.
-    ///
-    /// A missing session counts as clear. Used to observe connection-scoped teardown: after a
-    /// gateway connection drops, the capture loop clears a stale (closed) attachment.
+    /// Whether the session currently has no output subscriptions.
+    /// A missing session counts as clear.
     #[must_use]
     pub fn attachment_is_clear(&self, session_id: &SessionId) -> bool {
         self.registry.get(session_id).is_none_or(|entry| {
@@ -823,22 +756,24 @@ impl SessionRuntime {
                 .attached
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .is_none()
+                .is_empty()
         })
     }
 
-    /// Detach a session's reliable output channel by channel id.
-    ///
-    /// Idempotent: detaching an unknown/stale channel is a no-op. The capture loop simply stops
-    /// fanning out once the attachment is cleared.
+    /// Detach only the named output subscription, cancelling any blocked send or replay.
+    /// Detaching an unknown or stale channel is a no-op.
     pub fn detach(&self, channel_id: &ChannelId) {
-        for entry in self.registry.entries() {
-            let mut guard = entry.attached.lock().unwrap_or_else(|e| e.into_inner());
-            if guard
-                .as_ref()
-                .is_some_and(|sink| &sink.channel_id == channel_id)
+        // A settled session can still have a subscriber draining its final journal bytes.
+        let mut entries = self.registry.entries();
+        entries.extend(self.registry.lock_finished().iter().cloned());
+        for entry in entries {
+            if entry
+                .attached
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(channel_id)
+                .is_some()
             {
-                *guard = None;
                 return;
             }
         }
@@ -1058,17 +993,8 @@ async fn forward_input(
     }
 }
 
-/// The single PTY reader for a session. Reads `pty.output` until the slave closes or the session
-/// leader exits and, for each chunk, (a) publishes a lossy `IoChunk` telemetry event
-/// (recording/redaction path) and (b), when a gateway is attached, forwards the same bytes to the
-/// attach sink as a [`StreamFrame::Data`] via an **awaited** `out_tx.send`.
-///
-/// Because there is exactly one reader, the attach sink sees every byte (no second reader racing for
-/// the fd). Awaiting the attach send applies backpressure to this loop: the next `pty::read` waits
-/// until the gateway accepts the chunk, so a slow gateway throttles the PTY drain and the kernel PTY
-/// buffer backpressures the shell — the inversion of the lossy `Lagged`-drop path. Telemetry
-/// publish stays non-blocking (it may drop on lag, as before); only the attach send blocks.
-/// The leader's output source, handed to the capture reader at open.
+/// The leader's output source, handed to the single capture reader at open.
+/// Attachments tail its durable journal independently, never competing for reads of the PTY.
 enum LeaderOutputs {
     Pty {
         master: Arc<AsyncFd<OwnedFd>>,
@@ -1080,8 +1006,8 @@ enum LeaderOutputs {
 }
 
 /// Everything a captured chunk fans out to: the durable journal, the telemetry tap, and the
-/// reliable attach sink, plus the patterns each reader masks its own stream with. Shared by the
-/// PTY and pipe readers so both modes have exactly the same delivery guarantees.
+/// independent journal subscribers, plus the patterns each reader masks its own stream with.
+/// Shared by the PTY and pipe readers so both modes have the same delivery guarantees.
 #[derive(Clone)]
 struct Fanout {
     bus: Arc<EventBus>,
@@ -1110,16 +1036,17 @@ impl Fanout {
     }
 
     /// Deliver the next raw output bytes: masked once, journaled (minting the wire sequence), then
-    /// published as telemetry, then forwarded to the attach sink with backpressure.
+    /// published as telemetry, then made available to every journal subscriber.
     async fn deliver(&self, recorder: &mut StreamRecorder, raw: &[u8]) {
-        let (chunk, seq) = recorder.read_journaled(raw, |chunk| self.journal(chunk));
-        self.attach(&chunk, seq).await;
+        let _ = recorder.read_journaled(raw, |chunk| self.journal(chunk));
+        // A continuously readable PTY must still let the waiter and subscribers run, even when
+        // no connection's outbound queue is involved in capture anymore.
+        tokio::task::consume_budget().await;
     }
 
     /// Deliver what the output's masker still holds at its end, the same way.
     async fn finish(&self, recorder: &mut StreamRecorder, end: FinishReason) {
-        let (chunk, seq) = recorder.end_journaled(end, |chunk| self.journal(chunk));
-        self.attach(&chunk, seq).await;
+        let _ = recorder.end_journaled(end, |chunk| self.journal(chunk));
     }
 
     /// Append a masked chunk to the durable journal; the sequence minted here is the wire
@@ -1130,47 +1057,21 @@ impl Fanout {
             let mut journal = entry.journal.lock().unwrap_or_else(|e| e.into_inner());
             journal.append(chunk)
         };
-        seq.unwrap_or_else(|error| {
-            tracing::error!(%error, session = %entry.session_id,
-                "session journal append failed; output recording degraded");
-            self.status.add_degradation("session-journal-append-failed");
-            Some(u64::MAX)
-        })
-    }
-
-    async fn attach(&self, chunk: &MaskedChunk, seq: Option<u64>) {
-        let Some(seq) = seq else { return };
-        let entry = &self.entry;
-        let recorded = chunk.recorded();
-        // Reliable attach fan-out (backpressured). Snapshot the sink under the lock, then send
-        // outside it. A replaying attach holds the gate closed; chunks below its start_seq are
-        // covered by the replay and skipped here. If the gateway queue is closed (connection
-        // gone), clear the stale attachment so we stop trying.
-        let sink = entry
-            .attached
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
-        if let Some(sink) = sink {
-            let mut ready = sink.ready.clone();
-            // An error means the attach task died before opening the gate; treat the attachment
-            // as stale and drop it.
-            let gate_open = ready.wait_for(|open| *open).await.is_ok();
-            let wanted = gate_open && seq >= sink.start_seq.load(Ordering::SeqCst);
-            let delivered = if wanted {
-                let frame = StreamFrame::data(sink.channel_id.clone(), seq, recorded);
-                sink.out_tx.send(ServerMessage::Stream(frame)).await.is_ok()
-            } else {
-                gate_open
-            };
-            if !delivered {
-                let mut guard = entry.attached.lock().unwrap_or_else(|e| e.into_inner());
-                if guard
-                    .as_ref()
-                    .is_some_and(|s| s.channel_id == sink.channel_id)
-                {
-                    *guard = None;
+        match seq {
+            Ok(seq) => {
+                if seq.is_some() {
+                    entry.output_changed.send_modify(|_| {});
                 }
+                seq
+            }
+            Err(error) => {
+                tracing::error!(%error, session = %entry.session_id,
+                    "session journal append failed; output recording degraded");
+                self.status.add_degradation("session-journal-append-failed");
+                entry.output_changed.send_replace(Some(
+                    "session output journal could not be written".to_owned(),
+                ));
+                None
             }
         }
     }
@@ -1350,59 +1251,69 @@ async fn capture_stderr(stderr: ChildStderr, chunk_size: usize, fanout: Fanout) 
     recorder.end(end);
 }
 
-/// Replay a session's journal from `from` to its current end over `out_tx` (used for attaches to
-/// exited sessions, where no live producer exists).
-async fn replay_journal(
-    entry: &Arc<SessionEntry>,
+/// Replay and tail from one cursor. Only this task waits for its connection's outbound queue;
+/// the capture reader merely appends and wakes it. Batches keep per-subscriber memory bounded.
+async fn follow_journal(
+    entry: &SessionEntry,
     channel_id: &ChannelId,
     out_tx: &mpsc::Sender<ServerMessage>,
-    from: u64,
+    mut cursor: u64,
+    mut changed: watch::Receiver<Option<String>>,
 ) {
-    let upper = entry
-        .journal
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .next_seq();
-    replay_journal_until(entry, channel_id, out_tx, from, upper).await;
-}
-
-/// Replay journal records `[from, upper)` over `out_tx` in bounded batches. The journal lock is
-/// held only while reading a batch, never across a send.
-async fn replay_journal_until(
-    entry: &Arc<SessionEntry>,
-    channel_id: &ChannelId,
-    out_tx: &mpsc::Sender<ServerMessage>,
-    from: u64,
-    upper: u64,
-) {
-    /// Per-batch payload budget for journal reads during replay.
     const REPLAY_BATCH_BYTES: u64 = 256 * 1024;
-    let mut cursor = from;
-    while cursor < upper {
-        let chunks = {
-            let journal = entry.journal.lock().unwrap_or_else(|e| e.into_inner());
-            journal.read_from(cursor, REPLAY_BATCH_BYTES)
-        };
-        if chunks.is_empty() {
-            break;
+    let error = loop {
+        let failure = changed.borrow_and_update().clone();
+        if failure.is_some() {
+            break failure;
         }
-        let mut progressed = false;
-        for chunk in chunks {
-            if chunk.sequence >= upper {
+        // Observe exit before the journal snapshot: an exit observed afterwards could overtake
+        // the final append and make us send End before those bytes.
+        let exited = entry.exit_status();
+        let (first, next, chunks) = {
+            let journal = entry.journal.lock().unwrap_or_else(|e| e.into_inner());
+            (
+                journal.first_seq(),
+                journal.next_seq(),
+                journal.read_from(cursor, REPLAY_BATCH_BYTES),
+            )
+        };
+        if cursor < first {
+            break Some(
+                "output attachment fell behind the retained journal; attach again".to_owned(),
+            );
+        }
+        if chunks.is_empty() {
+            if cursor < next {
+                break Some("session output journal could not be read".to_owned());
+            }
+            if exited.is_some() {
+                break None;
+            }
+            if changed.changed().await.is_err() {
                 return;
             }
-            cursor = chunk.sequence + 1;
-            progressed = true;
+            continue;
+        }
+        for chunk in chunks {
             let frame =
                 StreamFrame::data(channel_id.clone(), chunk.sequence, chunk.data.as_slice());
             if out_tx.send(ServerMessage::Stream(frame)).await.is_err() {
                 return;
             }
+            cursor = chunk.sequence + 1;
         }
-        if !progressed {
-            break;
-        }
-    }
+    };
+    let exit = entry.exit_status().unwrap_or((None, None));
+    let frame = StreamFrame::end(
+        channel_id.clone(),
+        u64::MAX,
+        StreamEnd {
+            exit_code: exit.0,
+            signal: exit.1,
+            error,
+        },
+    );
+    let _ = out_tx.send(ServerMessage::Stream(frame)).await;
 }
 
 #[cfg(test)]
@@ -2224,6 +2135,276 @@ mod tests {
         );
     }
 
+    async fn attachment_contains(rx: &mut mpsc::Receiver<ServerMessage>, needle: &str) -> bool {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let mut output = Vec::new();
+            while let Some(message) = rx.recv().await {
+                if let ServerMessage::Stream(frame) = message
+                    && let sealant_protocol::StreamPayload::Data { data } = frame.payload
+                {
+                    output.extend_from_slice(data.as_slice());
+                    if String::from_utf8_lossy(&output).contains(needle) {
+                        return true;
+                    }
+                }
+            }
+            false
+        })
+        .await
+        .unwrap_or(false)
+    }
+
+    fn echo_session(rt: &SessionRuntime) -> SessionOpened {
+        rt.open(session_args(
+            &[
+                "-c",
+                "stty -echo; while IFS= read -r line; do printf '%s\\n' \"$line\"; done",
+            ],
+            80,
+            24,
+        ))
+        .expect("open echo session")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn multi_attach_both_receive_live_output() {
+        let rt = runtime();
+        let opened = echo_session(&rt);
+        let _group = GroupGuard { pgid: opened.pid };
+        let (a_tx, mut a_rx) = mpsc::channel(16);
+        let (b_tx, mut b_rx) = mpsc::channel(16);
+        rt.attach(&opened.session_id, ChannelId::new("a"), a_tx, Some(0))
+            .await
+            .expect("attach A");
+        rt.attach(&opened.session_id, ChannelId::new("b"), b_tx, Some(0))
+            .await
+            .expect("attach B");
+        rt.write_input(&opened.session_id, b"BOTH_LIVE\n")
+            .await
+            .expect("input");
+        let (a, b) = tokio::join!(
+            attachment_contains(&mut a_rx, "BOTH_LIVE"),
+            attachment_contains(&mut b_rx, "BOTH_LIVE"),
+        );
+        assert!(a && b, "both attachments receive live output: A={a}, B={b}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn multi_attach_detach_only_removes_its_own_subscription() {
+        for detach_latest in [false, true] {
+            let rt = runtime();
+            let opened = echo_session(&rt);
+            let _group = GroupGuard { pgid: opened.pid };
+            let (a_tx, mut a_rx) = mpsc::channel(16);
+            let (b_tx, mut b_rx) = mpsc::channel(16);
+            let a = ChannelId::new("a");
+            let b = ChannelId::new("b");
+            rt.attach(&opened.session_id, a.clone(), a_tx, Some(0))
+                .await
+                .expect("attach A");
+            rt.attach(&opened.session_id, b.clone(), b_tx, Some(0))
+                .await
+                .expect("attach B");
+            rt.detach(if detach_latest { &b } else { &a });
+            rt.write_input(&opened.session_id, b"STILL_LIVE\n")
+                .await
+                .expect("input");
+            let remaining = if detach_latest { &mut a_rx } else { &mut b_rx };
+            assert!(
+                attachment_contains(remaining, "STILL_LIVE").await,
+                "remaining attachment stays live after detaching latest={detach_latest}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn multi_attach_original_terminal_survives_web_join_and_leave() {
+        let rt = runtime();
+        let opened = echo_session(&rt);
+        let _group = GroupGuard { pgid: opened.pid };
+        let (a_tx, mut a_rx) = mpsc::channel(16);
+        rt.attach(&opened.session_id, ChannelId::new("laptop"), a_tx, Some(0))
+            .await
+            .expect("attach laptop");
+        rt.write_input(&opened.session_id, b"BEFORE_WEB\n")
+            .await
+            .expect("input");
+        assert!(attachment_contains(&mut a_rx, "BEFORE_WEB").await);
+        let (b_tx, mut b_rx) = mpsc::channel(16);
+        let web = ChannelId::new("web");
+        rt.attach(&opened.session_id, web.clone(), b_tx, Some(0))
+            .await
+            .expect("attach web");
+        assert!(
+            attachment_contains(&mut b_rx, "BEFORE_WEB").await,
+            "web replays history"
+        );
+        rt.detach(&web);
+        rt.write_input(&opened.session_id, b"AFTER_WEB\n")
+            .await
+            .expect("input");
+        assert!(
+            attachment_contains(&mut a_rx, "AFTER_WEB").await,
+            "laptop still receives output after the web joins and leaves"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn multi_attach_slow_subscriber_backpressures_only_itself() {
+        let rt = runtime();
+        let opened = rt
+            .open(session_args(
+                &[
+                    "-c",
+                    "stty -echo; read start; i=0; while [ $i -lt 20000 ]; do echo $i; i=$((i+1)); done; exit 7",
+                ],
+                80,
+                24,
+            ))
+            .expect("open");
+        let _group = GroupGuard { pgid: opened.pid };
+        let a = ChannelId::new("fast");
+        let b = ChannelId::new("slow");
+        let (a_tx, mut a_rx) = mpsc::channel(8);
+        let (b_tx, mut b_rx) = mpsc::channel(1);
+        rt.attach(&opened.session_id, a.clone(), a_tx, Some(0))
+            .await
+            .expect("attach fast terminal");
+        rt.attach(&opened.session_id, b.clone(), b_tx, Some(0))
+            .await
+            .expect("attach blocked terminal");
+        rt.write_input(&opened.session_id, b"start\n")
+            .await
+            .expect("start output");
+        // B's queue stays full until A has received every final byte and the exit.
+        let (fast, fast_exit) = tokio::time::timeout(
+            Duration::from_secs(5),
+            attach_output_until_end(&mut a_rx, &a),
+        )
+        .await
+        .expect("blocked B must not stall A or the PTY");
+        assert_eq!(fast_exit, Some(7));
+        assert!(String::from_utf8_lossy(&fast).contains("19999"));
+        let (slow, slow_exit) = tokio::time::timeout(
+            Duration::from_secs(5),
+            attach_output_until_end(&mut b_rx, &b),
+        )
+        .await
+        .expect("B resumes from its own journal cursor");
+        assert_eq!(slow, fast, "both receive the same ordered, lossless stream");
+        assert_eq!(slow_exit, fast_exit);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_subscriber_overtaken_by_retention_ends_instead_of_skipping_output() {
+        let mut rt = runtime();
+        let config = Arc::make_mut(&mut rt.config);
+        config.session_journal_segment_bytes = 64 * 1024;
+        config.io_chunk_bytes = 128;
+        let opened = rt
+            .open(session_args(
+                &[
+                    "-c",
+                    "stty -echo; read start; echo READY; read more; i=0; while [ $i -lt 100000 ]; do echo $i; i=$((i+1)); done; echo DONE; read end",
+                ],
+                80,
+                24,
+            ))
+            .expect("open");
+        let _group = GroupGuard { pgid: opened.pid };
+        let (tx, mut rx) = mpsc::channel(1);
+        rt.attach(&opened.session_id, ChannelId::new("slow"), tx, Some(0))
+            .await
+            .expect("attach");
+        rt.write_input(&opened.session_id, b"start\n")
+            .await
+            .expect("start");
+        assert!(attachment_contains(&mut rx, "READY").await);
+        rt.write_input(&opened.session_id, b"more\n")
+            .await
+            .expect("produce output while the subscriber stops reading");
+        let entry = rt.registry.get(&opened.session_id).expect("entry");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let output = rt
+                    .read_output(&opened.session_id, 0, None)
+                    .expect("journal");
+                let bytes: Vec<u8> = output
+                    .chunks
+                    .iter()
+                    .flat_map(|chunk| chunk.data.as_slice().iter().copied())
+                    .collect();
+                if String::from_utf8_lossy(&bytes).contains("DONE") {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("PTY capture continues past retention while the subscriber is blocked");
+        assert!(entry.journal.lock().expect("journal").first_seq() > 0);
+        let end = tokio::time::timeout(Duration::from_secs(2), async {
+            while let Some(message) = rx.recv().await {
+                if let ServerMessage::Stream(frame) = message
+                    && let sealant_protocol::StreamPayload::End(end) = frame.payload
+                {
+                    return end;
+                }
+            }
+            panic!("attachment must end explicitly");
+        })
+        .await
+        .expect("lagging subscription ends");
+        assert!(end.error.expect("lag error").contains("fell behind"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn detach_cancels_backpressured_replay_of_an_exited_session() {
+        let rt = runtime();
+        let opened = rt
+            .open(session_args(
+                &[
+                    "-c",
+                    "i=0; while [ $i -lt 10000 ]; do echo $i; i=$((i+1)); done",
+                ],
+                80,
+                24,
+            ))
+            .expect("open");
+        let _group = GroupGuard { pgid: opened.pid };
+        let entry = rt.registry.get(&opened.session_id).expect("entry");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while entry.exit_status().is_none() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("session settles without any subscriber");
+        let channel = ChannelId::new("blocked_replay");
+        let (tx, mut rx) = mpsc::channel(1);
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            rt.attach(&opened.session_id, channel.clone(), tx, Some(0)),
+        )
+        .await
+        .expect("attach must not wait for a blocked replay")
+        .expect("attach");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while rx.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("replay filled its queue");
+        rt.detach(&channel);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while rx.recv().await.is_some() {}
+        })
+        .await
+        .expect("detach cancels the blocked sender, including on a tombstone");
+        assert!(rt.attachment_is_clear(&opened.session_id));
+    }
+
     #[tokio::test]
     async fn detach_clears_the_attachment() {
         let rt = runtime();
@@ -2244,7 +2425,7 @@ mod tests {
                 .attached
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .is_none(),
+                .is_empty(),
             "detach should clear the attachment"
         );
         // Clean up the session.
