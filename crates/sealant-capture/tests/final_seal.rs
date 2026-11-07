@@ -15,6 +15,12 @@
 //!   restore of it left the two names on separate inodes, and the next flush's small snap
 //!   captured them.
 
+#[path = "common/clock.rs"]
+mod clock;
+
+use clock::on_clock;
+use sealant_capture::clock::{Clock, ManualClock};
+
 use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -52,12 +58,13 @@ struct Slow {
     inner: Arc<LocalDir>,
     delay: Duration,
     puts: AtomicU64,
+    clock: Clock,
 }
 
 impl BlobSink for Slow {
     fn put_if_absent(&self, key: &str, source: BlobSource<'_>) -> Result<PutOutcome, SinkError> {
         self.puts.fetch_add(1, Ordering::SeqCst);
-        std::thread::sleep(self.delay);
+        self.clock.sleep(self.delay);
         self.inner.put_if_absent(key, source)
     }
 
@@ -121,18 +128,23 @@ fn runner(config: CaptureConfig, sink: Arc<dyn BlobSink>, fx: &Fixture) -> Caden
 /// uploading. The flush seals the chain with a final capture, and the next flush stages nothing.
 #[test]
 fn a_final_flush_ahead_of_an_uploading_bulk_capture_ends_the_chain_in_a_final_capture() {
+    let manual = ManualClock::new();
     let fx = fixture(40);
     let slow = Arc::new(Slow {
         inner: fx.store.clone(),
         delay: Duration::from_millis(20),
         puts: AtomicU64::new(0),
+        clock: manual.clock(),
     });
     let mut config = CaptureConfig::new("wt", 1, &fx.root);
     config.dir_format = DirFormat::Objects;
     config.uploads_in_flight = 1;
+    config.clock = manual.clock();
     let runner = runner(config, slow, &fx);
     runner.start(None);
-    runner.flush(CaptureKind::Suspend, None).unwrap();
+    on_clock(&manual, || runner.flush(CaptureKind::Suspend, None))
+        .0
+        .unwrap();
     // A scheduled bulk capture, uploading one object at a time.
     let staged = runner
         .with_engine_mut(|engine| {
@@ -146,8 +158,12 @@ fn a_final_flush_ahead_of_an_uploading_bulk_capture_ends_the_chain_in_a_final_ca
     assert!(!staged.unchanged);
     fs::write(fx.root.join("src/lib.rs"), "pub fn f() { g() }\n").unwrap();
 
-    let flushed = runner.flush_final(None);
+    let (flushed, took) = on_clock(&manual, || runner.flush_final(None));
     assert!(flushed.complete(), "{flushed:?}");
+    assert!(
+        took > Duration::ZERO,
+        "waited for the uploading bulk capture"
+    );
     let chain = fx.registrar.chain();
     let head = chain.last().unwrap();
     assert_eq!(
@@ -164,7 +180,7 @@ fn a_final_flush_ahead_of_an_uploading_bulk_capture_ends_the_chain_in_a_final_ca
     // The same final flush again, as the drain and the SIGTERM handler ask it: nothing new.
     let registered = chain.len();
     for _ in 0..3 {
-        assert!(runner.flush_final(None).complete());
+        assert!(on_clock(&manual, || runner.flush_final(None)).0.complete());
     }
     assert_eq!(
         fx.registrar.chain().len(),

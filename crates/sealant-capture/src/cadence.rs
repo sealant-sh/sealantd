@@ -351,7 +351,8 @@ pub struct CadenceSnapshot {
 }
 
 struct Shared {
-    /// Where the timers and the ship worker's tick read the time: the real clock, or a test's.
+    /// Where the timers, the ship worker's tick and a flush's deadlines read the time: the real
+    /// clock, or a test's.
     clock: Clock,
     engine: Mutex<CaptureEngine>,
     staging: Arc<Staging>,
@@ -1083,6 +1084,8 @@ impl CadenceRunner {
         kind: CaptureKind,
         deadline: Option<Duration>,
     ) -> Result<usize, EngineError> {
+        // The caller's thread waits on the clock from here (a manual clock counts it).
+        let _entered = self.shared.clock.enter();
         if kind == CaptureKind::Final {
             let flushed = self.flush_final(deadline);
             return match flushed.incomplete {
@@ -1090,7 +1093,8 @@ impl CadenceRunner {
                 Some(incomplete) => Err(EngineError::Incomplete(incomplete)),
             };
         }
-        let until = deadline.map(|d| Instant::now() + d);
+        let clock = &self.shared.clock;
+        let until = deadline.map(|d| clock.now() + d);
         if self.sealed_and_current() {
             // After a complete final flush, over the disk it captured: a snap would only add
             // a capture of the same tree after the final one, and the chain would no longer
@@ -1106,7 +1110,7 @@ impl CadenceRunner {
         Ok(self
             .shared
             .shipper
-            .flush_small(until.map(|u| u.saturating_duration_since(Instant::now())))?)
+            .flush_small(until.map(|u| u.saturating_duration_since(clock.now())))?)
     }
 
     /// Whether a final flush now would find the disk as the last one captured it, so it need
@@ -1355,13 +1359,16 @@ impl CadenceRunner {
         deadline: Option<Duration>,
         writers_stopped: bool,
     ) -> FinalFlush {
+        // The caller's thread waits on the clock from here (a manual clock counts it).
+        let _entered = self.shared.clock.enter();
+        let clock = &self.shared.clock;
         // The executor is ending: everything it ships from now on preserves work it already
         // admitted, and its requests say so (`flush: final`; decision 35).
         self.shared.shipper.preserving().begin();
         // A seal answer an earlier final flush heard decides nothing here unless it was
         // `recorded`: this flush asks the registrar again (review 12 #4).
         self.shared.shipper.seal_heard();
-        let until = deadline.map(|d| Instant::now() + d);
+        let until = deadline.map(|d| clock.now() + d);
         let mut shipped = 0;
         let mut round = 0;
         let mut incomplete = loop {
@@ -1401,7 +1408,7 @@ impl CadenceRunner {
                     .unwrap_or_else(PoisonError::into_inner)
                     .clone();
                 if let Some(Err(found)) = census.map(|census| census()) {
-                    let time_left = until.is_none_or(|u| Instant::now() < u);
+                    let time_left = until.is_none_or(|u| clock.now() < u);
                     if round < FINAL_ROUNDS && time_left {
                         tracing::warn!(
                             round,
@@ -1421,7 +1428,7 @@ impl CadenceRunner {
                     Err(error) => Some(error),
                 };
                 if let Some(change) = changed {
-                    let time_left = until.is_none_or(|u| Instant::now() < u);
+                    let time_left = until.is_none_or(|u| clock.now() < u);
                     if round < FINAL_ROUNDS && time_left {
                         tracing::warn!(
                             round,
@@ -1496,7 +1503,8 @@ impl CadenceRunner {
     /// a refused capture from disk when the registrar asks for it; the first failure lands in
     /// `incomplete`. Returns the captures registered.
     fn ship_final(&self, until: Option<Instant>, incomplete: &mut Option<Incomplete>) -> usize {
-        let left = || until.map(|u| u.saturating_duration_since(Instant::now()));
+        let clock = &self.shared.clock;
+        let left = || until.map(|u| u.saturating_duration_since(clock.now()));
         let mut shipped = 0;
         let mut repairs = 0u32;
         loop {
@@ -1513,9 +1521,9 @@ impl CadenceRunner {
                         // Refused again after a rebuild: back off, never give up while there
                         // is time (the daemon's own flush has no deadline).
                         let wait = Duration::from_secs(1 << (repairs - 2).min(5));
-                        thread::sleep(left().map_or(wait, |l| wait.min(l)));
+                        clock.sleep(left().map_or(wait, |l| wait.min(l)));
                     }
-                    if until.is_some_and(|u| Instant::now() >= u) {
+                    if until.is_some_and(|u| clock.now() >= u) {
                         incomplete.get_or_insert(Incomplete::Deadline {
                             pending: self.shared.staging.pending().map_or(0, |p| p.len()),
                         });
@@ -1580,6 +1588,13 @@ impl CadenceRunner {
     /// The shipper's error.
     pub fn ship(&self, deadline: Duration) -> Result<usize, ShipError> {
         self.shared.shipper.flush(deadline)
+    }
+
+    /// Where its timers and its flushes' deadlines read the time: the real clock, unless a test
+    /// gave the engine its manual one (`CaptureConfig::clock`).
+    #[must_use]
+    pub fn clock(&self) -> &Clock {
+        &self.shared.clock
     }
 
     /// The shipper.

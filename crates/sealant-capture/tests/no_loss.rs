@@ -9,12 +9,18 @@
 //!   captures that were staged and not shipped, or over edits made after the last snap; the
 //!   queue ships, and a lease that moved to a new epoch meanwhile gets the disk captured afresh.
 
+#[path = "common/clock.rs"]
+mod clock;
+
+use clock::on_clock;
+use sealant_capture::clock::{Clock, ManualClock};
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use sealant_capture::engine::Pickup;
 use sealant_capture::manifest::BulkState;
@@ -182,12 +188,13 @@ struct Slow {
     inner: Arc<LocalDir>,
     delay: Duration,
     puts: AtomicU64,
+    clock: Clock,
 }
 
 impl BlobSink for Slow {
     fn put_if_absent(&self, key: &str, source: BlobSource<'_>) -> Result<PutOutcome, SinkError> {
         self.puts.fetch_add(1, Ordering::SeqCst);
-        std::thread::sleep(self.delay);
+        self.clock.sleep(self.delay);
         self.inner.put_if_absent(key, source)
     }
 
@@ -205,29 +212,35 @@ impl BlobSink for Slow {
 /// registered: the disk goes with the executor.
 #[test]
 fn a_final_flush_without_a_deadline_ships_the_bulk_class() {
+    let manual = ManualClock::new();
     let fx = fixture(60);
     let registrar = Arc::new(InMemoryRegistrar::new("wt", 1, None));
     let slow = Arc::new(Slow {
         inner: fx.store.clone(),
         delay: Duration::from_millis(20),
         puts: AtomicU64::new(0),
+        clock: manual.clock(),
     });
     let mut config = CaptureConfig::new("wt", 1, &fx.root);
     // One object per directory: well over a hundred objects to upload.
     config.dir_format = sealant_capture::manifest::DirFormat::Objects;
     config.uploads_in_flight = 1;
+    config.clock = manual.clock();
     let engine = CaptureEngine::open(config, None).unwrap();
     let sink: Arc<dyn BlobSink> = slow.clone();
     let dyn_registrar: Arc<dyn Registrar> = registrar.clone();
     let shipper = Arc::new(engine.shipper(sink, dyn_registrar));
     let runner = CadenceRunner::new(engine, shipper);
 
-    let start = Instant::now();
-    runner.flush(CaptureKind::Final, None).unwrap();
-    let took = start.elapsed();
+    let (_, took) = on_clock(&manual, || runner.flush(CaptureKind::Final, None).unwrap());
     let puts = slow.puts.load(Ordering::SeqCst);
     eprintln!("final flush: {puts} PUTs in {took:?}");
     assert!(puts > 100, "{puts}");
+    assert_eq!(
+        took,
+        Duration::from_millis(20) * puts as u32,
+        "waited for every PUT"
+    );
     assert!(
         runner.staging().pending().unwrap().is_empty(),
         "nothing left staged"
@@ -248,9 +261,12 @@ fn a_final_flush_without_a_deadline_ships_the_bulk_class() {
 /// capture among them) and the flush returns.
 #[test]
 fn a_final_flush_waits_for_a_held_bulk_capture() {
+    let manual = ManualClock::new();
     let fx = fixture(20);
     let registrar = Arc::new(InMemoryRegistrar::new("wt", 1, None));
-    let engine = CaptureEngine::open(CaptureConfig::new("wt", 1, &fx.root), None).unwrap();
+    let mut config = CaptureConfig::new("wt", 1, &fx.root);
+    config.clock = manual.clock();
+    let engine = CaptureEngine::open(config, None).unwrap();
     let sink: Arc<dyn BlobSink> = fx.store.clone();
     let dyn_registrar: Arc<dyn Registrar> = registrar.clone();
     let shipper = Arc::new(
@@ -263,26 +279,41 @@ fn a_final_flush_waits_for_a_held_bulk_capture() {
     runner.ship(Duration::from_secs(10)).unwrap();
     registrar.set_byte_quota(Some(registrar.used_bytes() + 512), Some(sink));
 
+    let clock = manual.clock();
+    let (ready, started) = std::sync::mpsc::sync_channel(0);
     let lift = {
         let registrar = registrar.clone();
         let shipper = shipper.clone();
         std::thread::spawn(move || {
-            let start = Instant::now();
+            let _entered = clock.enter();
+            ready.send(()).unwrap();
+            let start = clock.now();
             while shipper.held().is_empty() {
-                assert!(start.elapsed() < Duration::from_secs(20), "never refused");
-                std::thread::sleep(Duration::from_millis(10));
+                assert!(
+                    clock.now() - start < Duration::from_secs(20),
+                    "never refused"
+                );
+                clock.sleep(Duration::from_millis(10));
             }
-            std::thread::sleep(Duration::from_millis(300));
+            clock.sleep(Duration::from_millis(300));
             registrar.set_byte_quota(None, None);
-            Instant::now()
+            clock.now()
         })
     };
-    runner.flush(CaptureKind::Final, None).unwrap();
-    let returned = Instant::now();
+    started.recv().unwrap();
+    let start = manual.now();
+    on_clock(&manual, || runner.flush(CaptureKind::Final, None).unwrap());
+    let returned = manual.now();
+    // Finish the fixture even if a broken flush returned early; compare its original return time.
+    manual.advance(Duration::from_millis(20_000));
     let lifted = lift.join().unwrap();
     assert!(
         returned >= lifted,
         "the flush returned before the budget allowed the bulk capture"
+    );
+    assert!(
+        lifted - start >= Duration::from_millis(300),
+        "the budget stayed refused for the wait"
     );
     assert!(runner.staging().pending().unwrap().is_empty());
     assert!(matches!(

@@ -9,6 +9,12 @@
 
 mod common;
 
+#[path = "common/clock.rs"]
+mod clock;
+
+use clock::on_clock;
+use sealant_capture::clock::ManualClock;
+
 use std::fs;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -144,7 +150,10 @@ fn a_refusal_at_upload_urls_holds_the_bulk_capture_until_the_budget_allows() {
 
     let registrar = Arc::new(InMemoryRegistrar::new("wt", 1, Some(server.base.clone())));
     let sink = presigned(&registrar, false);
-    let mut engine = CaptureEngine::open(CaptureConfig::new("wt", 1, &root), None).unwrap();
+    let manual = ManualClock::new();
+    let mut config = CaptureConfig::new("wt", 1, &root);
+    config.clock = manual.clock();
+    let mut engine = CaptureEngine::open(config, None).unwrap();
     let shipper = shipper(&engine, sink.clone(), registrar.clone());
 
     // Capture 0 (small) ships; from here the session has 64 KiB left — room for another small
@@ -194,7 +203,7 @@ fn a_refusal_at_upload_urls_holds_the_bulk_capture_until_the_budget_allows() {
     assert_eq!(shipper.ship_pending().unwrap(), 0);
     assert_eq!(registrar.url_requests(), asked);
     // After it, it asks again, is refused again, and waits twice as long.
-    std::thread::sleep(BACKOFF);
+    manual.advance(BACKOFF);
     assert_eq!(shipper.ship_pending().unwrap(), 0);
     assert_eq!(registrar.url_requests(), asked + 1);
     assert_eq!(shipper.held()[0].refusals, 2);
@@ -218,7 +227,7 @@ fn a_refusal_at_upload_urls_holds_the_bulk_capture_until_the_budget_allows() {
 
     // The budget is raised: at the next ask the bulk capture registers, and the refusal clears.
     registrar.set_byte_quota(None, None);
-    std::thread::sleep(BACKOFF * 4);
+    manual.advance(BACKOFF * 4);
     assert_eq!(shipper.ship_pending().unwrap(), 1);
     assert!(staging.pending().unwrap().is_empty());
     assert!(shipper.held().is_empty());
@@ -253,7 +262,10 @@ fn a_refusal_at_register_holds_the_capture_after_the_packs_landed() {
     let store = Arc::new(LocalDir::new(&tmp.path().join("store")).unwrap());
     let sink: Arc<dyn BlobSink> = store.clone();
     let registrar = Arc::new(InMemoryRegistrar::new("wt", 1, None));
-    let mut engine = CaptureEngine::open(CaptureConfig::new("wt", 1, &root), None).unwrap();
+    let manual = ManualClock::new();
+    let mut config = CaptureConfig::new("wt", 1, &root);
+    config.clock = manual.clock();
+    let mut engine = CaptureEngine::open(config, None).unwrap();
     let shipper = shipper(&engine, sink.clone(), registrar.clone());
 
     snap(&mut engine, Class::Small, 1);
@@ -291,7 +303,7 @@ fn a_refusal_at_register_holds_the_capture_after_the_packs_landed() {
     assert_eq!(registrar.chain().len(), 1);
 
     registrar.set_byte_quota(None, None);
-    std::thread::sleep(BACKOFF);
+    manual.advance(BACKOFF);
     assert_eq!(shipper.ship_pending().unwrap(), 1);
     assert_eq!(
         registrar.head().unwrap().capture_id,
@@ -316,7 +328,10 @@ fn a_held_bulk_capture_is_replaced_by_the_newer_one() {
     workspace(&root, 50);
     let registrar = Arc::new(InMemoryRegistrar::new("wt", 1, Some(server.base.clone())));
     let sink = presigned(&registrar, false);
-    let mut engine = CaptureEngine::open(CaptureConfig::new("wt", 1, &root), None).unwrap();
+    let manual = ManualClock::new();
+    let mut config = CaptureConfig::new("wt", 1, &root);
+    config.clock = manual.clock();
+    let mut engine = CaptureEngine::open(config, None).unwrap();
     let shipper = shipper(&engine, sink.clone(), registrar.clone());
     snap(&mut engine, Class::Small, 1);
     assert_eq!(shipper.ship_pending().unwrap(), 1);
@@ -347,7 +362,7 @@ fn a_held_bulk_capture_is_replaced_by_the_newer_one() {
     assert_eq!(queued[0].capture_id, second.manifest.capture_id);
 
     registrar.set_byte_quota(None, None);
-    std::thread::sleep(BACKOFF);
+    manual.advance(BACKOFF);
     assert_eq!(shipper.ship_pending().unwrap(), 1);
     let head = registrar.head().unwrap();
     assert_eq!(head.capture_id, second.manifest.capture_id);
@@ -375,7 +390,10 @@ fn a_held_small_capture_drops_nothing_staged_after_it() {
     let store = Arc::new(LocalDir::new(&tmp.path().join("store")).unwrap());
     let sink: Arc<dyn BlobSink> = store.clone();
     let registrar = Arc::new(InMemoryRegistrar::new("wt", 1, None));
-    let mut engine = CaptureEngine::open(CaptureConfig::new("wt", 1, &root), None).unwrap();
+    let manual = ManualClock::new();
+    let mut config = CaptureConfig::new("wt", 1, &root);
+    config.clock = manual.clock();
+    let mut engine = CaptureEngine::open(config, None).unwrap();
     let shipper = shipper(&engine, sink.clone(), registrar.clone());
     snap(&mut engine, Class::Small, 1);
     assert_eq!(shipper.ship_pending().unwrap(), 1);
@@ -403,7 +421,7 @@ fn a_held_small_capture_drops_nothing_staged_after_it() {
     );
 
     registrar.set_byte_quota(None, None);
-    std::thread::sleep(BACKOFF * 4);
+    manual.advance(BACKOFF * 4);
     assert_eq!(shipper.ship_pending().unwrap(), 3);
     assert!(!shipper.is_refused(Class::Small));
     let head = registrar.head().unwrap();
@@ -458,7 +476,10 @@ fn a_final_flush_names_itself_on_upload_urls_and_register() {
             Box::new(minter),
             std::time::Duration::from_secs(30),
         ));
-        let mut engine = CaptureEngine::open(CaptureConfig::new("wt", 1, &root), None).unwrap();
+        let manual = ManualClock::new();
+        let mut config = CaptureConfig::new("wt", 1, &root);
+        config.clock = manual.clock();
+        let mut engine = CaptureEngine::open(config, None).unwrap();
         let shipper = shipper(&engine, sink, registrar.clone()).with_preserving(preserving);
 
         snap(&mut engine, Class::Small, 1);
@@ -483,7 +504,7 @@ fn a_final_flush_names_itself_on_upload_urls_and_register() {
 
         let runner = CadenceRunner::new(engine, Arc::new(shipper));
         let deadline = Duration::from_secs(if exempting { 60 } else { 3 });
-        let result = runner.flush_final(Some(deadline));
+        let (result, took) = on_clock(&manual, || runner.flush_final(Some(deadline)));
         let during = registrar.flush_seen()[before.len()..].to_vec();
         assert!(
             during.iter().any(|(call, _)| *call == "upload.urls")
@@ -505,6 +526,10 @@ fn a_final_flush_names_itself_on_upload_urls_and_register() {
             ));
         } else {
             assert!(!result.complete(), "{result:?}");
+            assert_eq!(
+                took, deadline,
+                "the non-exempting registrar holds it until the deadline"
+            );
             assert!(
                 !runner.staging().pending().unwrap().is_empty(),
                 "the held capture is kept"

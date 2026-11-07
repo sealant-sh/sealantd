@@ -14,12 +14,18 @@
 
 mod common;
 
+#[path = "common/clock.rs"]
+mod clock;
+
+use clock::on_clock;
+use sealant_capture::clock::{Clock, ManualClock};
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use sealant_capture::manifest::{BulkState, DirFormat};
 use sealant_capture::registrar::{
@@ -80,13 +86,15 @@ struct Slow {
     inner: Arc<dyn BlobSink>,
     delay: Duration,
     puts: AtomicU64,
+    clock: Clock,
 }
 
 impl Slow {
-    fn new(inner: Arc<dyn BlobSink>, delay: Duration) -> Arc<Self> {
+    fn new(inner: Arc<dyn BlobSink>, delay: Duration, clock: Clock) -> Arc<Self> {
         Arc::new(Self {
             inner,
             delay,
+            clock,
             puts: AtomicU64::new(0),
         })
     }
@@ -98,7 +106,7 @@ impl Slow {
 
 impl BlobSink for Slow {
     fn put_if_absent(&self, key: &str, source: BlobSource<'_>) -> Result<PutOutcome, SinkError> {
-        std::thread::sleep(self.delay);
+        self.clock.sleep(self.delay);
         self.puts.fetch_add(1, Ordering::SeqCst);
         self.inner.put_if_absent(key, source)
     }
@@ -110,7 +118,7 @@ impl BlobSink for Slow {
         part_size: u64,
         parts_in_flight: usize,
     ) -> Result<PutOutcome, SinkError> {
-        std::thread::sleep(self.delay);
+        self.clock.sleep(self.delay);
         self.puts.fetch_add(1, Ordering::SeqCst);
         self.inner
             .put_multipart(key, file, part_size, parts_in_flight)
@@ -143,11 +151,18 @@ fn snap(engine: &mut CaptureEngine, class: Class, seq: u64) -> sealant_capture::
         .unwrap()
 }
 
-fn wait_until(what: &str, timeout: Duration, mut done: impl FnMut() -> bool) {
-    let start = Instant::now();
-    while !done() {
-        assert!(start.elapsed() < timeout, "{what}: not within {timeout:?}");
-        std::thread::sleep(Duration::from_millis(10));
+fn wait_until(manual: &ManualClock, what: &str, timeout: Duration, mut done: impl FnMut() -> bool) {
+    let start = manual.now();
+    loop {
+        manual.settle();
+        if done() {
+            return;
+        }
+        assert!(
+            manual.now() - start < timeout,
+            "{what}: not within {timeout:?}"
+        );
+        manual.advance_next(start + timeout);
     }
 }
 
@@ -184,26 +199,27 @@ impl Session {
 
 /// The session: capture 0 registered, then a bulk capture of the dependency tree staged and the
 /// ship worker started on it behind a sink that spends `delay` on every object.
-fn session(delay: Duration) -> (Session, CadenceRunner, u64) {
+fn session(manual: &ManualClock, delay: Duration) -> (Session, CadenceRunner, u64) {
     let tmp = tempfile::tempdir().unwrap();
     let base = tmp.path().to_path_buf();
     let root = base.join("ws");
     workspace(&root, 80, 5);
     let store = Arc::new(LocalDir::new(&base.join("store")).unwrap());
-    let slow = Slow::new(store.clone(), delay);
+    let slow = Slow::new(store.clone(), delay, manual.clock());
     let registrar = Arc::new(InMemoryRegistrar::new("wt", 1, None));
     let mut config = CaptureConfig::new("wt", 1, &root);
     config.cadence = quiet_cadence();
     // The shipper's duty cycle is not what this test measures.
     config.cpu_fraction = 1.0;
     config.dir_format = DirFormat::Objects;
+    config.clock = manual.clock();
     let mut engine = CaptureEngine::open(config, None).unwrap();
     let sink: Arc<dyn BlobSink> = slow.clone();
     let dyn_registrar: Arc<dyn Registrar> = registrar.clone();
     let shipper = Arc::new(engine.shipper(sink, dyn_registrar));
 
     snap(&mut engine, Class::Small, 1);
-    assert_eq!(shipper.ship_pending().unwrap(), 1);
+    assert_eq!(on_clock(manual, || shipper.ship_pending()).0.unwrap(), 1);
     let bulk = snap(&mut engine, Class::Bulk, 2);
     assert_eq!(bulk.n, 1);
     let bulk_objects = engine.staging().pending().unwrap()[0].uploads.len() as u64;
@@ -213,9 +229,12 @@ fn session(delay: Duration) -> (Session, CadenceRunner, u64) {
     let before = slow.puts();
     runner.start(None);
     // The worker is on the bulk capture.
-    wait_until("the bulk upload starts", Duration::from_secs(10), || {
-        slow.puts() >= before + 5
-    });
+    wait_until(
+        manual,
+        "the bulk upload starts",
+        Duration::from_secs(10),
+        || slow.puts() >= before + 5,
+    );
     (
         Session {
             _tmp: tmp,
@@ -242,14 +261,16 @@ fn bulk_still_uploading(runner: &CadenceRunner) -> bool {
 #[test]
 fn a_small_capture_registers_while_a_bulk_capture_uploads() {
     // ≈ 170 objects at 250 ms each, eight in flight: about 5 s of bulk upload.
-    let (s, runner, bulk_objects) = session(Duration::from_millis(250));
+    let manual = ManualClock::new();
+    let (s, runner, bulk_objects) = session(&manual, Duration::from_millis(250));
 
     // The agent edits a tracked file; the turn boundary snaps.
     fs::write(s.root.join("src/lib.rs"), "pub fn f() { edited() }\n").unwrap();
-    let t0 = Instant::now();
+    let t0 = manual.now();
     let turn = runner.snap(CaptureKind::Turn).unwrap();
     assert!(!turn.unchanged);
     wait_until(
+        &manual,
         "the turn capture registers ahead of the bulk capture",
         Duration::from_secs(5),
         || {
@@ -258,7 +279,7 @@ fn a_small_capture_registers_while_a_bulk_capture_uploads() {
                 .is_some_and(|h| h.capture_id == turn.manifest.capture_id)
         },
     );
-    let registered_in = t0.elapsed();
+    let registered_in = manual.now() - t0;
     eprintln!("turn capture registered in {registered_in:?} during the bulk upload");
     assert!(
         registered_in < Duration::from_secs(3),
@@ -274,11 +295,13 @@ fn a_small_capture_registers_while_a_bulk_capture_uploads() {
 
     // A checkpoint's flush: back once its capture is registered, well inside Mend's 20 s.
     fs::write(s.root.join("src/lib.rs"), "pub fn f() { edited_twice() }\n").unwrap();
-    let t1 = Instant::now();
-    runner
-        .flush(CaptureKind::Suspend, Some(Duration::from_secs(20)))
-        .unwrap();
-    let flushed_in = t1.elapsed();
+    let t1 = manual.now();
+    on_clock(&manual, || {
+        runner.flush(CaptureKind::Suspend, Some(Duration::from_secs(20)))
+    })
+    .0
+    .unwrap();
+    let flushed_in = manual.now() - t1;
     eprintln!("flush returned in {flushed_in:?} during the bulk upload");
     assert!(
         flushed_in < Duration::from_secs(3),
@@ -310,6 +333,7 @@ fn a_small_capture_registers_while_a_bulk_capture_uploads() {
 
     // The bulk capture registers on top.
     wait_until(
+        &manual,
         "the bulk capture registers",
         Duration::from_secs(120),
         || s.registrar.chain().len() == 4,
@@ -372,6 +396,7 @@ fn presigned(
     server: &common::Server,
     delay: Duration,
     throttle: u32,
+    clock: Clock,
 ) -> (Arc<Throttled>, Arc<Slow>) {
     let inner = Arc::new(InMemoryRegistrar::new("wt", 1, Some(server.base.clone())));
     let registrar = Arc::new(Throttled {
@@ -390,7 +415,7 @@ fn presigned(
         Box::new(minter),
         Duration::from_secs(30),
     ));
-    (registrar, Slow::new(http, delay))
+    (registrar, Slow::new(http, delay, clock))
 }
 
 /// The `no url for …/trees/<sha>` refusal. A flush ran its pass beside the worker's, over the
@@ -404,17 +429,19 @@ fn a_flush_beside_the_worker_does_not_multiply_url_mints() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("ws");
     workspace(&root, 80, 5);
-    let (registrar, slow) = presigned(&server, Duration::from_millis(15), 0);
+    let manual = ManualClock::new();
+    let (registrar, slow) = presigned(&server, Duration::from_millis(15), 0, manual.clock());
     let mut config = CaptureConfig::new("wt", 1, &root);
     config.cpu_fraction = 1.0;
     config.dir_format = DirFormat::Objects;
+    config.clock = manual.clock();
     let mut engine = CaptureEngine::open(config, None).unwrap();
     let sink: Arc<dyn BlobSink> = slow.clone();
     let dyn_registrar: Arc<dyn Registrar> = registrar.clone();
     let shipper = Arc::new(engine.shipper(sink, dyn_registrar));
 
     snap(&mut engine, Class::Small, 1);
-    assert_eq!(shipper.ship_pending().unwrap(), 1);
+    assert_eq!(on_clock(&manual, || shipper.ship_pending()).0.unwrap(), 1);
     let small_calls = registrar.calls.load(Ordering::SeqCst);
     let bulk = snap(&mut engine, Class::Bulk, 2);
     let objects = engine.staging().pending().unwrap()[0].uploads.len();
@@ -422,14 +449,29 @@ fn a_flush_beside_the_worker_does_not_multiply_url_mints() {
 
     // The worker's pass is on the bulk capture when a flush arrives.
     let before = slow.puts();
+    let (ready, started) = std::sync::mpsc::sync_channel(0);
+    let clock = manual.clock();
     let worker = {
         let shipper = Arc::clone(&shipper);
-        std::thread::spawn(move || shipper.ship_pending())
+        std::thread::spawn(move || {
+            let _entered = clock.enter();
+            ready.send(()).unwrap();
+            shipper.ship_pending()
+        })
     };
-    wait_until("the bulk upload starts", Duration::from_secs(10), || {
-        slow.puts() >= before + 5
-    });
-    let flushed = shipper.flush(Duration::from_secs(60)).unwrap();
+    started.recv().unwrap();
+    wait_until(
+        &manual,
+        "the bulk upload starts",
+        Duration::from_secs(10),
+        || slow.puts() >= before + 5,
+    );
+    let (flushed, took) = on_clock(&manual, || shipper.flush(Duration::from_secs(60)));
+    let flushed = flushed.unwrap();
+    assert!(
+        took > Duration::ZERO,
+        "the flush waited for the worker's pass"
+    );
     let from_worker = worker.join().unwrap().unwrap();
     let bulk_calls = registrar.calls.load(Ordering::SeqCst) - small_calls;
     eprintln!("{objects} bulk objects shipped with {bulk_calls} upload.urls call(s)");
@@ -455,8 +497,11 @@ fn a_throttled_url_mint_is_retried_not_reported_as_no_url() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("ws");
     workspace(&root, 2, 2);
-    let (registrar, slow) = presigned(&server, Duration::ZERO, 2);
-    let mut engine = CaptureEngine::open(CaptureConfig::new("wt", 1, &root), None).unwrap();
+    let manual = ManualClock::new();
+    let (registrar, slow) = presigned(&server, Duration::ZERO, 2, manual.clock());
+    let mut config = CaptureConfig::new("wt", 1, &root);
+    config.clock = manual.clock();
+    let mut engine = CaptureEngine::open(config, None).unwrap();
     let sink: Arc<dyn BlobSink> = slow.clone();
     let dyn_registrar: Arc<dyn Registrar> = registrar.clone();
     let shipper = engine
@@ -468,7 +513,7 @@ fn a_throttled_url_mint_is_retried_not_reported_as_no_url() {
         })
         .with_outage_backoff(Duration::from_millis(200), Duration::from_millis(200));
     let small = snap(&mut engine, Class::Small, 1);
-    assert_eq!(shipper.ship_pending().unwrap(), 1);
+    assert_eq!(on_clock(&manual, || shipper.ship_pending()).0.unwrap(), 1);
     assert_eq!(
         registrar.inner.head().unwrap().capture_id,
         small.manifest.capture_id
@@ -485,7 +530,7 @@ fn a_throttled_url_mint_is_retried_not_reported_as_no_url() {
     registrar.throttle.store(100, Ordering::SeqCst);
     fs::write(root.join("src/lib.rs"), "pub fn f() { g() }\n").unwrap();
     snap(&mut engine, Class::Small, 2);
-    match shipper.ship_pending() {
+    match on_clock(&manual, || shipper.ship_pending()).0 {
         Err(sealant_capture::ship::ShipError::Upload { source, .. }) => {
             assert!(source.is_retryable(), "{source}");
             assert!(!matches!(source, SinkError::NoUrl { .. }), "{source}");
@@ -502,8 +547,8 @@ fn a_throttled_url_mint_is_retried_not_reported_as_no_url() {
         calls,
         "no call meanwhile"
     );
-    std::thread::sleep(Duration::from_millis(250));
-    assert_eq!(shipper.ship_pending().unwrap(), 1);
+    manual.advance(Duration::from_millis(250));
+    assert_eq!(on_clock(&manual, || shipper.ship_pending()).0.unwrap(), 1);
 }
 
 /// Take one from `counter` if it holds any; whether one was taken. (`fetch_update` is deprecated

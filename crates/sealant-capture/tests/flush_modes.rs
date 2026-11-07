@@ -10,6 +10,12 @@
 //! - A lost lease (409 `lease-lost`) pauses shipping and asks again; it is never a chain
 //!   conflict, which would end a final flush with everything still staged.
 
+#[path = "common/clock.rs"]
+mod clock;
+
+use clock::on_clock;
+use sealant_capture::clock::{Clock, ManualClock};
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -87,11 +93,13 @@ struct Slow {
     delay: Duration,
     puts: AtomicU64,
     first_put: Mutex<Option<Instant>>,
+    clock: Clock,
 }
 
 impl Slow {
-    fn new(inner: Arc<LocalDir>, delay: Duration) -> Arc<Self> {
+    fn new(inner: Arc<LocalDir>, delay: Duration, clock: Clock) -> Arc<Self> {
         Arc::new(Self {
+            clock,
             inner,
             delay,
             puts: AtomicU64::new(0),
@@ -110,9 +118,9 @@ impl BlobSink for Slow {
         self.first_put
             .lock()
             .unwrap()
-            .get_or_insert_with(Instant::now);
+            .get_or_insert_with(|| self.clock.now());
         self.puts.fetch_add(1, Ordering::SeqCst);
-        std::thread::sleep(self.delay);
+        self.clock.sleep(self.delay);
         self.inner.put_if_absent(key, source)
     }
 
@@ -178,11 +186,16 @@ fn restore_head(fx: &Fixture, into: &Path) {
 #[test]
 fn a_final_flush_snaps_a_freshly_changed_bulk_dir_and_waits_for_it() {
     let fx = fixture(40);
-    let slow = Slow::new(fx.store.clone(), Duration::from_millis(20));
-    let runner = runner(slow_config(&fx.root), slow.clone(), &fx);
+    let manual = ManualClock::new();
+    let slow = Slow::new(fx.store.clone(), Duration::from_millis(20), manual.clock());
+    let mut config = slow_config(&fx.root);
+    config.clock = manual.clock();
+    let runner = runner(config, slow.clone(), &fx);
     runner.start(None);
     // The first final flush captures everything as it was.
-    runner.flush(CaptureKind::Final, None).unwrap();
+    on_clock(&manual, || runner.flush(CaptureKind::Final, None))
+        .0
+        .unwrap();
     let before = fx.registrar.head().unwrap();
     assert!(matches!(before.manifest.sections.bulk, BulkState::Ready(_)));
 
@@ -192,12 +205,18 @@ fn a_final_flush_snaps_a_freshly_changed_bulk_dir_and_waits_for_it() {
     fs::write(fx.root.join("node_modules/fresh/index.js"), "new\n").unwrap();
     fs::remove_file(fx.root.join("node_modules/pkg7/lib/m0.js")).unwrap();
     let puts = slow.puts.load(Ordering::SeqCst);
-    let start = Instant::now();
-    runner.flush(CaptureKind::Final, None).unwrap();
+    let start = manual.now();
+    on_clock(&manual, || runner.flush(CaptureKind::Final, None))
+        .0
+        .unwrap();
     eprintln!(
         "final flush: {} PUTs in {:?}",
         slow.puts.load(Ordering::SeqCst) - puts,
-        start.elapsed()
+        manual.now() - start
+    );
+    assert_eq!(
+        manual.now() - start,
+        Duration::from_millis(20) * (slow.puts.load(Ordering::SeqCst) - puts) as u32
     );
     assert!(runner.staging().pending().unwrap().is_empty());
     let head = fx.registrar.head().unwrap();
@@ -353,12 +372,15 @@ fn a_preempted_scheduled_bulk_build_does_not_resume_after_the_final_flush() {
 fn a_final_flush_with_a_deadline_returns_at_it_and_keeps_the_rest_staged() {
     let fx = fixture(60);
     // One PUT at a time, 50 ms each: well over a hundred objects, ≈ 6 s for all of them.
-    let slow = Slow::new(fx.store.clone(), Duration::from_millis(50));
-    let runner = runner(slow_config(&fx.root), slow.clone(), &fx);
+    let manual = ManualClock::new();
+    let slow = Slow::new(fx.store.clone(), Duration::from_millis(50), manual.clock());
+    let mut config = slow_config(&fx.root);
+    config.clock = manual.clock();
+    let runner = runner(config, slow.clone(), &fx);
     let deadline = Duration::from_millis(300);
-    let start = Instant::now();
-    let flushed = runner.flush(CaptureKind::Final, Some(deadline));
-    let returned = Instant::now();
+    let start = manual.now();
+    let (flushed, _) = on_clock(&manual, || runner.flush(CaptureKind::Final, Some(deadline)));
+    let returned = manual.now();
     let error = flushed.expect_err("a flush cut short by its deadline is not complete");
     assert!(error.to_string().contains("deadline"), "{error}");
     let pending = runner.staging().pending().unwrap();
@@ -378,7 +400,9 @@ fn a_final_flush_with_a_deadline_returns_at_it_and_keeps_the_rest_staged() {
         shipping.saturating_duration_since(start)
     );
 
-    runner.flush(CaptureKind::Final, None).unwrap();
+    on_clock(&manual, || runner.flush(CaptureKind::Final, None))
+        .0
+        .unwrap();
     assert!(runner.staging().pending().unwrap().is_empty());
     let fresh = fx.base.join("fresh");
     restore_head(&fx, &fresh);
@@ -393,8 +417,11 @@ fn a_final_flush_with_a_deadline_returns_at_it_and_keeps_the_rest_staged() {
 #[test]
 fn a_suspend_flush_returns_ahead_of_a_bulk_upload() {
     let fx = fixture(60);
-    let slow = Slow::new(fx.store.clone(), Duration::from_millis(20));
-    let mut engine = CaptureEngine::open(slow_config(&fx.root), None).unwrap();
+    let manual = ManualClock::new();
+    let slow = Slow::new(fx.store.clone(), Duration::from_millis(20), manual.clock());
+    let mut config = slow_config(&fx.root);
+    config.clock = manual.clock();
+    let mut engine = CaptureEngine::open(config, None).unwrap();
     for (class, seq) in [(Class::Small, 1), (Class::Bulk, 2)] {
         engine
             .snap(SnapRequest {
@@ -409,9 +436,11 @@ fn a_suspend_flush_returns_ahead_of_a_bulk_upload() {
     let shipper = Arc::new(engine.shipper(sink, registrar));
     let runner = CadenceRunner::new(engine, shipper);
     fs::write(fx.root.join("src/lib.rs"), "pub fn f() { edited() }\n").unwrap();
-    let start = Instant::now();
-    runner.flush(CaptureKind::Suspend, None).unwrap();
-    let took = start.elapsed();
+    let start = manual.now();
+    on_clock(&manual, || runner.flush(CaptureKind::Suspend, None))
+        .0
+        .unwrap();
+    let took = manual.now() - start;
     let pending = runner.staging().pending().unwrap();
     assert_eq!(
         pending.len(),
@@ -433,8 +462,11 @@ fn a_suspend_flush_returns_ahead_of_a_bulk_upload() {
 #[test]
 fn pending_bytes_counts_what_is_not_uploaded_yet() {
     let fx = fixture(30);
-    let slow = Slow::new(fx.store.clone(), Duration::from_millis(10));
-    let mut engine = CaptureEngine::open(slow_config(&fx.root), None).unwrap();
+    let manual = ManualClock::new();
+    let slow = Slow::new(fx.store.clone(), Duration::from_millis(10), manual.clock());
+    let mut config = slow_config(&fx.root);
+    config.clock = manual.clock();
+    let mut engine = CaptureEngine::open(config, None).unwrap();
     for (class, seq) in [(Class::Small, 1), (Class::Bulk, 2)] {
         engine
             .snap(SnapRequest {
@@ -464,14 +496,23 @@ fn pending_bytes_counts_what_is_not_uploaded_yet() {
     let sink: Arc<dyn BlobSink> = slow.clone();
     let registrar: Arc<dyn Registrar> = fx.registrar.clone();
     let shipper = engine.shipper(sink, registrar);
-    shipper.flush(Duration::from_millis(150)).unwrap();
+    let (_, took) = on_clock(&manual, || {
+        shipper.flush(Duration::from_millis(150)).unwrap()
+    });
+    assert_eq!(
+        took,
+        Duration::from_millis(150),
+        "the shipping budget, exactly"
+    );
     let left = staging.pending().unwrap();
     let partial = staging.pending_bytes(&left);
     assert!(
         partial > 0 && partial < all,
         "part uploaded: {partial} of {all}"
     );
-    shipper.flush(Duration::from_secs(60)).unwrap();
+    on_clock(&manual, || shipper.flush(Duration::from_secs(60)))
+        .0
+        .unwrap();
     let left = staging.pending().unwrap();
     assert!(left.is_empty());
     assert_eq!(staging.pending_bytes(&left), 0);
@@ -484,7 +525,10 @@ fn pending_bytes_counts_what_is_not_uploaded_yet() {
 #[test]
 fn a_lost_lease_pauses_shipping_and_a_final_flush_waits_it_out() {
     let fx = fixture(5);
-    let engine = CaptureEngine::open(CaptureConfig::new("wt", 1, &fx.root), None).unwrap();
+    let manual = ManualClock::new();
+    let mut config = CaptureConfig::new("wt", 1, &fx.root);
+    config.clock = manual.clock();
+    let engine = CaptureEngine::open(config, None).unwrap();
     let sink: Arc<dyn BlobSink> = fx.store.clone();
     let registrar: Arc<dyn Registrar> = fx.registrar.clone();
     let shipper = Arc::new(
@@ -505,16 +549,28 @@ fn a_lost_lease_pauses_shipping_and_a_final_flush_waits_it_out() {
     assert!(!shipper.is_fenced());
     assert_eq!(runner.staging().pending().unwrap().len(), 1, "still staged");
 
+    let (ready, started) = std::sync::mpsc::sync_channel(0);
+    let clock = manual.clock();
     let lift = {
         let registrar = fx.registrar.clone();
         std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(400));
+            let _entered = clock.enter();
+            ready.send(()).unwrap();
+            clock.sleep(Duration::from_millis(400));
             registrar.set_lease_alive(true);
-            Instant::now()
+            clock.now()
         })
     };
-    runner.flush(CaptureKind::Final, None).unwrap();
-    let returned = Instant::now();
+    started.recv().unwrap();
+    let (_, took) = on_clock(&manual, || runner.flush(CaptureKind::Final, None).unwrap());
+    let returned = manual.now();
+    assert_eq!(
+        took,
+        Duration::from_millis(440),
+        "first retry after the lease returns: 20, 60, 140, 240, 340, 440 ms"
+    );
+    // Finish the fixture even if a broken flush returned early; compare its original return time.
+    manual.advance(Duration::from_millis(400));
     let lifted = lift.join().unwrap();
     assert!(returned >= lifted, "returned before the lease came back");
     assert!(runner.staging().pending().unwrap().is_empty());

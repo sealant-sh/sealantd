@@ -8,6 +8,12 @@
 
 mod common;
 
+#[path = "common/clock.rs"]
+mod clock;
+
+use clock::on_clock;
+use sealant_capture::clock::ManualClock;
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -242,14 +248,19 @@ fn a_store_outage_reuses_minted_urls_and_backs_off() {
 /// tight loop that runs the call quota down.
 #[test]
 fn a_throttled_registrar_is_asked_again_after_a_backoff() {
-    let fx = fixture();
+    let manual = ManualClock::new();
+    let mut fx = fixture();
+    fx.shipper = fx.shipper.with_clock(manual.clock());
     let uploads = (0..5)
         .map(|i| fx.stage(&format!("o{i}"), &bytes(500 + i, i as u32)))
         .collect();
     fx.staging.enqueue(&entry(0, uploads)).unwrap();
     fx.registrar.throttled.store(true, Ordering::SeqCst);
 
-    let failed = fx.shipper.flush_final(Some(Duration::from_secs(3)));
+    let (failed, took) = on_clock(&manual, || {
+        fx.shipper.flush_final(Some(Duration::from_secs(3)))
+    });
+    assert_eq!(took, Duration::from_secs(3), "the deadline, exactly");
     assert!(failed.is_err(), "throttled throughout: {failed:?}");
     let calls = fx.url_calls();
     eprintln!("{calls} upload.urls calls in 3 s of 429s");
@@ -260,8 +271,10 @@ fn a_throttled_registrar_is_asked_again_after_a_backoff() {
     );
 
     fx.registrar.throttled.store(false, Ordering::SeqCst);
-    fx.shipper
-        .flush_final(Some(Duration::from_secs(40)))
-        .expect("the registrar is back");
+    on_clock(&manual, || {
+        fx.shipper.flush_final(Some(Duration::from_secs(40)))
+    })
+    .0
+    .expect("the registrar is back");
     assert_eq!(fx.registrar.inner.chain().len(), 1);
 }
