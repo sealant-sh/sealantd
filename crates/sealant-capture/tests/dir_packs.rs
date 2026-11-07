@@ -8,6 +8,12 @@
 //! (format 1) materializes, a capture staged on top of it carries its bulk section as it is (one
 //! manifest, two formats), and a section format this build does not know is refused.
 
+#[path = "common/clock.rs"]
+mod clock;
+
+use clock::on_clock;
+use sealant_capture::clock::{Clock, ManualClock};
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -130,6 +136,7 @@ fn listing(dir: &Path) -> BTreeMap<String, (String, u32, Vec<u8>)> {
 struct Counting {
     inner: LocalDir,
     delay: Duration,
+    clock: Clock,
     puts: AtomicU64,
     gets: AtomicU64,
     in_flight: AtomicUsize,
@@ -141,6 +148,7 @@ impl Counting {
         Arc::new(Self {
             inner: LocalDir::new(dir).unwrap(),
             delay,
+            clock: Clock::real(),
             puts: AtomicU64::new(0),
             gets: AtomicU64::new(0),
             in_flight: AtomicUsize::new(0),
@@ -161,7 +169,7 @@ impl BlobSink for Counting {
         self.puts.fetch_add(1, Ordering::SeqCst);
         let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
         self.max_in_flight.fetch_max(now, Ordering::SeqCst);
-        std::thread::sleep(self.delay);
+        self.clock.sleep(self.delay);
         let result = self.inner.put_if_absent(key, source);
         self.in_flight.fetch_sub(1, Ordering::SeqCst);
         result
@@ -533,8 +541,14 @@ fn a_newer_section_format_is_refused() {
 /// many objects still ships whole.
 #[test]
 fn uploads_run_in_parallel_up_to_the_bound() {
-    let s = session(40, Duration::from_millis(20));
-    let mut engine = s.engine(DirFormat::Objects, None);
+    let manual = ManualClock::new();
+    let mut s = session(40, Duration::from_millis(20));
+    Arc::get_mut(&mut s.sink).unwrap().clock = manual.clock();
+    let mut config = CaptureConfig::new("wt", 1, &s.root);
+    config.dir_format = DirFormat::Objects;
+    config.cpu_fraction = 1.0;
+    config.clock = manual.clock();
+    let mut engine = CaptureEngine::open(config, None).unwrap();
     snap(&mut engine, Class::Small, 1);
     snap(&mut engine, Class::Bulk, 2);
     let objects = engine
@@ -545,9 +559,7 @@ fn uploads_run_in_parallel_up_to_the_bound() {
         .map(|e| e.uploads.len())
         .sum::<usize>();
     assert!(objects > 100, "{objects}");
-    let start = std::time::Instant::now();
-    s.ship(&engine);
-    let took = start.elapsed();
+    let (_, took) = on_clock(&manual, || s.ship(&engine));
     let most = s.sink.max_in_flight.load(Ordering::SeqCst);
     eprintln!("{objects} objects in {took:?}, at most {most} in flight");
     assert_eq!(most, sealant_capture::ship::DEFAULT_UPLOADS_IN_FLIGHT);
@@ -562,13 +574,15 @@ fn uploads_run_in_parallel_up_to_the_bound() {
     );
 
     // One at a time when asked.
-    let s = session(5, Duration::from_millis(5));
+    let mut s = session(5, Duration::from_millis(5));
+    Arc::get_mut(&mut s.sink).unwrap().clock = manual.clock();
     let mut config = CaptureConfig::new("wt", 1, &s.root);
     config.dir_format = DirFormat::Objects;
     config.uploads_in_flight = 1;
+    config.clock = manual.clock();
     let mut engine = CaptureEngine::open(config, None).unwrap();
     snap(&mut engine, Class::Small, 1);
     snap(&mut engine, Class::Bulk, 2);
-    s.ship(&engine);
+    on_clock(&manual, || s.ship(&engine));
     assert_eq!(s.sink.max_in_flight.load(Ordering::SeqCst), 1);
 }

@@ -3213,9 +3213,19 @@ mod tests {
     fn watch_status(
         capture: &Arc<CaptureRuntime>,
     ) -> (Arc<AtomicBool>, std::thread::JoinHandle<Readings>) {
+        watch_status_on_clock(capture, Clock::real())
+    }
+
+    fn watch_status_on_clock(
+        capture: &Arc<CaptureRuntime>,
+        clock: Clock,
+    ) -> (Arc<AtomicBool>, std::thread::JoinHandle<Readings>) {
         let stop = Arc::new(AtomicBool::new(false));
         let (flag, capture) = (stop.clone(), capture.clone());
+        let (ready, started) = std::sync::mpsc::sync_channel(0);
         let handle = std::thread::spawn(move || {
+            let _entered = clock.enter();
+            ready.send(()).unwrap();
             let mut seen = Vec::new();
             loop {
                 // One reading after the flag, too: the state the caller stopped in.
@@ -3225,9 +3235,10 @@ mod tests {
                 if done {
                     return seen;
                 }
-                std::thread::sleep(Duration::from_millis(1));
+                clock.sleep(Duration::from_millis(1));
             }
         });
+        started.recv().unwrap();
         (stop, handle)
     }
 
@@ -3336,13 +3347,20 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_running_final_flush_reads_in_progress() {
         let tmp = tempfile::tempdir().unwrap();
-        let (boot, _registrar) = boot_with(tmp.path(), |inner| {
-            Arc::new(Slow {
-                inner,
-                delay: Duration::from_millis(100),
-                clock: Clock::real(),
-            })
-        });
+        let manual = ManualClock::new();
+        let clock = manual.clock();
+        let (boot, _registrar) = boot_on_clock(
+            tmp.path(),
+            &manual,
+            |inner| {
+                Arc::new(Slow {
+                    inner,
+                    delay: Duration::from_millis(100),
+                    clock,
+                })
+            },
+            |_| {},
+        );
         let ws = tmp.path().join("ws");
         let mut config = RuntimeConfig::new(new_runtime_id());
         config.workspace_root = ws.clone();
@@ -3359,9 +3377,10 @@ mod tests {
             Some("not-final")
         );
 
-        let (stop, watcher) = watch_status(&capture);
-        let report = runtime.final_flush(None, Some(2_000)).await.unwrap();
+        let (stop, watcher) = watch_status_on_clock(&capture, manual.clock());
+        let (report, _) = on_clock(&manual, final_flush(&runtime, 2_000)).await;
         stop.store(true, Ordering::SeqCst);
+        tokio::task::block_in_place(|| manual.advance(Duration::from_millis(1)));
         let seen = watcher.join().unwrap();
         assert!(report.complete, "{report:?}");
         // Readings taken before the flush began say `not-final`; from its first moment to its
