@@ -48,7 +48,6 @@ const BOOT_OWNED_KEYS: &[&str] = &["HOME", "USER", "LOGNAME", "PATH"];
 
 /// Entry point for the `boot` subcommand. Performs synchronous prep, then enters Tokio to run the
 /// control server and supervise the harness. Returns the process exit code.
-#[must_use]
 pub fn run_boot(log_level: &str, recovery: bool) -> ExitCode {
     init_tracing(log_level);
 
