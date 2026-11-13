@@ -4,6 +4,21 @@ Rules and skills shared by every Sealant repo, including Linear, PRs, verificati
 live in the home repo, cloned beside this one at `../agent-home`. Start sessions there when work
 spans repos.
 
+The TypeScript packages in `packages/` (`@sealant/runtime-client`, `@sealant/runtime-protocol`) are
+published to npm, and sealant's `workspaces`, `telemetry` and `ssh-gateway` depend on them. A change
+to them or to a `.proto` file is a change to sealant's inputs.
+
+## Linear, fixes and PRs
+
+- When the work has a Linear ticket, load the `linear` skill
+  (`../agent-home/.agents/skills/linear/`) before you start. Keep the ticket current while you work:
+  when you make a decision, hit a blocker or change scope, comment on the ticket then, before
+  carrying on.
+- Fix a problem straight away only if it meets Fix Now or File in `../agent-home/AGENTS.md`. File
+  the rest in Linear.
+- Every change lands through a PR, docs and config included; never push to `main`. Open it with the
+  `file-pr` skill (`../agent-home/.agents/skills/file-pr/`).
+
 ## Linux only
 
 sealantd targets Linux. On a Mac, run every `cargo` command except `cargo fmt` in a Linux container,
