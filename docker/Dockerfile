@@ -9,7 +9,7 @@
 # The protobuf compiler is vendored by the build (protoc-bin-vendored), so the build needs no system
 # protoc and the runtime binary has no protobuf dependency.
 
-FROM rust:slim AS builder
+FROM rust:1.100.0-slim AS builder
 RUN apt-get update \
  && apt-get install -y --no-install-recommends musl-tools \
  && rm -rf /var/lib/apt/lists/*

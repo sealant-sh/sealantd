@@ -1,3 +1,7 @@
+# The Rust release every build uses: CI, the Docker images and the scripts. A new stable release can
+# add Clippy lints that fail CI with no code change, so moving to one is a deliberate change. When you
+# move it, change the `rust:<version>-slim` images to match:
+#   rg -l 'rust:[0-9.]+-slim'
 [toolchain]
-channel = "stable"
+channel = "1.100.0"
 components = ["rustfmt", "clippy"]

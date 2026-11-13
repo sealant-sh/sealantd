@@ -6,7 +6,7 @@
 # Usage: scripts/linux-test.sh [extra cargo test args...]
 set -euo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
-IMAGE="${SEALANTD_RUST_IMAGE:-rust:slim}"
+IMAGE="${SEALANTD_RUST_IMAGE:-rust:1.100.0-slim}"
 exec docker run --rm -t \
   -v "$REPO":/src -w /src \
   -v sealantd-cargo-registry:/usr/local/cargo/registry \

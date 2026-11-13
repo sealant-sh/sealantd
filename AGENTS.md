@@ -13,7 +13,7 @@ the way `scripts/linux-test.sh` does:
 docker run --rm -v "$PWD":/src -w /src \
   -v sealantd-cargo-registry:/usr/local/cargo/registry \
   -v sealantd-linux-target:/src/target \
-  rust:slim <command>
+  rust:1.100.0-slim <command>
 ```
 
 ## Checks before a PR

@@ -12,7 +12,7 @@ for arch in ${ARCHES[*]}; do
   echo ">> building $target"
   docker run --rm -v "$PWD":/src -w /src \
     -v sealantd-cargo-registry:/usr/local/cargo/registry \
-    rust:slim sh -euc "
+    rust:1.100.0-slim sh -euc "
       apt-get update >/dev/null && apt-get install -y --no-install-recommends musl-tools >/dev/null
       rustup target add $target >/dev/null
       cargo build --locked --release --bin sealantd --target $target
