@@ -2,7 +2,7 @@
 
 Daemon-side contract for the two capabilities added for the agent-workbench direction
 (Mend plan §8.1.A/§8.1.B), plus the file-watch default flip. This is the coordination surface for
-the Core control plane; everything here is drivable today with zero Core changes via
+the sealant control plane; everything here is drivable today with zero sealant changes via
 `blueprint.runtime.env` (emitted last-wins after the repo vars) plus one `docker run -v`.
 
 ## 1. Mount-based workspace provisioning
@@ -33,7 +33,7 @@ Mount-mode invariants, enforced at boot:
   where it does not.
 - Recording, exec, redaction, PTY, and network semantics are identical to clone-based workspaces.
 
-Orchestrator obligations (Core adapter, when it grows a mounts knob): canonicalize the host path
+Orchestrator obligations (sealant adapter, when it grows a mounts knob): canonicalize the host path
 before launch (the daemon's allowlist check is lexical — it cannot resolve host symlinks from
 inside the container), establish the bind mount before the container starts (docker `-v` does),
 and keep `stop == docker rm -f` (never `rm -v`; there are no volumes to remove).
@@ -79,9 +79,9 @@ replayable output journal and full lifecycle reporting.
 
 TTL note: the daemon has no TTL — expiry is entirely control-plane. Because a mounted workspace's
 work product lives on the host path, an expiring TTL that `docker rm -f`s the container can never
-violate the mount invariant. For PTY-attached workspaces Core should either exempt workspaces with
-running sessions from the default TTL or refresh `expiresAt` while `listSessions` reports a
-running session — the daemon exposes the signal, the policy is Core's.
+violate the mount invariant. For PTY-attached workspaces sealant should either exempt workspaces
+with running sessions from the default TTL or refresh `expiresAt` while `listSessions` reports a
+running session — the daemon exposes the signal, the policy is sealant's.
 
 ## 3. File events (watch on by default)
 
@@ -95,7 +95,7 @@ exec/openSession/executionStart wins), so a run's edits correlate to that run. `
 
 `packages/runtime-client/demo/demo-mount.sh` and `demo-pty.sh` run the definition-of-done
 end-to-end against a real container (bind-mounted store worktree, `docker exec socat` control
-bridge — the same transport Core uses): allowlist rejection, mount boot without clone, exec and
+bridge — the same transport sealant uses): allowlist rejection, mount boot without clone, exec and
 PTY edits producing `fileChange` events, kill-client → reattach → full scrollback replay from
 sequence 0, input/resize taking effect, SIGTERM → exited tombstone → post-exit replay, and host
 persistence after `docker rm -f`.

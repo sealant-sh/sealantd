@@ -13,7 +13,7 @@
 # and any writer can run a branch workflow that requests it, code-owner review or not. Every action
 # and BuildKit image in those jobs is pinned and no cache other jobs write is restored. Every job runs
 # on a GitHub-hosted runner, a fresh VM: the box's runner VMs keep state between jobs, so code from an
-# earlier pull request could change what a job there builds or pushes. Core pins
+# earlier pull request could change what a job there builds or pushes. sealant pins
 # sealantd as `tag@sha256:…`, which keeps out a tag moved after the pin (ADR 0015, Known gaps).
 #
 # SECURITY: `workflow_run` runs this file as it is on main, never a pull request's copy, and the
@@ -212,7 +212,7 @@ jobs:
       # A version is tagged once, with this run's index. The tag is read before it is written, and
       # the read after the write decides (sealant-sh/mend release-cli.yml, finalize-images): absent
       # creates it, this run's digest is done, any other digest is refused, and a read that failed
-      # fails the job. Re-running the failed npm job keeps the image Core may already have pulled;
+      # fails the job. Re-running the failed npm job keeps the image sealant may already have pulled;
       # re-running all jobs rebuilds the images, and their new index is refused: the version is spent.
       # scripts/next-tag.test.mjs runs this step as written, against a stand-in docker.
       - name: Tag the multi-arch image
@@ -323,7 +323,7 @@ jobs:
       # --ignore-scripts: never run dependency lifecycle scripts.
       - run: pnpm install --frozen-lockfile --ignore-scripts
       # The version and the commit go into each package.json: npm records `gitHead`, which the plan
-      # job compares on a re-run and Core's and Mend's release guards read.
+      # job compares on a re-run and sealant's and Mend's release guards read.
       - name: Set the prerelease version and commit
         env:
           VERSION: ${{ needs.plan.outputs.version }}

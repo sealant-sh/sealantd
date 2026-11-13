@@ -1,7 +1,7 @@
 //! A final flush that reports complete leaves nothing for a later one to capture.
 //!
 //! Docker end to end, round 3: after the first final flush answered `complete: true`, the next
-//! one (Core's drain, the daemon's SIGTERM handler) registered another final capture of 8 KB or
+//! one (sealant's drain, the daemon's SIGTERM handler) registered another final capture of 8 KB or
 //! 19 KB, `files_read=0`. Two causes, one test each:
 //!
 //! - The final small snap was staged ahead of a scheduled bulk capture still uploading, and the

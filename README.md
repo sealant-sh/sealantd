@@ -80,7 +80,7 @@ The daemon runs as root, and so does every process it starts, unless the request
   shared worktree is (pnpm relinks bins with a `chmod`). It amounts to root: whoever can `chmod`
   any file can then read and write it, make a setuid root binary or plant `/etc/ld.so.preload`. It
   adds nothing only where the person already has root through a working setuid `sudo`, the gate
-  Mend's ADR 0016 and Core's image probe require. Under no-new-privileges `sudo` cannot work, so
+  Mend's ADR 0016 and sealant's image probe require. Under no-new-privileges `sudo` cannot work, so
   the capability is withheld there, and `runtime.getCapabilities` says so
   (`personCapabilities` empty, `personCapabilitiesWithheld` the reason); pnpm then fails to
   relink bins as a person.
@@ -140,7 +140,7 @@ The daemon runs as root, and so does every process it starts, unless the request
   `sealantd capabilities --json` prints the same, with the version, without booting, for an image
   build to record.
 
-## Capture store: what Core and Mend rely on
+## Capture store: what sealant and Mend rely on
 
 A capture-source workspace (`SEALANT_WORKSPACE_SOURCE=capture`, ADR-0015) keeps its work product
 in the control plane's store. The contracts below are the ones the control plane builds against;
@@ -284,14 +284,14 @@ the protocol details live in `crates/sealant-capture/src/registrar.rs` and `mani
   whether the chain head's git section names the format or the repository is already on the
   disk (a restart, a standby's base). Before, both were left out of it: the boot admitted
   writers, and only their final flush said incomplete.
-- **Launch identity.** Core passes `SEALANT_CAPTURE_LAUNCH_ID` (the launch Mend minted and bound
+- **Launch identity.** sealant passes `SEALANT_CAPTURE_LAUNCH_ID` (the launch Mend minted and bound
   the session token to) in the boot environment. The first `plan.get` names it as `launch`
   (else the launch the disk last served, on a restart or a recovery boot); a plan answering
   another `executor` refuses the boot, and Mend refuses a `launch` that is not its token's (409
   `launch-mismatch`). A disk's staging continues the chain across an epoch change only for the
   launch that staged it. The daemon keeps presenting its own launch's token, a recovery boot's
   included.
-- **Ownership on restore (Mend's per-person layout).** Core passes `SEALANT_CAPTURE_OWNER_MAP`
+- **Ownership on restore (Mend's per-person layout).** sealant passes `SEALANT_CAPTURE_OWNER_MAP`
   (`{"gid":40000,"worktree":<change owner's uid>,"people":{"<account id>":<uid>}}`). At boot the
   worktree root is given to the change's owner and the group, made group-writable and setgid, and
   the group's default ACL is set on it and on `/opt` and `/var/cache` (one `setfacl`). On every
@@ -350,7 +350,7 @@ the protocol details live in `crates/sealant-capture/src/registrar.rs` and `mani
   boot_id)` — by `observation`; same `(epoch, launch)`, different boot ids, both generations
   above 0 and different — by `(boot_generation, observation)` (a recovery boot of the same disk
   counts up). Anything else — a field absent, a generation of 0, one generation under two boot
-  ids, another epoch or launch — is incomparable. Core and Mend supersede evidence only by this,
+  ids, another epoch or launch — is incomparable. sealant and Mend supersede evidence only by this,
   keep wall-clock times for display, and treat incomparable or contradictory evidence as unknown:
   no deletion, no "saved".
 - **`complete` means current.** `capture.status` says `complete` only while the disk is as the
@@ -424,10 +424,10 @@ the protocol details live in `crates/sealant-capture/src/registrar.rs` and `mani
   make every later git command of its kind fail, and refusing the flush over it would keep an
   executor a killed git left a lock on from ever completing.
 - **A preserving flush is named on the wire: `flush: "final"` (decision 35).** Once a final
-  flush begins on the executor — a drain, Core's deadline, `SIGTERM`, a recovery boot — every
+  flush begins on the executor — a drain, sealant's deadline, `SIGTERM`, a recovery boot — every
   `upload.urls` and `capture.register` it sends carries `"flush":"final"` until the process
   ends, so the registrar can exempt it from its byte and call quotas (before, only a Mend drain
-  it had marked itself was exempt, and a final flush Core or the daemon asked for got 413 at
+  it had marked itself was exempt, and a final flush sealant or the daemon asked for got 413 at
   `upload.urls`). Additive: absent before a final flush and from an older daemon; an older
   registrar ignores the member (Mend's request schemas drop unknown properties) and meters the
   request as before.
@@ -492,10 +492,10 @@ the protocol details live in `crates/sealant-capture/src/registrar.rs` and `mani
   nothing, and the platform may release that executor. Checked under the disk lock, before
   `plan.get`. Any other disk a recovery cannot save stays 75. One daemon runs per capture disk: every capture boot holds an exclusive lock on
   `<worktree>/.sealantd/boot.lock`, and a second boot beside a live one exits 75 without touching
-  anything. On a still-running MicroVM, Core's agent stops every process the dead daemon left,
+  anything. On a still-running MicroVM, sealant's agent stops every process the dead daemon left,
   then spawns `sealantd boot --recovery` exactly as it spawned `sealantd boot`.
 - **A standby no session claimed has nothing to save.** A boot whose launch is a standby's (the
-  plan's executor is `standby:<id>`, as Mend names it and Core delivers it in
+  plan's executor is `standby:<id>`, as Mend names it and sealant delivers it in
   `SEALANT_CAPTURE_LAUNCH_ID`) and whose launcher named no worktree (`SEALANT_CAPTURE_WORKTREE_ID`
   unset: the channel answers the project's base under a placeholder and refuses every write for
   it) writes `<worktree>/.sealantd/capture/unclaimed.json` (the placeholder's worktree, epoch and
@@ -518,12 +518,12 @@ the protocol details live in `crates/sealant-capture/src/registrar.rs` and `mani
   the session's work) is never nothing to save. Before, a claimed standby whose re-plan failed
   (Docker end to end, round 8, F7: its `plan.get` timed out) kept its placeholder captures queued
   forever (`lease-lost`), its final flush never completed, and the launch waited 12 minutes,
-  failed and needed a discard. What the control plane reads: Core's recovery sweep already
-  releases on the recovery boot's 76 (`nothing-to-save`), and Core's own observation of the
+  failed and needed a discard. What the control plane reads: sealant's recovery sweep already
+  releases on the recovery boot's 76 (`nothing-to-save`), and sealant's own observation of the
   `complete: true` answer is `observed-complete`. Mend's evidence binds a `complete` to the lease
   epoch its claim took, which the placeholder's answer does not carry: until Mend reads a claimed
   standby's answer under its placeholder epoch and launch (`standby:<id>`) as nothing to save, it
-  sees the executor end (Core's `stopped` after the 76) instead.
+  sees the executor end (sealant's `stopped` after the 76) instead.
 
 ## Build & validate
 

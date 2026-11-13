@@ -1,6 +1,6 @@
 //! The workspace's own Docker daemon, as the final capture sees it.
 //!
-//! A workspace can have a Docker daemon of its own: Core's Lambda MicroVM image starts `dockerd`
+//! A workspace can have a Docker daemon of its own: sealant's Lambda MicroVM image starts `dockerd`
 //! in the VM (`DOCKER_HOST=unix:///run/docker/docker.sock`), its Kubernetes adapter runs a
 //! rootless dind sidecar in the Pod (the same socket path), and its Docker adapter attaches a
 //! dind sidecar container on a per-workspace network (`DOCKER_HOST=tcp://docker:2375`, TLS off).
@@ -10,7 +10,7 @@
 //! before it snaps, and waits until none is running.
 //!
 //! Which daemon ([`workspace_endpoint`]): `SEALANT_WORKSPACE_DOCKER_HOST` when the launcher sets
-//! it; otherwise `DOCKER_HOST` only when it is one of the endpoints above, which Core reserves
+//! it; otherwise `DOCKER_HOST` only when it is one of the endpoints above, which sealant reserves
 //! for the workspace-scoped daemon (a caller cannot set `DOCKER_HOST`). Any other `DOCKER_HOST` —
 //! a devcontainer pointing at its host's daemon, say — is never touched: stopping every
 //! container of a host daemon would stop the workspace's own container and other people's.
@@ -25,7 +25,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// The launcher's explicit name for the workspace's own daemon.
 pub const WORKSPACE_DOCKER_HOST_ENV: &str = "SEALANT_WORKSPACE_DOCKER_HOST";
 
-/// `DOCKER_HOST` values Core sets for a workspace-scoped daemon: the MicroVM's and the
+/// `DOCKER_HOST` values sealant sets for a workspace-scoped daemon: the MicroVM's and the
 /// Kubernetes sidecar's socket, and the Docker adapter's dind sidecar.
 pub const KNOWN_WORKSPACE_DOCKER_HOSTS: &[&str] =
     &["unix:///run/docker/docker.sock", "tcp://docker:2375"];
@@ -74,7 +74,7 @@ impl std::fmt::Display for DockerEndpoint {
 }
 
 /// The workspace's own daemon, from `SEALANT_WORKSPACE_DOCKER_HOST` (`explicit`) or a
-/// `DOCKER_HOST` Core reserves for one. `None`: the workspace has none this capture stops.
+/// `DOCKER_HOST` sealant reserves for one. `None`: the workspace has none this capture stops.
 #[must_use]
 pub fn workspace_endpoint(
     explicit: Option<&str>,

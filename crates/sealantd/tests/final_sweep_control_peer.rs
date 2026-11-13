@@ -1,6 +1,6 @@
 //! The final capture's sweep and the connection that asked for it.
 //!
-//! In Docker, Core reaches sealantd through `docker exec … socat - UNIX-CONNECT:<control
+//! In Docker, sealant reaches sealantd through `docker exec … socat - UNIX-CONNECT:<control
 //! socket>`. sealantd is PID 1 of the container's PID namespace there, so the sweep takes every
 //! process in the namespace — the `socat` carrying the `capture.flush {kind: final}` included:
 //! nothing can tell a relay from a writer (an external client, or its parent, could write the
@@ -284,7 +284,7 @@ async fn a_final_flush_sweeps_the_relay_and_the_final_flush_asked_again_answers_
         "the sweep ran over the namespace: the bystander is stopped"
     );
 
-    // Core, on "connection closed" during a final flush, asks again: the outcome is kept.
+    // sealant, on "connection closed" during a final flush, asks again: the outcome is kept.
     let ask = |id: &'static str, command: Command| {
         let socket = control_sock.clone();
         async move {

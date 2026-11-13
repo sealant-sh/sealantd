@@ -1,7 +1,7 @@
 //! A recovery boot on the disk of a standby no session claimed and no writer was admitted on
 //! (Docker end to end, round 8, F7) has nothing to save, and says so before it dials the
 //! channel: exit 76 ([`sealantd::runtime::EXIT_NOTHING_TO_SAVE`]), `sealantd boot: nothing to
-//! save: a standby no session claimed (…)` on stderr (the line Core's recovery reads), the disk
+//! save: a standby no session claimed (…)` on stderr (the line sealant's recovery reads), the disk
 //! untouched. Before, the recovery resumed the placeholder's captures, which no registrar takes,
 //! and exited 75: the platform kept the standby until someone discarded it. The same disk once
 //! a writer was admitted (the marker gone) is not nothing: the recovery goes on and, here

@@ -4,7 +4,7 @@ Status: proposed 2026-09-12, amended 2026-09-12: mechanism replaced by the captu
 decision 2026-09-12). Cross-repo context: Mend `docs/DEPLOYMENT-STRATEGIES.md` (the co-located
 store invariant this supersedes for remote deployments), Mend `docs/adr/0002` (to follow: the
 product half — per-worktree leases, hosted `SessionRepository`, the capture-store schema and the
-session-channel routes; the counterpart of this document), Sealant Core (`RuntimeAdapter` per
+session-channel routes; the counterpart of this document), sealant (`RuntimeAdapter` per
 platform, launch material, session channel). Builds on ADR-0008 (the `sealant-fs` watcher and
 snapshot walk), ADR-0007 (the spool discipline the staging queue copies) and ADR-0003 (the
 execution `Sequence` every capture is stamped with).
@@ -174,7 +174,7 @@ conflict.
   `gc.pid`, SQLite `-shm`, sockets, pid files, the OS `/tmp`, the daemon runtime directory and its
   staging under `<workspace root>/.sealantd/`. Every harness credential under the harness home is
   excluded, and never restored from a capture made before it was listed ("Harness credentials"
-  below; Core injects the session's own login at launch).
+  below; sealant injects the session's own login at launch).
 - SQLite `db` + `-wal` are one file group: read consecutively (`-wal` first), re-read as a group if
   either changed underneath, bounded to three attempts, then shipped marked torn in the entry.
 - A `.pack` without its `.idx` in the workspace class is a mid-`index-pack` rename: skipped, never
@@ -465,7 +465,7 @@ Wiring in existing crates, all verified against today's tree:
 
 ### What the platform adapters own
 
-Only what they own today: launching the executor and reaching its PTY (Sealant Core's
+Only what they own today: launching the executor and reaching its PTY (sealant's
 `RuntimeAdapter`), delivering session configuration and the short-lived session credential through
 the secret env channel, and the terminal ingress. No adapter knows what a capture is. Added by this
 amendment: an adapter confirms termination of the old executor before Mend claims a replacement
@@ -554,7 +554,7 @@ figure is a multiple of it.
    reproducible — Mend-controlled installs only, reinstall on architecture mismatch — which is
    cheaper and safer but changes what "resume" restores.
 2. **Credential files in captures.** Keep `.claude/.credentials.json` and `.codex/auth.json` on
-   the exclusion list and rely on Core's re-injection at launch (a pickup may prompt re-auth on
+   the exclusion list and rely on sealant's re-injection at launch (a pickup may prompt re-auth on
    some CLI versions), or capture them and accept a durable copy of every OAuth refresh token in
    the bucket.
    **Answered 2026-10-04:** excluded, and the list covers every harness's credentials ("Harness

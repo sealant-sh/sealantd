@@ -3242,7 +3242,7 @@ mod tests {
         (stop, handle)
     }
 
-    /// Docker end to end, round 3: every stop ran four final flushes (Mend's, Core's drain, the
+    /// Docker end to end, round 3: every stop ran four final flushes (Mend's, sealant's drain, the
     /// SIGTERM handler, the boot's own on the harness's exit), and each after the first walked
     /// the bulk class again — 2.5–3 s each, `complete: false` / `bulk_building: true` meanwhile.
     /// Once a final flush snapped everything with the writers stopped and admission closed, a
@@ -3485,7 +3485,7 @@ mod tests {
         );
     }
 
-    /// Core's drain sends a final flush with a deadline and polls. A final flush that returns at
+    /// sealant's drain sends a final flush with a deadline and polls. A final flush that returns at
     /// its deadline with captures still uploading is `complete: false` (`deadline`) and ends
     /// nothing: the daemon stays up, admission stays closed, the writers stay stopped, and the
     /// ship worker keeps uploading until `capture.status` says `complete`. The same final flush
@@ -3672,7 +3672,7 @@ mod tests {
         assert!(registrar.seals().is_empty(), "{status:?}");
         assert!(runtime.capture_incomplete());
 
-        // Core, on an empty but unconfirmed queue, asks again: the flush seals and says so.
+        // sealant, on an empty but unconfirmed queue, asks again: the flush seals and says so.
         let (resp, took) = on_clock(&manual, flush("r2", Some(30_000))).await;
         let report = flush_report(resp);
         // The sealing capture is staged and shipped: one PUT.
@@ -3785,7 +3785,7 @@ mod tests {
         capture.runner().stop();
     }
 
-    /// A recovery boot (Core restarted a retained executor): admission is closed from the start
+    /// A recovery boot (sealant restarted a retained executor): admission is closed from the start
     /// and no harness runs, so nothing but the capture engine touches the disk. An exec is
     /// refused; the final flush snaps the disk as the executor left it — the work it never
     /// snapped included — ships, seals, and answers complete.

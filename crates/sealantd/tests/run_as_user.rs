@@ -1814,7 +1814,7 @@ fn the_dotfiles_writer_thread_is_the_person_and_holds_nothing_of_root() {
     assert_eq!(std::fs::read_to_string(&roots).unwrap(), "root's\n");
 }
 
-/// The review's attack (P2-1 on Core's #334): a person links a directory of their home into
+/// The review's attack (P2-1 on sealant#334): a person links a directory of their home into
 /// another person's and has their dotfiles applied, with the copy manager. Nothing lands in the
 /// other home, the apply names the path it could not reach, and the other person's files keep
 /// their bytes and owner. The same for a link where the archives are staged in the home.
@@ -2727,7 +2727,7 @@ impl SudoersEntry {
     const DIR: &str = "/etc/sudoers.d";
     const PREFIX: &str = "mtest-sealantd-";
 
-    /// Passwordless sudo for the test person, as Core's images give the `mend` group.
+    /// Passwordless sudo for the test person, as sealant's images give the `mend` group.
     fn add() -> Self {
         std::fs::create_dir_all(Self::DIR).unwrap();
         let path = PathBuf::from(Self::DIR).join(format!("{}{}", Self::PREFIX, std::process::id()));

@@ -130,7 +130,7 @@ const CONSUMED_KEYS: &[&str] = &[
 
 /// The marker file that asks for a recovery boot ([`BootConfig::recovery`]) when the environment
 /// cannot: a kept Docker container restarts (`docker start`) with the environment it was created
-/// with, so Core writes this file into the stopped container (`docker cp`) before it starts it.
+/// with, so sealant writes this file into the stopped container (`docker cp`) before it starts it.
 /// At the root of the container's filesystem: outside every capture root, and present in any
 /// image.
 pub const RECOVERY_MARKER: &str = "/.sealantd-recovery";
@@ -257,7 +257,7 @@ pub struct StandbyConfig {
 pub struct CaptureSourceConfig {
     /// `SEALANT_CAPTURE_ENDPOINT`: the session channel the registrar calls go to.
     pub endpoint: String,
-    /// `SEALANT_CAPTURE_WORKTREE_ID`, when Core set it; otherwise `plan.get` says which worktree
+    /// `SEALANT_CAPTURE_WORKTREE_ID`, when sealant set it; otherwise `plan.get` says which worktree
     /// the session token is scoped to.
     pub worktree_id: Option<String>,
     /// `SEALANT_CAPTURE_HARNESS_HOME`: the harness home captured with the workspace class.
@@ -573,9 +573,9 @@ pub struct BootConfig {
     /// executor's ([`privilege_posture`]).
     pub no_new_privileges: bool,
     /// The workspace's own Docker daemon (`SEALANT_WORKSPACE_DOCKER_HOST`, or a `DOCKER_HOST`
-    /// Core reserves for one): the final capture stops its containers.
+    /// sealant reserves for one): the final capture stops its containers.
     pub workspace_docker: Option<crate::docker::DockerEndpoint>,
-    /// A recovery boot (`SEALANT_RECOVERY=1`, or [`RECOVERY_MARKER`]): Core restarted a retained
+    /// A recovery boot (`SEALANT_RECOVERY=1`, or [`RECOVERY_MARKER`]): sealant restarted a retained
     /// executor, one that ended without a complete final flush, to save what its disk holds.
     /// The daemon resumes its own staging on that disk — never materializing over it — and
     /// ships; runs no lifecycle step, no dotfiles and no harness; admits no exec, session or
