@@ -26,7 +26,7 @@ On Linux, run it directly. On a Mac, run it in a Linux container:
 docker run --rm -v "$PWD":/src -w /src \
   -v sealantd-cargo-registry:/usr/local/cargo/registry \
   -v sealantd-linux-target:/src/target \
-  rust:slim examples/demo.sh
+  rust:1.100.0-slim examples/demo.sh
 ```
 
 The first run compiles the workspace and takes several minutes. The cache volumes make later runs
