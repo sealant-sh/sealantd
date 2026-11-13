@@ -13,7 +13,7 @@
 //!   (their parent is outside the namespace, so no ancestry would find them). The container is
 //!   the workspace.
 //! - **the host's agent names its helpers** (`SEALANT_SWEEP_EXEMPT_FILE`; a MicroVM, where
-//!   Core's agent is PID 1 and starts `sealantd boot` beside itself): every process on the
+//!   sealant's agent is PID 1 and starts `sealantd boot` beside itself): every process on the
 //!   machine ([`Scope::Machine`]) but sealantd's ancestors (the agent that started it) and the
 //!   processes the agent lists, each by pid and start time ([`read_exempt`]; a pid reused since
 //!   is not the helper), with their descendants only where the list says so. A recovery boot
@@ -37,7 +37,7 @@
 //! `git` filter). Being in sealantd's process group is not enough on its own: a process that
 //! moved itself there, or a descendant of a helper that left the group, is swept.
 //!
-//! Nothing else is spared, the far end of a control connection included. In Docker, Core
+//! Nothing else is spared, the far end of a control connection included. In Docker, sealant
 //! reaches sealantd through `docker exec … socat - UNIX-CONNECT:<control socket>`, and that
 //! `socat` carries the final flush's own request: it is swept like any other process that could
 //! write (an external client, or its parent, could write the workspace as well, and nothing here
@@ -626,7 +626,7 @@ mod tests {
         assert_eq!(all, vec![7, 8, 50, 51, 101]);
     }
 
-    /// The exempt file, as Core's MicroVM agent writes it: an entry spares a live process whose
+    /// The exempt file, as sealant's MicroVM agent writes it: an entry spares a live process whose
     /// pid and start time match (a string or a number); a stale one (another start time: the pid
     /// was reused) or one without a usable pid or start time spares nothing; a file that is not
     /// the list, or another version, is refused whole.

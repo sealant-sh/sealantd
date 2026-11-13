@@ -1,6 +1,6 @@
-//! Docker end to end, round 5 (session HS): the store went down, Core stopped the executor, and
+//! Docker end to end, round 5 (session HS): the store went down, sealant stopped the executor, and
 //! the `SIGTERM` final flush retried the uploads with no deadline — the container ran until
-//! Core's 3600 s stop timeout killed it, so the exit-75 path ("keep my disk, recover it") was
+//! sealant's 3600 s stop timeout killed it, so the exit-75 path ("keep my disk, recover it") was
 //! never reached, and every retry minted fresh upload URLs until the registrar's call quota ran
 //! out. With `SEALANT_SHUTDOWN_FINAL_DEADLINE_MS` the shutdown's final flush gives up at that
 //! deadline, counted from the `SIGTERM`: the daemon exits 75 with its staging directory as it

@@ -67,7 +67,7 @@ pub const WITHHELD: &[&str] = &[
     "XDG_CACHE_HOME",
 ];
 
-/// The image's environment for a person's processes (Core's images write it, sealant#330): its
+/// The image's environment for a person's processes (sealant's images write it, sealant#330): its
 /// first line is exactly [`PERSON_ENV_VERSION_LINE`], then one literal `KEY=VALUE` per line,
 /// applied to every process run as a person (exec, session, the dotfiles commands) and never to
 /// root. `PATH_PREPEND` goes in front of the base `PATH`. Blank lines, other `#` lines, lines
@@ -571,7 +571,7 @@ fn capset(data: [CapData; 2]) -> libc::c_long {
 /// It amounts to root: whoever can `chmod` any file can read and write any file (`chmod` it
 /// first), and can make a setuid root binary or plant `/etc/ld.so.preload`. It adds nothing only
 /// where the person already has root through a working setuid `sudo`: the gate Mend's ADR 0016
-/// and Core's image probe require. So it is never granted under no-new-privileges, where `sudo`
+/// and sealant's image probe require. So it is never granted under no-new-privileges, where `sudo`
 /// cannot work ([`fowner_withheld`]); nothing else of root's is ever kept.
 pub const CAP_FOWNER: u32 = 3;
 
@@ -728,7 +728,7 @@ mod tests {
 
     #[test]
     fn the_image_s_person_environment_is_read_as_literal_lines() {
-        // Core's marker and lines as its images write them (sealant#330), then the edge cases.
+        // sealant's marker and lines as its images write them (sealant#330), then the edge cases.
         let text = "# person-env 1\r\nPATH_PREPEND=/opt/npm-global/bin:/opt/pnpm/bin:/opt/pnpm\n\
                     pnpm_config_store_dir=/var/cache/pnpm/store\nnpm_config_prefix=/opt/npm-global\n\
                     MISE_DATA_DIR=/opt/mise\n# a comment\n\nnot a line\n1BAD=x\nBAD-NAME=x\n\

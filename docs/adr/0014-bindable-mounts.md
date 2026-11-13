@@ -1,7 +1,7 @@
 # ADR-0014: Bindable mounts — the daemon binds a mounted root's subdirectory on demand
 
 Status: accepted 2026-09-02. Cross-repo context: Mend `docs/adr/0001-standby-workspaces-bind-at-claim.md`
-(the product decision), Sealant Core (standby source, bindable extra mounts, `workspace.bind`).
+(the product decision), sealant (standby source, bindable extra mounts, `workspace.bind`).
 
 ## Context
 

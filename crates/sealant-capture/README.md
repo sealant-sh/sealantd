@@ -547,7 +547,7 @@ restore, byte for byte, so the user never notices the compute changed.
      until none is left: a writer that `setsid`'d or double-forked out of its group used to
      keep writing after the last snap. Scope: when sealantd is PID 1 of its PID namespace
      (`sealantd boot` as a container's entrypoint, Docker and Kubernetes), every process in
-     the namespace, `docker exec`'d ones included; otherwise (a Lambda MicroVM, where Core's
+     the namespace, `docker exec`'d ones included; otherwise (a Lambda MicroVM, where sealant's
      agent is PID 1 and starts `sealantd boot`; `sealantd serve`), every descendant of
      sealantd, which as the child subreaper inherits every orphan of what it started — the
      VM's agent and its `sealantctl` are never touched. sealantd, its threads, kernel threads
@@ -555,18 +555,18 @@ restore, byte for byte, so the user never notices the compute changed.
      and has not reaped (the spawn gate, `sealant_process::spawn`) that stayed in its own
      process group — the capture engine's `git` — with their children still in that group. A
      process that joined sealantd's process group, or that sealantd only adopted, is swept.
-     Nothing else is spared, the far end of a control connection included: in Docker, Core
+     Nothing else is spared, the far end of a control connection included: in Docker, sealant
      reaches the socket through `docker exec … socat - UNIX-CONNECT:…`, and that `socat` is
      swept with the rest (nothing tells a relay from a writer). The reply to the request that
      ended the executor may be lost with it ("connection closed"); the outcome is not:
      `capture.status` reads it, and a final flush asked again answers it at once without
-     stopping anything twice. Core, on "connection closed" during a final flush, reads
+     stopping anything twice. sealant, on "connection closed" during a final flush, reads
      `capture.status` or asks the final flush again. A daemon that is not PID 1 of its namespace and did not become a child subreaper
      cannot see an orphan, so every final flush it runs is incomplete (`sweep-unavailable`,
      logged at boot). And every running container of the workspace's own Docker daemon is
      stopped (`POST /containers/{id}/stop?t=<grace>`, `crates/sealantd/src/docker.rs`) until
      the daemon reports none running: a container can bind-mount the worktree. The daemon is
-     `SEALANT_WORKSPACE_DOCKER_HOST`, else a `DOCKER_HOST` Core reserves for the workspace's
+     `SEALANT_WORKSPACE_DOCKER_HOST`, else a `DOCKER_HOST` sealant reserves for the workspace's
      own daemon — `unix:///run/docker/docker.sock` (Docker in the MicroVM, the Kubernetes dind
      sidecar) or `tcp://docker:2375` (the Docker adapter's dind sidecar); any other
      `DOCKER_HOST` (a host daemon) is never touched. The containers stop first, with the
@@ -624,13 +624,13 @@ restore, byte for byte, so the user never notices the compute changed.
   SIGINT, `runtime.gracefulShutdown`, the harness exiting on its own), whose final flush has no
   deadline, exits with 75 (`EX_TEMPFAIL`) when it ends incomplete — never 0 — after logging
   `FINAL CAPTURE INCOMPLETE` at error, and leaves the staging directory as it is.
-- **A retained executor boots in recovery mode.** Core keeps an executor that ended without a
+- **A retained executor boots in recovery mode.** sealant keeps an executor that ended without a
   complete final flush, and recovers it by starting it again on its own disk (Docker:
   `docker start` of the kept container). That boot must save what the disk holds and add
   nothing, so it is a recovery boot (`crates/sealantd/src/boot`, `BootConfig::recovery`): the
   environment says `SEALANT_RECOVERY=1` (an adapter that starts a new container or Pod over the
   kept disk), or the file `/.sealantd-recovery` exists (a kept Docker container restarts with
-  the environment it was created with: Core writes the marker into the stopped container with
+  the environment it was created with: sealant writes the marker into the stopped container with
   `docker cp` before `docker start`; the root of the container's filesystem is outside every
   capture root). A recovery boot resumes the disk's own staging and never materializes over
   it: it boots only when its staging continues the chain head, or its materialize of the head
@@ -644,7 +644,7 @@ restore, byte for byte, so the user never notices the compute changed.
   (the channel refuses, the disk is not its own, the capture token is gone) exits 75 too:
   still unsaved work, never a clean exit. Capture-store workspaces only (any other source
   refuses the flag). The capture token must still be there: a boot reads it from
-  `SEALANT_SECRET_ENV_FILE`, which Core removes once the executor is ready, so Core must stage
+  `SEALANT_SECRET_ENV_FILE`, which sealant removes once the executor is ready, so sealant must stage
   it again (a token Mend still honours for the session) before it starts a retained executor.
 - **A deadline is the caller's.** The daemon used to clamp every flush's deadline to its
   shutdown grace (10 s, never configured at boot), so a caller that allowed 30 minutes for a
@@ -1450,7 +1450,7 @@ tested (`tests/quota_refusals.rs`).
 
 Preserving work already admitted is never refused for budget reasons (cross-repo decisions 30
 and 35; review 2026-09-28, eleventh pass, carried tenth-review #6: a registrar exempted only
-what a control plane's drain had marked, so a final flush Core's deadline or the daemon's own
+what a control plane's drain had marked, so a final flush sealant's deadline or the daemon's own
 shutdown asked for was metered at `upload.urls`, and a held dependency tree stayed unsaved).
 Once this executor begins a final flush — whoever asked for it: a drain, a runtime deadline,
 `SIGTERM`, a recovery boot — every `upload.urls` and `capture.register` it sends carries

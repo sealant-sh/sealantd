@@ -235,7 +235,7 @@ mod tests {
         SecretEnv::parse(entries, env).err()
     }
 
-    /// The rules both spawn paths apply, and Core's process admission mirrors: each case is
+    /// The rules both spawn paths apply, and sealant's process admission mirrors: each case is
     /// refused at its index by its rule, and none of the diagnostics carries a name or value.
     #[test]
     fn each_rule_refuses_its_entry_without_its_name_or_value() {

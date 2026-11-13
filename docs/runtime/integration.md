@@ -128,21 +128,21 @@ The `next` trusted publisher is registered only on the two `-next` packages, so 
 workflow can publish `@sealant/runtime-*`. Images have no such boundary: a job with
 `packages: write` can push `ghcr.io/sealant-sh/sealantd` too (GHCR cannot scope it), and any of the
 repository's writers can run a branch workflow that requests it, code-owner review or not. The image
-jobs' actions and BuildKit are pinned, and Core pins sealantd by `tag@sha256:…`, which keeps out a
-tag moved after the pin. Only `publish` holds the npm credential; it installs nothing, runs no
+jobs' actions and BuildKit are pinned, and sealant pins sealantd by `tag@sha256:…`, which keeps out
+a tag moved after the pin. Only `publish` holds the npm credential; it installs nothing, runs no
 repository code, refuses an artifact holding anything but the expected tarballs, runs npm from an
 empty directory, and publishes a tarball it rebuilt from npm's own reading with an allowlisted
 manifest.
 
-Core pins a prerelease by exact version when it needs a daemon change before sealantd releases:
-`ghcr.io/sealant-sh/sealantd-next:<version>@sha256:<digest>` (Core's `tooling/scripts/pin-sealantd.mjs`
-writes it) and the runtime packages as exact aliases
-(`"@sealant/runtime-client": "npm:@sealant/runtime-client-next@<version>"`). Core's recovery check
-treats a `sealantd-next:X.Y.Z-next.N` image of a version after 0.19.0 like a release.
+sealant pins a prerelease by exact version when it needs a daemon change before sealantd releases:
+`ghcr.io/sealant-sh/sealantd-next:<version>@sha256:<digest>` (sealant's
+`tooling/scripts/pin-sealantd.mjs` writes it) and the runtime packages as exact aliases
+(`"@sealant/runtime-client": "npm:@sealant/runtime-client-next@<version>"`). sealant's recovery
+check treats a `sealantd-next:X.Y.Z-next.N` image of a version after 0.19.0 like a release.
 
-To release: merge the Version Packages pull request and **freeze main until the tag**; Core pins
-that commit's next build; then tag that same commit. Core refuses to cut a stable release while it
-pins a prerelease, so this tag comes first. The whole order is in sealant-sh/mend
+To release: merge the Version Packages pull request and **freeze main until the tag**; sealant pins
+that commit's next build; then tag that same commit. sealant refuses to cut a stable release while
+it pins a prerelease, so this tag comes first. The whole order is in sealant-sh/mend
 `docs/operations/next-channel.md`. The release refuses while an npm prerelease of the version came
 from a commit the tag leaves out, which is what a merge during the freeze produces.
 
@@ -199,12 +199,12 @@ plain `X.Y.Z` with at most nine digits per part, fails the job.
 
 **Identity checks, not acceptance.** The identity checks prove the staged index is the build this
 tag describes and that its daemon starts on both arches. They do not exercise the runtime contract.
-A sealantd image is accepted through Core's pin: Core resolves `ghcr.io/sealant-sh/sealantd:X.Y.Z`
-to its digest (`tooling/scripts/pin-sealantd.mjs`), its release refuses any sealantd that is not
-pinned as `X.Y.Z@sha256:…`, and its CI and release `workspace-e2e` run against exactly that pinned
-digest (since sealant#368) before Core ships. Core takes the runtime packages through its
-`@sealant/runtime-*` ranges and exercises them in the same runs. A sealantd release Core cannot
-accept is fixed by a new sealantd version.
+A sealantd image is accepted through sealant's pin: sealant resolves
+`ghcr.io/sealant-sh/sealantd:X.Y.Z` to its digest (`tooling/scripts/pin-sealantd.mjs`), its release
+refuses any sealantd that is not pinned as `X.Y.Z@sha256:…`, and its CI and release `workspace-e2e`
+run against exactly that pinned digest (since sealant#368) before sealant ships. sealant takes the
+runtime packages through its `@sealant/runtime-*` ranges and exercises them in the same runs. A
+sealantd release that sealant cannot accept is fixed by a new sealantd version.
 
 **The `ci` gate.** `stable-tag` lists the `ci` workflow's runs of the tagged commit and requires one
 that is a push to this repository's main and concluded `success`, the signal Next trusts through
@@ -217,9 +217,9 @@ D1/D2 in the CI plan. Once D1 (per-job rollback to a clean golden image) is live
 comes from a VM that starts clean for every job, and this section should say so.
 
 **Tags that never move.** No job writes `:latest` or `:X.Y`. They stay at 0.19.0, where the old
-pipeline left them, and nothing in Core, Mend or sealantd reads them: every consumer pins a version
-or a digest, and Core's release guard refuses anything else. They cannot be deleted without
-deleting the GHCR package version that also carries `:0.19.0`, which Core pins by digest.
+pipeline left them, and nothing in sealant, Mend or sealantd reads them: every consumer pins a
+version or a digest, and sealant's release guard refuses anything else. They cannot be deleted
+without deleting the GHCR package version that also carries `:0.19.0`, which sealant pins by digest.
 
 **No GitHub release.** sealantd publishes none, and nothing installs sealantd from one.
 

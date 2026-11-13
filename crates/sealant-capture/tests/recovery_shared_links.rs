@@ -1,6 +1,6 @@
 //! A recovery boot's final flush seals the hardlinks a tracked file shares with the bulk class.
 //!
-//! Docker end to end, round 8 (F5): after a `docker kill` and Core's recovery boot, 88 groups of
+//! Docker end to end, round 8 (F5): after a `docker kill` and sealant's recovery boot, 88 groups of
 //! tracked files pnpm had hardlinked into `node_modules` came back as separate files (contents,
 //! modes and times intact; only the shared inode lost). A normal Stop kept them. The executor
 //! was killed after a bulk snap and before the small snap that would have recorded the links;

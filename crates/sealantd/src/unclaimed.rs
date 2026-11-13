@@ -35,7 +35,7 @@ use serde::{Deserialize, Serialize};
 /// The marker's name in the capture staging directory (`<worktree>/.sealantd/capture`).
 pub const FILE: &str = "unclaimed.json";
 
-/// The prefix of a standby's launch id (`standby:<id>`, as Mend names it and Core delivers it
+/// The prefix of a standby's launch id (`standby:<id>`, as Mend names it and sealant delivers it
 /// as `SEALANT_CAPTURE_LAUNCH_ID`; the plan answers it as the executor).
 pub const STANDBY_LAUNCH_PREFIX: &str = "standby:";
 

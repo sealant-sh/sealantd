@@ -1,4 +1,4 @@
-//! A recovery reboot on a still-running machine (review 2026-09-28 #7; what Core's MicroVM
+//! A recovery reboot on a still-running machine (review 2026-09-28 #7; what sealant's MicroVM
 //! agent runs after `sealantd boot` exited 75 and the VM is still up): `sealantd boot
 //! --recovery`, with the first boot's environment and secret environment file, on the same
 //! disk. The first daemon materialized the head, staged a capture and died before shipping it,

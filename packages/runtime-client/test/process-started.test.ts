@@ -1,6 +1,6 @@
 // `process.started` never carries argument text: `args` stays in the schema, always empty, and
 // `argCount` / `argLengths` (UTF-8 bytes per argument) describe the arguments. These are the JSON
-// names Sealant Core's normalizer reads from the payload (protobuf JSON, camelCase).
+// names sealant's normalizer reads from the payload (protobuf JSON, camelCase).
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -9,7 +9,7 @@ import { fromBinary, toBinary, toJson } from "@bufbuild/protobuf";
 
 import { create, ProcessStartedSchema } from "@sealant/runtime-protocol";
 
-test("ProcessStarted's argument fields use Core's JSON names", () => {
+test("ProcessStarted's argument fields use sealant's JSON names", () => {
   const byName = new Map(ProcessStartedSchema.fields.map((f) => [f.name, f]));
   assert.equal(byName.get("arg_count")?.jsonName, "argCount");
   assert.equal(byName.get("arg_count")?.number, 8);

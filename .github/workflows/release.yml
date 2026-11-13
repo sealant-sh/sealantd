@@ -7,9 +7,9 @@
 #    release-manifest records every digest and each tarball's sha512.
 # 3. identity resolves each platform through the staged index on its own arch, requires the index to
 #    map it to that arch's build, pulls it and checks it is this release's build: the image ID it
-#    runs, its labels, and `sealantd --version`. Identity checks, not acceptance:
-#    a sealantd image is accepted by Core, which pins it by digest and runs its workspace e2e
-#    against exactly that digest before Core releases (docs/runtime/integration.md, Stable releases).
+#    runs, its labels, and `sealantd --version`. Identity checks, not acceptance: a sealantd image
+#    is accepted by sealant, which pins it by digest and runs its workspace e2e against exactly
+#    that digest before sealant releases (docs/runtime/integration.md, Stable releases).
 # 4. finalize-images writes :<version>, once, from the checked index; then npm publishes exactly the
 #    packed tarballs, under the stable floor.
 #

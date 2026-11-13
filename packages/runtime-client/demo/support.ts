@@ -1,5 +1,5 @@
 // Shared support for the mount / PTY demos: a control connection into a running workspace
-// container via `docker exec -i socat` (the same bridge the Core control plane uses).
+// container via `docker exec -i socat` (the same bridge the sealant control plane uses).
 
 import { spawn } from "node:child_process";
 import type { ChildProcess } from "node:child_process";

@@ -1,6 +1,6 @@
 //! A recovery boot's final flush covers every writer on the machine, not only its own
 //! descendants (review 2026-09-28, fourth pass, #4). On a MicroVM the recovered daemon is not
-//! PID 1: Core's agent is, and it adopted every orphan the dead daemon left — a writer that
+//! PID 1: sealant's agent is, and it adopted every orphan the dead daemon left — a writer that
 //! escaped it included. That writer is the recovered daemon's sibling, so a sweep of its
 //! descendants never saw it, and the final flush answered `complete` while it kept writing.
 //!
@@ -236,7 +236,7 @@ async fn a_recovery_final_flush_covers_writers_the_agent_adopted() {
     );
     assert!(alive(&writer) && alive(&helper));
 
-    // The agent names its own helper, as Core's writes it (pid, `/proc/<pid>/stat` field 22 as
+    // The agent names its own helper, as sealant's writes it (pid, `/proc/<pid>/stat` field 22 as
     // a string, role, descendants): the machine is swept, the writer stopped, the helper
     // spared, and the flush is complete.
     let start_time = &stat_fields(&helper).unwrap()[19];

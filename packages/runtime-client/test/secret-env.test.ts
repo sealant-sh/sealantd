@@ -89,7 +89,7 @@ test("secretEnv is never sent to a daemon that does not name the capability", as
     await assert.rejects(client.exec({ executable: "/bin/true", secretEnv }), /secret-env/);
     await assert.rejects(client.openSession({ cols: 80, rows: 24, secretEnv }), /secret-env/);
     await assert.rejects(client.execAttached({ executable: "/bin/true", secretEnv }), /secret-env/);
-    // A raw request, the path Core's requestResult takes, is checked the same way.
+    // A raw request, the path sealant's requestResult takes, is checked the same way.
     await assert.rejects(
       client.request({ case: "openSession", value: { cols: 80, rows: 24, secretEnv } }),
       /secret-env/,

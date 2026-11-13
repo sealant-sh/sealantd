@@ -24,7 +24,7 @@ async fn the_offline_report_is_the_booted_one() {
         .output_gated()
         .expect("run sealantd capabilities");
     assert!(offline.status.success());
-    // The exact shape Core's image probe parses (sealant#327 reads `supports`): one line, these
+    // The exact shape sealant's image probe parses (sealant#327 reads `supports`): one line, these
     // keys in this order, nothing else. A change here is a change to that contract.
     let printed = String::from_utf8(offline.stdout.clone()).unwrap();
     assert_eq!(
