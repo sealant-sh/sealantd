@@ -8,6 +8,9 @@ description: Run a real sealantd, drive it with sealantctl, and keep the event s
 Prove the change by running the real daemon and reading what it records. A green test suite says the
 code does what the tests ask; this says the daemon does what the change claims.
 
+Run `pnpm verify plan` first: it lists what the change owes. This skill discharges its `stack`
+obligation.
+
 ## 1. Say what you expect to see
 
 Before running anything, write down the events or output the change should produce, and what you

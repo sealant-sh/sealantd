@@ -1,0 +1,99 @@
+[
+  {
+    "id": "pre-pr-checks",
+    "from": "scripts/ci-docs-only.sh",
+    "why": "Every change CI does not call documentation-only runs the checks AGENTS.md lists before a PR",
+    "owes": [{ "kind": "tests", "command": "pnpm verify check" }]
+  },
+  {
+    "id": "daemon-behaviour",
+    "paths": ["crates/*/src/**", "crates/*/build.rs", "crates/sealant-protocol/proto/**"],
+    "why": "Tests passing is not verification: run the real daemon and read the events it records",
+    "owes": [
+      {
+        "kind": "stack",
+        "command": "examples/demo.sh",
+        "note": "Then drive the changed behaviour as .agents/skills/verify says"
+      }
+    ]
+  },
+  {
+    "id": "protocol-generated-typescript",
+    "paths": ["crates/sealant-protocol/proto/**", "buf.yaml", "buf.gen.yaml"],
+    "why": "The TypeScript in packages/runtime-protocol/src/gen is generated from the .proto and CI does not check it is current",
+    "owes": [
+      {
+        "kind": "tests",
+        "command": "pnpm exec buf generate && git diff --exit-code -- packages/runtime-protocol/src/gen"
+      }
+    ]
+  },
+  {
+    "id": "root-only-tests",
+    "paths": [
+      "crates/sealant-capture/src/owners.rs",
+      "crates/sealant-capture/src/materialize.rs",
+      "crates/sealant-capture/src/worktree_meta.rs",
+      "crates/sealant-process/src/identity.rs",
+      "crates/sealant-process/src/platform.rs",
+      "crates/sealant-process/src/spawn.rs",
+      "crates/sealant-process/src/sftp.rs",
+      "crates/sealantd/src/boot/mod.rs",
+      "crates/sealantd/src/boot/capture.rs",
+      "crates/sealant-capture/tests/owner_map.rs",
+      "crates/sealantd/tests/run_as_user.rs",
+      "crates/sealantd/tests/boot_privilege_posture.rs",
+      "scripts/ci-root-tests.sh"
+    ],
+    "why": "Ownership, other users and boot privileges are proved only as root; without root these tests skip",
+    "owes": [
+      {
+        "kind": "tests",
+        "command": "scripts/ci-root-tests.sh",
+        "note": "Only in a throwaway container: it adds users and installs packages (AGENTS.md)"
+      }
+    ]
+  },
+  {
+    "id": "test-support-gate",
+    "paths": ["Cargo.toml", "Cargo.lock", "crates/*/Cargo.toml", "scripts/ci-test-support-gate.sh", "scripts/test-support-probe/**"],
+    "why": "The manual clock and the dotfiles hold seam must stay out of every production build",
+    "owes": [{ "kind": "tests", "command": "scripts/ci-test-support-gate.sh" }]
+  },
+  {
+    "id": "fuzz-decode-client",
+    "paths": [
+      "crates/sealant-protocol/src/**",
+      "crates/sealant-protocol/proto/**",
+      "crates/sealant-protocol/build.rs",
+      "fuzz/Cargo.toml",
+      "fuzz/fuzz_targets/decode_client.rs"
+    ],
+    "why": "decode_client reads untrusted bytes from every control connection: it must never panic",
+    "owes": [{ "kind": "formal", "model": "fuzz:decode_client", "command": "cargo +nightly fuzz run decode_client -- -max_total_time=60" }]
+  },
+  {
+    "id": "fuzz-decode-server",
+    "paths": [
+      "crates/sealant-protocol/src/**",
+      "crates/sealant-protocol/proto/**",
+      "crates/sealant-protocol/build.rs",
+      "fuzz/Cargo.toml",
+      "fuzz/fuzz_targets/decode_server.rs"
+    ],
+    "why": "decode_server reads what a daemon sends the client: it must never panic",
+    "owes": [{ "kind": "formal", "model": "fuzz:decode_server", "command": "cargo +nightly fuzz run decode_server -- -max_total_time=60" }]
+  },
+  {
+    "id": "fuzz-decode-event",
+    "paths": [
+      "crates/sealant-protocol/src/**",
+      "crates/sealant-protocol/proto/**",
+      "crates/sealant-protocol/build.rs",
+      "fuzz/Cargo.toml",
+      "fuzz/fuzz_targets/decode_event.rs"
+    ],
+    "why": "decode_event reads every event a daemon streams: it must never panic",
+    "owes": [{ "kind": "formal", "model": "fuzz:decode_event", "command": "cargo +nightly fuzz run decode_event -- -max_total_time=60" }]
+  }
+]

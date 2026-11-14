@@ -1,0 +1,34 @@
+{
+  "check": [
+    {
+      "test": "sealant-capture::owner_map *",
+      "gate": "SEALANTD_REQUIRE_ROOT_TESTS",
+      "reason": "Needs root. CI runs it under sudo, where a skip fails (scripts/ci-root-tests.sh)"
+    },
+    {
+      "test": "sealantd::run_as_user *",
+      "gate": "SEALANTD_REQUIRE_ROOT_TESTS",
+      "reason": "Needs root. CI runs it under sudo, where a skip fails (scripts/ci-root-tests.sh)"
+    },
+    {
+      "test": "sealantd::boot_privilege_posture *",
+      "gate": "SEALANTD_REQUIRE_ROOT_TESTS",
+      "reason": "Needs root. CI runs it under sudo, where a skip fails (scripts/ci-root-tests.sh)"
+    },
+    {
+      "test": "sealant-capture::node_modules_measure *",
+      "gate": "#[ignore]",
+      "reason": "A measurement, run by hand with --ignored"
+    },
+    {
+      "test": "sealant-capture::restore_measure *",
+      "gate": "#[ignore]",
+      "reason": "A measurement over a real worktree, run by hand with --ignored"
+    },
+    {
+      "test": "sealant-capture::restore_measure_owners *",
+      "gate": "#[ignore]",
+      "reason": "A measurement over a real worktree as root, run by hand with --ignored"
+    }
+  ]
+}
