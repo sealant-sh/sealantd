@@ -228,6 +228,108 @@ const PLAN_LEASED_WAIT: Duration = Duration::from_secs(1);
 /// The longest wait between two `plan.get`s refused as `worktree-leased`.
 const PLAN_LEASED_WAIT_MAX: Duration = Duration::from_secs(30);
 
+/// How a boot asks `plan.get` again after an error a retry can help
+/// ([`sealant_capture::RegistrarError::is_retryable`]: the request may never have reached the
+/// registrar — a connection closed, reset or refused, a name that did not resolve, a timeout, a
+/// 5xx — and `plan.get` is safe to repeat).
+#[derive(Debug, Clone, Copy)]
+struct PlanRetry {
+    /// The first wait: the failure seen in practice is one dropped connection, so the second
+    /// attempt comes almost at once.
+    first: Duration,
+    /// The wait doubles up to this.
+    max: Duration,
+    /// The boot gives up when the next wait would take it past this long since the first failed
+    /// attempt began. The launcher waits a fixed time for the executor to come up; this stays
+    /// well inside it.
+    budget: Duration,
+}
+
+/// 0.25 s, 0.5 s, 1 s, 2 s, then every 4 s: nine attempts in about 20 s when each fails at once.
+const PLAN_RETRY: PlanRetry = PlanRetry {
+    first: Duration::from_millis(250),
+    max: Duration::from_secs(4),
+    budget: Duration::from_secs(20),
+};
+
+/// Where a boot's `plan.get` waits read the time: the real clock, or a test's.
+trait BootWait {
+    /// Now.
+    fn now(&self) -> std::time::Instant;
+    /// Wait `wait`.
+    fn sleep(&self, wait: Duration);
+}
+
+/// The real clock.
+struct RealWait;
+
+impl BootWait for RealWait {
+    fn now(&self) -> std::time::Instant {
+        std::time::Instant::now()
+    }
+    fn sleep(&self, wait: Duration) {
+        std::thread::sleep(wait);
+    }
+}
+
+/// The boot's `plan.get`, asked again while another launch holds the worktree and, within
+/// `retry`, after an error a retry can help. Any other error fails the boot at once.
+fn fetch_plan(
+    registrar: &dyn Registrar,
+    request: &PlanGetRequest,
+    retry: PlanRetry,
+    clock: &dyn BootWait,
+) -> Result<sealant_capture::registrar::PlanGetResponse, BootError> {
+    let mut leased_wait = PLAN_LEASED_WAIT;
+    // The run of retryable failures this boot is in: when its first attempt began, and how many
+    // attempts it holds. An answer from the registrar (`worktree-leased`) ends it.
+    let mut failing: Option<(std::time::Instant, u32)> = None;
+    let mut retry_wait = retry.first;
+    loop {
+        let asked = clock.now();
+        match registrar.plan_get(request) {
+            Ok(plan) => return Ok(plan),
+            // Another launch holds the worktree (409 `worktree-leased`): no epoch is this
+            // executor's, and it adopts none — it waits, touching nothing, and asks again until
+            // it is given one.
+            Err(sealant_capture::RegistrarError::WorktreeLeased) => {
+                failing = None;
+                retry_wait = retry.first;
+                tracing::warn!(
+                    retry_in_ms = leased_wait.as_millis() as u64,
+                    "capture plan.get: another launch holds the worktree's lease; waiting"
+                );
+                clock.sleep(leased_wait);
+                leased_wait = (leased_wait * 2).min(PLAN_LEASED_WAIT_MAX);
+            }
+            Err(error) if error.is_retryable() => {
+                let (since, attempts) = failing.get_or_insert((asked, 0));
+                *attempts += 1;
+                let spent = clock.now().saturating_duration_since(*since);
+                if spent + retry_wait > retry.budget {
+                    return Err(BootError::config(format!(
+                        "capture plan.get failed after {attempts} attempts over {:.1} s: {error}",
+                        spent.as_secs_f64()
+                    )));
+                }
+                tracing::warn!(
+                    %error,
+                    attempt = *attempts,
+                    retry_in_ms = retry_wait.as_millis() as u64,
+                    "capture plan.get failed; asking again"
+                );
+                clock.sleep(retry_wait);
+                retry_wait = (retry_wait * 2).min(retry.max);
+            }
+            Err(error) => {
+                return Err(BootError::config(format!(
+                    "capture plan.get failed: {error}"
+                )));
+            }
+        }
+    }
+}
+
 /// [`materialize`] over any registrar. `sink` is the object store to read the head from; `None`
 /// is the presigned-URL sink over the registrar (GET URLs from the plan, PUT URLs minted on
 /// demand), which is what a real boot uses.
@@ -242,6 +344,27 @@ pub fn boot_from(
     working_directory: &Path,
     workspace_root: &Path,
 ) -> Result<CaptureBoot, BootError> {
+    boot_waiting(
+        registrar,
+        sink,
+        source,
+        working_directory,
+        workspace_root,
+        PLAN_RETRY,
+        &RealWait,
+    )
+}
+
+/// [`boot_from`], its `plan.get` retried by `retry` on `clock`.
+fn boot_waiting(
+    registrar: Arc<dyn Registrar>,
+    sink: Option<Arc<dyn BlobSink>>,
+    source: &CaptureSourceConfig,
+    working_directory: &Path,
+    workspace_root: &Path,
+    retry: PlanRetry,
+    clock: &dyn BootWait,
+) -> Result<CaptureBoot, BootError> {
     // The first boot of this disk: no capture state on it yet (a restart finds its own).
     let first_boot = !CaptureConfig::new("", 0, working_directory)
         .staging_dir()
@@ -252,26 +375,7 @@ pub fn boot_from(
         CaptureEngine::disk_launch(&CaptureConfig::new("", 0, working_directory).staging_dir())
     });
     let request = PlanGetRequest::booting(source.worktree_id.clone()).with_launch(claimed.clone());
-    // Another launch holds the worktree (409 `worktree-leased`): no epoch is this executor's,
-    // and it adopts none — it waits, touching nothing, and asks again until it is given one.
-    let mut wait = PLAN_LEASED_WAIT;
-    let plan = loop {
-        match registrar.plan_get(&request) {
-            Err(sealant_capture::RegistrarError::WorktreeLeased) => {
-                tracing::warn!(
-                    retry_in_ms = wait.as_millis() as u64,
-                    "capture plan.get: another launch holds the worktree's lease; waiting"
-                );
-                std::thread::sleep(wait);
-                wait = (wait * 2).min(PLAN_LEASED_WAIT_MAX);
-            }
-            other => {
-                break other.map_err(|error| {
-                    BootError::config(format!("capture plan.get failed: {error}"))
-                })?;
-            }
-        }
-    };
+    let plan = fetch_plan(registrar.as_ref(), &request, retry, clock)?;
     // A plan for another launch is not this executor's: capturing under it would seal (or
     // resume) as a launch it is not.
     if let (Some(named), Some(executor)) = (&source.launch_id, &plan.executor)
@@ -1708,16 +1812,253 @@ mod tests {
         registrar.set_live_epoch(4);
         registrar.refuse_plans_leased(2);
         let ws = tmp.path().join("ws");
-        let started = std::time::Instant::now();
-        let boot = boot_from(registrar.clone(), Some(sink), &source(), &ws, tmp.path()).unwrap();
-        assert!(
-            started.elapsed() >= Duration::from_secs(3),
+        let clock = FakeWait::new();
+        let boot = boot_waiting(
+            registrar.clone(),
+            Some(sink),
+            &source(),
+            &ws,
+            tmp.path(),
+            PLAN_RETRY,
+            &clock,
+        )
+        .unwrap();
+        assert_eq!(
+            clock.slept(),
+            [Duration::from_secs(1), Duration::from_secs(2)],
             "it waited 1 s, then 2 s"
         );
         let asked = registrar.plan_requests();
         assert_eq!(asked.len(), 3);
         assert!(asked.iter().all(|r| r.epoch == 0), "no epoch was adopted");
         assert_eq!(boot.epoch, 4, "the epoch it was given");
+    }
+
+    /// A clock that moves only when a boot waits on it, and keeps every wait.
+    struct FakeWait {
+        now: std::sync::Mutex<std::time::Instant>,
+        slept: std::sync::Mutex<Vec<Duration>>,
+    }
+
+    impl FakeWait {
+        fn new() -> Self {
+            Self {
+                now: std::sync::Mutex::new(std::time::Instant::now()),
+                slept: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+        fn slept(&self) -> Vec<Duration> {
+            self.slept.lock().unwrap().clone()
+        }
+    }
+
+    impl BootWait for FakeWait {
+        fn now(&self) -> std::time::Instant {
+            *self.now.lock().unwrap()
+        }
+        fn sleep(&self, wait: Duration) {
+            *self.now.lock().unwrap() += wait;
+            self.slept.lock().unwrap().push(wait);
+        }
+    }
+
+    /// A registrar whose `plan.get` answers with `errors`, in order, before it asks the
+    /// registrar behind it; it counts every `plan.get`.
+    struct FailingPlans {
+        inner: Arc<InMemoryRegistrar>,
+        errors: std::sync::Mutex<std::collections::VecDeque<sealant_capture::RegistrarError>>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl FailingPlans {
+        fn new(
+            inner: Arc<InMemoryRegistrar>,
+            errors: impl IntoIterator<Item = sealant_capture::RegistrarError>,
+        ) -> Arc<Self> {
+            Arc::new(Self {
+                inner,
+                errors: std::sync::Mutex::new(errors.into_iter().collect()),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            })
+        }
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl Registrar for FailingPlans {
+        fn plan_get(
+            &self,
+            req: &PlanGetRequest,
+        ) -> Result<sealant_capture::registrar::PlanGetResponse, sealant_capture::RegistrarError>
+        {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(error) = self.errors.lock().unwrap().pop_front() {
+                return Err(error);
+            }
+            self.inner.plan_get(req)
+        }
+        fn upload_urls(
+            &self,
+            req: &sealant_capture::registrar::UploadUrlsRequest,
+        ) -> Result<sealant_capture::registrar::UploadUrlsResponse, sealant_capture::RegistrarError>
+        {
+            self.inner.upload_urls(req)
+        }
+        fn upload_complete(
+            &self,
+            req: &sealant_capture::registrar::UploadCompleteRequest,
+        ) -> Result<
+            sealant_capture::registrar::UploadCompleteResponse,
+            sealant_capture::RegistrarError,
+        > {
+            self.inner.upload_complete(req)
+        }
+        fn capture_register(
+            &self,
+            req: &sealant_capture::registrar::RegisterRequest,
+        ) -> Result<sealant_capture::registrar::RegisterResponse, sealant_capture::RegistrarError>
+        {
+            self.inner.capture_register(req)
+        }
+        fn lease_heartbeat(
+            &self,
+            req: &sealant_capture::registrar::HeartbeatRequest,
+        ) -> Result<sealant_capture::registrar::HeartbeatResponse, sealant_capture::RegistrarError>
+        {
+            self.inner.lease_heartbeat(req)
+        }
+        fn change_summary(
+            &self,
+            req: &sealant_capture::registrar::ChangeSummaryRequest,
+        ) -> Result<(), sealant_capture::RegistrarError> {
+            self.inner.change_summary(req)
+        }
+    }
+
+    /// The words a dropped connection reaches `plan.get` with on Boat (SLNT-957).
+    fn dropped() -> sealant_capture::RegistrarError {
+        sealant_capture::RegistrarError::Transport("io: unexpected end of file".to_owned())
+    }
+
+    /// A boot over `plans` on a fake clock, on a disk under `tmp` holding a captured head.
+    fn boot_over(
+        tmp: &Path,
+        errors: Vec<sealant_capture::RegistrarError>,
+    ) -> (Arc<FailingPlans>, FakeWait, Result<CaptureBoot, BootError>) {
+        let registrar = Arc::new(InMemoryRegistrar::new("wt-boot", 1, None));
+        let sink: Arc<dyn BlobSink> = capture_source(tmp, &registrar);
+        let plans = FailingPlans::new(registrar, errors);
+        let clock = FakeWait::new();
+        let boot = boot_waiting(
+            plans.clone(),
+            Some(sink),
+            &source(),
+            &tmp.join("ws"),
+            tmp,
+            PLAN_RETRY,
+            &clock,
+        );
+        (plans, clock, boot)
+    }
+
+    /// A dropped connection, a reset, a name that did not resolve: the request never reached
+    /// the registrar, and `plan.get` is safe to repeat. The boot asks again, quickly at first,
+    /// and boots on the plan it is given. Before, the first one failed the session's start.
+    #[test]
+    fn a_boot_asks_plan_get_again_after_a_dropped_connection() {
+        let tmp = tempfile::tempdir().unwrap();
+        let errors = vec![
+            dropped(),
+            sealant_capture::RegistrarError::Transport("connection reset by peer".to_owned()),
+            sealant_capture::RegistrarError::Transport("dns: no such host".to_owned()),
+            sealant_capture::RegistrarError::Transport("plan.get: http 503".to_owned()),
+            dropped(),
+        ];
+        let (plans, clock, boot) = boot_over(tmp.path(), errors);
+        let boot = boot.expect("the boot goes on once plan.get answers");
+        assert_eq!(plans.calls(), 6, "five failures, then the answer");
+        assert_eq!(
+            clock.slept(),
+            [250, 500, 1000, 2000, 4000].map(Duration::from_millis),
+        );
+        assert_eq!(boot.epoch, 1);
+        assert!(
+            tmp.path().join("ws/lib.rs").exists(),
+            "the head is materialized"
+        );
+    }
+
+    /// The retries are bounded: a channel that never answers ends the boot after about 20 s, and
+    /// the error says how many attempts it made, over how long, and what the last one met.
+    #[test]
+    fn a_channel_that_never_answers_ends_the_boot_within_the_bound() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut errors: Vec<_> = (0..20).map(|_| dropped()).collect();
+        errors[8] = sealant_capture::RegistrarError::Transport("the last words".to_owned());
+        let (plans, clock, boot) = boot_over(tmp.path(), errors);
+        let Err(error) = boot else {
+            panic!("a channel that never answers ends the boot")
+        };
+        let text = error.to_string();
+        assert_eq!(plans.calls(), 9);
+        assert_eq!(
+            clock.slept(),
+            [250, 500, 1000, 2000, 4000, 4000, 4000, 4000].map(Duration::from_millis),
+        );
+        assert!(
+            text.contains("capture plan.get failed after 9 attempts over 19.8 s"),
+            "{text}"
+        );
+        assert!(text.ends_with("transport: the last words"), "{text}");
+        assert!(!tmp.path().join("ws").exists(), "nothing touched the disk");
+    }
+
+    /// An answer a retry cannot change — a refusal from the registrar, a plan it will not give
+    /// this launch — still ends the boot on the first call, with no wait.
+    #[test]
+    fn a_refusal_from_the_registrar_fails_the_boot_at_once() {
+        for refusal in [
+            sealant_capture::RegistrarError::Protocol(
+                "plan.get refused: launch-mismatch".to_owned(),
+            ),
+            sealant_capture::RegistrarError::Protocol("plan.get: http 401".to_owned()),
+            sealant_capture::RegistrarError::LeaseLost,
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let words = refusal.to_string();
+            let (plans, clock, boot) = boot_over(tmp.path(), vec![refusal]);
+            let Err(error) = boot else {
+                panic!("{words}: refused")
+            };
+            assert_eq!(plans.calls(), 1, "{words}");
+            assert!(clock.slept().is_empty(), "{words}");
+            let text = error.to_string();
+            assert!(
+                text.ends_with(&format!("capture plan.get failed: {words}")),
+                "{text}"
+            );
+        }
+    }
+
+    /// A registrar that answers `worktree-leased` was reached: the run of failures before it is
+    /// over, and the transport retries after it start again from the first, quick wait.
+    #[test]
+    fn a_leased_answer_starts_the_transport_retries_over() {
+        let tmp = tempfile::tempdir().unwrap();
+        let errors = vec![
+            dropped(),
+            dropped(),
+            sealant_capture::RegistrarError::WorktreeLeased,
+            dropped(),
+        ];
+        let (plans, clock, boot) = boot_over(tmp.path(), errors);
+        boot.expect("the boot goes on");
+        assert_eq!(plans.calls(), 5);
+        assert_eq!(
+            clock.slept(),
+            [250, 500, 1000, 250].map(Duration::from_millis)
+        );
     }
 
     /// A disk the daemon before never materialized — absent, empty, or holding only the daemon's
