@@ -16,6 +16,11 @@
       "reason": "Needs root. CI runs it under sudo, where a skip fails (scripts/ci-root-tests.sh)"
     },
     {
+      "test": "sealantd::docker_restart_policy *",
+      "gate": "SEALANTD_TEST_WORKSPACE_DOCKER_HOST",
+      "reason": "Needs a disposable Docker daemon it may stop every container of. CI does not provide one either, so no run proves it today"
+    },
+    {
       "test": "sealant-capture::node_modules_measure *",
       "gate": "#[ignore]",
       "reason": "A measurement, run by hand with --ignored"
@@ -24,6 +29,11 @@
       "test": "sealant-capture::restore_measure *",
       "gate": "#[ignore]",
       "reason": "A measurement over a real worktree, run by hand with --ignored"
+    },
+    {
+      "test": "sealantd::run_as_user *_timing",
+      "gate": "#[ignore]",
+      "reason": "A measurement as root, run by hand with --ignored"
     },
     {
       "test": "sealant-capture::restore_measure_owners *",

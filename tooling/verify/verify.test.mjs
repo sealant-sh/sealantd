@@ -6,7 +6,7 @@ import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { judgeSkips, nextestSkips, nodeSkips, rustScope } from "./check.mjs";
+import { GATES, judgeSkips, nextestSkips, nodeSkips, rustScope } from "./check.mjs";
 import { ciSaysCode, loadMap, obligationsFor } from "./plan.mjs";
 import { globToRegExp } from "./repo.mjs";
 import { exitCode, rollUp, validate } from "./result.mjs";
@@ -147,17 +147,23 @@ test("nextest output yields ignored tests and passing tests that said they skipp
     "        PASS [   0.010s] (4/5) sealantd boot::dotfiles::tests::stow_applies",
     "  stderr ───",
     "    SKIPPED: stow is not on PATH; the real stow apply was not exercised",
-    "        PASS [   0.010s] (5/5) sealantd boot::dotfiles::tests::skip_worktree_is_kept",
+    "        PASS [   1.200s] (5/7) sealant-capture::owner_map captures_record_no_owner",
+    "  stderr ───",
+    "    not root: ownership tests skipped",
+    "        PASS [   2.100s] (6/7) sealant-capture::delta head_over_base_writes_only_the_delta",
+    "  stderr ───",
+    "    base fresh: files written 426 (1717496 bytes), skipped 0 (0 bytes), removed 0",
+    "        PASS [   0.010s] (7/7) sealantd boot::dotfiles::tests::skip_worktree_is_kept",
     "  stdout ───",
     "    test boot::dotfiles::tests::skip_worktree_is_kept ... ok",
   ].join("\n");
-  const gates = [{ env: "SEALANTD_REQUIRE_DOTFILES_TOOLS", tests: ["sealantd boot::dotfiles::*"] }];
   assert.deepEqual(
-    nextestSkips(output, gates).skipped.map(({ name, gate }) => [name, gate]),
+    nextestSkips(output, GATES).skipped.map(({ name, gate }) => [name, gate]),
     [
       ["sealant-capture::restore_measure measures_a_restore", "#[ignore]"],
       ["sealantd::boot_privilege_posture a_boot_sets_it", "SEALANTD_REQUIRE_ROOT_TESTS"],
       ["sealantd boot::dotfiles::tests::stow_applies", "SEALANTD_REQUIRE_DOTFILES_TOOLS"],
+      ["sealant-capture::owner_map captures_record_no_owner", "SEALANTD_REQUIRE_ROOT_TESTS"],
     ],
   );
 });

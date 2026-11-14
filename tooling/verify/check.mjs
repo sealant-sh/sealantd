@@ -33,8 +33,14 @@ export const GATES = [
     env: "SEALANTD_REQUIRE_DOTFILES_TOOLS",
     tests: ["sealantd boot::dotfiles::*"],
     ready: (onPath) => onPath("stow") && onPath("chezmoi"),
-    unready: "stow or chezmoi is not on PATH: the real dotfiles applies were not exercised",
     next: "scripts/ci-install-dotfiles-tools.sh",
+  },
+  {
+    env: "SEALANTD_REQUIRE_ROOT_TESTS",
+    // Never set by `check`: these run as root, in CI or a throwaway container
+    // (scripts/ci-root-tests.sh), and allowed-skips.json lets them skip here.
+    tests: ["sealant-capture::owner_map *", "sealantd::run_as_user *", "sealantd::boot_privilege_posture *"],
+    ready: () => false,
   },
   {
     env: "SEALANTD_REQUIRE_NNP_FREE",
@@ -60,6 +66,10 @@ export const judgeSkips = (skipped, allowed) =>
     return entry ? { ...s, allowed: true, reason: s.reason ?? entry.reason } : { ...s, allowed: false };
   });
 
+// How this repo's gated tests announce a skip on stderr: `SKIPPED: …`, `skipped: …`, or a line
+// ending `… tests skipped`. A count such as `skipped 0 (0 bytes)` in a test's report is not one.
+const SKIP_LINE = /^(skipped|SKIPPED):|\btests? skipped$|^skipped$/i;
+
 // nextest's human output with `--status-level all --success-output immediate`: SKIP lines are
 // `#[ignore]`d tests; a passing test whose stderr says it skipped is a runtime skip.
 export const nextestSkips = (output, gates = []) => {
@@ -81,7 +91,7 @@ export const nextestSkips = (output, gates = []) => {
       stream = header[1];
       continue;
     }
-    if (current && stream === "stderr" && /\bskip(ped)?\b/i.test(line) && passed.has(current)) {
+    if (current && stream === "stderr" && SKIP_LINE.test(line.trim()) && passed.has(current)) {
       if (!skipped.some((s) => s.name === current)) {
         const gate = gates.find((g) => g.tests.some((t) => nameMatches(current, t)));
         const env = line.match(/\b(SEALANTD_[A-Z_]+)\b/)?.[1];
@@ -266,7 +276,7 @@ export const check = async (root, { files, all, progress = () => {} }) => {
                   for (const test of gate.tests.filter((t) => !t.includes("*") && passed.has(t))) {
                     if (!skipped.some((s) => s.name === test)) skipped.push({ name: test, gate: gate.env, reason: gate.unready });
                   }
-                  if (gate.next) next.push(gate.next);
+                  if (gate.next && skipped.some((s) => s.gate === gate.env)) next.push(gate.next);
                 }
                 for (const s of skipped) if (s.gate === "#[ignore]") s.reason ??= ignoreReason(root, s.name);
                 r.skipped = judgeSkips(skipped, allowed);
