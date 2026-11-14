@@ -12,8 +12,8 @@
     "owes": [
       {
         "kind": "stack",
-        "command": "examples/demo.sh",
-        "note": "Then drive the changed behaviour as .agents/skills/verify says"
+        "command": "pnpm verify daemon --driver <file>",
+        "note": "A driver that exercises the change: copy tooling/verify/drivers/exec.mjs (.agents/skills/verify)"
       }
     ]
   },

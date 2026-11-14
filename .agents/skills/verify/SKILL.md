@@ -1,6 +1,6 @@
 ---
 name: verify
-description: Run a real sealantd, drive it with sealantctl, and keep the event stream as evidence. Use to prove a sealantd change works beyond its tests, before opening or merging its PR.
+description: Run a real sealantd, drive it with a driver script, and keep the event stream as evidence. Use to prove a sealantd change works beyond its tests, before opening or merging its PR.
 ---
 
 # Verify a sealantd change
@@ -17,54 +17,35 @@ Before running anything, write down the events or output the change should produ
 would see if it were broken. For example: "a secret written in two parts appears masked in both
 `io.chunk` events". This is the claim the run checks.
 
-## 2. Start with the demo
+## 2. Drive the changed behaviour
 
-`examples/demo.sh` builds `sealantd` and `sealantctl`, starts a daemon on a temporary socket with
-filesystem watching and the network proxy on, then runs `health`, `capabilities`, an `exec` that
-writes and prints a file, and a graceful `shutdown`. Each `sealantctl` call prints JSON events.
-
-On Linux, run it directly. On a Mac, run it in a Linux container:
+Copy `tooling/verify/drivers/exec.mjs` to a scratch file outside the repo and change its middle to
+exercise the change. Its header lists what the driver receives. Then:
 
 ```sh
-docker run --rm -v "$PWD":/src -w /src \
-  -v sealantd-cargo-registry:/usr/local/cargo/registry \
-  -v sealantd-linux-target:/src/target \
-  rust:1.100.0-slim examples/demo.sh
+pnpm verify daemon --driver <file>            # extra daemon flags go after `--`
 ```
 
-The first run compiles the workspace and takes several minutes. The cache volumes make later runs
-quick.
+It builds the daemon from this tree, starts it on a scratch socket and workspace, waits until it
+answers healthy, runs the driver, records every event to `events.jsonl` beside the daemon's log, and
+tears everything down. `--keep` leaves the daemon running and prints how to reach and stop it.
 
-**Done when** the demo ends with `demo complete`. If it doesn't, the daemon is broken before your
-change is even exercised; fix that first.
+- The driver decides the verdict: exit 0 only when the behaviour held. An exec's response and
+  `sealantctl` both report success for a command that failed; the `processExited` event says.
+- It needs Linux with Rust and Node, as the daemon does; the `rust` container AGENTS.md names
+  for Macs has no Node.
 
-## 3. Drive the changed behaviour
+**Done when** the events you wrote down in step 1 are in `events.jsonl`, and a driver for the case
+that would show the bug has failed on the old behaviour or passed on the new.
 
-Copy `examples/demo.sh` to a scratch file outside the repo and replace the `exec` step with commands
-that exercise the change. `sealantctl --help` lists the commands. Things to know:
-
-- `sealantctl` streams live events only. It can't query past events, so capture its output as it
-  runs (`> events.jsonl`).
-- `sealantctl` exits 0 even when the child process fails. Read `process.exited` and its `exitCode`
-  instead.
-- To check behaviour through the TypeScript client, follow
-  `packages/runtime-client/test/e2e.test.ts`, which spawns a daemon and drives it with
-  `SealantClient`.
-
-**Done when** the events you wrote down in step 1 appear, and you have also run the case that would
-show the bug.
-
-## 4. When the effect only shows end to end
+## 3. When the effect only shows end to end
 
 Some changes only show through sealant or Mend, such as how a workspace starts or what a session
 records. Use Mend's `verify` skill (`../mend/.claude/skills/verify/SKILL.md`). Its Launch section
 takes `--sealantd <path|PR|ref>` to build this repo's change into a full stack.
 
-## 5. Report
+## 4. Report
 
-Put the verdict on the PR, and on the Linear ticket if there is one:
-
-- the commit you ran;
-- the commands you ran;
-- the events that show the change working, trimmed to the lines that matter;
-- anything you could not check, and why.
+Put the verdict on the PR, and on the Linear ticket if there is one: `pnpm verify status --markdown`
+for the receipt, the events that show the change working (trimmed to the lines that matter), and
+anything you could not check, and why.

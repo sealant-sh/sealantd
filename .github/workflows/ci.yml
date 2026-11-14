@@ -153,3 +153,5 @@ jobs:
       - run: rustup toolchain install
       - run: cargo build --locked -p sealantd # the TypeScript e2e spawns the daemon binary
       - run: pnpm -r test
+      # `pnpm verify daemon` against a daemon built from this commit, with the client built above.
+      - run: node --test tooling/verify/daemon.test.mjs

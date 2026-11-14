@@ -167,12 +167,12 @@ const workspacePackages = (root) => {
   }));
 };
 
-// The `node --test …` line from ci.yml's node job, so this runs exactly the list CI runs.
+// Every file ci.yml's node job hands `node --test`, so this runs exactly the list CI runs.
 export const scriptTests = (root) => {
   const workflow = parse(readFileSync(path.join(root, ".github/workflows/ci.yml"), "utf8"));
-  const run = workflow.jobs.node.steps.map((s) => s.run ?? "").find((r) => r.trim().startsWith("node --test"));
-  if (!run) throw new Error("ci.yml's node job has no `node --test` step");
-  return run.trim().split(/\s+/);
+  const runs = workflow.jobs.node.steps.map((s) => (s.run ?? "").trim()).filter((r) => r.startsWith("node --test"));
+  if (runs.length === 0) throw new Error("ci.yml's node job has no `node --test` step");
+  return ["node", "--test", ...runs.flatMap((r) => r.split(/\s+/).slice(2))];
 };
 
 const runLogged = (root, argv, { env, log }) =>
