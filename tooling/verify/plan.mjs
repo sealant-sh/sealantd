@@ -47,16 +47,13 @@ export const obligationsFor = (root, map, files) => {
       : files.some((f) => matchesAny(f, entry.paths));
     if (!hit) continue;
     const matched = entry.from ? files : files.filter((f) => matchesAny(f, entry.paths));
-    for (const owe of entry.owes) {
+    for (const { kind, ...owe } of entry.owes) {
       owed.push({
-        id: entry.owes.length > 1 ? `${entry.id}:${owe.kind}` : entry.id,
-        kind: owe.kind,
+        id: entry.owes.length > 1 ? `${entry.id}:${kind}` : entry.id,
+        kind,
         why: entry.why,
         status: "owed",
-        ...(owe.command && { command: owe.command }),
-        ...(owe.model && { model: owe.model }),
-        ...(owe.what && { what: owe.what }),
-        ...(owe.note && { note: owe.note }),
+        ...owe,
         paths: matched,
       });
     }

@@ -16,3 +16,8 @@ scripts/test-support-probe/Cargo.lock
 
 # `pnpm verify` results and logs
 .verify/
+
+# What a fuzz run writes (`pnpm verify formal`, .github/workflows/fuzz.yml); the fuzz crate is unlocked.
+fuzz/corpus/
+fuzz/artifacts/
+fuzz/Cargo.lock
