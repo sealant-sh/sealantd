@@ -75,6 +75,7 @@ export const validate = (result) => {
   need(["clean", "left", "none"].includes(result.cleanup?.status), "cleanup.status");
   need(Array.isArray(result.cleanup?.left), "cleanup.left");
   need(Array.isArray(result.next) && result.next.every(isString), "next");
+  need(result.keep === undefined || (Number.isInteger(result.keep.pid) && isString(result.keep.stop)), "keep");
   need(result.ciJobs === undefined || (Array.isArray(result.ciJobs) && result.ciJobs.every(isString)), "ciJobs");
   return errors;
 };

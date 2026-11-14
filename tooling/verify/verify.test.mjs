@@ -56,7 +56,7 @@ test("every verb's result matches the schema, with the exit code its status impl
   for (const args of [
     ["plan", "--files", "crates/sealant-protocol/src/convert.rs"],
     ["status", "--files", "README.md"],
-    ["daemon"],
+    ["formal"],
     ["db"],
   ]) {
     const { code, result } = run(args, { root });

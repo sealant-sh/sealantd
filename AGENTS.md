@@ -68,4 +68,4 @@ fixes included. See `.changeset/README.md`.
 ## Verifying a change
 
 Tests passing is not verification. To see a change working in a real daemon, use the `verify` skill
-in `.agents/skills/verify/`.
+in `.agents/skills/verify/`: it runs a driver script with `pnpm verify daemon --driver <file>`.

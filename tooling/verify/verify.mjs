@@ -6,6 +6,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { check } from "./check.mjs";
+import { daemon } from "./daemon.mjs";
 import { plan } from "./plan.mjs";
 import { changedFiles, git, head as readHead } from "./repo.mjs";
 import { exitCode, rollUp, save, SCHEMA_VERSION } from "./result.mjs";
@@ -15,7 +16,7 @@ const VERBS = {
   plan: "What this change owes and which CI jobs it runs [--base <ref>] [--files <paths…>]",
   check: "The pre-PR checks for what the change touches, skips reported [--all] [--base <ref>]",
   status: "Whether each obligation has a passing result for this commit [--markdown]",
-  daemon: "Run a driver script against a freshly built daemon (not implemented yet)",
+  daemon: "Run a driver against a freshly built daemon, recording its events --driver <file> [--keep] [--timeout <s>] [-- <daemon flags>]",
   formal: "Property tests and fuzz targets covering the change (not implemented yet)",
 };
 // Verbs other repos have. Asked for here, they say so rather than pretend.
@@ -27,12 +28,19 @@ const usage = () =>
     .join("\n")}\n`;
 
 export const parseArgs = (argv) => {
-  const args = { verb: argv[0], json: false, all: false, markdown: false, base: "origin/main", files: null };
+  const args = { verb: argv[0], json: false, all: false, markdown: false, keep: false, base: "origin/main", files: null, driver: null, timeoutS: 600, daemonArgs: [] };
   for (let i = 1; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--json") args.json = true;
     else if (a === "--all") args.all = true;
     else if (a === "--markdown") args.markdown = true;
+    else if (a === "--keep") args.keep = true;
+    else if (a === "--driver" && argv[i + 1]) args.driver = argv[++i];
+    else if (a === "--timeout" && /^\d+$/.test(argv[i + 1] ?? "")) args.timeoutS = Number(argv[++i]);
+    else if (a === "--") {
+      args.daemonArgs = argv.slice(i + 1);
+      break;
+    }
     else if (a === "--base" && argv[i + 1] && !argv[i + 1].startsWith("--")) args.base = argv[++i];
     else if (a === "--files") {
       args.files = [];
@@ -56,6 +64,7 @@ const main = async () => {
   try {
     args = parseArgs(argv);
     if (!VERBS[args.verb] && !ELSEWHERE.includes(args.verb)) throw new Error(`unknown verb ${args.verb}`);
+    if (args.verb === "daemon" && !args.driver) throw new Error("verify daemon needs --driver <file>");
   } catch (error) {
     process.stderr.write(`verify: ${error.message}\n\n${usage()}`);
     return 2;
@@ -87,6 +96,19 @@ const main = async () => {
         next: [...new Set(obligations.filter((o) => o.status !== "discharged" && o.command).map((o) => o.command))],
       };
       if (args.markdown && !args.json) process.stdout.write(markdown(head, obligations));
+    } else if (args.verb === "daemon") {
+      // Ctrl-C tears the run down; a second one leaves at once (the exit hook still kills the daemon).
+      const abort = new AbortController();
+      const onSignal = () => {
+        if (abort.signal.aborted) process.exit(130);
+        progress("interrupted: tearing down");
+        abort.abort();
+      };
+      process.on("SIGINT", onSignal);
+      process.on("SIGTERM", onSignal);
+      body = await daemon(root, { driver: args.driver, keep: args.keep, timeoutS: args.timeoutS, daemonArgs: args.daemonArgs, progress, signal: abort.signal });
+      process.off("SIGINT", onSignal);
+      process.off("SIGTERM", onSignal);
     } else {
       const what = VERBS[args.verb] ? "not built in sealantd yet" : "a verb of another Sealant repo, not sealantd";
       body = { steps: [{ id: args.verb, title: `verify ${args.verb}`, status: "not_implemented", detail: what }] };
@@ -108,9 +130,10 @@ const main = async () => {
     steps,
     obligations: body.obligations ?? [],
     evidence: body.evidence ?? [],
-    cleanup: { status: "none", left: [] },
+    cleanup: body.cleanup ?? { status: "none", left: [] },
     next: body.next ?? [],
     ...(body.ciJobs && { ciJobs: body.ciJobs }),
+    ...(body.keep && { keep: body.keep }),
   };
   const saved = save(root, result);
 
