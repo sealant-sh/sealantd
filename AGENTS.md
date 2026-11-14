@@ -33,8 +33,16 @@ docker run --rm -v "$PWD":/src -w /src \
 
 ## Checks before a PR
 
-CI (`.github/workflows/ci.yml`) runs these on x64 and arm64. Run them before pushing and see them
-pass:
+`pnpm verify plan` says what a change owes: the checks, which CI jobs run, the fuzz targets and
+root-only tests its files reach. `pnpm verify check` then runs the checks below for the crates and
+packages the diff touches (`--all` for everything) and reports every test that skipped, with its
+gate. `pnpm verify status --markdown` prints the receipt for the PR body. Each verb takes `--json`
+for one JSON result on stdout; results land in `.verify/`. Exit codes: 0 passed, 1 failed, 2 wrong
+usage, 3 a missing prerequisite (cargo, cargo-nextest), 4 skipped or not built yet. A test may skip
+only when `tooling/verify/allowed-skips.json` names it with its gate.
+
+CI (`.github/workflows/ci.yml`) runs these on x64 and arm64. `verify check` runs them on the host,
+so on a Mac run them in the container below instead. See them pass before pushing:
 
 ```sh
 cargo fmt --all --check
