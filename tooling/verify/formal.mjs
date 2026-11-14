@@ -77,11 +77,17 @@ export const formal = async (root, { obligations, fuzzSeconds = FUZZ_SECONDS, pr
     const toolchains = spawnSync("rustup", ["toolchain", "list"], { encoding: "utf8" });
     const nightly = toolchains.status === 0 && /^nightly\b/m.test(toolchains.stdout);
     const cargoFuzz = nightly && works(["cargo", "+nightly", "fuzz", "--version"], root);
-    if (!cargoFuzz) {
-      const missing = nightly ? "cargo-fuzz is not installed" : "nightly Rust is not installed (through rustup)";
+    // libfuzzer-sys compiles libFuzzer, which is C++.
+    const cxx = works(["sh", "-c", "command -v c++"], root);
+    if (!cargoFuzz || !cxx) {
+      const missing = !nightly
+        ? "nightly Rust is not installed (through rustup)"
+        : !cargoFuzz
+          ? "cargo-fuzz is not installed"
+          : "no C++ compiler (c++) on PATH: libFuzzer is built from C++";
       for (const o of fuzzing) steps.push({ id: o.id, title: o.model, status: "blocked_by_prerequisite", detail: missing });
       if (!nightly) next.push("rustup toolchain install nightly --profile minimal");
-      next.push("cargo install cargo-fuzz --locked");
+      if (!cargoFuzz) next.push("cargo install cargo-fuzz --locked");
     } else {
       for (const o of fuzzing) {
         const log = `.verify/logs/formal-${o.id}.log`;
