@@ -444,7 +444,9 @@ fn overflow_and_a_missing_budget_fall_back_to_polling() {
         "not on the quiet timer (the watcher is gone): registered {took:?} after the change"
     );
     let fired = *t.poll_fired.get(polls).expect("the poll timer fired") - written;
-    eprintln!("(c) after overflow: change → poll timer {fired:?} → registered {took:?} (virtual time)");
+    eprintln!(
+        "(c) after overflow: change → poll timer {fired:?} → registered {took:?} (virtual time)"
+    );
     assert!(
         took >= Duration::from_millis(1000),
         "not on the quiet timer (the watcher is gone): {took:?}"
