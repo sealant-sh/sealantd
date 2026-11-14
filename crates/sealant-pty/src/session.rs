@@ -1866,10 +1866,22 @@ mod tests {
 
         exec_done(first.pid, "sleep").await;
         exec_done(second.pid, "sh").await;
-        // Each session's slave is its leader's stdin; its master is the one master the test
-        // process holds now, on that PTY, that it did not hold before.
+        // Each session's slave is its leader's stdin; its master is the descriptor the runtime
+        // holds for it. Not "a master the test process did not hold before": other tests in
+        // this process open and close PTYs, and a PTY number one of them held when the test
+        // looked can be the session's by now (sealantd#190).
+        let master_fd = |opened: &SessionOpened| -> u32 {
+            use std::os::fd::AsRawFd;
+            let entry = rt.registry.get(&opened.session_id).expect("the session");
+            let LeaderIo::Pty { master } = &entry.io else {
+                panic!("a PTY session: {:?}", entry.io)
+            };
+            let master = master.upgrade().expect("the session's master is open");
+            master.as_raw_fd().try_into().expect("a descriptor")
+        };
+        let masters = [master_fd(&first), master_fd(&second)];
         let now = open_fds(own);
-        let session = |leader: i32| {
+        let session = |leader: i32, master: u32| {
             let slave = open_fds(leader)
                 .into_iter()
                 .find(|fd| fd.fd == 0)
@@ -1879,27 +1891,24 @@ mod tests {
                 .strip_prefix("/dev/pts/")
                 .and_then(|n| n.parse().ok())
                 .unwrap_or_else(|| panic!("the leader's stdin is a pty slave: {slave:?}"));
-            let masters: Vec<&OpenFd> = now
+            // The positive control: the oracle reads the master sealantd holds for the session
+            // as a master on the leader's PTY, and it is close-on-exec whatever a spawn does.
+            let master = now
                 .iter()
-                .filter(|fd| fd.is_master() && fd.tty_index == Some(index))
-                .filter(|fd| !before.iter().any(|b| b.same_file(fd)))
-                .collect();
-            // The positive control: the oracle finds the master sealantd holds for the session,
-            // and it is close-on-exec whatever a spawn does.
-            assert_eq!(
-                masters.len(),
-                1,
-                "the test process holds exactly one new master on /dev/pts/{index}: {now:?}"
+                .find(|fd| fd.fd == master)
+                .unwrap_or_else(|| panic!("the test process holds descriptor {master}: {now:?}"));
+            assert!(
+                master.is_master() && master.tty_index == Some(index),
+                "the session's master is a master on /dev/pts/{index}: {master:?}"
             );
             assert!(
-                masters[0].close_on_exec(),
-                "the session's master is close-on-exec: {:?}",
-                masters[0]
+                master.close_on_exec(),
+                "the session's master is close-on-exec: {master:?}"
             );
-            (masters[0].clone(), slave)
+            (master.clone(), slave)
         };
-        let (first_master, first_slave) = session(first.pid);
-        let (second_master, second_slave) = session(second.pid);
+        let (first_master, first_slave) = session(first.pid, masters[0]);
+        let (second_master, second_slave) = session(second.pid, masters[1]);
         let sessions = [
             ("first", &first_master, &first_slave),
             ("second", &second_master, &second_slave),
