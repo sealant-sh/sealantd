@@ -11,6 +11,7 @@ import { ciSaysCode, loadMap, obligationsFor } from "./plan.mjs";
 import { globToRegExp } from "./repo.mjs";
 import { exitCode, rollUp, validate } from "./result.mjs";
 import { resolve } from "./status.mjs";
+import { propertyVerdict } from "./formal.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const repo = path.resolve(here, "../..");
@@ -56,7 +57,7 @@ test("every verb's result matches the schema, with the exit code its status impl
   for (const args of [
     ["plan", "--files", "crates/sealant-protocol/src/convert.rs"],
     ["status", "--files", "README.md"],
-    ["formal"],
+    ["formal", "--files", "README.md"],
     ["db"],
   ]) {
     const { code, result } = run(args, { root });
@@ -186,11 +187,13 @@ test("the map names what a change owes", () => {
   assert.deepEqual(owed("crates/sealant-protocol/src/convert.rs"), [
     "pre-pr-checks",
     "daemon-behaviour",
+    "property-decoders",
     "fuzz-decode-client",
     "fuzz-decode-server",
     "fuzz-decode-event",
   ]);
   assert.deepEqual(owed("fuzz/fuzz_targets/decode_event.rs"), ["pre-pr-checks", "fuzz-decode-event"]);
+  assert.deepEqual(owed("crates/sealant-runtime-core/src/redact.rs"), ["pre-pr-checks", "daemon-behaviour", "property-redaction"]);
   assert.deepEqual(owed("crates/sealant-process/src/identity.rs"), ["pre-pr-checks", "daemon-behaviour", "root-only-tests"]);
   assert.deepEqual(owed("crates/sealant-protocol/proto/sealant.proto").includes("protocol-generated-typescript"), true);
   assert.deepEqual(owed("README.md", "AGENTS.md"), []);
@@ -252,4 +255,28 @@ test("status discharges an obligation only with a passing result for this commit
   assert.equal(statusOf(result(), { sha, dirty: true }).obligations[0].status, "stale");
   assert.equal(statusOf(result({ status: "failed" })).steps[0].status, "failed");
   assert.equal(statusOf(null).steps[0].status, "skipped");
+});
+
+test("a property test passes only when exactly the named test ran", () => {
+  const ok = "running 1 test\ntest x ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 41 filtered out\n";
+  const none = "running 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 42 filtered out\n";
+  assert.equal(propertyVerdict(0, ok).status, "passed");
+  assert.equal(propertyVerdict(0, none).status, "failed");
+  assert.equal(propertyVerdict(101, ok.replace("ok. 1 passed; 0 failed", "FAILED. 0 passed; 1 failed")).status, "failed");
+});
+
+// Every property test the map names must exist where it says, or `verify formal` fails on it.
+test("each formal obligation names a test or a fuzz target that exists", () => {
+  for (const entry of loadMap()) {
+    for (const owe of entry.owes.filter((o) => o.kind === "formal")) {
+      if (owe.fuzz) {
+        assert.ok(readFileSync(path.join(repo, "fuzz/Cargo.toml"), "utf8").includes(`name = "${owe.fuzz}"`), owe.fuzz);
+      } else {
+        const [module, ...rest] = owe.test.name.split("::");
+        const fn = rest.pop();
+        const source = readFileSync(path.join(repo, "crates", owe.test.package, "src", `${module}.rs`), "utf8");
+        assert.match(source, new RegExp(`fn ${fn}\\(`), owe.test.name);
+      }
+    }
+  }
 });

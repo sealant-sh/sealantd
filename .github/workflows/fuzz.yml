@@ -1,0 +1,45 @@
+# Nightly: each control-protocol decoder fuzz target (fuzz/) runs for 60 seconds. A crash, leak or
+# timeout fails the job and uploads the input that caused it. `pnpm verify formal` runs a shorter
+# pass of the targets a change reaches.
+#
+# SECURITY: scheduled and dispatched on main only, read-only token, no secrets.
+name: fuzz
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fuzz-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [decode_client, decode_server, decode_event]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # cargo-fuzz builds with sanitizers, which need nightly; the detached fuzz/ crate builds only there.
+      - run: rustup toolchain install nightly --profile minimal
+      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
+        with:
+          tool: cargo-fuzz
+      - run: cargo +nightly fuzz run "$TARGET" -- -max_total_time=60
+        env:
+          TARGET: ${{ matrix.target }}
+      - if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: fuzz-${{ matrix.target }}-crash
+          path: fuzz/artifacts/${{ matrix.target }}/
+          if-no-files-found: ignore

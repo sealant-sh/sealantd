@@ -3,11 +3,20 @@
     "id": "pre-pr-checks",
     "from": "scripts/ci-docs-only.sh",
     "why": "Every change CI does not call documentation-only runs the checks AGENTS.md lists before a PR",
-    "owes": [{ "kind": "tests", "command": "pnpm verify check" }]
+    "owes": [
+      {
+        "kind": "tests",
+        "command": "pnpm verify check"
+      }
+    ]
   },
   {
     "id": "daemon-behaviour",
-    "paths": ["crates/*/src/**", "crates/*/build.rs", "crates/sealant-protocol/proto/**"],
+    "paths": [
+      "crates/*/src/**",
+      "crates/*/build.rs",
+      "crates/sealant-protocol/proto/**"
+    ],
     "why": "Tests passing is not verification: run the real daemon and read the events it records",
     "owes": [
       {
@@ -19,7 +28,11 @@
   },
   {
     "id": "protocol-generated-typescript",
-    "paths": ["crates/sealant-protocol/proto/**", "buf.yaml", "buf.gen.yaml"],
+    "paths": [
+      "crates/sealant-protocol/proto/**",
+      "buf.yaml",
+      "buf.gen.yaml"
+    ],
     "why": "The TypeScript in packages/runtime-protocol/src/gen is generated from the .proto and CI does not check it is current",
     "owes": [
       {
@@ -56,9 +69,58 @@
   },
   {
     "id": "test-support-gate",
-    "paths": ["Cargo.toml", "Cargo.lock", "crates/*/Cargo.toml", "scripts/ci-test-support-gate.sh", "scripts/test-support-probe/**"],
+    "paths": [
+      "Cargo.toml",
+      "Cargo.lock",
+      "crates/*/Cargo.toml",
+      "scripts/ci-test-support-gate.sh",
+      "scripts/test-support-probe/**"
+    ],
     "why": "The manual clock and the dotfiles hold seam must stay out of every production build",
-    "owes": [{ "kind": "tests", "command": "scripts/ci-test-support-gate.sh" }]
+    "owes": [
+      {
+        "kind": "tests",
+        "command": "scripts/ci-test-support-gate.sh"
+      }
+    ]
+  },
+  {
+    "id": "property-decoders",
+    "paths": [
+      "crates/sealant-protocol/src/**",
+      "crates/sealant-protocol/proto/**",
+      "crates/sealant-protocol/build.rs"
+    ],
+    "why": "No input of 600 random or bit-flipped bytes makes a control-protocol decoder panic",
+    "owes": [
+      {
+        "kind": "formal",
+        "model": "property:decoders_never_panic_on_arbitrary_input",
+        "test": {
+          "package": "sealant-protocol",
+          "name": "convert::tests::decoders_never_panic_on_arbitrary_input"
+        },
+        "command": "pnpm verify formal"
+      }
+    ]
+  },
+  {
+    "id": "property-redaction",
+    "paths": [
+      "crates/sealant-runtime-core/src/redact.rs"
+    ],
+    "why": "However a process splits its output, the recording masks the same secrets as one pass over it",
+    "owes": [
+      {
+        "kind": "formal",
+        "model": "property:every_partition_records_what_one_pass_records",
+        "test": {
+          "package": "sealant-runtime-core",
+          "name": "redact::tests::every_partition_records_what_one_pass_records"
+        },
+        "command": "pnpm verify formal"
+      }
+    ]
   },
   {
     "id": "fuzz-decode-client",
@@ -70,7 +132,14 @@
       "fuzz/fuzz_targets/decode_client.rs"
     ],
     "why": "decode_client reads untrusted bytes from every control connection: it must never panic",
-    "owes": [{ "kind": "formal", "model": "fuzz:decode_client", "command": "cargo +nightly fuzz run decode_client -- -max_total_time=60" }]
+    "owes": [
+      {
+        "kind": "formal",
+        "model": "fuzz:decode_client",
+        "fuzz": "decode_client",
+        "command": "pnpm verify formal"
+      }
+    ]
   },
   {
     "id": "fuzz-decode-server",
@@ -82,7 +151,14 @@
       "fuzz/fuzz_targets/decode_server.rs"
     ],
     "why": "decode_server reads what a daemon sends the client: it must never panic",
-    "owes": [{ "kind": "formal", "model": "fuzz:decode_server", "command": "cargo +nightly fuzz run decode_server -- -max_total_time=60" }]
+    "owes": [
+      {
+        "kind": "formal",
+        "model": "fuzz:decode_server",
+        "fuzz": "decode_server",
+        "command": "pnpm verify formal"
+      }
+    ]
   },
   {
     "id": "fuzz-decode-event",
@@ -94,6 +170,13 @@
       "fuzz/fuzz_targets/decode_event.rs"
     ],
     "why": "decode_event reads every event a daemon streams: it must never panic",
-    "owes": [{ "kind": "formal", "model": "fuzz:decode_event", "command": "cargo +nightly fuzz run decode_event -- -max_total_time=60" }]
+    "owes": [
+      {
+        "kind": "formal",
+        "model": "fuzz:decode_event",
+        "fuzz": "decode_event",
+        "command": "pnpm verify formal"
+      }
+    ]
   }
 ]
