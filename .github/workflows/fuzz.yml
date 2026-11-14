@@ -31,9 +31,9 @@ jobs:
           persist-credentials: false
       # cargo-fuzz builds with sanitizers, which need nightly; the detached fuzz/ crate builds only there.
       - run: rustup toolchain install nightly --profile minimal
-      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
-        with:
-          tool: cargo-fuzz
+      # Built here, not fetched: cargo-fuzz builds for the triple it was itself built for, and the
+      # prebuilt one install-action falls back to is musl, which the runner has no std for.
+      - run: cargo install cargo-fuzz --locked
       - run: cargo +nightly fuzz run "$TARGET" -- -max_total_time=60
         env:
           TARGET: ${{ matrix.target }}
