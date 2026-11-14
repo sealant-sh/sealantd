@@ -140,6 +140,8 @@ struct OnClock<'a> {
     /// When the max-interval timer, and the quiet timer, fired (each time its counter rose).
     max_fired: Vec<Duration>,
     quiet_fired: Vec<Duration>,
+    /// When a polled class's interval elapsed (each time its counter rose).
+    poll_fired: Vec<Duration>,
 }
 
 impl<'a> OnClock<'a> {
@@ -157,6 +159,7 @@ impl<'a> OnClock<'a> {
             registered: Vec::new(),
             max_fired: Vec::new(),
             quiet_fired: Vec::new(),
+            poll_fired: Vec::new(),
         }
     }
 
@@ -173,6 +176,9 @@ impl<'a> OnClock<'a> {
         }
         while self.quiet_fired.len() < snap.quiet_fired as usize {
             self.quiet_fired.push(now);
+        }
+        while self.poll_fired.len() < snap.poll_fired as usize {
+            self.poll_fired.push(now);
         }
         while self.registered.len() < self.fx.chain().len() {
             self.registered.push(now);
@@ -224,126 +230,57 @@ fn fast_bulk(mut cadence: Cadence, quiet_ms: u64, max_ms: u64) -> Cadence {
     cadence
 }
 
-/// The same work as a timer's capture, forced, with no timer and no wake-up: the first capture
-/// of an identical workspace, snapped and shipped on this machine. What a timer's snap, ship
-/// and registration are held to, instead of a wall-clock constant: on a runner with a slow disk
-/// every fsync and git spawn is slower, for both alike.
-fn forced_capture() -> Duration {
-    let twin = Fixture::build();
-    let twin_runner = twin.runner(twin.config(Cadence::default()));
-    fs::write(twin.root.join("src/new.rs"), "fn n() {}\n").unwrap();
-    let t1 = Instant::now();
-    assert!(!twin_runner.snap(CaptureKind::Turn).unwrap().unchanged);
-    twin_runner.ship(Duration::from_secs(30)).unwrap();
-    let forced = t1.elapsed();
-    assert_eq!(twin.chain().len(), 1, "the forced capture registered");
-    twin_runner.stop();
-    forced
-}
-
-/// How long a timer's capture may take to register after the timer fired: three times the same
-/// work forced, and half a second (the worker's wake-up, scheduling).
-fn after_timer_bound(forced: Duration) -> Duration {
-    forced * 3 + Duration::from_millis(500)
-}
-
-/// Wait until the chain holds `n` captures, noting when `fired` (a timer's counter in the
-/// runner's snapshot) first rose above `before`. Both from `t0`; `None` for a registration past
-/// `timeout`.
-fn wait_timer_and_chain(
-    fx: &Fixture,
-    runner: &CadenceRunner,
-    n: usize,
-    t0: Instant,
-    timeout: Duration,
-    fired: impl Fn(&sealant_capture::CadenceSnapshot) -> u64,
-    before: u64,
-) -> (Option<Duration>, Option<Duration>) {
-    let mut fired_at = None;
-    while t0.elapsed() < timeout {
-        if fired_at.is_none() && fired(&runner.snapshot()) > before {
-            fired_at = Some(t0.elapsed());
-        }
-        if fx.chain().len() >= n {
-            return (fired_at.or(Some(t0.elapsed())), Some(t0.elapsed()));
-        }
-        std::thread::sleep(Duration::from_millis(5));
-    }
-    (fired_at, None)
-}
-
 /// (a) A change registers within the quiet period (2 s) plus the snap and a local ship.
 ///
-/// The quiet timer is held to the configured period (it does no I/O). What follows it — the
-/// snap, the worker's wake-up, the ship and the registration — is held to the same work forced
-/// (an identical workspace's first capture, snapped and shipped right after on the same
-/// machine), not to a wall-clock constant: on a runner with a slow disk every fsync and git
-/// spawn is slower, for both alike. The change is written as the runner starts, so a missed
-/// wake-up (the capture waiting for the ship worker's tick, [`SHIP_TICK`] after its first pass
-/// at the start) costs ≈ 3 s after the timer: held to at least 2 s, one forced capture measured
-/// once is not the only yardstick on a loaded runner (a scheduling stall of a second or so
-/// failed it), and a missed wake-up still fails it.
+/// On a [`ManualClock`] ([`OnClock`]): the quiet timer is held to the configured period, and what
+/// follows it — the snap, the worker's wake-up, the ship, the registration — takes no virtual
+/// time, so it is held to none, whatever CPU the test gets (sealantd#167). The change is written
+/// as the runner starts, so a missed wake-up (the capture waiting for the ship worker's tick,
+/// [`SHIP_TICK`] after its first pass) registers seconds of virtual time after the timer and
+/// fails it.
 #[test]
 fn a_change_registers_within_the_quiet_period() {
     let fx = Fixture::build();
     let cadence = Cadence::default();
     let quiet = cadence.quiet;
-    let runner = fx.runner(fx.config(cadence));
-    // The ship worker made its first pass as the runner started; it ticks next about SHIP_TICK
-    // after this.
-    let started = Instant::now();
-    assert_eq!(runner.snapshot().small_mode, WatchMode::Watched);
+    let mut t = OnClock::start(&fx, fx.config(cadence));
+    assert_eq!(t.runner.snapshot().small_mode, WatchMode::Watched);
     assert!(fx.chain().is_empty(), "no snap without a change");
 
-    let t0 = Instant::now();
-    fs::write(fx.root.join("src/new.rs"), "fn n() {}\n").unwrap();
-    let mut fired = None;
-    let registered = loop {
-        assert!(
-            t0.elapsed() < quiet + Duration::from_secs(30),
-            "no capture registered (quiet timer fired after {fired:?})"
-        );
-        if fired.is_none() && runner.snapshot().quiet_fired > 0 {
-            fired = Some(t0.elapsed());
-        }
-        if !fx.chain().is_empty() {
-            break t0.elapsed();
-        }
-        std::thread::sleep(Duration::from_millis(5));
-    };
-    let fired = fired.unwrap_or(registered);
-    let after_quiet = registered.saturating_sub(fired);
-    let snap = runner.snapshot();
+    t.write("src/new.rs", "fn n() {}\n");
+    let written = t.now();
+    assert!(
+        t.wait_for_chain(1, quiet + SHIP_TICK * 2).is_some(),
+        "no capture registered (quiet timer fired at {:?})",
+        t.quiet_fired
+    );
+    let fired = *t.quiet_fired.first().expect("the quiet timer fired") - written;
+    let registered = t.registered[0] - written;
+    eprintln!("(a) change → quiet timer {fired:?} → registered {registered:?} (virtual time)");
+    let snap = t.runner.snapshot();
     assert_eq!(snap.quiet_fired, 1);
     assert_eq!(snap.max_fired, 0);
     assert!(!snap.small_dirty, "a snap clears dirty");
 
-    // The same work forced, right after on this machine.
-    let forced = forced_capture();
-    eprintln!(
-        "(a) change → quiet timer {fired:?} → registered {after_quiet:?} later; \
-         forced snap + ship {forced:?}"
-    );
-
-    // The event arrives after the write, and the timer runs from the event.
+    // The timer runs from the change.
     assert!(fired >= quiet, "not before the quiet period: {fired:?}");
     assert!(
         fired <= quiet + Duration::from_secs(1),
         "the quiet timer fires at the quiet period: {fired:?}"
     );
-    // A missed wake-up registers at the worker's next tick, about this long after the timer.
-    let tick_after_timer = (started + SHIP_TICK).saturating_duration_since(t0 + fired);
+    // A missed wake-up registers at the worker's next tick instead.
     assert!(
-        after_quiet <= after_timer_bound(forced).max(Duration::from_secs(2)),
-        "snap + ship after the quiet timer took {after_quiet:?}; forced, the same work took \
-         {forced:?}; the worker's next tick was {tick_after_timer:?} after the timer"
+        registered == fired,
+        "snap + ship after the quiet timer took {:?} of virtual time",
+        registered.saturating_sub(fired)
     );
 
     // Nothing changes after it: nothing more is captured.
-    std::thread::sleep(quiet + Duration::from_millis(500));
+    let after = t.now() + quiet + Duration::from_millis(500);
+    t.run_to(after);
     assert_eq!(fx.chain().len(), 1, "no snap without a change");
-    assert_eq!(runner.snapshot().quiet_fired, 1);
-    runner.stop();
+    assert_eq!(t.runner.snapshot().quiet_fired, 1);
+    t.runner.stop();
 }
 
 /// (b) Writes every 500 ms for 15 s: captures register at most every `max_interval` (10 s),
@@ -439,48 +376,37 @@ fn continuous_writes_register_at_the_max_interval() {
 /// (c) An overflow drops the watcher: snaps still happen, at the max interval; a budget of 0
 /// polls from the start.
 ///
-/// The poll timer is held to the max interval; the reconciliation, and each snap and ship after
-/// a timer, to the same work forced on this machine ([`after_timer_bound`]), as in (a).
+/// On a [`ManualClock`] ([`OnClock`]): the reconciliation the overflow asks for waits for no
+/// timer, and the poll timer fires at the max interval after the last snap, each in virtual time;
+/// the snap and ship after a timer take none (sealantd#191).
 #[test]
 fn overflow_and_a_missing_budget_fall_back_to_polling() {
-    let forced = forced_capture();
-    let bound = after_timer_bound(forced);
     let fx = Fixture::build();
     let cadence = Cadence {
         quiet: Duration::from_millis(500),
         max_interval: Duration::from_secs(3),
         ..Cadence::default()
     };
-    let runner = fx.runner(fx.config(cadence));
-    assert_eq!(runner.snapshot().small_mode, WatchMode::Watched);
+    let mut t = OnClock::start(&fx, fx.config(cadence));
+    assert_eq!(t.runner.snapshot().small_mode, WatchMode::Watched);
 
-    runner.signal(ChangeSignal::Overflow);
+    t.runner.signal(ChangeSignal::Overflow);
+    t.clock.settle();
+    t.sample();
     // The overflow reconciles both classes at once (a small and a bulk snap, which coalesce
-    // into one or two captures depending on who ships first), then polls. Two snaps and their
-    // ships: held to twice the forced one's bound.
-    let settle = Instant::now();
-    loop {
-        let snap = runner.snapshot();
-        if snap.small_snaps >= 1 && snap.bulk_snaps >= 1 && !snap.bulk_running {
-            break;
-        }
-        assert!(
-            settle.elapsed() < bound * 2,
-            "overflow reconciles now: {snap:?} after {:?}; forced, one capture took {forced:?}",
-            settle.elapsed()
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    let reconciled = fx.wait_for_chain(1, bound * 2);
+    // into one or two captures depending on who ships first), then polls: no virtual time.
+    let snap = t.runner.snapshot();
     assert!(
-        reconciled.is_some(),
-        "the reconciliation registers; forced, one capture took {forced:?}"
+        snap.small_snaps >= 1 && snap.bulk_snaps >= 1 && !snap.bulk_running,
+        "overflow reconciles now: {snap:?}"
     );
-    let snap = runner.snapshot();
+    assert!(
+        t.wait_for_chain(1, Duration::ZERO).is_some(),
+        "the reconciliation registers at once: {snap:?}"
+    );
     assert_eq!(snap.small_mode, WatchMode::Polled);
     assert_eq!(snap.bulk_mode, WatchMode::Polled);
     assert_eq!(snap.overflows, 1);
-    std::thread::sleep(Duration::from_millis(300));
     let n = fx.chain().len();
     assert!(
         fx.chain()
@@ -494,22 +420,14 @@ fn overflow_and_a_missing_budget_fall_back_to_polling() {
         "the bulk class was reconciled too"
     );
 
-    let polls = runner.snapshot().poll_fired;
-    let t0 = Instant::now();
-    fs::write(fx.root.join("src/after.rs"), "fn a() {}\n").unwrap();
-    let (fired, took) = wait_timer_and_chain(
-        &fx,
-        &runner,
-        n + 1,
-        t0,
-        cadence.max_interval + Duration::from_secs(30),
-        |s| s.poll_fired,
-        polls,
-    );
-    let Some(took) = took else {
+    let polls = t.poll_fired.len();
+    let quiets = t.quiet_fired.len();
+    t.write("src/after.rs", "fn a() {}\n");
+    let written = t.now();
+    let Some(took) = t.wait_for_chain(n + 1, cadence.max_interval + SHIP_TICK * 2) else {
         panic!(
             "polled snap registers the change: {:?} chain {:?}",
-            runner.snapshot(),
+            t.runner.snapshot(),
             fx.chain()
                 .iter()
                 .map(|h| (
@@ -520,11 +438,13 @@ fn overflow_and_a_missing_budget_fall_back_to_polling() {
                 .collect::<Vec<_>>()
         );
     };
-    let fired = fired.unwrap_or(took);
-    eprintln!(
-        "(c) after overflow: change → poll timer {fired:?} → registered {took:?}; forced \
-         snap + ship {forced:?}"
+    assert_eq!(
+        t.quiet_fired.len(),
+        quiets,
+        "not on the quiet timer (the watcher is gone): registered {took:?} after the change"
     );
+    let fired = *t.poll_fired.get(polls).expect("the poll timer fired") - written;
+    eprintln!("(c) after overflow: change → poll timer {fired:?} → registered {took:?} (virtual time)");
     assert!(
         took >= Duration::from_millis(1000),
         "not on the quiet timer (the watcher is gone): {took:?}"
@@ -534,44 +454,37 @@ fn overflow_and_a_missing_budget_fall_back_to_polling() {
         "the poll timer fires at the max interval: {fired:?}"
     );
     assert!(
-        took - fired <= bound,
-        "snap + ship after the poll timer took {:?}; forced, the same work took {forced:?}",
-        took - fired
+        took == fired,
+        "snap + ship after the poll timer took {:?} of virtual time",
+        took.saturating_sub(fired)
     );
-    runner.stop();
+    t.runner.stop();
 
     // Budget 0: polled from the start.
     let fx = Fixture::build();
     let mut config = fx.config(cadence);
     config.watch.budget = Some(0);
-    let runner = fx.runner(config);
-    assert_eq!(runner.snapshot().small_mode, WatchMode::Polled);
-    let t0 = Instant::now();
-    fs::write(fx.root.join("src/polled.rs"), "fn p() {}\n").unwrap();
-    let (fired, took) = wait_timer_and_chain(
-        &fx,
-        &runner,
-        1,
-        t0,
-        cadence.max_interval + Duration::from_secs(30),
-        |s| s.poll_fired,
-        0,
-    );
-    let took = took.expect("polled snap registers");
-    let fired = fired.unwrap_or(took);
-    eprintln!("(c) budget 0: change → poll timer {fired:?} → registered {took:?}");
+    let mut t = OnClock::start(&fx, config);
+    assert_eq!(t.runner.snapshot().small_mode, WatchMode::Polled);
+    t.write("src/polled.rs", "fn p() {}\n");
+    let written = t.now();
+    let took = t
+        .wait_for_chain(1, cadence.max_interval + SHIP_TICK * 2)
+        .expect("polled snap registers");
+    let fired = *t.poll_fired.first().expect("the poll timer fired") - written;
+    eprintln!("(c) budget 0: change → poll timer {fired:?} → registered {took:?} (virtual time)");
     assert!(took >= Duration::from_millis(1000), "{took:?}");
     assert!(
         fired <= cadence.max_interval + Duration::from_secs(1),
         "the poll timer fires at the max interval: {fired:?}"
     );
     assert!(
-        took - fired <= bound,
-        "snap + ship after the poll timer took {:?}; forced, the same work took {forced:?}",
-        took - fired
+        took == fired,
+        "snap + ship after the poll timer took {:?} of virtual time",
+        took.saturating_sub(fired)
     );
-    assert!(runner.snapshot().poll_fired >= 1);
-    runner.stop();
+    assert!(t.runner.snapshot().poll_fired >= 1);
+    t.runner.stop();
 }
 
 /// (d) Bulk changes alone produce no small-class capture and exactly one coalesced bulk capture
