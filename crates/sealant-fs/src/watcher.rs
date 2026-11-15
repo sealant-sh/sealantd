@@ -125,20 +125,46 @@ pub fn watch_pruned(
     dir: &Path,
     prune: &dyn Fn(&Path, &str) -> bool,
 ) -> usize {
+    watch_listed(watcher, watched, dir, prune, &mut |d, p| pruned_dirs(d, p))
+}
+
+/// Whether to leave a directory out of a listing (and not descend into it).
+type Prune<'a> = &'a dyn Fn(&Path, &str) -> bool;
+
+/// [`watch_pruned`] over what `list` lists (a test lists, then creates a directory). A directory
+/// created after a listing but before its parent's watch existed raises no event, so `dir` is
+/// listed again after every pass that added a watch, until a pass adds none (SLNT-758).
+fn watch_listed(
+    watcher: &mut RecommendedWatcher,
+    watched: &mut HashSet<PathBuf>,
+    dir: &Path,
+    prune: Prune<'_>,
+    list: &mut dyn FnMut(&Path, Prune<'_>) -> Vec<PathBuf>,
+) -> usize {
     let mut added = 0;
-    for d in pruned_dirs(dir, prune) {
-        if watched.contains(&d) {
-            continue;
-        }
-        match watcher.watch(&d, RecursiveMode::NonRecursive) {
-            Ok(()) => {
-                watched.insert(d);
-                added += 1;
+    let mut failed = HashSet::new();
+    loop {
+        let mut new = 0;
+        for d in list(dir, prune) {
+            if watched.contains(&d) || failed.contains(&d) {
+                continue;
             }
-            Err(error) => tracing::warn!(dir = %d.display(), %error, "could not watch directory"),
+            match watcher.watch(&d, RecursiveMode::NonRecursive) {
+                Ok(()) => {
+                    watched.insert(d);
+                    new += 1;
+                }
+                Err(error) => {
+                    tracing::warn!(dir = %d.display(), %error, "could not watch directory");
+                    failed.insert(d);
+                }
+            }
+        }
+        added += new;
+        if new == 0 {
+            return added;
         }
     }
-    added
 }
 
 fn ignore_prune(config: &SnapshotConfig) -> impl Fn(&Path, &str) -> bool + '_ {
@@ -374,4 +400,64 @@ pub(crate) fn build_watcher(
     Ok(WatcherHandle {
         watcher: watcher_slot,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// SLNT-758: a directory created inside a new directory after the walk listed it, but before
+    /// the walk's watches exist, raises no event of its own. It is watched all the same: a file
+    /// written in it afterwards is reported. The listing creates it, standing in for a writer that
+    /// ran between the worker's walk and its registration.
+    #[test]
+    fn a_directory_made_between_the_listing_and_the_watch_is_watched() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let root = tmp.path().to_path_buf();
+        let (tx, rx) = mpsc::channel::<notify::Event>();
+        let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+            if let Ok(event) = res {
+                let _ = tx.send(event);
+            }
+        })
+        .expect("watcher");
+        watcher
+            .watch(&root, RecursiveMode::NonRecursive)
+            .expect("watch the root");
+        let mut watched = HashSet::from([root.clone()]);
+
+        let src = root.join("src");
+        std::fs::create_dir(&src).expect("mkdir src");
+        let nested = src.join("nested");
+        let mut listings = 0;
+        watch_listed(
+            &mut watcher,
+            &mut watched,
+            &src,
+            &|_, _| false,
+            &mut |d, prune| {
+                let listed = pruned_dirs(d, prune);
+                listings += 1;
+                if listings == 1 {
+                    std::fs::create_dir(&nested).expect("mkdir src/nested");
+                }
+                listed
+            },
+        );
+
+        // One inotify queue keeps order: an event for the nested file comes before the fence's.
+        let deep = nested.join("deep.txt");
+        let fence = root.join("fence");
+        std::fs::write(&deep, b"payload").expect("write deep.txt");
+        std::fs::write(&fence, b"").expect("write the fence");
+        let mut seen = Vec::new();
+        while !seen.contains(&fence) {
+            seen.extend(rx.recv().expect("the watcher's events").paths);
+        }
+        assert!(
+            seen.contains(&deep),
+            "expected an event for the file inside the directory made before its parent's watch, \
+             got {seen:?}"
+        );
+    }
 }
