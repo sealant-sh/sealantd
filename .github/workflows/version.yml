@@ -4,6 +4,7 @@
 # SECURITY: this ONLY opens a PR — it has no `publish` step and no npm credentials. It runs only on
 # direct pushes to this repo's main (forks/PRs do not trigger `push`); the repository guard is extra
 # belt. Publishing stays exclusively in release.yml (tag-triggered, environment-gated, OIDC).
+# approve-checks then starts that PR's held CI run (.changeset/README.md).
 name: version
 
 on:
@@ -25,6 +26,8 @@ jobs:
     permissions:
       contents: write # commit the version bump to the changeset-release branch
       pull-requests: write # open/update the Version Packages PR
+    outputs:
+      pull-request: ${{ steps.changesets.outputs.pullRequestNumber }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: corepack enable
@@ -34,7 +37,8 @@ jobs:
           package-manager-cache: false
           node-version: 24
       - run: pnpm install --frozen-lockfile --ignore-scripts
-      - uses: changesets/action@a45c4d594aa4e2c509dc14a9f2b3b67ba3780d0d # v1.9.0
+      - id: changesets
+        uses: changesets/action@a45c4d594aa4e2c509dc14a9f2b3b67ba3780d0d # v1.9.0
         with:
           version: pnpm changeset version
           # No `publish:` — this workflow never publishes. Merge the Version PR, then tag to release.
@@ -42,3 +46,68 @@ jobs:
           title: "chore: version packages"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # GitHub holds the Version Packages PR's pull_request runs at `action_required` because
+  # github-actions[bot] pushed its branch, so the required `rust` and `node` checks never report on
+  # it. Approving the held run starts it as an ordinary pull_request run, which the PR counts. Only
+  # the run this workflow's own push created is approved: ci.yml (the only workflow a pull request
+  # runs), on the PR's head commit, triggered by github-actions[bot]. A job of its own, so the token
+  # that can push cannot approve.
+  approve-checks:
+    name: Start the Version Packages PR's checks
+    needs: version
+    if: needs.version.outputs.pull-request != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      actions: write # approve the held run
+      pull-requests: read # read the PR's head
+    steps:
+      - name: Approve its held CI run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR: ${{ needs.version.outputs.pull-request }}
+          # GitHub creates the runs a few seconds after the push; give up after five minutes.
+          TRIES: "30"
+          POLL_SECONDS: "10"
+        run: |
+          set -euo pipefail
+          branch=changeset-release/main
+          head=$(gh pr view "$PR" --json headRefName,headRefOid \
+            --jq "select(.headRefName == \"$branch\") | .headRefOid")
+          if [ -z "$head" ]; then
+            echo "::error::#$PR is not the Version Packages PR (head branch is not $branch)"
+            exit 1
+          fi
+          pending="ci.yml"
+          for try in $(seq "$TRIES"); do
+            runs=$(gh api "repos/$GH_REPO/actions/runs?head_sha=$head&event=pull_request&per_page=50" \
+              --jq ".workflow_runs[] | select(.head_branch == \"$branch\")
+                | [.path, .id, .conclusion // \"none\", .actor.login] | @tsv")
+            left=""
+            for workflow in $pending; do
+              # Newest first: the run this push created.
+              run=$(printf '%s\n' "$runs" | awk -F '\t' -v path=".github/workflows/$workflow" \
+                '$1 == path { print; exit }')
+              if [ -z "$run" ]; then
+                left="$left $workflow"
+                continue
+              fi
+              IFS=$'\t' read -r _ id conclusion actor <<<"$run"
+              if [ "$conclusion" != action_required ]; then
+                echo "$workflow run $id on $head is already started"
+              elif [ "$actor" != "github-actions[bot]" ]; then
+                echo "::error::$workflow run $id on $head waits for approval but $actor triggered it"
+                exit 1
+              else
+                gh api -X POST "repos/$GH_REPO/actions/runs/$id/approve" >/dev/null
+                echo "Approved $workflow run $id on $head"
+              fi
+            done
+            pending=$left
+            [ -z "$pending" ] && exit 0
+            [ "$try" -lt "$TRIES" ] && sleep "$POLL_SECONDS"
+          done
+          echo "::error::No pull_request run of$pending appeared on $head"
+          exit 1
