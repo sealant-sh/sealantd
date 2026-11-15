@@ -36,9 +36,12 @@ docker run --rm -v "$PWD":/src -w /src \
 `pnpm verify plan` says what a change owes: the checks, which CI jobs run, the property tests,
 fuzz targets and root-only tests its files reach. `pnpm verify check` then runs the checks below for
 the crates and packages the diff touches (`--all` for everything) and reports every test that
-skipped, with its gate. `pnpm verify formal` runs the property tests and a 20-second fuzz pass of
-each decoder target the diff reaches; fuzzing needs nightly Rust and cargo-fuzz, which it names when
-they are missing (the full 60-second runs are nightly, `.github/workflows/fuzz.yml`). `pnpm verify
+skipped, with its gate. `pnpm verify formal` runs the TLA+ models (`docs/formal/<area>/`, quick
+bounds; `--full` for the full ones), the property tests and a 20-second fuzz pass of each decoder
+target the diff reaches. A model needs java; fuzzing needs nightly Rust and cargo-fuzz; it names
+what is missing. A diff to a model's covered code that neither changes the model nor moves its
+`COVERAGE` sync commit fails its guard: follow the model's skill (`.agents/skills/<area>`). Full
+bounds and full 60-second fuzz runs are nightly (`formal.yml`, `fuzz.yml`). `pnpm verify
 status --markdown` prints the receipt for the PR body. Each verb takes `--json` for one JSON result
 on stdout; results land in `.verify/`. Exit codes: 0 passed, 1 failed, 2 wrong usage, 3 a missing
 prerequisite (cargo, cargo-nextest, nightly, cargo-fuzz), 4 skipped or not built yet. A test may

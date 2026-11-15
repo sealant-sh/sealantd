@@ -85,6 +85,23 @@
     ]
   },
   {
+    "id": "model-capture-queue",
+    "paths": [
+      "crates/sealant-capture/src/ship.rs",
+      "crates/sealant-capture/src/engine.rs",
+      "docs/formal/capture-queue/**"
+    ],
+    "why": "Every capture that reaches the staging queue registers once, in order, whatever step a crash lands on",
+    "owes": [
+      {
+        "kind": "formal",
+        "model": "model:capture-queue",
+        "dir": "docs/formal/capture-queue",
+        "command": "pnpm verify formal"
+      }
+    ]
+  },
+  {
     "id": "property-decoders",
     "paths": [
       "crates/sealant-protocol/src/**",

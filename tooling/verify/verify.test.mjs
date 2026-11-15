@@ -11,7 +11,7 @@ import { ciSaysCode, loadMap, obligationsFor } from "./plan.mjs";
 import { globToRegExp } from "./repo.mjs";
 import { exitCode, rollUp, validate } from "./result.mjs";
 import { resolve } from "./status.mjs";
-import { propertyVerdict } from "./formal.mjs";
+import { guard, parseCoverage, propertyVerdict, readCoverage } from "./formal.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const repo = path.resolve(here, "../..");
@@ -266,10 +266,15 @@ test("a property test passes only when exactly the named test ran", () => {
 });
 
 // Every property test the map names must exist where it says, or `verify formal` fails on it.
-test("each formal obligation names a test or a fuzz target that exists", () => {
+test("each formal obligation names a model, a test or a fuzz target that exists", () => {
   for (const entry of loadMap()) {
     for (const owe of entry.owes.filter((o) => o.kind === "formal")) {
-      if (owe.fuzz) {
+      if (owe.dir) {
+        // The map owes the model for exactly the code its COVERAGE names, and for the model itself.
+        const coverage = readCoverage(repo, owe.dir);
+        assert.deepEqual([...entry.paths].sort(), [...coverage.paths, `${owe.dir}/**`].sort(), entry.id);
+        for (const file of coverage.model) assert.ok(readFileSync(path.join(repo, file)), file);
+      } else if (owe.fuzz) {
         assert.ok(readFileSync(path.join(repo, "fuzz/Cargo.toml"), "utf8").includes(`name = "${owe.fuzz}"`), owe.fuzz);
       } else {
         const [module, ...rest] = owe.test.name.split("::");
@@ -279,4 +284,48 @@ test("each formal obligation names a test or a fuzz target that exists", () => {
       }
     }
   }
+});
+
+// A repository with one model whose COVERAGE names src/a.rs at the first commit.
+const modelFixture = (t) => {
+  const root = mkdtempSync(path.join(tmpdir(), "verify-model-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  git(root, "init", "-q", "-b", "main");
+  git(root, "config", "user.name", "verify test");
+  git(root, "config", "user.email", "verify@localhost");
+  write(root, "src/a.rs", "fn a() {}\n");
+  write(root, "src/b.rs", "fn b() {}\n");
+  write(root, "docs/formal/m/M.tla", "---- MODULE M ----\n====\n");
+  git(root, "add", "-A");
+  git(root, "commit", "-qm", "code");
+  const sync = git(root, "rev-parse", "HEAD");
+  write(root, "docs/formal/m/COVERAGE", `sync ${sync}\nmodel M.tla\npath src/a.rs\n`);
+  git(root, "add", "-A");
+  git(root, "commit", "-qm", "model");
+  return { root, base: git(root, "rev-parse", "HEAD") };
+};
+
+test("the model guard fails covered code that changes without the model or its sync commit", (t) => {
+  const { root, base } = modelFixture(t);
+  const coverage = () => readCoverage(root, "docs/formal/m");
+  const verdict = (files) => guard(root, coverage(), { files, base }).status;
+  assert.equal(verdict(["src/b.rs"]), "passed", "no covered code");
+  assert.equal(verdict(["src/a.rs"]), "failed", "covered code alone");
+  assert.equal(verdict(["src/a.rs", "docs/formal/m/M.tla"]), "passed", "with the model");
+  write(root, "src/a.rs", "fn a() { 1 }\n");
+  git(root, "commit", "-qam", "change");
+  const moved = readFileSync(path.join(root, "docs/formal/m/COVERAGE"), "utf8").replace(/^sync \S+/, `sync ${git(root, "rev-parse", "HEAD")}`);
+  write(root, "docs/formal/m/COVERAGE", moved);
+  assert.equal(verdict(["src/a.rs", "docs/formal/m/COVERAGE"]), "passed", "with the sync commit moved");
+});
+
+test("COVERAGE needs a full sync commit and a covered path", () => {
+  assert.throws(() => parseCoverage("sync abc\npath x\n", "d"), /sync commit/);
+  assert.throws(() => parseCoverage(`sync ${"a".repeat(40)}\n`, "d"), /covered path/);
+  assert.deepEqual(parseCoverage(`sync ${"a".repeat(40)}\nmodel M.tla\npath x\n`, "d").model, ["d/M.tla"]);
+});
+
+test("a diff to the staging queue owes the capture-queue model", () => {
+  const owed = obligationsFor(repo, loadMap(), ["crates/sealant-capture/src/ship.rs"]);
+  assert.ok(owed.some((o) => o.id === "model-capture-queue" && o.kind === "formal" && o.dir === "docs/formal/capture-queue"));
 });

@@ -1,11 +1,130 @@
-// `verify formal`: the property tests and fuzz targets whose covered files the change touches, from
-// the obligations map's `formal` entries. sealantd has no model with a sync commit, so there is no
-// drift to report; a fuzz target needs nightly Rust and cargo-fuzz, and says so when they are missing.
-import { spawn, spawnSync } from "node:child_process";
-import { createWriteStream, existsSync, mkdirSync, readdirSync } from "node:fs";
+// `verify formal`: the models, property tests and fuzz targets whose covered files the change
+// touches, from the obligations map's `formal` entries.
+//
+// A model (an entry with `dir`, docs/formal/<area>/) stands for the code its COVERAGE names at its
+// sync commit. For each owed model:
+// - the guard (this diff): a change to covered code must change the model or move COVERAGE's sync
+//   commit, after the area's skill says the model still describes the code; otherwise it fails;
+// - drift (since the sync commit): covered files changed since the model was last confirmed,
+//   reported, not failed;
+// - the check: `check.sh --quick`, or the full bounds with --full.
+// A fuzz target needs nightly Rust and cargo-fuzz, and says so when they are missing.
+//
+// No dependency outside node: CI's `formal` job runs `node tooling/verify/formal.mjs ci …` with no
+// install.
+import { execFileSync, spawn, spawnSync } from "node:child_process";
+import { createWriteStream, existsSync, mkdirSync, readdirSync, readFileSync } from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+import { matchesAny } from "./repo.mjs";
 
 export const FUZZ_SECONDS = 20;
+
+const gitOut = (root, args) =>
+  execFileSync("git", args, { cwd: root, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], maxBuffer: 64 * 1024 * 1024 });
+
+/** COVERAGE's `sync`, `model` and `path` lines; model files are given relative to the repo root. */
+export const parseCoverage = (text, dir) => {
+  const coverage = { dir, sync: null, model: [], paths: [] };
+  for (const line of text.split("\n")) {
+    const [word, value] = line.trim().split(/\s+/, 2);
+    if (word === "sync") coverage.sync = value;
+    else if (word === "model") coverage.model.push(path.posix.join(dir, value));
+    else if (word === "path") coverage.paths.push(value);
+  }
+  if (!/^[0-9a-f]{40}$/.test(coverage.sync ?? "")) throw new Error(`${dir}/COVERAGE names no full sync commit`);
+  if (coverage.paths.length === 0) throw new Error(`${dir}/COVERAGE names no covered path`);
+  return coverage;
+};
+
+export const readCoverage = (root, dir) => parseCoverage(readFileSync(path.join(root, dir, "COVERAGE"), "utf8"), dir);
+
+/** The sync commit COVERAGE named at `ref`, or null where it did not exist yet. */
+const syncAt = (root, dir, ref) => {
+  try {
+    return parseCoverage(gitOut(root, ["show", `${ref}:${dir}/COVERAGE`]), dir).sync;
+  } catch {
+    return null;
+  }
+};
+
+/** The guard for one model over a diff's files; `base` is where the diff starts. */
+export const guard = (root, coverage, { files, base }) => {
+  const code = files.filter((f) => coverage.paths.includes(f));
+  if (code.length === 0) return { status: "passed", detail: "no covered code changed" };
+  const model = files.filter((f) => coverage.model.includes(f));
+  if (model.length > 0) return { status: "passed", detail: `covered code and the model changed (${model.join(", ")})` };
+  const before = base ? syncAt(root, coverage.dir, base) : null;
+  if (before !== null && before !== coverage.sync) {
+    return { status: "passed", detail: `covered code changed and the sync commit moved to ${coverage.sync.slice(0, 10)}` };
+  }
+  const area = path.posix.basename(coverage.dir);
+  return {
+    status: "failed",
+    detail: `${code.join(", ")} changed, and neither the model nor COVERAGE's sync commit moved. Follow .agents/skills/${area}: account for each hunk in the model, run the full check, then move the sync line in ${coverage.dir}/COVERAGE`,
+  };
+};
+
+/** Covered files that changed since the sync commit, at `head`. */
+export const drift = (root, coverage, head) => {
+  try {
+    gitOut(root, ["cat-file", "-e", `${coverage.sync}^{commit}`]);
+  } catch {
+    return { known: false, files: [] };
+  }
+  const files = gitOut(root, ["diff", "--name-only", coverage.sync, head, "--", ...coverage.paths]).split("\n").filter(Boolean);
+  return { known: true, files };
+};
+
+const driftDetail = (coverage, moved) =>
+  `drift since ${coverage.sync.slice(0, 10)}: ${moved.known ? (moved.files.length ? moved.files.join(", ") : "none") : "the sync commit is not in this clone"}`;
+
+/** The guard and the check for each owed model. `run(argv, log)` resolves to { code }. */
+export const modelSteps = async (root, models, { files, base, head, full = false, run }) => {
+  const steps = [];
+  const evidence = [];
+  const next = [];
+  for (const o of models) {
+    let coverage;
+    try {
+      coverage = readCoverage(root, o.dir);
+    } catch (error) {
+      steps.push({ id: `${o.id}-guard`, title: o.model, status: "failed", detail: error.message });
+      continue;
+    }
+    const verdict = base ? guard(root, coverage, { files, base }) : { status: "passed", detail: "no base: the guard needs a diff" };
+    steps.push({
+      id: `${o.id}-guard`,
+      title: `${o.model}: covered code changes move the model or its sync commit`,
+      status: verdict.status,
+      detail: `${verdict.detail}. ${driftDetail(coverage, drift(root, coverage, head))}`,
+    });
+    if (spawnSync("sh", ["-c", "command -v java"], { stdio: "ignore" }).status !== 0) {
+      steps.push({ id: `${o.id}-check`, title: o.model, status: "blocked_by_prerequisite", detail: "check.sh needs java (TLC is a Java program)" });
+      next.push("install a JDK (17 or later) so `java` is on PATH");
+      continue;
+    }
+    const argv = ["bash", path.join(o.dir, "check.sh"), ...(full ? [] : ["--quick"])];
+    const log = `.verify/logs/formal-${o.id}.log`;
+    const started = Date.now();
+    const { code } = await run(argv, log);
+    evidence.push({ kind: "log", path: log });
+    steps.push({
+      id: `${o.id}-check`,
+      title: `${o.model}: model check, ${full ? "full" : "quick"} bounds`,
+      command: argv.join(" "),
+      log,
+      durationMs: Date.now() - started,
+      ...(code === 0
+        ? { status: "passed", detail: "every row as expected" }
+        : code === 2
+          ? { status: "blocked_by_prerequisite", detail: `no TLA+ checker: see ${log}` }
+          : { status: "failed", detail: `a row is NOT AS EXPECTED: ${log} names it, and .agents/skills/${path.posix.basename(o.dir)} step 3 classifies it` }),
+    });
+  }
+  return { steps, evidence, next };
+};
 
 const runLogged = (root, argv, log) =>
   new Promise((resolve) => {
@@ -45,16 +164,31 @@ export const propertyVerdict = (code, text) => {
   return { status: "passed", detail: "1 passed" };
 };
 
-export const formal = async (root, { obligations, fuzzSeconds = FUZZ_SECONDS, progress = () => {} }) => {
+export const formal = async (
+  root,
+  { obligations, files = [], base = null, head = "HEAD", full = false, fuzzSeconds = FUZZ_SECONDS, progress = () => {} },
+) => {
   mkdirSync(path.join(root, ".verify", "logs"), { recursive: true });
-  const steps = [];
-  const evidence = [];
-  const next = [];
+  const models = obligations.filter((o) => o.kind === "formal" && o.dir);
   const owed = obligations.filter((o) => o.kind === "formal" && (o.test || o.fuzz));
-  if (owed.length === 0) {
-    steps.push({ id: "formal", title: "Nothing covered", status: "passed", detail: "the change touches no file a property test or fuzz target covers" });
-    return { steps, evidence, next };
+  if (models.length === 0 && owed.length === 0) {
+    return {
+      steps: [{ id: "formal", title: "Nothing covered", status: "passed", detail: "the change touches no file a model, property test or fuzz target covers" }],
+      evidence: [],
+      next: [],
+    };
   }
+  const { steps, evidence, next } = await modelSteps(root, models, {
+    files,
+    base,
+    head,
+    full,
+    run: (argv, log) => {
+      progress(argv.join(" "));
+      return runLogged(root, argv, log);
+    },
+  });
+  if (owed.length === 0) return { steps, evidence, next };
   if (!works(["cargo", "--version"], root)) {
     for (const o of owed) steps.push({ id: o.id, title: o.model, status: "blocked_by_prerequisite", detail: "cargo is not on PATH: install rustup, which reads rust-toolchain.toml" });
     return { steps, evidence, next };
@@ -113,3 +247,49 @@ export const formal = async (root, { obligations, fuzzSeconds = FUZZ_SECONDS, pr
   }
   return { steps, evidence, next: [...new Set(next)] };
 };
+
+// CI: `node tooling/verify/formal.mjs ci <base sha|-> <head sha> [--full]`. The models only: the
+// property tests run in the rust job, the fuzz targets nightly. With `-` (a push to main, the
+// nightly run) there is no diff: every model runs and the guard is not asked.
+const ci = async (argv) => {
+  const [base, head, ...flags] = argv;
+  if (!base || !head) {
+    process.stderr.write("usage: node tooling/verify/formal.mjs ci <base sha|-> <head sha> [--full]\n");
+    return 2;
+  }
+  const root = fileURLToPath(new URL("../../", import.meta.url));
+  const map = JSON.parse(readFileSync(new URL("./obligations.json", import.meta.url), "utf8"));
+  const diffBase = base === "-" ? null : gitOut(root, ["merge-base", base, head]).trim();
+  const files = diffBase === null ? [] : gitOut(root, ["diff", "--name-only", "--no-renames", diffBase, head]).split("\n").filter(Boolean);
+  const models = map.flatMap((entry) =>
+    diffBase !== null && !files.some((f) => matchesAny(f, entry.paths ?? []))
+      ? []
+      : entry.owes.filter((o) => o.kind === "formal" && o.dir).map((o) => ({ id: entry.id, ...o })),
+  );
+  if (models.length === 0) {
+    console.log("passed  formal: the change touches no file a model covers");
+    return 0;
+  }
+  const { steps } = await modelSteps(root, models, {
+    files,
+    base: diffBase,
+    head,
+    full: flags.includes("--full"),
+    run: (cmd) =>
+      new Promise((resolve) => {
+        console.log(`$ ${cmd.join(" ")}`);
+        const child = spawn(cmd[0], cmd.slice(1), { cwd: root, stdio: "inherit" });
+        child.once("error", () => resolve({ code: 127 }));
+        child.once("close", (code) => resolve({ code: code ?? 1 }));
+      }),
+  });
+  for (const step of steps) console.log(`${step.status.padEnd(24)} ${step.id}: ${step.detail}`);
+  const bad = steps.filter((step) => step.status !== "passed");
+  if (bad.length > 0) console.log(`::error::${bad.map((step) => step.id).join(", ")} did not pass`);
+  return bad.length === 0 ? 0 : 1;
+};
+
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  process.exitCode = process.argv[2] === "ci" ? await ci(process.argv.slice(3)) : 2;
+  if (process.argv[2] !== "ci") process.stderr.write("usage: node tooling/verify/formal.mjs ci <base sha|-> <head sha> [--full]\n");
+}
