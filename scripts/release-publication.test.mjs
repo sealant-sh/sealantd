@@ -2189,6 +2189,10 @@ const SKIPPED_TOGETHER = new Map([
   ["next.yml image-tag", "skipped exactly when plan decided not to publish"],
   ["next.yml pack", "skipped exactly when plan decided not to publish"],
   ["next.yml publish", "skipped exactly when plan decided not to publish"],
+  [
+    "version.yml approve-checks",
+    "version skips only on a fork; nothing it did not push to approve",
+  ],
 ]);
 
 test("no workflow job is skipped behind a job its own path expected to skip, unless reviewed", () => {
@@ -2210,6 +2214,89 @@ test("no workflow job is skipped behind a job its own path expected to skip, unl
   assert.equal(callsStatusFunction("inputs.dry_run && 'always()' != ''"), false);
   assert.equal(callsStatusFunction("${{ !cancelled() && github.event_name == 'push' }}"), true);
   assert.equal(callsStatusFunction(undefined), false);
+});
+
+// The Version workflow approves the Version Packages PR's held pull_request run, so the required
+// `rust` and `node` checks run on it. A fake `gh` serves the PR and its runs through the step's
+// real `--jq` filters (with jq, which gh's filters match here) and records each approval.
+const FAKE_GH = `#!/usr/bin/env bash
+set -euo pipefail
+jq_arg() { while [ $# -gt 0 ]; do [ "$1" = --jq ] && { printf '%s' "$2"; return; }; shift; done; }
+case "$1 $2" in
+  "pr view") jq -r "$(jq_arg "$@")" "$FAKE_DIR/pr.json" ;;
+  "api -X") echo "$4" >>"$FAKE_DIR/approved" ;;
+  api*) jq -r "$(jq_arg "$@")" "$FAKE_DIR/runs.json" ;;
+  *) exit 64 ;;
+esac
+`;
+
+const VERSION_HEAD = "f".repeat(40);
+const versionRun = (id, file, conclusion, actor = "github-actions[bot]") => ({
+  id,
+  path: `.github/workflows/${file}`,
+  head_branch: "changeset-release/main",
+  conclusion,
+  actor: { login: actor },
+});
+
+const approve = (t, runs) => {
+  const directory = scratch(t, "approve-checks-");
+  writeFileSync(path.join(directory, "gh"), FAKE_GH, { mode: 0o755 });
+  writeFileSync(
+    path.join(directory, "pr.json"),
+    JSON.stringify({ headRefName: "changeset-release/main", headRefOid: VERSION_HEAD }),
+  );
+  writeFileSync(path.join(directory, "runs.json"), JSON.stringify({ workflow_runs: runs }));
+  const [step] = workflow("version.yml").jobs["approve-checks"].steps;
+  const { status } = spawnSync("bash", ["-e", "-o", "pipefail", "-c", step.run], {
+    env: {
+      ...process.env,
+      PATH: `${directory}:${process.env.PATH}`,
+      FAKE_DIR: directory,
+      GH_REPO: "sealant-sh/sealantd",
+      PR: "203",
+      TRIES: "2",
+      POLL_SECONDS: "0",
+    },
+    encoding: "utf8",
+  });
+  const approvals = path.join(directory, "approved");
+  const approved = existsSync(approvals) ? readFileSync(approvals, "utf8").trim().split("\n") : [];
+  return { status, approved };
+};
+
+test("Version approves only the held CI run its own push created", (t) => {
+  assert.deepEqual(
+    approve(t, [
+      versionRun(2, "fuzz.yml", "action_required"),
+      versionRun(1, "ci.yml", "action_required"),
+    ]),
+    { status: 0, approved: ["repos/sealant-sh/sealantd/actions/runs/1/approve"] },
+  );
+  assert.deepEqual(approve(t, [versionRun(1, "ci.yml", null)]), { status: 0, approved: [] });
+});
+
+test("Version approves no held run that someone else triggered", (t) => {
+  const { status, approved } = approve(t, [versionRun(1, "ci.yml", "action_required", "someone")]);
+  assert.notEqual(status, 0);
+  assert.deepEqual(approved, []);
+});
+
+test("Version fails when CI never starts a run on the head", (t) => {
+  assert.deepEqual(approve(t, [versionRun(1, "fuzz.yml", "action_required")]), {
+    status: 1,
+    approved: [],
+  });
+});
+
+test("Version approves only from a job that cannot push", () => {
+  const { jobs } = workflow("version.yml");
+  assert.deepEqual(jobs["approve-checks"].permissions, {
+    actions: "write",
+    "pull-requests": "read",
+  });
+  assert.deepEqual([jobs["approve-checks"].needs].flat(), ["version"]);
+  assert.equal(jobs.version.permissions.actions, undefined);
 });
 
 // --- the dry run ---
