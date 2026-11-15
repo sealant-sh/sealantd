@@ -890,6 +890,18 @@ impl RegistrarError {
 pub trait Registrar: Send + Sync {
     /// Head manifest and GET URLs for materialize.
     fn plan_get(&self, req: &PlanGetRequest) -> Result<PlanGetResponse, RegistrarError>;
+    /// [`Self::plan_get`], given up on as a [`RegistrarError::Transport`] when no answer has come
+    /// within `limit` (a boot's: shorter than the channel's own timeout, so one call that hangs
+    /// leaves time to ask again). A registrar with no transport of its own to time answers it as
+    /// [`Self::plan_get`].
+    fn plan_get_within(
+        &self,
+        req: &PlanGetRequest,
+        limit: Duration,
+    ) -> Result<PlanGetResponse, RegistrarError> {
+        let _ = limit;
+        self.plan_get(req)
+    }
     /// PUT URLs for a key list (minted only while the lease predicate holds).
     fn upload_urls(&self, req: &UploadUrlsRequest) -> Result<UploadUrlsResponse, RegistrarError>;
     /// Complete a multipart upload write-once; [`RegistrarError::KeyExists`] when the key is
@@ -1815,10 +1827,23 @@ impl HttpRegistrar {
         req: &Req,
         epoch: u64,
     ) -> Result<Resp, RegistrarError> {
+        self.call_within(name, req, epoch, None)
+    }
+
+    /// [`Self::call`], under `limit` instead of the agent's timeout when one is given.
+    fn call_within<Req: Serialize, Resp: for<'de> Deserialize<'de>>(
+        &self,
+        name: &str,
+        req: &Req,
+        epoch: u64,
+        limit: Option<Duration>,
+    ) -> Result<Resp, RegistrarError> {
         let body = serde_json::to_vec(req).map_err(|e| RegistrarError::Protocol(e.to_string()))?;
-        let mut resp = self
-            .agent
-            .post(format!("{}/{name}", self.endpoint))
+        let mut post = self.agent.post(format!("{}/{name}", self.endpoint));
+        if let Some(limit) = limit {
+            post = post.config().timeout_global(Some(limit)).build();
+        }
+        let mut resp = post
             .header("Authorization", format!("Bearer {}", self.token))
             .header("Content-Type", "application/json")
             .send(&body[..])
@@ -1921,6 +1946,14 @@ fn refusal(name: &str, status: u16, bytes: &[u8], epoch: u64) -> RegistrarError 
 impl Registrar for HttpRegistrar {
     fn plan_get(&self, req: &PlanGetRequest) -> Result<PlanGetResponse, RegistrarError> {
         self.call("plan.get", req, req.epoch)
+    }
+
+    fn plan_get_within(
+        &self,
+        req: &PlanGetRequest,
+        limit: Duration,
+    ) -> Result<PlanGetResponse, RegistrarError> {
+        self.call_within("plan.get", req, req.epoch, Some(limit))
     }
 
     fn upload_urls(&self, req: &UploadUrlsRequest) -> Result<UploadUrlsResponse, RegistrarError> {
@@ -2625,6 +2658,38 @@ mod tests {
     /// this build reads); a request without it is a format-1 reader. The test double answers as
     /// Mend does: never above what the executor reads, and a head it could not read is refused
     /// (409 `manifest-format`, never read as a chain conflict).
+    /// A boot's `plan.get` is given up on at its own limit, not the channel's: a registrar that
+    /// takes the request and never answers fails it as a transport error a retry can help,
+    /// while the channel's other calls keep the agent's longer timeout.
+    #[test]
+    fn plan_get_within_gives_up_at_its_limit() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let (done, finished) = std::sync::mpsc::channel::<()>();
+        let held = std::thread::spawn(move || {
+            // Take the connection and hold it open, answering nothing, until the test is done.
+            let (stream, _) = listener.accept().unwrap();
+            let _ = finished.recv_timeout(Duration::from_secs(30));
+            drop(stream);
+        });
+        let registrar = HttpRegistrar::new(
+            &endpoint,
+            "token",
+            Duration::from_secs(60),
+            &ChannelTransport::verified(),
+        )
+        .unwrap();
+        let started = std::time::Instant::now();
+        let error = registrar
+            .plan_get_within(&PlanGetRequest::booting(None), Duration::from_millis(300))
+            .unwrap_err();
+        let spent = started.elapsed();
+        assert!(error.is_retryable(), "{error}");
+        assert!(spent < Duration::from_secs(5), "gave up after {spent:?}");
+        done.send(()).unwrap();
+        held.join().unwrap();
+    }
+
     #[test]
     fn plan_get_sends_the_manifest_format_it_reads() {
         assert_eq!(MAX_SECTION_FORMAT, 2);
