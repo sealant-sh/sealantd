@@ -56,6 +56,24 @@ jobs:
           HEAD: ${{ github.event.pull_request.head.sha }}
         run: scripts/ci-docs-only.sh >>"$GITHUB_OUTPUT"
 
+  # The TLA+ models whose COVERAGE the change touches (docs/formal/<area>/): the drift guard, then
+  # check.sh --quick. Not gated on `changes`: a change to a model alone is documentation to the
+  # scoping script and still owes its check, and a change that touches no model ends in seconds.
+  # tooling/verify/formal.mjs needs no install; the runner image has java, and check.sh fetches the
+  # pinned TLA+ tools and checks their sha256. Nightly, formal.yml runs every model at full bounds.
+  formal:
+    runs-on: ${{ inputs.runner == 'box' && fromJSON('["self-hosted","box","linux","x64"]') || 'ubuntu-24.04' }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0 # the diff against the pull request's base, and the models' sync commits
+      - run: node tooling/verify/formal.mjs ci "$BASE" "$HEAD"
+        env:
+          BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || '-' }}
+          HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+
   rust:
     needs: changes
     if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.code != 'false') }}

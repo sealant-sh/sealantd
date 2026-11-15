@@ -18,7 +18,7 @@ const VERBS = {
   check: "The pre-PR checks for what the change touches, skips reported [--all] [--base <ref>]",
   status: "Whether each obligation has a passing result for this commit [--markdown]",
   daemon: "Run a driver against a freshly built daemon, recording its events --driver <file> [--keep] [--timeout <s>] [-- <daemon flags>]",
-  formal: "The property tests and a short fuzz pass of the targets the change reaches [--all] [--fuzz-seconds <n>]",
+  formal: "The models, property tests and a short fuzz pass of the targets the change reaches [--all] [--full] [--fuzz-seconds <n>]",
 };
 // Verbs other repos have. Asked for here, they say so rather than pretend.
 const ELSEWHERE = ["db", "stack", "drive", "evidence", "box", "health", "runtime", "boat-harness"];
@@ -29,11 +29,12 @@ const usage = () =>
     .join("\n")}\n`;
 
 export const parseArgs = (argv) => {
-  const args = { verb: argv[0], json: false, all: false, markdown: false, keep: false, base: "origin/main", files: null, driver: null, timeoutS: 600, daemonArgs: [], fuzzSeconds: FUZZ_SECONDS };
+  const args = { verb: argv[0], json: false, all: false, full: false, markdown: false, keep: false, base: "origin/main", files: null, driver: null, timeoutS: 600, daemonArgs: [], fuzzSeconds: FUZZ_SECONDS };
   for (let i = 1; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--json") args.json = true;
     else if (a === "--all") args.all = true;
+    else if (a === "--full") args.full = true;
     else if (a === "--markdown") args.markdown = true;
     else if (a === "--keep") args.keep = true;
     else if (a === "--fuzz-seconds" && /^[1-9]\d*$/.test(argv[i + 1] ?? "")) args.fuzzSeconds = Number(argv[++i]);
@@ -104,7 +105,17 @@ const main = async () => {
             e.owes.filter((o) => o.kind === "formal").map(({ kind, ...o }) => ({ id: e.id, kind, why: e.why, status: "owed", ...o })),
           )
         : plan(root, files()).obligations;
-      body = await formal(root, { obligations, fuzzSeconds: args.fuzzSeconds, progress });
+      // The models' guard reads the diff; with --all and no merge base it has none to read.
+      const changed = args.files || head.mergeBase ? files() : [];
+      body = await formal(root, {
+        obligations,
+        files: changed,
+        base: head.mergeBase,
+        head: head.sha,
+        full: args.full,
+        fuzzSeconds: args.fuzzSeconds,
+        progress,
+      });
     } else if (args.verb === "daemon") {
       // Ctrl-C tears the run down; a second one leaves at once (the exit hook still kills the daemon).
       const abort = new AbortController();

@@ -1,0 +1,29 @@
+# Nightly: every TLA+ model under docs/formal/ at its full bounds (check.sh without --quick), and
+# its drift since the sync commit. Pull requests run the quick bounds of the models they touch
+# (ci.yml's `formal` job); `pnpm verify formal --full` runs this locally.
+#
+# SECURITY: scheduled and dispatched on main only, read-only token, no secrets.
+name: formal
+
+on:
+  schedule:
+    - cron: "41 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: formal-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  models:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0 # each model's sync commit, for its drift
+      - run: node tooling/verify/formal.mjs ci - "$GITHUB_SHA" --full
