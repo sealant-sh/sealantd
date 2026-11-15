@@ -1292,7 +1292,25 @@ impl CaptureEngine {
     /// on its own disk): when the queue descends from `previous`, the newest queued capture is
     /// the one the next snap names as its parent, and a queued bulk capture can again have a
     /// small one staged ahead of it.
+    ///
+    /// A queued capture the registrar already holds as the head (the daemon died after its
+    /// register and before its ack) is acked first. Left queued, it was the newest `auto` capture
+    /// and not in flight: the next snap coalesced with it, took its `n` and its parent, and every
+    /// register from then on was a wrong-parent conflict (SLNT-1009). It is the only registered
+    /// capture that can still be queued: the shipper acks each one before it claims the next.
     fn resume_queue(&mut self) -> Result<(), EngineError> {
+        if let Some(head) = &self.previous {
+            for e in self.staging.pending()? {
+                if e.n == head.manifest.n && e.capture_id == head.capture_id {
+                    self.staging.ack(&e)?;
+                    tracing::warn!(
+                        n = e.n,
+                        capture = %e.capture_id,
+                        "a capture registered before the daemon stopped was still queued; acked"
+                    );
+                }
+            }
+        }
         let queued: Vec<QueueEntry> = self
             .staging
             .pending()?

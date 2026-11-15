@@ -6,7 +6,7 @@ description: Keep the TLA+ model of the capture staging queue (docs/formal/captu
 # Capture staging queue model
 
 `docs/formal/capture-queue/` models the staging queue with all its writers and a crash at any step.
-Its `README.md` holds the promise, the invariants, the finding (SLNT-1009), the bounds and the action
+Its `README.md` holds the promise, the invariants, the finding it made (SLNT-1009, fixed), the bounds and the action
 table that maps each model action to the code. This skill is the procedure: decide whether a change
 touches the model, run it, read what it says, and keep it true.
 
@@ -27,7 +27,7 @@ Done when each such hunk has a model action it changes, or a reason it changes n
 
 ```sh
 docs/formal/capture-queue/check.sh --quick   # while iterating: about 10 s
-docs/formal/capture-queue/check.sh           # before moving the sync line: about 5 min
+docs/formal/capture-queue/check.sh           # before moving the sync line: about 1 min
 ```
 
 Each row prints `as expected` or `NOT AS EXPECTED`. A row is as expected only when its verdict and
@@ -53,8 +53,7 @@ it is one rename, one removal or one registrar call there.
 
 Change the action that stands for the code you changed; a new writer of the queue is a new action
 in `Next` and a new line in the README's table. A fix keeps the old behaviour as a mutant expected
-to fail. When SLNT-1009 is fixed, `Restart` takes the `Fix` branch, `Fix` goes, and the three
-failing `code-` rows become rows that hold.
+to fail, as `resume-keeps-registered` keeps the restart before SLNT-1009.
 
 Then run the full check, update the counts in `ROWS` and the README, and move `COVERAGE`'s `sync`
 line to the commit you checked.
