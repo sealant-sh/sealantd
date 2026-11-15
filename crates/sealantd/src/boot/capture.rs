@@ -234,22 +234,42 @@ const PLAN_LEASED_WAIT_MAX: Duration = Duration::from_secs(30);
 /// 5xx — and `plan.get` is safe to repeat).
 #[derive(Debug, Clone, Copy)]
 struct PlanRetry {
-    /// The first wait: the failure seen in practice is one dropped connection, so the second
+    /// The first wait: one dropped connection is a failure seen in practice, so the second
     /// attempt comes almost at once.
     first: Duration,
     /// The wait doubles up to this.
     max: Duration,
-    /// The boot gives up when the next wait would take it past this long since the first failed
-    /// attempt began. The launcher waits a fixed time for the executor to come up; this stays
-    /// well inside it.
+    /// Once [`Self::min_attempts`] are made, the boot gives up when the next wait would take it
+    /// past this long since the first failed attempt began.
     budget: Duration,
+    /// Attempts always made, however long they took: one call that hangs must not spend the
+    /// budget alone.
+    min_attempts: u32,
+    /// Each attempt's time limit, by its place in the run of failures (the last one for every
+    /// later attempt). Much shorter than the channel's own timeout ([`CHANNEL_TIMEOUT`]), so a
+    /// call that hangs is given up on in time to ask again; growing, so an answer that is slow
+    /// but coming (the registrar may check the head's git section before it answers) gets
+    /// longer each time.
+    call_limits: [Duration; 3],
 }
 
-/// 0.25 s, 0.5 s, 1 s, 2 s, then every 4 s: nine attempts in about 20 s when each fails at once.
+/// Waits of 0.25 s, 0.5 s, 1 s, 2 s, then every 4 s; attempts limited to 10 s, 15 s, then 20 s.
+/// Nine attempts in about 20 s when each fails at once. At least three, whatever they cost: the
+/// worst case is three calls that each hang to their limit, 10 + 15 + 20 s plus 0.75 s of waits,
+/// 45.75 s from the first attempt. (A later attempt starts only within the 20 s budget, so it
+/// ends by 40 s.) sealant's Boat launcher gives the executor 120 s and stops polling for its
+/// readiness 85 s into the launch (`packages/workspaces/src/worker/boat-readiness.ts`
+/// `LAUNCH_BUDGET_MS`, `READINESS_DEADLINE_MS`): this leaves the rest of the boot about 35 s.
 const PLAN_RETRY: PlanRetry = PlanRetry {
     first: Duration::from_millis(250),
     max: Duration::from_secs(4),
     budget: Duration::from_secs(20),
+    min_attempts: 3,
+    call_limits: [
+        Duration::from_secs(10),
+        Duration::from_secs(15),
+        Duration::from_secs(20),
+    ],
 };
 
 /// Where a boot's `plan.get` waits read the time: the real clock, or a test's.
@@ -273,7 +293,8 @@ impl BootWait for RealWait {
 }
 
 /// The boot's `plan.get`, asked again while another launch holds the worktree and, within
-/// `retry`, after an error a retry can help. Any other error fails the boot at once.
+/// `retry`, after an error a retry can help (a call that found no answer within its limit among
+/// them). Any other error fails the boot at once.
 fn fetch_plan(
     registrar: &dyn Registrar,
     request: &PlanGetRequest,
@@ -287,7 +308,9 @@ fn fetch_plan(
     let mut retry_wait = retry.first;
     loop {
         let asked = clock.now();
-        match registrar.plan_get(request) {
+        let place = failing.map_or(0, |(_, attempts)| attempts as usize);
+        let limit = retry.call_limits[place.min(retry.call_limits.len() - 1)];
+        match registrar.plan_get_within(request, limit) {
             Ok(plan) => return Ok(plan),
             // Another launch holds the worktree (409 `worktree-leased`): no epoch is this
             // executor's, and it adopts none — it waits, touching nothing, and asks again until
@@ -306,7 +329,7 @@ fn fetch_plan(
                 let (since, attempts) = failing.get_or_insert((asked, 0));
                 *attempts += 1;
                 let spent = clock.now().saturating_duration_since(*since);
-                if spent + retry_wait > retry.budget {
+                if *attempts >= retry.min_attempts && spent + retry_wait > retry.budget {
                     return Err(BootError::config(format!(
                         "capture plan.get failed after {attempts} attempts over {:.1} s: {error}",
                         spent.as_secs_f64()
@@ -315,6 +338,7 @@ fn fetch_plan(
                 tracing::warn!(
                     %error,
                     attempt = *attempts,
+                    limit_ms = limit.as_millis() as u64,
                     retry_in_ms = retry_wait.as_millis() as u64,
                     "capture plan.get failed; asking again"
                 );
@@ -1850,6 +1874,10 @@ mod tests {
         fn slept(&self) -> Vec<Duration> {
             self.slept.lock().unwrap().clone()
         }
+        /// Time passing inside a call, not a wait of the boot's.
+        fn pass(&self, time: Duration) {
+            *self.now.lock().unwrap() += time;
+        }
     }
 
     impl BootWait for FakeWait {
@@ -1862,41 +1890,73 @@ mod tests {
         }
     }
 
-    /// A registrar whose `plan.get` answers with `errors`, in order, before it asks the
-    /// registrar behind it; it counts every `plan.get`.
+    /// How one `plan.get` of [`FailingPlans`] fails.
+    enum Fail {
+        /// At once, with this error.
+        Now(sealant_capture::RegistrarError),
+        /// After hanging for the call's whole limit, as the transport's timeout.
+        Hang,
+    }
+
+    impl From<sealant_capture::RegistrarError> for Fail {
+        fn from(error: sealant_capture::RegistrarError) -> Self {
+            Self::Now(error)
+        }
+    }
+
+    /// A registrar whose `plan.get` fails as `fails` says, in order, on `clock`, before it asks
+    /// the registrar behind it; it keeps the time limit of every `plan.get`.
     struct FailingPlans {
         inner: Arc<InMemoryRegistrar>,
-        errors: std::sync::Mutex<std::collections::VecDeque<sealant_capture::RegistrarError>>,
-        calls: std::sync::atomic::AtomicUsize,
+        clock: Arc<FakeWait>,
+        fails: std::sync::Mutex<std::collections::VecDeque<Fail>>,
+        limits: std::sync::Mutex<Vec<Duration>>,
     }
 
     impl FailingPlans {
         fn new(
             inner: Arc<InMemoryRegistrar>,
-            errors: impl IntoIterator<Item = sealant_capture::RegistrarError>,
+            clock: Arc<FakeWait>,
+            fails: impl IntoIterator<Item = Fail>,
         ) -> Arc<Self> {
             Arc::new(Self {
                 inner,
-                errors: std::sync::Mutex::new(errors.into_iter().collect()),
-                calls: std::sync::atomic::AtomicUsize::new(0),
+                clock,
+                fails: std::sync::Mutex::new(fails.into_iter().collect()),
+                limits: std::sync::Mutex::new(Vec::new()),
             })
         }
         fn calls(&self) -> usize {
-            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+            self.limits.lock().unwrap().len()
+        }
+        fn limits(&self) -> Vec<Duration> {
+            self.limits.lock().unwrap().clone()
         }
     }
 
     impl Registrar for FailingPlans {
         fn plan_get(
             &self,
-            req: &PlanGetRequest,
+            _req: &PlanGetRequest,
         ) -> Result<sealant_capture::registrar::PlanGetResponse, sealant_capture::RegistrarError>
         {
-            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            if let Some(error) = self.errors.lock().unwrap().pop_front() {
-                return Err(error);
+            unreachable!("a boot asks plan.get with a time limit")
+        }
+        fn plan_get_within(
+            &self,
+            req: &PlanGetRequest,
+            limit: Duration,
+        ) -> Result<sealant_capture::registrar::PlanGetResponse, sealant_capture::RegistrarError>
+        {
+            self.limits.lock().unwrap().push(limit);
+            match self.fails.lock().unwrap().pop_front() {
+                Some(Fail::Now(error)) => Err(error),
+                Some(Fail::Hang) => {
+                    self.clock.pass(limit);
+                    Err(hung())
+                }
+                None => self.inner.plan_get(req),
             }
-            self.inner.plan_get(req)
         }
         fn upload_urls(
             &self,
@@ -1941,15 +2001,25 @@ mod tests {
         sealant_capture::RegistrarError::Transport("io: unexpected end of file".to_owned())
     }
 
-    /// A boot over `plans` on a fake clock, on a disk under `tmp` holding a captured head.
+    /// The words a call given up on at its time limit reaches `plan.get` with.
+    fn hung() -> sealant_capture::RegistrarError {
+        sealant_capture::RegistrarError::Transport("timeout: global".to_owned())
+    }
+
+    /// A boot whose `plan.get`s fail as `fails` says, on a fake clock, on a disk under `tmp`
+    /// holding a captured head.
     fn boot_over(
         tmp: &Path,
-        errors: Vec<sealant_capture::RegistrarError>,
-    ) -> (Arc<FailingPlans>, FakeWait, Result<CaptureBoot, BootError>) {
+        fails: Vec<impl Into<Fail>>,
+    ) -> (
+        Arc<FailingPlans>,
+        Arc<FakeWait>,
+        Result<CaptureBoot, BootError>,
+    ) {
         let registrar = Arc::new(InMemoryRegistrar::new("wt-boot", 1, None));
         let sink: Arc<dyn BlobSink> = capture_source(tmp, &registrar);
-        let plans = FailingPlans::new(registrar, errors);
-        let clock = FakeWait::new();
+        let clock = Arc::new(FakeWait::new());
+        let plans = FailingPlans::new(registrar, clock.clone(), fails.into_iter().map(Into::into));
         let boot = boot_waiting(
             plans.clone(),
             Some(sink),
@@ -1957,7 +2027,7 @@ mod tests {
             &tmp.join("ws"),
             tmp,
             PLAN_RETRY,
-            &clock,
+            clock.as_ref(),
         );
         (plans, clock, boot)
     }
@@ -2059,6 +2129,83 @@ mod tests {
             clock.slept(),
             [250, 500, 1000, 250].map(Duration::from_millis)
         );
+    }
+
+    /// SLNT-964: a `plan.get` that hangs and then drops. On Boat one call hung 30 s, spent the
+    /// whole 20 s budget alone, and the session failed to start. Each call now has its own
+    /// limit, much shorter than the channel's, and at least three are made: two calls that hang
+    /// to their limits, then an answer, and the boot goes on.
+    #[test]
+    fn a_boot_survives_plan_get_hanging_twice() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (plans, clock, boot) = boot_over(tmp.path(), vec![Fail::Hang, Fail::Hang]);
+        let boot = boot.expect("the third plan.get answers and the boot goes on");
+        assert_eq!(
+            plans.limits(),
+            [10, 15, 20].map(Duration::from_secs),
+            "each call's limit, growing"
+        );
+        assert_eq!(clock.slept(), [250, 500].map(Duration::from_millis));
+        assert_eq!(boot.epoch, 1);
+        assert!(
+            tmp.path().join("ws/lib.rs").exists(),
+            "the head is materialized"
+        );
+    }
+
+    /// The worst case: every call hangs to its limit. Three are made, and the boot ends 45.75 s
+    /// after the first began, inside the 85 s sealant's Boat launcher waits for readiness, with
+    /// the attempts, the time and the last error's words.
+    #[test]
+    fn plan_get_hanging_every_time_ends_the_boot_within_the_bound() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fails: Vec<Fail> = (0..10).map(|_| Fail::Hang).collect();
+        let (plans, clock, boot) = boot_over(tmp.path(), fails);
+        let Err(error) = boot else {
+            panic!("a channel that only hangs ends the boot")
+        };
+        assert_eq!(plans.calls(), 3);
+        let text = error.to_string();
+        assert!(
+            text.ends_with(
+                "capture plan.get failed after 3 attempts over 45.8 s: transport: timeout: global"
+            ),
+            "{text}"
+        );
+        assert_eq!(clock.slept(), [250, 500].map(Duration::from_millis));
+        assert!(!tmp.path().join("ws").exists(), "nothing touched the disk");
+    }
+
+    /// Whatever mix of calls that hang and calls that fail at once the channel answers with, the
+    /// boot asks at least three times and ends within 45.75 s of the first attempt.
+    #[test]
+    fn every_mix_of_hangs_and_drops_ends_within_the_bound() {
+        let request = PlanGetRequest::booting(None);
+        let bound = Duration::from_millis(45_750);
+        for pattern in 0u32..1 << 12 {
+            let clock = Arc::new(FakeWait::new());
+            let fails = (0..12).map(|bit| {
+                if pattern & (1 << bit) != 0 {
+                    Fail::Hang
+                } else {
+                    Fail::Now(dropped())
+                }
+            });
+            let registrar = Arc::new(InMemoryRegistrar::new("wt-boot", 1, None));
+            let plans = FailingPlans::new(registrar, clock.clone(), fails);
+            let start = clock.now();
+            let error = fetch_plan(plans.as_ref(), &request, PLAN_RETRY, clock.as_ref())
+                .expect_err("twelve failures outlast the schedule");
+            let spent = clock.now() - start;
+            assert!(spent <= bound, "pattern {pattern:#014b}: {spent:?}");
+            assert!(plans.calls() >= 3, "pattern {pattern:#014b}");
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("after {} attempts over", plans.calls())),
+                "{error}"
+            );
+        }
     }
 
     /// A disk the daemon before never materialized — absent, empty, or holding only the daemon's

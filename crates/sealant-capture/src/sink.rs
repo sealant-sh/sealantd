@@ -126,6 +126,18 @@ pub enum SinkError {
     /// I/O.
     #[error(transparent)]
     Io(#[from] io::Error),
+    /// A read ([`PresignedHttp::get`]) failed on every attempt its [`GetRetry`] allows. Not
+    /// retryable: the schedule already spent its retries, and a caller that retries on
+    /// [`SinkError::is_retryable`] would multiply them.
+    #[error("gave up after {attempts} attempts over {:.1} s: {last}", .elapsed.as_secs_f64())]
+    Exhausted {
+        /// Attempts made.
+        attempts: u32,
+        /// From the start of the first attempt to the end of the last.
+        elapsed: Duration,
+        /// The last attempt's error.
+        last: Box<SinkError>,
+    },
 }
 
 impl SinkError {
@@ -139,7 +151,8 @@ impl SinkError {
             | Self::LeaseLost { .. }
             | Self::NotFound(_)
             | Self::Multipart { .. }
-            | Self::QuotaRefused { .. } => false,
+            | Self::QuotaRefused { .. }
+            | Self::Exhausted { .. } => false,
         }
     }
 }
@@ -170,6 +183,54 @@ impl PartRetry {
     fn delay(&self, attempt: u32) -> Duration {
         let mult = 1u32 << attempt.min(10);
         (self.backoff * mult).min(self.max_backoff)
+    }
+}
+
+/// How [`PresignedHttp::get`] reads an object again after a failure a retry can help
+/// ([`SinkError::is_retryable`]: a connection dropped, reset or refused, a timeout, a 5xx). A GET
+/// is safe to repeat, and each attempt reads the whole body again from its first byte: nothing of
+/// a body cut off part way is kept. A refusal a retry cannot help (403, an expired URL among
+/// them; 404) fails at once.
+///
+/// The schedule counts attempts and waits, not the time an attempt spent: a pack can take
+/// minutes to read on a slow link, and that is no reason to stop asking for it. Each attempt is
+/// bounded by the sink's own per-request timeout.
+#[derive(Debug, Clone, Copy)]
+pub struct GetRetry {
+    /// Attempts per read, the first included; 1 asks once.
+    pub attempts: u32,
+    /// The first wait; it doubles per retry.
+    pub first: Duration,
+    /// Wait cap.
+    pub max: Duration,
+}
+
+impl Default for GetRetry {
+    /// Four attempts, 0.25 s, 0.5 s, then 1 s apart: 1.75 s of waiting at most per read.
+    fn default() -> Self {
+        Self {
+            attempts: 4,
+            first: Duration::from_millis(250),
+            max: Duration::from_secs(1),
+        }
+    }
+}
+
+/// Where [`PresignedHttp::get`]'s retries read the time and wait: the real clock, or a test's.
+trait GetWait: Send + Sync {
+    fn now(&self) -> std::time::Instant;
+    fn sleep(&self, wait: Duration);
+}
+
+/// The real clock.
+struct RealGetWait;
+
+impl GetWait for RealGetWait {
+    fn now(&self) -> std::time::Instant {
+        std::time::Instant::now()
+    }
+    fn sleep(&self, wait: Duration) {
+        thread::sleep(wait);
     }
 }
 
@@ -537,6 +598,8 @@ pub struct PresignedHttp {
     timeout: Duration,
     minter: Box<dyn UrlMinter>,
     part_retry: PartRetry,
+    get_retry: GetRetry,
+    get_wait: Arc<dyn GetWait>,
     /// CPU time (µs) burnt by finished part-upload threads.
     helper_cpu_micros: AtomicU64,
 }
@@ -572,6 +635,8 @@ impl PresignedHttp {
                 transport: transport.clone(),
             }),
             part_retry: PartRetry::default(),
+            get_retry: GetRetry::default(),
+            get_wait: Arc::new(RealGetWait),
             helper_cpu_micros: AtomicU64::new(0),
         }
     }
@@ -583,8 +648,40 @@ impl PresignedHttp {
         self
     }
 
+    /// Retry policy for a read ([`BlobSink::get`]).
+    #[must_use]
+    pub fn with_get_retry(mut self, retry: GetRetry) -> Self {
+        self.get_retry = retry;
+        self
+    }
+
     fn url(&self, key: &str) -> Result<String, SinkError> {
         self.minter.get_url(key)
+    }
+
+    /// One GET of `key`, its whole body read into memory: on any error the bytes read so far
+    /// are dropped with it.
+    fn get_once(&self, key: &str) -> Result<Vec<u8>, SinkError> {
+        let url = self.url(key)?;
+        let mut resp = self
+            .agent
+            .get(&url)
+            .call()
+            .map_err(|e| transport("GET", key, e))?;
+        match resp.status().as_u16() {
+            200..=299 => resp
+                .body_mut()
+                .with_config()
+                .limit(u64::MAX)
+                .read_to_vec()
+                .map_err(|e| transport("GET", key, e)),
+            404 => Err(SinkError::NotFound(key.to_owned())),
+            status => Err(SinkError::Http {
+                method: "GET",
+                key: key.to_owned(),
+                status,
+            }),
+        }
     }
 }
 
@@ -947,26 +1044,39 @@ impl BlobSink for PresignedHttp {
         Ok(completed.outcome)
     }
 
+    /// Asked again after a failure a retry can help, within [`GetRetry`]. Its callers — the
+    /// boot's and a re-plan's head manifest, packs, dir packs and plan sources — do not retry a
+    /// read themselves, and the shipper never reads (it probes with [`Self::exists`], which is
+    /// not retried here).
     fn get(&self, key: &str) -> Result<Vec<u8>, SinkError> {
-        let url = self.url(key)?;
-        let mut resp = self
-            .agent
-            .get(&url)
-            .call()
-            .map_err(|e| transport("GET", key, e))?;
-        match resp.status().as_u16() {
-            200..=299 => resp
-                .body_mut()
-                .with_config()
-                .limit(u64::MAX)
-                .read_to_vec()
-                .map_err(|e| transport("GET", key, e)),
-            404 => Err(SinkError::NotFound(key.to_owned())),
-            status => Err(SinkError::Http {
-                method: "GET",
-                key: key.to_owned(),
-                status,
-            }),
+        let started = self.get_wait.now();
+        let attempts = self.get_retry.attempts.max(1);
+        let mut wait = self.get_retry.first;
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            match self.get_once(key) {
+                Ok(bytes) => return Ok(bytes),
+                Err(error) if error.is_retryable() && attempts > 1 => {
+                    if attempt >= attempts {
+                        return Err(SinkError::Exhausted {
+                            attempts: attempt,
+                            elapsed: self.get_wait.now().saturating_duration_since(started),
+                            last: Box::new(error),
+                        });
+                    }
+                    tracing::warn!(
+                        key,
+                        %error,
+                        attempt,
+                        retry_in_ms = wait.as_millis() as u64,
+                        "object GET failed; asking again"
+                    );
+                    self.get_wait.sleep(wait);
+                    wait = (wait * 2).min(self.get_retry.max);
+                }
+                Err(error) => return Err(error),
+            }
         }
     }
 
@@ -1112,6 +1222,175 @@ mod tests {
             PutOutcome::AlreadyPresent
         );
         assert_eq!(s.helper_cpu(), Duration::ZERO);
+    }
+
+    /// What the scripted store answers one connection with.
+    enum Answer {
+        /// Close the connection before answering.
+        Drop,
+        /// A 200 promising `len` bytes, then the first `sent` of `body`, then close.
+        Partial(Vec<u8>, usize),
+        /// A bare status.
+        Status(u16),
+        /// A 200 with the whole body.
+        Body(Vec<u8>),
+    }
+
+    /// A store answering each connection with the next scripted answer, and how many it served.
+    fn scripted(answers: Vec<Answer>) -> (String, Arc<AtomicUsize>) {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let served = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&served);
+        thread::spawn(move || {
+            let mut answers = answers.into_iter();
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                // The request's head, up to its blank line.
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") {
+                    match stream.read(&mut byte) {
+                        Ok(1) => head.push(byte[0]),
+                        _ => break,
+                    }
+                }
+                count.fetch_add(1, Ordering::SeqCst);
+                let reply = |stream: &mut std::net::TcpStream,
+                             status: u16,
+                             len: usize,
+                             body: &[u8]| {
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 {status} X\r\ncontent-length: {len}\r\nconnection: close\r\n\r\n"
+                    );
+                    let _ = stream.write_all(body);
+                    let _ = stream.flush();
+                };
+                match answers.next() {
+                    None | Some(Answer::Drop) => {}
+                    Some(Answer::Partial(body, sent)) => {
+                        reply(&mut stream, 200, body.len(), &body[..sent]);
+                    }
+                    Some(Answer::Status(status)) => reply(&mut stream, status, 0, b""),
+                    Some(Answer::Body(body)) => reply(&mut stream, 200, body.len(), &body),
+                }
+                let _ = stream.shutdown(std::net::Shutdown::Both);
+            }
+        });
+        (base, served)
+    }
+
+    struct At(String);
+
+    impl UrlMinter for At {
+        fn put_url(&self, key: &str, _size: u64) -> Result<String, SinkError> {
+            Ok(format!("{}/{key}", self.0))
+        }
+        fn get_url(&self, key: &str) -> Result<String, SinkError> {
+            Ok(format!("{}/{key}?sig=get", self.0))
+        }
+    }
+
+    /// A clock that moves only when the sink waits on it, and the waits it was asked for.
+    struct FakeWait {
+        start: std::time::Instant,
+        slept: Mutex<Vec<Duration>>,
+    }
+
+    impl GetWait for Arc<FakeWait> {
+        fn now(&self) -> std::time::Instant {
+            self.start + self.slept.lock().unwrap().iter().sum::<Duration>()
+        }
+        fn sleep(&self, wait: Duration) {
+            self.slept.lock().unwrap().push(wait);
+        }
+    }
+
+    fn sink_over(answers: Vec<Answer>) -> (PresignedHttp, Arc<FakeWait>, Arc<AtomicUsize>) {
+        let (base, served) = scripted(answers);
+        let wait = Arc::new(FakeWait {
+            start: std::time::Instant::now(),
+            slept: Mutex::new(Vec::new()),
+        });
+        let mut sink = PresignedHttp::new(Box::new(At(base)), Duration::from_secs(5));
+        sink.get_wait = Arc::new(Arc::clone(&wait));
+        (sink, wait, served)
+    }
+
+    fn body() -> Vec<u8> {
+        (0..200_000u32).map(|i| (i % 241) as u8).collect()
+    }
+
+    #[test]
+    fn a_get_whose_connection_drops_is_asked_again() {
+        let (sink, wait, served) = sink_over(vec![Answer::Drop, Answer::Body(body())]);
+        assert_eq!(sink.get("captures/wt/1/packs/a").unwrap(), body());
+        assert_eq!(served.load(Ordering::SeqCst), 2);
+        assert_eq!(*wait.slept.lock().unwrap(), [Duration::from_millis(250)]);
+    }
+
+    #[test]
+    fn a_body_cut_off_part_way_is_read_again_from_its_first_byte() {
+        let (sink, _, served) = sink_over(vec![
+            Answer::Partial(body(), 70_000),
+            Answer::Partial(body(), 10),
+            Answer::Body(body()),
+        ]);
+        // Exactly the object's bytes: nothing of the cut-off bodies is kept.
+        assert_eq!(sink.get("captures/wt/1/packs/a").unwrap(), body());
+        assert_eq!(served.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn a_refused_or_missing_object_fails_on_the_first_call() {
+        let (sink, wait, served) = sink_over(vec![Answer::Status(403)]);
+        let error = sink.get("captures/wt/1/packs/a").unwrap_err();
+        assert!(
+            matches!(error, SinkError::Http { status: 403, .. }),
+            "{error}"
+        );
+        assert_eq!(served.load(Ordering::SeqCst), 1);
+        assert!(wait.slept.lock().unwrap().is_empty());
+
+        let (sink, wait, served) = sink_over(vec![Answer::Status(404)]);
+        let error = sink.get("captures/wt/1/packs/a").unwrap_err();
+        assert!(matches!(error, SinkError::NotFound(_)), "{error}");
+        assert_eq!(served.load(Ordering::SeqCst), 1);
+        assert!(wait.slept.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_get_that_keeps_failing_gives_up_within_its_schedule() {
+        let (sink, wait, served) = sink_over(vec![
+            Answer::Drop,
+            Answer::Status(503),
+            Answer::Partial(body(), 5),
+            Answer::Drop,
+            Answer::Body(body()),
+        ]);
+        let error = sink.get("captures/wt/1/packs/a").unwrap_err();
+        // Four attempts, 0.25 s, 0.5 s and 1 s apart; the fifth answer is never asked for.
+        assert_eq!(served.load(Ordering::SeqCst), 4);
+        assert_eq!(
+            *wait.slept.lock().unwrap(),
+            [
+                Duration::from_millis(250),
+                Duration::from_millis(500),
+                Duration::from_secs(1),
+            ]
+        );
+        assert!(
+            matches!(&error, SinkError::Exhausted { attempts: 4, .. }),
+            "{error}"
+        );
+        assert!(!error.is_retryable(), "a caller must not retry it again");
+        let words = error.to_string();
+        assert!(
+            words.starts_with("gave up after 4 attempts over 1.8 s: GET captures/wt/1/packs/a: "),
+            "{words}"
+        );
     }
 
     #[test]
