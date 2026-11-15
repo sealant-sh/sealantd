@@ -1710,6 +1710,11 @@ mod tests {
         assert_eq!(exit_code, Some(0));
     }
 
+    /// A helper that ignores the hangup and keeps writing after the leader exits does not hold
+    /// the attachment open: the drain after the exit stops at its byte budget, and the
+    /// attachment ends though the helper never stops writing. Held in bytes, as the drain is,
+    /// not in time: a starved runner delivers the budget slowly, but a helper that holds the
+    /// attachment open never stops writing into it (SLNT-979).
     #[tokio::test]
     async fn attach_end_is_not_extended_by_a_writing_helper() {
         let rt = runtime();
@@ -1726,25 +1731,61 @@ mod tests {
         // The helper ignores the hangup and may outlive the leader: the test ends it
         // (sealantd#183).
         let group = GroupGuard { pgid: opened.pid };
+        let entry = rt.registry.get(&opened.session_id).expect("the session");
         rt.attach(&opened.session_id, channel.clone(), out_tx, None)
             .await
             .expect("attach");
-
-        let exit_code = tokio::time::timeout(Duration::from_secs(1), async {
+        let end = tokio::spawn(async move {
             loop {
-                let message = out_rx.recv().await.expect("frame");
+                let message = out_rx.recv().await.expect("frames until the end");
                 if let ServerMessage::Stream(frame) = message {
                     assert_eq!(frame.channel_id, channel);
                     if let sealant_protocol::StreamPayload::End(end) = frame.payload {
-                        return end.exit_code;
+                        return end;
                     }
                 }
             }
-        })
-        .await
-        .expect("helper output must not extend the attachment after leader exit");
+        });
+        tokio::pin!(end);
 
-        assert_eq!(exit_code, Some(0));
+        // From the leader's exit on, what the session records is the drain. Read just after the
+        // exit, the journal's end can still lie before the drain begins (the capture learns of
+        // the exit after the exit watch does): up to one more budget's worth.
+        entry
+            .exit_watch()
+            .wait_for(|exited| *exited)
+            .await
+            .expect("the leader exits");
+        let from = entry
+            .journal
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .next_seq();
+        let bound = 2 * POST_EXIT_DRAIN_BUDGET;
+        let mut changed = entry.output_changed.subscribe();
+        let end = loop {
+            let after: usize = entry
+                .journal
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .read_from(from, bound as u64 + 1)
+                .iter()
+                .map(|chunk| chunk.data.len())
+                .sum();
+            assert!(
+                after <= bound,
+                "helper output extends the attachment after the leader exit: {after} bytes \
+                 recorded since, and no end"
+            );
+            tokio::select! {
+                end = &mut end => break end.expect("the attachment's reader"),
+                _ = changed.changed() => {}
+            }
+        };
+
+        // The session's own end, not a reader overtaken by retention.
+        assert_eq!(end.error, None);
+        assert_eq!(end.exit_code, Some(0));
         assert!(
             group.end(),
             "a process of the test's session is left over after it"
