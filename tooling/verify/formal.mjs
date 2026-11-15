@@ -196,7 +196,9 @@ export const formal = async (
 
   for (const o of owed.filter((o) => o.test)) {
     const log = `.verify/logs/formal-${o.id}.log`;
-    const argv = ["cargo", "test", "-p", o.test.package, "--lib", "--", "--exact", o.test.name];
+    // A test in the crate's own source runs from --lib; one in tests/<file>.rs from --test <file>.
+    const target = o.test.file ? ["--test", o.test.file] : ["--lib"];
+    const argv = ["cargo", "test", "-p", o.test.package, ...target, "--", "--exact", o.test.name];
     progress(`${o.model}: ${argv.join(" ")}`);
     const started = Date.now();
     const { code, text } = await runLogged(root, argv, log);

@@ -34,6 +34,7 @@ test-support = []
 [dev-dependencies]
 sealant-capture = { path = ".", features = ["test-support"] }
 tempfile = { workspace = true }
+proptest = { workspace = true }
 # A throwaway PKI and a TLS listener for the channel transport tests.
 rcgen = { workspace = true }
 rustls = { workspace = true }

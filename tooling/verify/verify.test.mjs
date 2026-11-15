@@ -278,8 +278,9 @@ test("each formal obligation names a model, a test or a fuzz target that exists"
         assert.ok(readFileSync(path.join(repo, "fuzz/Cargo.toml"), "utf8").includes(`name = "${owe.fuzz}"`), owe.fuzz);
       } else {
         const [module, ...rest] = owe.test.name.split("::");
-        const fn = rest.pop();
-        const source = readFileSync(path.join(repo, "crates", owe.test.package, "src", `${module}.rs`), "utf8");
+        const fn = owe.test.file ? module : rest.pop();
+        const file = owe.test.file ? path.join("tests", `${owe.test.file}.rs`) : path.join("src", `${module}.rs`);
+        const source = readFileSync(path.join(repo, "crates", owe.test.package, file), "utf8");
         assert.match(source, new RegExp(`fn ${fn}\\(`), owe.test.name);
       }
     }

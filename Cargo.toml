@@ -52,6 +52,8 @@ sha2 = "0.10"
 ring = "0.17"
 getrandom = "0.2"
 tempfile = "3"
+# Generated inputs for property tests (the restore round trip).
+proptest = { version = "1", default-features = false, features = ["std"] }
 # session capture store (ADR-0015): content-defined chunking, per-chunk zstd (the C library built by
 # cc, as ring already is; no system zstd), presigned-URL HTTP via ureq on rustls+ring (no
 # native-tls, no openssl).
