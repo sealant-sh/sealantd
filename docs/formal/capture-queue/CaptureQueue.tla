@@ -17,8 +17,7 @@ CONSTANTS
     MaxSnaps,     \* snaps the engine takes
     MaxCrashes,   \* process crashes
     MaxRefusals,  \* registrar refusals (422 missing-objects), each answered by a repair
-    Fix,          \* TRUE: the restart acks a queued capture the registrar already holds (README.md)
-    Mutant        \* "none" is the code; README.md lists the others
+    Mutants       \* {} is the code; README.md lists the deliberate breaks
 
 Classes == {"small", "bulk"}
 Snaps == 1..MaxSnaps
@@ -76,11 +75,12 @@ InFlight == IF ship.st = "idle" THEN NoId ELSE ship.e.id
 \* A write over the file at e.n (write-then-rename: one atomic step).
 Put(q, e) == {x \in q : x.n # e.n} \cup {e}
 
-\* What restart takes as the capture to continue (resume_queue): the newest queued capture when the
-\* queue descends from the registered head, else the head.
-ResumeFrom ==
-    IF queue # {} /\ \E e \in queue : e.parent = HeadId \/ e.id = HeadId
-    THEN [id |-> Newest.id, n |-> Newest.n]
+\* What restart takes as the capture to continue from queue q (resume_queue): the newest queued
+\* capture when q descends from the registered head, else the head.
+ResumeFrom(q) ==
+    IF q # {} /\ \E e \in q : e.parent = HeadId \/ e.id = HeadId
+    THEN LET newest == CHOOSE e \in q : \A f \in q : f.n <= e.n
+         IN [id |-> newest.id, n |-> newest.n]
     ELSE [id |-> HeadId, n |-> HeadN]
 
 ----------------------------------------------------------------------------
@@ -113,7 +113,7 @@ EngineFree == up /\ eng = "idle" /\ ~jpending /\ ~(\E e \in queue : e.id = repai
 CanCoalesce(class) ==
     /\ queue # {}
     /\ Newest.class = class
-    /\ (Mutant = "coalesce-in-flight" \/ Newest.id # InFlight)
+    /\ ("coalesce-in-flight" \in Mutants \/ Newest.id # InFlight)
 
 \* CaptureEngine::hoist_target: a small snap goes ahead of the newest queued capture when it is a
 \* bulk one the shipper is not on and the engine staged it last.
@@ -172,7 +172,7 @@ SnapHoist ==
           /\ snaps' = s
           /\ nextId' = nextId + 2
           /\ staged' = staged \cup {s}
-          /\ IF Mutant = "no-journal"
+          /\ IF "no-journal" \in Mutants
              \* The restage as it was: the queue files written one by one, nothing to finish it.
              THEN /\ jpending' = FALSE
                   /\ eng' = "restage"
@@ -193,7 +193,7 @@ Repair ==
                            class |-> r.class]
            IN /\ journal' = [write |-> <<rebuilt>>, sup |-> followers \cup {r}, repair |-> TRUE]
               /\ prev' = [id |-> rebuilt.id, n |-> rebuilt.n]
-    /\ jpending' = (Mutant # "no-journal")
+    /\ jpending' = ("no-journal" \notin Mutants)
     /\ eng' = "restage"
     /\ jstep' = 1
     /\ nextId' = nextId + 1
@@ -278,12 +278,12 @@ Register ==
     /\ LET e == ship.e
            lostAck == chain # << >> /\ e.n = HeadN /\ e.id = HeadId
            next == e.n = HeadN + 1 /\ e.parent = HeadId
-       IN \/ /\ Mutant = "no-cas"
+       IN \/ /\ "no-cas" \in Mutants
              \* A registrar that appends whatever it is sent.
              /\ chain' = Append(chain, e)
              /\ ship' = [ship EXCEPT !.st = "registered"]
              /\ UNCHANGED <<repairReq, refusals, conflicted>>
-          \/ /\ Mutant # "no-cas"
+          \/ /\ "no-cas" \notin Mutants
              /\ \/ /\ lostAck
                    /\ ship' = [ship EXCEPT !.st = "registered"]
                    /\ UNCHANGED <<chain, repairReq, refusals, conflicted>>
@@ -309,7 +309,7 @@ Register ==
 Ack ==
     /\ up
     /\ \/ ship.st = "registered"
-       \/ Mutant = "ack-before-register" /\ ship.st = "uploaded"
+       \/ "ack-before-register" \in Mutants /\ ship.st = "uploaded"
     /\ queue' = {x \in queue : x.n # ship.e.n}
     /\ acked' = acked \cup {ship.e.id}
     /\ ship' = Idle
@@ -330,22 +330,20 @@ Crash ==
                    staged, acked, conflicted>>
 
 \* Staging::open has finished any committed restage (ApplyWrite.. with up = FALSE); the engine
-\* opens on the registered head and resumes the queue. With Fix, a candidate fix for the finding in
-\* README.md: a queued capture the registrar already holds is acked before anything snaps.
+\* opens on the registered head and resume_queue acks a queued capture the registrar holds as its
+\* head (registered, its ack lost) before anything snaps (SLNT-1009). Then it continues from the
+\* queue. "resume-keeps-registered" is the code before SLNT-1009: the capture stays queued.
 Restart ==
     /\ ~up /\ ~jpending
     /\ up' = TRUE
-    /\ IF Fix
-       THEN LET q == {x \in queue : x.id \notin ChainIds}
-            IN /\ queue' = q
-               /\ prev' = IF q # {} /\ \E e \in q : e.parent = HeadId
-                          THEN [id |-> (CHOOSE e \in q : \A f \in q : f.n <= e.n).id,
-                                n |-> (CHOOSE e \in q : \A f \in q : f.n <= e.n).n]
-                          ELSE [id |-> HeadId, n |-> HeadN]
-       ELSE /\ prev' = ResumeFrom
-            /\ UNCHANGED queue
+    /\ LET q == IF "resume-keeps-registered" \in Mutants
+                THEN queue
+                ELSE {x \in queue : ~(x.id = HeadId /\ x.n = HeadN)}
+       IN /\ queue' = q
+          /\ prev' = ResumeFrom(q)
+          /\ acked' = acked \cup {x.id : x \in queue \ q}
     /\ UNCHANGED <<jpending, journal, repairReq, chain, eng, jstep, ship, nextId, snaps, crashes,
-                   refusals, staged, acked, conflicted>>
+                   refusals, staged, conflicted>>
 
 ----------------------------------------------------------------------------
 Next ==

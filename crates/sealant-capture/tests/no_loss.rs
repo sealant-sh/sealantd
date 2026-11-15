@@ -575,7 +575,11 @@ fn a_capture_registered_before_a_crash_is_not_coalesced_with_after_the_restart()
     assert_eq!(registrar.head().unwrap().n, 0);
 
     let mut engine = reopen(config(), &fx.store, &registrar);
-    fs::write(fx.root.join("src/lib.rs"), "pub fn f() { after_restart() }\n").unwrap();
+    fs::write(
+        fx.root.join("src/lib.rs"),
+        "pub fn f() { after_restart() }\n",
+    )
+    .unwrap();
     snap(&mut engine, CaptureKind::Auto, Class::Small, 2);
     let sink: Arc<dyn BlobSink> = fx.store.clone();
     let shipped = engine.shipper(sink, registrar.clone()).ship_pending();
@@ -615,7 +619,11 @@ fn edits_staged_after_a_lost_ack_survive_a_second_restart() {
     } // The daemon dies again, nothing shipped.
 
     let engine = reopen(config(), &fx.store, &registrar);
-    assert_eq!(ship(&engine, &fx.store, &registrar), 2, "both staged captures ship");
+    assert_eq!(
+        ship(&engine, &fx.store, &registrar),
+        2,
+        "both staged captures ship"
+    );
     assert_eq!(registrar.head().unwrap().n, 2);
     let fresh = fx.base.join("fresh");
     restore(&fx.store, &registrar, &fresh);

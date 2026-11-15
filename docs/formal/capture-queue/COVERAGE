@@ -1,9 +1,11 @@
 # What the capture staging queue model stands for. .agents/skills/capture-queue says how to keep it
 # true: its Coverage record maps each model action to the code below.
 #
-# sync: the commit whose code the model was last confirmed to describe (main when SLNT-1007's model
-# was written). Move it only as the skill's step 1 and full run say.
-sync 04a7eb882a141d51e0e16e93f63b3cf0dff54a87
+# sync: the commit whose code the model was last confirmed to describe. 5c17ba50b8 is the SLNT-1009
+# fix on its branch (sealantd's pull request for SLNT-1009); its squash commit on main holds the same
+# covered files byte for byte. The next move goes to a commit on main. Move it only as the skill's
+# step 1 and full run say.
+sync 5c17ba50b8e34cb81e176162933cadd659bf7f23
 
 model CaptureQueue.tla
 model check.sh

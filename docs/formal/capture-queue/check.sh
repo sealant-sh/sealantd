@@ -23,34 +23,28 @@ TLA2TOOLS_SHA256=936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e8
 FULL="6 3 2"
 QUICK="4 2 1"
 
-# row | Fix | mutant | invariants | expected | distinct states (full) | distinct states (--quick)
+# row | mutants | invariants | expected | distinct states (full) | distinct states (--quick)
 #
-# The `code-` rows are the code as it is (Fix = FALSE). Three of them fail on the finding README.md
-# describes (SLNT-1009): a capture registered but not acked before a crash is coalesced into by the
-# next snap after the restart. When the code is fixed, Fix goes, those rows hold, and the `fixed-`
-# rows are the ones that stay.
-#
-# Every `mutant-` row breaks one mechanism the code relies on, on a model where its invariant holds,
-# so the row shows that invariant can fail and that the checker sees it. Most run on the fixed
-# model. `mutant-no-cas` runs on the code's: with Fix a capture the registrar holds is acked at the
-# restart and never sent again, so the registrar's lost-ack answer is never asked for there.
+# `code` is the code as it is: every invariant holds. Each `mutant-` row breaks one mechanism the
+# code relies on (two for `mutant-no-cas`), so the row shows its invariant can fail and that the
+# checker sees it. `resume-keeps-registered` is the code before SLNT-1009: a capture the registrar
+# already holds stays queued after a restart. `mutant-no-cas` needs it: with the fix a registered
+# capture is acked at the restart and never sent again, so a register that the registrar answers as
+# a lost ack is never sent.
 #
 # The last two fields pin the distinct states TLC finds. A row is as expected only when its
 # verdict and its count both match, so a checker that says "holds" over a different state space
 # fails the run. When a change to the model moves a count, take the new one from a TLC run.
 ROWS=(
-  "code-no-double-ship|FALSE|none|NoDoubleShip|holds|14800955|94378"
-  "code-acked-are-registered|FALSE|none|AckedAreRegistered|holds|14800955|94378"
-  "code-claimed-never-superseded|FALSE|none|ClaimedNeverSuperseded|holds|14800955|94378"
-  "code-queue-continues-chain|FALSE|none|QueueContinuesChain|violated QueueContinuesChain|858|620"
-  "code-no-conflict|FALSE|none|NoConflict|violated NoConflict|5568|2691"
-  "code-no-loss|FALSE|none|NoLoss|violated NoLoss|9201|3869"
-  "fixed-all|TRUE|none|NoLoss NoDoubleShip QueueContinuesChain AckedAreRegistered ClaimedNeverSuperseded NoConflict|holds|39463617|125595"
-  "mutant-no-journal-loss|TRUE|no-journal|NoLoss|violated NoLoss|32|32"
-  "mutant-no-journal-chain|TRUE|no-journal|QueueContinuesChain|violated QueueContinuesChain|31|31"
-  "mutant-no-cas|FALSE|no-cas|NoDoubleShip|violated NoDoubleShip|2623|1330"
-  "mutant-ack-before-register|TRUE|ack-before-register|AckedAreRegistered|violated AckedAreRegistered|68|67"
-  "mutant-coalesce-in-flight|TRUE|coalesce-in-flight|ClaimedNeverSuperseded|violated ClaimedNeverSuperseded|23|23"
+  "code||NoLoss NoDoubleShip QueueContinuesChain AckedAreRegistered ClaimedNeverSuperseded NoConflict|holds|8603032|61783"
+  "mutant-resume-keeps-registered-chain|resume-keeps-registered|QueueContinuesChain|violated QueueContinuesChain|858|620"
+  "mutant-resume-keeps-registered-conflict|resume-keeps-registered|NoConflict|violated NoConflict|5568|2691"
+  "mutant-resume-keeps-registered-loss|resume-keeps-registered|NoLoss|violated NoLoss|9201|3869"
+  "mutant-no-journal-loss|no-journal|NoLoss|violated NoLoss|32|32"
+  "mutant-no-journal-chain|no-journal|QueueContinuesChain|violated QueueContinuesChain|31|31"
+  "mutant-no-cas|no-cas resume-keeps-registered|NoDoubleShip|violated NoDoubleShip|2623|1330"
+  "mutant-ack-before-register|ack-before-register|AckedAreRegistered|violated AckedAreRegistered|68|67"
+  "mutant-coalesce-in-flight|coalesce-in-flight|ClaimedNeverSuperseded|violated ClaimedNeverSuperseded|23|23"
 )
 
 # The help is the comment block at the top of this file.
@@ -120,15 +114,16 @@ trap 'rm -rf -- "$scratch"' EXIT
 export JAVA_TOOL_OPTIONS="-Djava.io.tmpdir=$scratch"
 
 run_row() {
-  local name=$1 fix=$2 mutant=$3 invariants=$4 expected=$5 pinned=$6
+  local name=$1 mutants=$2 invariants=$3 expected=$4 pinned=$5
+  local set="" m
+  for m in $mutants; do set+="${set:+, }\"$m\""; done
   local cfg="$scratch/$name.cfg" log="$scratch/$name.out"
   {
     echo "CONSTANTS"
     echo "  MaxSnaps = $snaps"
     echo "  MaxCrashes = $crashes"
     echo "  MaxRefusals = $refusals"
-    echo "  Fix = $fix"
-    echo "  Mutant = \"$mutant\""
+    echo "  Mutants = {$set}"
     echo "SPECIFICATION Spec"
     echo "INVARIANT TypeOK"
     for inv in $invariants; do echo "INVARIANT $inv"; done
@@ -171,12 +166,12 @@ echo "TLC (tla2tools $TLA2TOOLS_VERSION) · MaxSnaps = $snaps · MaxCrashes = $c
 failed=0
 matched=0
 for row in "${ROWS[@]}"; do
-  IFS='|' read -r name fix mutant invariants expected full_states quick_states <<<"$row"
+  IFS='|' read -r name mutants invariants expected full_states quick_states <<<"$row"
   [[ -n "$only" && "$name" != "$only" ]] && continue
   matched=1
   pinned=$full_states
   [[ $quick -eq 1 ]] && pinned=$quick_states
-  run_row "$name" "$fix" "$mutant" "$invariants" "$expected" "$pinned" || failed=1
+  run_row "$name" "$mutants" "$invariants" "$expected" "$pinned" || failed=1
 done
 if [[ $matched -eq 0 ]]; then
   echo "check.sh: no row named $only; rows are:" >&2

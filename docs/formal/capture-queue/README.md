@@ -22,10 +22,10 @@ Every capture that reaches the queue is registered once, in order, whatever step
 A snap is a token; a capture carries the tokens of every snap folded into it (a coalesce, a repair).
 `NoLoss` and `NoDoubleShip` are stated over tokens.
 
-## The finding (SLNT-1009)
+## The finding, fixed (SLNT-1009)
 
-The code breaks `QueueContinuesChain`, `NoConflict` and, with a second crash, `NoLoss`. TLC's
-shortest trace, reproduced on the real engine with the in-memory registrar:
+The code before SLNT-1009 broke `QueueContinuesChain`, `NoConflict` and, with a second crash,
+`NoLoss`. TLC's shortest trace, reproduced on the real engine with the in-memory registrar:
 
 1. A snap stages an `auto` capture A at `n`. The shipper claims, uploads and registers it.
 2. The process dies before `Staging::ack`. A is still queued; the registrar's head is A.
@@ -34,39 +34,42 @@ shortest trace, reproduced on the real engine with the in-memory registrar:
    the newest queued `auto` capture, not in flight): B takes A's `n` and A's parent.
 5. The registrar's head is already at `n`: every pass answers B with wrong-parent.
 
-With another snap (C at `n + 1`, parent B), a second crash and restart, the queue no longer descends
-from the head. The engine continues from the head and its next snap writes over C's queue file:
-C's work is lost. (The boot's `pickup` would also answer Materialize there and lay the head over the
+With another snap (C at `n + 1`, parent B), a second crash and restart, the queue no longer descended
+from the head. The engine continued from the head and its next snap wrote over C's queue file:
+C's work was lost. (The boot's `pickup` also answered Materialize there and laid the head over the
 disk.)
 
-The model keeps the code as it is. `Fix = TRUE` is a candidate fix: the restart acks a queued
-capture the registrar already holds before anything snaps. Every invariant holds with it.
+`resume_queue` now acks a queued capture the registrar holds as its head before anything snaps; the
+model's `Restart` does the same. The old behaviour is kept as the `resume-keeps-registered` mutant,
+expected to fail. The tests `a_capture_registered_before_a_crash_is_not_coalesced_with_after_the_restart`
+and `edits_staged_after_a_lost_ack_survive_a_second_restart` (`crates/sealant-capture/tests/no_loss.rs`)
+are the trace on the real engine.
 
 ## Rows and deliberate breaks
 
-`check.sh` runs the rows in its `ROWS` table. `code-` rows are the code (`Fix = FALSE`); the
-`fixed-all` row checks every invariant with `Fix`. Each `mutant-` row breaks one mechanism on a
-model where its invariant holds, and must be caught:
+`check.sh` runs the rows in its `ROWS` table. The `code` row is the code: every invariant holds.
+Each `mutant-` row breaks one mechanism, on a model where its invariant holds, and must be caught:
 
-| Mutant                | What it breaks                                                                                   | Caught by                              |
-| --------------------- | ------------------------------------------------------------------------------------------------ | -------------------------------------- |
-| `no-journal`          | A restage writes its queue files one by one, with no `restage.json` to finish it after a crash    | `NoLoss`, `QueueContinuesChain`        |
-| `no-cas`              | The registrar appends whatever it is sent: a register sent again after a lost ack is a second link | `NoDoubleShip`                         |
-| `ack-before-register` | The shipper acks once the objects are up, before `capture.register`                              | `AckedAreRegistered`                   |
-| `coalesce-in-flight`  | `coalescible` ignores the entry the shipper has claimed                                          | `ClaimedNeverSuperseded`               |
+| Mutant                    | What it breaks                                                                                   | Caught by                                    |
+| ------------------------- | ------------------------------------------------------------------------------------------------ | -------------------------------------------- |
+| `resume-keeps-registered` | The restart leaves a registered capture queued (the code before SLNT-1009)                       | `QueueContinuesChain`, `NoConflict`, `NoLoss` |
+| `no-journal`              | A restage writes its queue files one by one, with no `restage.json` to finish it after a crash    | `NoLoss`, `QueueContinuesChain`              |
+| `no-cas`                  | The registrar appends whatever it is sent: a register sent again after a lost ack is a second link | `NoDoubleShip`                               |
+| `ack-before-register`     | The shipper acks once the objects are up, before `capture.register`                              | `AckedAreRegistered`                         |
+| `coalesce-in-flight`      | `coalescible` ignores the entry the shipper has claimed                                          | `ClaimedNeverSuperseded`                     |
 
-`no-cas` runs on the code's model: with `Fix` a registered capture is acked at restart and never sent
-again, so the lost-ack answer is never asked for.
+`no-cas` runs together with `resume-keeps-registered`: the restart acks a registered capture, so the
+code never sends one again, and a lost-ack answer is never asked for without it.
 
 ## Bounds
 
 | Run            | Snaps | Crashes | Refusals | Time (4 workers)  |
 | -------------- | ----- | ------- | -------- | ----------------- |
 | `--quick` (PR) | 4     | 2       | 1        | about 10 s in all |
-| full (nightly) | 6     | 3       | 2        | about 5 min       |
+| full (nightly) | 6     | 3       | 2        | about 1 min       |
 
-The quick bounds are the smallest that reach every finding: the `NoLoss` trace needs four snaps and
-two crashes. `check.sh` pins each row's distinct-state count at both bounds.
+The quick bounds are the smallest that reach every break: the `resume-keeps-registered` `NoLoss`
+trace needs four snaps and two crashes. `check.sh` pins each row's distinct-state count at both bounds.
 
 ## What each action stands for
 
@@ -81,7 +84,7 @@ two crashes. `check.sh` pins each row's distinct-state count at both bounds.
 | `Register`                            | `register_one` against the registrar's CAS (`Registrar::capture_register`)                                |
 | `Ack`                                 | `Staging::ack` (by the entry's `n`), then `release`                                                        |
 | `ClearStaleRepair`                    | `pass_once` clearing a repair for a capture no longer queued                                              |
-| `Crash`, `Restart`                    | The process dies; `CaptureEngine::pickup`, `Staging::open`, `CaptureEngine::open` and `resume_queue`       |
+| `Crash`, `Restart`                    | The process dies; `CaptureEngine::pickup`, `Staging::open`, `CaptureEngine::open` and `resume_queue` (its ack of a registered head first) |
 
 ## Assumptions and what is left out
 
