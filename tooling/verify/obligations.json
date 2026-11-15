@@ -140,6 +140,26 @@
     ]
   },
   {
+    "id": "property-restore-round-trip",
+    "paths": [
+      "crates/sealant-capture/src/**",
+      "crates/sealant-capture/tests/restore_round_trip.rs"
+    ],
+    "why": "Capturing a generated worktree and restoring its head gives back the same names, bytes, modes, mtimes, symlinks and empty directories",
+    "owes": [
+      {
+        "kind": "formal",
+        "model": "property:capture_then_restore_gives_back_the_same_tree",
+        "test": {
+          "package": "sealant-capture",
+          "file": "restore_round_trip",
+          "name": "capture_then_restore_gives_back_the_same_tree"
+        },
+        "command": "pnpm verify formal"
+      }
+    ]
+  },
+  {
     "id": "fuzz-decode-client",
     "paths": [
       "crates/sealant-protocol/src/**",
