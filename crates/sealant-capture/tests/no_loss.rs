@@ -517,3 +517,110 @@ fn staging_continues_across_an_epoch_only_for_the_launch_that_staged_it() {
         );
     }
 }
+
+/// Ship every queued capture, then put their queue files back: the daemon died after the
+/// registrar took them and before the shipper acked them.
+fn ship_and_lose_the_acks(
+    engine: &CaptureEngine,
+    sink: &Arc<LocalDir>,
+    registrar: &Arc<InMemoryRegistrar>,
+) {
+    let queue = engine.staging().dir().join("queue");
+    let saved: Vec<(PathBuf, Vec<u8>)> = fs::read_dir(&queue)
+        .unwrap()
+        .map(|d| {
+            let path = d.unwrap().path();
+            let bytes = fs::read(&path).unwrap();
+            (path, bytes)
+        })
+        .collect();
+    assert!(!saved.is_empty());
+    ship(engine, sink, registrar);
+    for (path, bytes) in saved {
+        fs::write(path, bytes).unwrap();
+    }
+}
+
+/// The boot on the same disk, as `boot::capture` runs it: `pickup` must resume, and the engine
+/// opens on the registered head.
+fn reopen(config: CaptureConfig, sink: &LocalDir, registrar: &InMemoryRegistrar) -> CaptureEngine {
+    let head = registrar.head().unwrap();
+    assert!(
+        matches!(
+            CaptureEngine::pickup(&config, Some(&head.capture_id)).unwrap(),
+            Pickup::Resume { .. }
+        ),
+        "the disk continues the head: it is resumed, not materialized over"
+    );
+    let encoded = Materializer::new(sink, MaterializeTargets::new(&config.root, None))
+        .fetch_manifest(&head.manifest_key, &head.capture_id)
+        .unwrap();
+    CaptureEngine::open(config, Some(encoded)).unwrap()
+}
+
+/// SLNT-1009. The daemon dies after the registrar took a capture and before its ack, so the
+/// capture is still queued at the restart. The first snap after it must not coalesce with that
+/// capture: it would take the head's `n` and parent, and every register after it would be a
+/// wrong-parent conflict. The snap registers after the head, and the head restores it.
+#[test]
+fn a_capture_registered_before_a_crash_is_not_coalesced_with_after_the_restart() {
+    let fx = fixture(2);
+    let registrar = Arc::new(InMemoryRegistrar::new("wt", 1, None));
+    let config = || CaptureConfig::new("wt", 1, &fx.root);
+    {
+        let mut engine = CaptureEngine::open(config(), None).unwrap();
+        snap(&mut engine, CaptureKind::Auto, Class::Small, 1);
+        ship_and_lose_the_acks(&engine, &fx.store, &registrar);
+    } // The daemon dies.
+    assert_eq!(registrar.head().unwrap().n, 0);
+
+    let mut engine = reopen(config(), &fx.store, &registrar);
+    fs::write(fx.root.join("src/lib.rs"), "pub fn f() { after_restart() }\n").unwrap();
+    snap(&mut engine, CaptureKind::Auto, Class::Small, 2);
+    let sink: Arc<dyn BlobSink> = fx.store.clone();
+    let shipped = engine.shipper(sink, registrar.clone()).ship_pending();
+    assert!(
+        matches!(shipped, Ok(1)),
+        "the snap after the restart registers: {shipped:?}"
+    );
+    assert_eq!(registrar.head().unwrap().n, 1);
+    let fresh = fx.base.join("fresh");
+    restore(&fx.store, &registrar, &fresh);
+    assert_eq!(
+        fs::read_to_string(fresh.join("src/lib.rs")).unwrap(),
+        "pub fn f() { after_restart() }\n"
+    );
+}
+
+/// SLNT-1009, a second restart. Before the fix, the snap after the first restart replaced the
+/// registered capture, so the queue no longer descended from the head: the next boot found a disk
+/// that did not continue the chain, laid the head over it and lost every edit staged since.
+/// Here both restarts resume the disk, and every edit registers.
+#[test]
+fn edits_staged_after_a_lost_ack_survive_a_second_restart() {
+    let fx = fixture(2);
+    let registrar = Arc::new(InMemoryRegistrar::new("wt", 1, None));
+    let config = || CaptureConfig::new("wt", 1, &fx.root);
+    {
+        let mut engine = CaptureEngine::open(config(), None).unwrap();
+        snap(&mut engine, CaptureKind::Auto, Class::Small, 1);
+        ship_and_lose_the_acks(&engine, &fx.store, &registrar);
+    } // The daemon dies after the register.
+    {
+        let mut engine = reopen(config(), &fx.store, &registrar);
+        fs::write(fx.root.join("src/lib.rs"), "pub fn f() { second() }\n").unwrap();
+        snap(&mut engine, CaptureKind::Auto, Class::Small, 2);
+        fs::write(fx.root.join("src/lib.rs"), "pub fn f() { third() }\n").unwrap();
+        snap(&mut engine, CaptureKind::Turn, Class::Small, 3);
+    } // The daemon dies again, nothing shipped.
+
+    let engine = reopen(config(), &fx.store, &registrar);
+    assert_eq!(ship(&engine, &fx.store, &registrar), 2, "both staged captures ship");
+    assert_eq!(registrar.head().unwrap().n, 2);
+    let fresh = fx.base.join("fresh");
+    restore(&fx.store, &registrar, &fresh);
+    assert_eq!(
+        fs::read_to_string(fresh.join("src/lib.rs")).unwrap(),
+        "pub fn f() { third() }\n"
+    );
+}
