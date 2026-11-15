@@ -1712,9 +1712,9 @@ mod tests {
 
     /// A helper that ignores the hangup and keeps writing after the leader exits does not hold
     /// the attachment open: the drain after the exit stops at its byte budget, and the
-    /// attachment ends though the helper never stops writing. Held in bytes, as the drain is, not in
-    /// time: a starved runner delivers the budget slowly, but a helper that holds the attachment
-    /// open never stops writing into it (SLNT-979).
+    /// attachment ends though the helper never stops writing. Held in bytes, as the drain is,
+    /// not in time: a starved runner delivers the budget slowly, but a helper that holds the
+    /// attachment open never stops writing into it (SLNT-979).
     #[tokio::test]
     async fn attach_end_is_not_extended_by_a_writing_helper() {
         let rt = runtime();
