@@ -345,6 +345,19 @@ fn sync_dir(dir: &Path) {
     }
 }
 
+/// The line a snap logs when the capture it could coalesce with was staged under another
+/// identity: never folded in, it would give the snap a parent on no chain of this worktree and
+/// objects under a key prefix the registrar mints no URL for.
+fn skipped_foreign(entry: &QueueEntry) {
+    tracing::info!(
+        n = entry.n,
+        capture = %entry.capture_id,
+        worktree = %entry.register.worktree_id,
+        epoch = entry.register.epoch,
+        "a capture staged under another identity is not coalesced with"
+    );
+}
+
 /// The staging area.
 #[derive(Debug)]
 pub struct Staging {
@@ -352,7 +365,10 @@ pub struct Staging {
     /// The worktree and epoch this executor stages under. A re-plan (`capture.replan`) moves
     /// it; entries staged under another identity are foreign and never shipped.
     identity: Mutex<(String, u64)>,
-    in_flight: Mutex<Option<u64>>,
+    /// The entry the shipper has claimed, as it read it. Compared by capture id, never by `n`
+    /// alone: after a re-plan the session's first capture takes the chain position a foreign
+    /// entry the shipper is on still has, and writes over its queue file.
+    in_flight: Mutex<Option<QueueEntry>>,
     /// Held by the engine from `coalescible` to `replace` / `enqueue`, and by the shipper while
     /// it claims an entry: a pending `auto` capture is never coalesced away under a shipper that
     /// has started on it, and never claimed once replaced.
@@ -463,10 +479,7 @@ impl Staging {
         let written: HashSet<u64> = journal.write.iter().map(|e| e.n).collect();
         for old in &journal.superseded {
             if !written.contains(&old.n) {
-                match fs::remove_file(self.queue_path(old.n)) {
-                    Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
-                    _ => {}
-                }
+                self.remove_if_queued(old)?;
                 self.step()?;
             }
         }
@@ -537,13 +550,10 @@ impl Staging {
     /// engine held: a later `auto` snap must not coalesce with a foreign entry.
     pub fn discard_foreign(&self) -> io::Result<usize> {
         let _g = self.coalesce_guard();
-        let in_flight = *self
-            .in_flight
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut dropped = 0;
         for entry in self.pending()? {
-            if !self.is_foreign(&entry) || in_flight == Some(entry.n) {
+            // The one the shipper is on is dropped when it lets go of it ([`Self::release`]).
+            if !self.is_foreign(&entry) || self.is_in_flight(&entry) {
                 continue;
             }
             fs::remove_file(self.queue_path(entry.n)).ok();
@@ -588,11 +598,29 @@ impl Staging {
         self.generation.fetch_add(1, Ordering::SeqCst);
     }
 
-    fn in_flight(&self) -> Option<u64> {
-        *self
-            .in_flight
+    /// Whether `entry` is the one the shipper has claimed (the same capture, not only its `n`).
+    fn is_in_flight(&self, entry: &QueueEntry) -> bool {
+        self.in_flight
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(|e| e.n == entry.n && e.capture_id == entry.capture_id)
+    }
+
+    /// Remove `entry`'s queue file if it still holds that capture; a different capture at its
+    /// `n` is left alone. Whether it was removed. Call under [`Staging::coalesce_guard`].
+    fn remove_if_queued(&self, entry: &QueueEntry) -> io::Result<bool> {
+        if self
+            .read_entry(entry.n)
+            .is_none_or(|e| e.capture_id != entry.capture_id)
+        {
+            return Ok(false);
+        }
+        match fs::remove_file(self.queue_path(entry.n)) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e),
+        }
     }
 
     /// Root.
@@ -753,8 +781,43 @@ impl Staging {
         }
     }
 
-    /// Append an entry (write-then-rename).
+    /// Append an entry (write-then-rename). A different capture already queued at its `n` is
+    /// written over: after a re-plan the session's first capture takes the chain position of a
+    /// capture staged under the old identity, which no registrar takes. Its objects no queued
+    /// entry lists are swept then, or, when the shipper is on it, once it lets go of it
+    /// ([`Self::release`]). Call under [`Staging::coalesce_guard`].
     pub fn enqueue(&self, entry: &QueueEntry) -> io::Result<()> {
+        let displaced = self
+            .read_entry(entry.n)
+            .filter(|d| d.capture_id != entry.capture_id);
+        self.write_entry(entry)?;
+        if let Some(displaced) = displaced {
+            let in_flight = self.is_in_flight(&displaced);
+            if self.is_foreign(&displaced) {
+                tracing::info!(
+                    n = displaced.n,
+                    capture = %displaced.capture_id,
+                    worktree = %displaced.register.worktree_id,
+                    epoch = displaced.register.epoch,
+                    in_flight,
+                    "a capture staged under another identity was written over at its n"
+                );
+            } else {
+                tracing::warn!(
+                    n = displaced.n,
+                    capture = %displaced.capture_id,
+                    in_flight,
+                    "a queued capture was written over at its n"
+                );
+            }
+            if !in_flight {
+                self.sweep(&displaced)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn write_entry(&self, entry: &QueueEntry) -> io::Result<()> {
         let path = self.queue_path(entry.n);
         let tmp = path.with_extension("tmp");
         fs::write(&tmp, serde_json::to_vec(entry)?).at("write", &tmp)?;
@@ -811,7 +874,7 @@ impl Staging {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         match current {
             Some(e) if e.capture_id == entry.capture_id => {
-                *in_flight = Some(entry.n);
+                *in_flight = Some(e);
                 true
             }
             _ => {
@@ -821,12 +884,43 @@ impl Staging {
         }
     }
 
-    /// The shipper is done with the claimed entry (shipped or failed).
+    /// The shipper is done with the claimed entry (shipped or failed). An entry a re-plan made
+    /// foreign while the shipper was on it ([`Self::discard_foreign`] skips that one) is dropped
+    /// now, with its objects no queued entry lists: nothing of it can register, and left queued
+    /// it was the newest `auto` capture a session's snap coalesced with. An I/O error is logged;
+    /// the shipper's next pass drops it.
     pub fn release(&self) {
-        *self
+        if let Err(error) = self.let_go() {
+            tracing::warn!(%error, "a foreign capture could not be dropped; the next pass drops it");
+        }
+    }
+
+    /// [`Self::release`], with its error.
+    fn let_go(&self) -> io::Result<()> {
+        let _g = self.coalesce_guard();
+        let Some(entry) = self
             .in_flight
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        else {
+            return Ok(());
+        };
+        if !self.is_foreign(&entry) {
+            return Ok(());
+        }
+        let queued = self.remove_if_queued(&entry)?;
+        self.bump();
+        self.sweep(&entry)?;
+        tracing::info!(
+            n = entry.n,
+            capture = %entry.capture_id,
+            worktree = %entry.register.worktree_id,
+            epoch = entry.register.epoch,
+            written_over = !queued,
+            "a capture staged under another identity was dropped once the shipper let go of it"
+        );
+        Ok(())
     }
 
     /// The newest pending entry if it is an `auto` capture not yet being shipped: the one a new
@@ -837,7 +931,11 @@ impl Staging {
         let Some(last) = pending.last() else {
             return Ok(None);
         };
-        if last.kind == CaptureKind::Auto && self.in_flight() != Some(last.n) {
+        if self.is_foreign(last) {
+            skipped_foreign(last);
+            return Ok(None);
+        }
+        if last.kind == CaptureKind::Auto && !self.is_in_flight(last) {
             Ok(Some(last.clone()))
         } else {
             Ok(None)
@@ -852,9 +950,13 @@ impl Staging {
         let Some(below) = pending.iter().rev().find(|e| e.n < top.n) else {
             return Ok(None);
         };
+        if self.is_foreign(below) {
+            skipped_foreign(below);
+            return Ok(None);
+        }
         if below.kind == CaptureKind::Auto
             && below.class != Some(Class::Bulk)
-            && self.in_flight() != Some(below.n)
+            && !self.is_in_flight(below)
         {
             Ok(Some(below.clone()))
         } else {
@@ -871,20 +973,36 @@ impl Staging {
         Ok(pending
             .last()
             .filter(|e| {
-                e.class == Some(Class::Bulk) && self.in_flight() != Some(e.n) && !self.is_foreign(e)
+                e.class == Some(Class::Bulk) && !self.is_in_flight(e) && !self.is_foreign(e)
             })
             .cloned())
     }
 
-    /// Remove an entry and every object file no remaining entry references.
+    /// Remove an entry and every object file no remaining entry references. Only that capture:
+    /// a different one queued at its `n` meanwhile (the session's first capture after a re-plan,
+    /// written over a foreign entry the shipper was on) stays queued. Releases the entry when it
+    /// is the one the shipper claimed.
     pub fn ack(&self, entry: &QueueEntry) -> io::Result<()> {
-        fs::remove_file(self.queue_path(entry.n)).or_else(|e| {
-            if e.kind() == io::ErrorKind::NotFound {
-                Ok(())
-            } else {
-                Err(e)
+        let _g = self.coalesce_guard();
+        if !self.remove_if_queued(entry)? && self.read_entry(entry.n).is_some() {
+            tracing::info!(
+                n = entry.n,
+                capture = %entry.capture_id,
+                "acked a capture written over at its n; the capture queued there stays"
+            );
+        }
+        {
+            let mut in_flight = self
+                .in_flight
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if in_flight
+                .as_ref()
+                .is_some_and(|e| e.n == entry.n && e.capture_id == entry.capture_id)
+            {
+                *in_flight = None;
             }
-        })?;
+        }
         self.bump();
         self.sweep(entry)
     }
@@ -892,9 +1010,9 @@ impl Staging {
     /// Replace `old` by `new` (coalescing): the old queue entry is removed, objects only it
     /// referenced are deleted.
     pub fn replace(&self, old: &QueueEntry, new: &QueueEntry) -> io::Result<()> {
-        self.enqueue(new)?;
+        self.write_entry(new)?;
         if old.n != new.n {
-            fs::remove_file(self.queue_path(old.n)).ok();
+            self.remove_if_queued(old)?;
         }
         self.sweep(old)
     }
@@ -2307,14 +2425,29 @@ impl Shipper {
             }
             if self.staging.is_foreign(entry) {
                 // Staged under an identity a re-plan replaced: nothing of it can register.
-                self.staging.release();
-                self.staging.ack(entry)?;
-                tracing::info!(n = entry.n, worktree = %entry.register.worktree_id, epoch = entry.register.epoch, "foreign capture dropped");
+                // Letting go of it drops it, by its capture id.
+                self.staging.let_go()?;
                 continue;
             }
             let result = self
                 .upload_all(&entry.uploads, &mut cycle)
                 .and_then(|()| self.register_one(entry));
+            if let Err(error) = &result
+                && self.staging.is_foreign(entry)
+            {
+                // A re-plan moved the identity while this entry was in flight: the answer
+                // (lease-lost, a fence, a quota, a refusal) is the old identity's. It holds
+                // nothing of the session's, pauses nothing and asks for no repair; letting go
+                // of it drops it, and the pass goes on with the session's captures.
+                tracing::info!(
+                    n = entry.n,
+                    capture = %entry.capture_id,
+                    %error,
+                    "a capture staged under another identity failed in flight"
+                );
+                self.staging.let_go()?;
+                continue;
+            }
             match result {
                 Ok(()) => {
                     // Acked before it is released: a snap must never coalesce with, or be

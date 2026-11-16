@@ -23,7 +23,11 @@ TLA2TOOLS_SHA256=936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e8
 FULL="6 3 2"
 QUICK="4 2 1"
 
-# row | mutants | invariants | expected | distinct states (full) | distinct states (--quick)
+# row | mutants | invariants | expected | distinct states (full) | distinct states (--quick) | replan
+#
+# `replan` (the last field, absent: no) runs the model with Replan = TRUE: the executor starts as a
+# standby under a placeholder identity, stages one capture there, and a re-plan moves it onto the
+# session at any step, the shipper possibly on that capture (SLNT-1059).
 #
 # `code` is the code as it is: every invariant holds. Each `mutant-` row breaks one mechanism the
 # code relies on (two for `mutant-no-cas`), so the row shows its invariant can fail and that the
@@ -45,6 +49,12 @@ ROWS=(
   "mutant-no-cas|no-cas resume-keeps-registered|NoDoubleShip|violated NoDoubleShip|2623|1330"
   "mutant-ack-before-register|ack-before-register|AckedAreRegistered|violated AckedAreRegistered|68|67"
   "mutant-coalesce-in-flight|coalesce-in-flight|ClaimedNeverSuperseded|violated ClaimedNeverSuperseded|23|23"
+  "replan||NoLoss NoDoubleShip QueueContinuesChain AckedAreRegistered ClaimedNeverSuperseded NoConflict ForeignOnlyInFlight|holds|17207138|123799|replan"
+  "mutant-before-slnt-1059-chain|keep-foreign coalesce-foreign by-n|QueueContinuesChain|violated QueueContinuesChain|73|72|replan"
+  "mutant-before-slnt-1059-conflict|keep-foreign coalesce-foreign by-n|NoConflict|violated NoConflict|940|804|replan"
+  "mutant-keep-foreign|keep-foreign|ForeignOnlyInFlight|violated ForeignOnlyInFlight|28|28|replan"
+  "mutant-keep-foreign-coalesce|keep-foreign coalesce-foreign|QueueContinuesChain|violated QueueContinuesChain|73|72|replan"
+  "mutant-by-n|by-n|NoLoss|violated NoLoss|70|69|replan"
 )
 
 # The help is the comment block at the top of this file.
@@ -114,7 +124,8 @@ trap 'rm -rf -- "$scratch"' EXIT
 export JAVA_TOOL_OPTIONS="-Djava.io.tmpdir=$scratch"
 
 run_row() {
-  local name=$1 mutants=$2 invariants=$3 expected=$4 pinned=$5
+  local name=$1 mutants=$2 invariants=$3 expected=$4 pinned=$5 replan=FALSE
+  [[ "${6:-}" == replan ]] && replan=TRUE
   local set="" m
   for m in $mutants; do set+="${set:+, }\"$m\""; done
   local cfg="$scratch/$name.cfg" log="$scratch/$name.out"
@@ -123,6 +134,7 @@ run_row() {
     echo "  MaxSnaps = $snaps"
     echo "  MaxCrashes = $crashes"
     echo "  MaxRefusals = $refusals"
+    echo "  Replan = $replan"
     echo "  Mutants = {$set}"
     echo "SPECIFICATION Spec"
     echo "INVARIANT TypeOK"
@@ -166,12 +178,12 @@ echo "TLC (tla2tools $TLA2TOOLS_VERSION) · MaxSnaps = $snaps · MaxCrashes = $c
 failed=0
 matched=0
 for row in "${ROWS[@]}"; do
-  IFS='|' read -r name mutants invariants expected full_states quick_states <<<"$row"
+  IFS='|' read -r name mutants invariants expected full_states quick_states replan <<<"$row"
   [[ -n "$only" && "$name" != "$only" ]] && continue
   matched=1
   pinned=$full_states
   [[ $quick -eq 1 ]] && pinned=$quick_states
-  run_row "$name" "$mutants" "$invariants" "$expected" "$pinned" || failed=1
+  run_row "$name" "$mutants" "$invariants" "$expected" "$pinned" "$replan" || failed=1
 done
 if [[ $matched -eq 0 ]]; then
   echo "check.sh: no row named $only; rows are:" >&2

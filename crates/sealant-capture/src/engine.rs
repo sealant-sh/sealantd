@@ -2222,7 +2222,24 @@ impl CaptureEngine {
                 staging.clear_repair()?;
                 return Ok(false);
             };
-            (pending[at].clone(), pending[at + 1..].to_vec())
+            // A capture staged under another identity is never rebuilt under this one: it would
+            // take that identity's parent. The shipper drops it; nothing is asked for it.
+            if staging.is_foreign(&pending[at]) {
+                tracing::info!(
+                    n = request.n,
+                    capture = %request.capture_id,
+                    "a repair asked for a capture staged under another identity is not run"
+                );
+                staging.clear_repair()?;
+                return Ok(false);
+            }
+            // Nor is one folded into the rebuild: its objects sit under another key prefix.
+            let followers: Vec<QueueEntry> = pending[at + 1..]
+                .iter()
+                .filter(|e| !staging.is_foreign(e))
+                .cloned()
+                .collect();
+            (pending[at].clone(), followers)
         };
         let sections = &entry.register.manifest.sections;
         let git_keys: HashSet<String> = sections
