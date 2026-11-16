@@ -27,7 +27,7 @@ Done when each such hunk has a model action it changes, or a reason it changes n
 
 ```sh
 docs/formal/capture-queue/check.sh --quick   # while iterating: about 10 s
-docs/formal/capture-queue/check.sh           # before moving the sync line: about 1 min
+docs/formal/capture-queue/check.sh           # before moving the sync line: about 3 min
 ```
 
 Each row prints `as expected` or `NOT AS EXPECTED`. A row is as expected only when its verdict and

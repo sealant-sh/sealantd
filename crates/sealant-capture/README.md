@@ -363,6 +363,40 @@ is answered `unchanged`. `crates/sealantd/src/capture.rs` tests it end to end: b
 for `wt-real`, standby boots as `standby-1`/epoch 7, the chain moves on, re-plan, the next
 capture registers as `wt-real`/epoch 1 with the head as its parent.
 
+**A foreign entry is never folded into the session's captures (SLNT-1059).** A standby holds
+no lease, so a capture it stages in its first minute is answered `lease-lost` and stays queued
+while the shipper asks again. When the claim's re-plan landed while the shipper was on it, the
+rebase skipped it (`dropped=0`), the shipper let go of it, and the session's first `auto` snap
+coalesced with it: the session's capture took the placeholder capture's parent, on no chain of
+the session's worktree, and its packs, under `captures/standby-<id>/…`, which Mend mints no URL
+for. It could never ship, and the stop read `not saved · workspace kept` (2 of 13 claimed
+standbys on the test server). Now:
+
+- An entry is foreign when its `(worktree_id, epoch)` is not staging's identity now. The engine
+  stages every capture under its config's identity, and `rebase` moves the config and staging
+  together while it holds the engine, so no snap runs between the two: an entry is foreign only
+  when it was staged before the last identity change. A re-plan onto the identity the executor
+  has (`unchanged`), a re-plan that fails before its rebase, and a restart make nothing foreign.
+- `Staging::coalescible` and `coalescible_below` skip a foreign entry (`a capture staged under
+  another identity is not coalesced with`), as `hoistable` did; `CaptureEngine::repair` never
+  rebuilds a foreign capture nor folds one into a rebuild.
+- The shipper letting go of an entry (`Staging::release`) drops it when it is foreign, with its
+  objects no queued entry lists (`a capture staged under another identity was dropped once the
+  shipper let go of it`); an answer about a foreign entry in flight (lease-lost, a fence, a quota,
+  a refusal) is the old identity's and pauses nothing, holds nothing and asks for no repair.
+- The chain fixes the session's first capture at the head's `n + 1`, which can be the
+  placeholder capture's `n`: the registrar takes no other. So the two share a queue slot, and the
+  session's capture is written over the foreign one (`Staging::enqueue` sweeps the objects of the
+  capture it wrote over, or leaves them to the release when the shipper is on it). Every write-back
+  of the shipper acts on the capture it claimed, by capture id: `ack`, `claim`, `replace` and a
+  restage's removals leave a different capture at that `n` alone.
+
+`tests/replan_in_flight.rs` runs every order of the shipper's claim, the rebase, the shipper
+letting go, the session's snap and an ack of the placeholder capture, on the engine and on the
+real shipper with the re-plan landing inside its register call, plus a restart between the rebase
+and the next snap, a re-plan onto the same identity, and a re-plan that fails before its rebase.
+`docs/formal/capture-queue` models the re-plan (its `replan` rows).
+
 ## Cadence (`cadence.rs`, `watch.rs`)
 
 `CadenceRunner` owns the engine and two clocks. `watch.rs` runs the `sealant-fs` pruned
