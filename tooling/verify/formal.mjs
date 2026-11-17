@@ -100,16 +100,13 @@ export const modelSteps = async (root, models, { files, base, head, full = false
       status: verdict.status,
       detail: `${verdict.detail}. ${driftDetail(coverage, drift(root, coverage, head))}`,
     });
-    if (spawnSync("sh", ["-c", "command -v java"], { stdio: "ignore" }).status !== 0) {
-      steps.push({ id: `${o.id}-check`, title: o.model, status: "blocked_by_prerequisite", detail: "check.sh needs java (TLC is a Java program)" });
-      next.push("install a JDK (17 or later) so `java` is on PATH");
-      continue;
-    }
+    // check.sh runs tlx, which docs/formal/tlx.sh builds from its pinned commit the first time.
     const argv = ["bash", path.join(o.dir, "check.sh"), ...(full ? [] : ["--quick"])];
     const log = `.verify/logs/formal-${o.id}.log`;
     const started = Date.now();
     const { code } = await run(argv, log);
     evidence.push({ kind: "log", path: log });
+    if (code === 2) next.push("check.sh builds tlx the first time: it needs git, cargo (rustup: https://rustup.rs) and a C compiler as cc");
     steps.push({
       id: `${o.id}-check`,
       title: `${o.model}: model check, ${full ? "full" : "quick"} bounds`,
@@ -119,7 +116,7 @@ export const modelSteps = async (root, models, { files, base, head, full = false
       ...(code === 0
         ? { status: "passed", detail: "every row as expected" }
         : code === 2
-          ? { status: "blocked_by_prerequisite", detail: `no TLA+ checker: see ${log}` }
+          ? { status: "blocked_by_prerequisite", detail: `no tlx, and it could not be built: see ${log}` }
           : { status: "failed", detail: `a row is NOT AS EXPECTED: ${log} names it, and .agents/skills/${path.posix.basename(o.dir)} step 3 classifies it` }),
     });
   }

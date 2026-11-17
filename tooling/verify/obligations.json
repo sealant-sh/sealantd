@@ -89,7 +89,8 @@
     "paths": [
       "crates/sealant-capture/src/ship.rs",
       "crates/sealant-capture/src/engine.rs",
-      "docs/formal/capture-queue/**"
+      "docs/formal/capture-queue/**",
+      "docs/formal/tlx.sh"
     ],
     "why": "Every capture that reaches the staging queue registers once, in order, whatever step a crash lands on",
     "owes": [

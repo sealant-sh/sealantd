@@ -2,6 +2,10 @@
 # its drift since the sync commit. Pull requests run the quick bounds of the models they touch
 # (ci.yml's `formal` job); `pnpm verify formal --full` runs this locally.
 #
+# check.sh runs tlx, the model checker, which docs/formal/tlx.sh builds from its pinned commit. The
+# binary is cached by that commit, as in ci.yml's `formal` job. TLC stays in check.sh
+# (`--engine tlc`) for a cross-check by hand; nothing here runs it.
+#
 # SECURITY: scheduled and dispatched on main only, read-only token, no secrets.
 name: formal
 
@@ -20,10 +24,19 @@ concurrency:
 jobs:
   models:
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    # Measured on this runner (SLNT-1081, 17 Nov 2026): the job takes 1.5 minutes with tlx cached
+    # (74 s of checking) and 4.5 minutes when it builds tlx first (3 minutes of build). The limit is
+    # about twice the run that builds.
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           fetch-depth: 0 # each model's sync commit, for its drift
+      - id: tlx
+        run: echo "commit=$(bash docs/formal/tlx.sh --commit)" >>"$GITHUB_OUTPUT"
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.cache/sealantd-formal/tlx-${{ steps.tlx.outputs.commit }}
+          key: tlx-ubuntu-24.04-${{ runner.arch }}-${{ steps.tlx.outputs.commit }}
       - run: node tooling/verify/formal.mjs ci - "$GITHUB_SHA" --full

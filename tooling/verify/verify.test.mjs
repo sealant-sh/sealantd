@@ -270,9 +270,10 @@ test("each formal obligation names a model, a test or a fuzz target that exists"
   for (const entry of loadMap()) {
     for (const owe of entry.owes.filter((o) => o.kind === "formal")) {
       if (owe.dir) {
-        // The map owes the model for exactly the code its COVERAGE names, and for the model itself.
+        // The map owes the model for exactly the code its COVERAGE names, for the model itself, and
+        // for docs/formal/tlx.sh, which pins the checker every model runs on.
         const coverage = readCoverage(repo, owe.dir);
-        assert.deepEqual([...entry.paths].sort(), [...coverage.paths, `${owe.dir}/**`].sort(), entry.id);
+        assert.deepEqual([...entry.paths].sort(), [...coverage.paths, `${owe.dir}/**`, "docs/formal/tlx.sh"].sort(), entry.id);
         for (const file of coverage.model) assert.ok(readFileSync(path.join(repo, file)), file);
       } else if (owe.fuzz) {
         assert.ok(readFileSync(path.join(repo, "fuzz/Cargo.toml"), "utf8").includes(`name = "${owe.fuzz}"`), owe.fuzz);

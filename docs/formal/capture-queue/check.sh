@@ -1,15 +1,23 @@
 #!/usr/bin/env bash
-# Model-checks CaptureQueue.tla with TLC (README.md beside this file says what it checks).
+# Model-checks CaptureQueue.tla with tlx (README.md beside this file says what it checks).
 #
-#   check.sh            every row of ROWS at the full bounds; exits 0 only when each row ends with
-#                       the verdict and the distinct-state count ROWS pins
-#   check.sh --quick    the same at the pull-request bounds: seconds
-#   check.sh <row>      one row (with --quick or not), printing TLC's whole output and its trace
+#   check.sh                every row of ROWS at the full bounds; exits 0 only when each row ends
+#                           with the verdict and the distinct-state count ROWS pins
+#   check.sh --quick        the same at the pull-request bounds: seconds
+#   check.sh <row>          one row (with --quick or not), printing the checker's output and trace
+#   check.sh --engine tlc   any of the above with TLC instead, to cross-check tlx by hand
+#                           (FORMAL_ENGINE=tlc does the same)
+#
+# tlx, the checker of record, is the Rust model checker (github.com/tlaplus-x/tlx) at the commit
+# ../tlx.sh pins, which builds it the first time (needs git, cargo and a C compiler). It runs with
+# -tlc, its mode that promises TLC's verdicts, distinct-state counts and shortest traces.
 #
 # TLC is tla2tools 1.7.4 (TLC 2.19), checked against its sha256 before it runs: $TLA2TOOLS_JAR when
 # set, else the copy cached under ~/.cache/sealantd-formal, fetched from the GitHub release once
-# (needs java and curl). TLC runs on $FORMAL_WORKERS workers (default 4) for a row that must hold;
-# a row that must fail runs on one, so it stops at the same shortest trace every time.
+# (needs java and curl). Nothing scheduled runs it.
+#
+# Either checker runs on $FORMAL_WORKERS workers (default 4) for a row that must hold; a row that
+# must fail runs on one, so it stops at the same shortest trace every time.
 #
 # Exit status 0: every row as expected. 1: a row was not. 2: no checker, or a wrong argument.
 set -euo pipefail
@@ -36,9 +44,10 @@ QUICK="4 2 1"
 # capture is acked at the restart and never sent again, so a register that the registrar answers as
 # a lost ack is never sent.
 #
-# The last two fields pin the distinct states TLC finds. A row is as expected only when its
-# verdict and its count both match, so a checker that says "holds" over a different state space
-# fails the run. When a change to the model moves a count, take the new one from a TLC run.
+# The last two fields pin the distinct states the checker finds; tlx and TLC found the same on every
+# row (README.md, "tlx and TLC"). A row is as expected only when its verdict and its count both
+# match, so a checker that says "holds" over a different state space fails the run. When a change
+# to the model moves a count, take the new one from a tlx run and cross-check it with --engine tlc.
 ROWS=(
   "code||NoLoss NoDoubleShip QueueContinuesChain AckedAreRegistered ClaimedNeverSuperseded NoConflict|holds|8603032|61783"
   "mutant-resume-keeps-registered-chain|resume-keeps-registered|QueueContinuesChain|violated QueueContinuesChain|858|620"
@@ -62,9 +71,19 @@ usage() { awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' 
 
 quick=0
 only=""
+engine=${FORMAL_ENGINE:-tlx}
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --quick) quick=1 ;;
+    --engine)
+      [[ $# -ge 2 ]] || {
+        echo "check.sh: --engine needs tlx or tlc" >&2
+        exit 2
+      }
+      engine=$2
+      shift
+      ;;
+    --engine=*) engine=${1#--engine=} ;;
     -h | --help)
       usage
       exit 0
@@ -88,40 +107,61 @@ bounds=$FULL
 [[ $quick -eq 1 ]] && bounds=$QUICK
 read -r snaps crashes refusals <<<"$bounds"
 workers=${FORMAL_WORKERS:-4}
+case "$engine" in
+  tlx | tlc) ;;
+  *)
+    echo "check.sh: unknown engine $engine; it is tlx or tlc" >&2
+    exit 2
+    ;;
+esac
 
 sha256_of() {
   if command -v sha256sum >/dev/null; then sha256sum "$1" | cut -d' ' -f1; else shasum -a 256 "$1" | cut -d' ' -f1; fi
 }
 
-command -v java >/dev/null || {
-  echo "check.sh: java is not on PATH; nothing was checked" >&2
-  exit 2
-}
-if [[ -n "${TLA2TOOLS_JAR:-}" ]]; then
-  jar=$TLA2TOOLS_JAR
-else
-  cache="${XDG_CACHE_HOME:-$HOME/.cache}/sealantd-formal"
-  jar="$cache/tla2tools-$TLA2TOOLS_VERSION.jar"
-  if [[ ! -f "$jar" ]]; then
-    command -v curl >/dev/null || {
-      echo "check.sh: no TLA2TOOLS_JAR, no cached tla2tools and no curl to fetch it; nothing was checked" >&2
-      exit 2
-    }
-    mkdir -p "$cache"
-    curl -fsSL -o "$jar.part" \
-      "https://github.com/tlaplus/tlaplus/releases/download/v$TLA2TOOLS_VERSION/tla2tools.jar"
-    mv "$jar.part" "$jar"
-  fi
-fi
-if [[ "$(sha256_of "$jar")" != "$TLA2TOOLS_SHA256" ]]; then
-  echo "check.sh: $jar is not tla2tools $TLA2TOOLS_VERSION (sha256 differs); nothing was checked" >&2
-  exit 2
-fi
-
 scratch=$(mktemp -d -t capture-queue.XXXXXX)
 trap 'rm -rf -- "$scratch"' EXIT
-# TLC writes its standard modules into java.io.tmpdir: keep them in this run's scratch directory.
-export JAVA_TOOL_OPTIONS="-Djava.io.tmpdir=$scratch"
+
+if [[ "$engine" == tlx ]]; then
+  tlx=$(bash "$here/../tlx.sh") || {
+    echo "check.sh: no tlx; nothing was checked" >&2
+    exit 2
+  }
+  # tlx has no version flag; it prints its version first even for a file it cannot read.
+  version=$("$tlx" check "$scratch/none.tla" 2>&1 | sed -n 's/^tlx version //p' | head -1 || true)
+  header="tlx ${version:-(version unknown)} at $(bash "$here/../tlx.sh" --commit | cut -c1-10)"
+  [[ -n "${FORMAL_TLX:-}" ]] && header="tlx ${version:-(version unknown)} ($tlx, from FORMAL_TLX)"
+  checker=("$tlx" check -tlc)
+else
+  command -v java >/dev/null || {
+    echo "check.sh: java is not on PATH; nothing was checked" >&2
+    exit 2
+  }
+  if [[ -n "${TLA2TOOLS_JAR:-}" ]]; then
+    jar=$TLA2TOOLS_JAR
+  else
+    cache="${XDG_CACHE_HOME:-$HOME/.cache}/sealantd-formal"
+    jar="$cache/tla2tools-$TLA2TOOLS_VERSION.jar"
+    if [[ ! -f "$jar" ]]; then
+      command -v curl >/dev/null || {
+        echo "check.sh: no TLA2TOOLS_JAR, no cached tla2tools and no curl to fetch it; nothing was checked" >&2
+        exit 2
+      }
+      mkdir -p "$cache"
+      curl -fsSL -o "$jar.part" \
+        "https://github.com/tlaplus/tlaplus/releases/download/v$TLA2TOOLS_VERSION/tla2tools.jar"
+      mv "$jar.part" "$jar"
+    fi
+  fi
+  if [[ "$(sha256_of "$jar")" != "$TLA2TOOLS_SHA256" ]]; then
+    echo "check.sh: $jar is not tla2tools $TLA2TOOLS_VERSION (sha256 differs); nothing was checked" >&2
+    exit 2
+  fi
+  # TLC writes its standard modules into java.io.tmpdir: keep them in this run's scratch directory.
+  export JAVA_TOOL_OPTIONS="-Djava.io.tmpdir=$scratch"
+  header="TLC (tla2tools $TLA2TOOLS_VERSION)"
+  checker=(java -XX:+UseParallelGC -cp "$jar" tlc2.TLC)
+fi
 
 run_row() {
   local name=$1 mutants=$2 invariants=$3 expected=$4 pinned=$5 replan=FALSE
@@ -144,7 +184,7 @@ run_row() {
   local w=$workers
   [[ "$expected" == holds ]] || w=1
   local started=$SECONDS
-  (cd "$here" && java -XX:+UseParallelGC -cp "$jar" tlc2.TLC -workers "$w" -config "$cfg" \
+  (cd "$here" && "${checker[@]}" -workers "$w" -config "$cfg" \
     -metadir "$scratch/meta-$name" CaptureQueue.tla) 2>&1 |
     grep -v '^Picked up JAVA_TOOL_OPTIONS' >"$log" || true
   local seconds=$((SECONDS - started))
@@ -167,14 +207,14 @@ run_row() {
   printf '%-32s %-38s %-38s %10s %5ss  %s\n' "$name" "expected: $expected" "observed: $observed" \
     "${states:-?}" "$seconds" "$verdict"
   if [[ -n "$only" || "$verdict" != "as expected" ]]; then
-    echo "----- TLC output for $name -----"
+    echo "----- $engine output for $name -----"
     cat "$log"
     echo "----- end of $name -----"
   fi
   [[ "$verdict" == "as expected" ]]
 }
 
-echo "TLC (tla2tools $TLA2TOOLS_VERSION) · MaxSnaps = $snaps · MaxCrashes = $crashes · MaxRefusals = $refusals"
+echo "$header · MaxSnaps = $snaps · MaxCrashes = $crashes · MaxRefusals = $refusals"
 failed=0
 matched=0
 for row in "${ROWS[@]}"; do
