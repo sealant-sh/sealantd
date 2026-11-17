@@ -24,9 +24,10 @@ concurrency:
 jobs:
   models:
     runs-on: ubuntu-24.04
-    # Measured on this runner (SLNT-1081): the full check takes about MEASURED_WARM with tlx cached,
-    # MEASURED_COLD when the run builds it. The limit is about twice the cold run.
-    timeout-minutes: 15
+    # Measured on this runner (SLNT-1081, 17 Nov 2026): the job takes 1.5 minutes with tlx cached
+    # (74 s of checking) and 4.5 minutes when it builds tlx first (3 minutes of build). The limit is
+    # about twice the run that builds.
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
