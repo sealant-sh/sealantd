@@ -4,8 +4,8 @@
 every writer it has: the engine's snaps, the shipper, and a process crash at any step followed by a
 restart on the same disk. Its `replan` rows add a standby: the executor starts under a placeholder
 identity, stages a capture there that no registrar takes, and a re-plan (`capture.replan`) moves it
-onto the session at any step, the shipper possibly on that capture. TLC checks every order of their
-steps within the bounds below.
+onto the session at any step, the shipper possibly on that capture. tlx, the Rust model checker,
+checks every order of their steps within the bounds below.
 `check.sh` runs it; the `capture-queue` skill (`.agents/skills/capture-queue`) is the procedure for
 keeping it true to the code.
 
@@ -95,15 +95,42 @@ off the placeholder's chain. `mutant-before-slnt-1059-*` runs all three, the cod
 
 ## Bounds
 
-| Run            | Snaps | Crashes | Refusals | Time (4 workers)  |
-| -------------- | ----- | ------- | -------- | ----------------- |
-| `--quick` (PR) | 4     | 2       | 1        | about 10 s in all |
-| full (nightly) | 6     | 3       | 2        | about 3 min       |
+| Run            | Snaps | Crashes | Refusals | Time (tlx, 4 workers) |
+| -------------- | ----- | ------- | -------- | --------------------- |
+| `--quick` (PR) | 4     | 2       | 1        | about 2 s in all      |
+| full (nightly) | 6     | 3       | 2        | about 30 s in all     |
 
 The quick bounds are the smallest that reach every break: the `resume-keeps-registered` `NoLoss`
 trace needs four snaps and two crashes. The `replan` rows run at the same bounds plus the standby's
 one capture: the `replan` code row holds over 17,207,138 distinct states at full bounds (about
-2 min) and 123,799 at the quick ones. `check.sh` pins each row's distinct-state count at both bounds.
+16 s) and 123,799 at the quick ones. `check.sh` pins each row's distinct-state count at both bounds.
+
+## tlx and TLC
+
+tlx ([tlaplus-x/tlx](https://github.com/tlaplus-x/tlx), version 0.1, no releases) is the checker of
+record. `check.sh` runs it with `-tlc`, its mode that promises TLC's verdicts, distinct-state
+counts, depth and shortest traces. `../tlx.sh` pins the commit
+(`8d5f082b0f0d922bf5999d9a8db00c70a4c1d261`, the one Mend measured and tlx's newest on 17 Nov 2026)
+and builds it into `~/.cache/sealantd-formal/tlx-<commit>/` the first time. That needs git, cargo
+and a C compiler, and takes about 2 minutes on 4 jobs. `FORMAL_TLX` names another binary instead.
+CI caches the binary by the commit.
+
+TLC (tla2tools 1.7.4) stays as `check.sh --engine tlc` (or `FORMAL_ENGINE=tlc`) for a cross-check by
+hand; it needs java. Nothing scheduled runs it.
+
+Before the switch (SLNT-1081, 17 Nov 2026) both checkers ran every row at both bounds, on 4 workers
+for a row that holds and one for a row that must fail. Every verdict, violated invariant,
+distinct-state count, generated-state count and trace length matched, and every row that must fail
+failed under both. So did the search depth of every row but `code`, where TLC on 4 workers said 71
+and tlx 70; TLC on one worker says 70 (its depth on several workers is approximate). On a shared
+32-core machine:
+
+| Run                          | TLC           | tlx          |
+| ---------------------------- | ------------- | ------------ |
+| `code`, full bounds          | 33 s          | 8 s          |
+| `replan`, full bounds        | 70 s          | 16 s         |
+| whole `check.sh` (wall, RSS) | 112 s, 6.9 GB | 29 s, 1.9 GB |
+| whole `check.sh --quick`     | 11 s          | 2 s          |
 
 ## What each action stands for
 

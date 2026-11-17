@@ -59,8 +59,11 @@ jobs:
   # The TLA+ models whose COVERAGE the change touches (docs/formal/<area>/): the drift guard, then
   # check.sh --quick. Not gated on `changes`: a change to a model alone is documentation to the
   # scoping script and still owes its check, and a change that touches no model ends in seconds.
-  # tooling/verify/formal.mjs needs no install; the runner image has java, and check.sh fetches the
-  # pinned TLA+ tools and checks their sha256. Nightly, formal.yml runs every model at full bounds.
+  # tooling/verify/formal.mjs needs no install. check.sh runs tlx, the model checker, which
+  # docs/formal/tlx.sh builds from its pinned commit (rustup and cc are on the runner image). The
+  # binary is cached by that commit, so only the first run after the pin moves builds it (about 3
+  # minutes); a change that runs no model never builds it. Nightly, formal.yml runs every model at
+  # full bounds.
   formal:
     runs-on: ${{ inputs.runner == 'box' && fromJSON('["self-hosted","box","linux","x64"]') || 'ubuntu-24.04' }}
     timeout-minutes: 15
@@ -69,6 +72,12 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 0 # the diff against the pull request's base, and the models' sync commits
+      - id: tlx
+        run: echo "commit=$(bash docs/formal/tlx.sh --commit)" >>"$GITHUB_OUTPUT"
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.cache/sealantd-formal/tlx-${{ steps.tlx.outputs.commit }}
+          key: tlx-${{ inputs.runner == 'box' && 'box' || 'ubuntu-24.04' }}-${{ runner.arch }}-${{ steps.tlx.outputs.commit }}
       - run: node tooling/verify/formal.mjs ci "$BASE" "$HEAD"
         env:
           BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || '-' }}

@@ -26,19 +26,22 @@ Done when each such hunk has a model action it changes, or a reason it changes n
 ## 2. Run the check
 
 ```sh
-docs/formal/capture-queue/check.sh --quick   # while iterating: about 10 s
-docs/formal/capture-queue/check.sh           # before moving the sync line: about 3 min
+docs/formal/capture-queue/check.sh --quick   # while iterating: about 2 s
+docs/formal/capture-queue/check.sh           # before moving the sync line: about 30 s
 ```
 
-Each row prints `as expected` or `NOT AS EXPECTED`. A row is as expected only when its verdict and
-its distinct-state count both match `ROWS` in `check.sh`. When an intended model change moves a
-count, take the new one from a run at those bounds, full and `--quick`.
+`check.sh` runs tlx, the checker of record, which `docs/formal/tlx.sh` builds from its pinned
+commit the first time. Each row prints `as expected` or `NOT AS EXPECTED`. A row is as expected only
+when its verdict and its distinct-state count both match `ROWS` in `check.sh`. When an intended
+model change moves a count, take the new one from a run at those bounds, full and `--quick`, and
+cross-check the rows whose counts moved with `check.sh --engine tlc <row>`: tlx is young, and TLC
+is the checker it promises to agree with.
 
 ## 3. Classify a row that is not as expected
 
-`check.sh <row>` (with `--quick` or not) prints TLC's whole trace. Walk every step against the code
-its action names. A step is real when the code can take it in that state: its guards allow it, and
-it is one rename, one removal or one registrar call there.
+`check.sh <row>` (with `--quick` or not) prints the checker's whole trace. Walk every step against
+the code its action names. A step is real when the code can take it in that state: its guards allow
+it, and it is one rename, one removal or one registrar call there.
 
 - **Every step real: a finding.** Write the trace as numbered steps in the code's words, reproduce
   it on the engine when you can (the in-memory registrar and a queue file put back stand in for a
@@ -47,7 +50,8 @@ it is one rename, one removal or one registrar call there.
   writes merged into one action. Fix the action, say in its comment what code it stands for, rerun.
 - **A mutant that holds.** The code catches that break some other way now, or the model lost the
   behaviour the break needs. Pick a break that still matters and say why in `check.sh`.
-- **`error`.** TLC did not finish: a parse error, `TypeOK`, or memory.
+- **`error`.** The checker did not finish: a parse error, `TypeOK`, or memory. If tlx fails where
+  `--engine tlc` does not, that is a tlx bug: put the row and both outputs on a ticket.
 
 ## 4. Update the model for an intended change
 
