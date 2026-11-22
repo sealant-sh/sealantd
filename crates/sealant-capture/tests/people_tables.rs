@@ -92,6 +92,10 @@ const SAVED: &[&str] = &[
     "codex-db/state_5.sqlite-wal",
     "codex-db/memories_1.sqlite",
     "codex-db/memories_1.sqlite-wal",
+    ".gemini/antigravity-cli/conversations/s1.db",
+    ".gemini/antigravity-cli/conversations/s1.db-wal",
+    ".gemini/antigravity-cli/brain/s1/notes.md",
+    ".gemini/antigravity-cli/settings.json",
     "conversations/s1/sessions/rollout-2.jsonl",
 ];
 

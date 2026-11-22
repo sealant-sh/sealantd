@@ -212,6 +212,18 @@ impl Fixture {
         }
         fs::create_dir_all(home.join(".codex/sessions")).unwrap();
         fs::write(home.join(".codex/config.toml"), "model = \"x\"\n").unwrap();
+        fs::create_dir_all(home.join(".gemini/antigravity-cli/conversations")).unwrap();
+        fs::write(
+            home.join(".gemini/antigravity-cli/conversations/s1.db"),
+            b"SQLite",
+        )
+        .unwrap();
+        fs::write(
+            home.join(".gemini/antigravity-cli/conversations/s1.db-wal"),
+            b"WAL",
+        )
+        .unwrap();
+        fs::write(home.join(".gemini/antigravity-cli/settings.json"), "{}").unwrap();
         // A stale lock, always excluded.
         fs::write(root.join(".git/index.lock"), b"").unwrap();
         Self {
@@ -390,6 +402,17 @@ fn round_trip_materializes_an_identical_workspace() {
     assert!(home2.join(".codex/config.toml").exists());
     assert!(home2.join(".pi/agent/settings.json").exists());
     assert!(home2.join(".local/share/opencode/opencode.db").exists());
+    assert!(
+        home2
+            .join(".gemini/antigravity-cli/conversations/s1.db")
+            .exists()
+    );
+    assert!(
+        home2
+            .join(".gemini/antigravity-cli/conversations/s1.db-wal")
+            .exists()
+    );
+    assert!(home2.join(".gemini/antigravity-cli/settings.json").exists());
     assert!(home2.join("state.db-shm").exists());
     // Hardlink groups materialize as links; mtimes are restored.
     let a = fs::metadata(restore.join("node_modules/pkg1/lib/shared.js")).unwrap();
