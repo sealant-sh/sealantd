@@ -194,7 +194,8 @@ siblings named after it with a suffix too (`auth.json.lock`, a write's temporary
 `mcp.json.mend-seed-12`, a `.migrated` copy). The `.pi/agent/mend/` and `.mend/` entries are where
 Mend delivers a person's pi profile. The list fails open: a credential missing from it is captured.
 It was made on 2026-10-04 from each harness's source at the version workspace images install (Claude
-Code 2.1.289, Codex 0.160.0, opencode 1.18.34, pi 1.0.2), and from what each wrote in an
+Code 2.1.289, Codex 0.160.0, opencode 1.18.34, pi 1.0.2; extended on 2026-11-22 for Antigravity
+`agy` 1.5.14), and from what each wrote in an
 unprivileged container with no OS keyring, where Codex and Claude Code keep their tokens in
 plaintext files, both after a clean exit and while a turn runs, killed with SIGKILL: a file a
 harness removes when it exits (Codex's and Claude Code's shell snapshots) is captured while it
@@ -231,6 +232,13 @@ harness.
 | `.pi/agent/crashes.json` | pi | error messages and stacks as they were, a secret in one included |
 | `.pi/agent/mend/profile/root/mcp.json` | pi | the same, as Mend delivered it from a person's pi profile |
 | `.mend/pi-profile-kept/` | pi | pi profiles Mend set aside, their `mcp.json` included |
+| `.gemini/antigravity-cli/antigravity-oauth-token` | antigravity | Google OAuth access and refresh tokens and account email |
+| `.gemini/antigravity-acp/antigravity-oauth-token` | antigravity | the same when `agy acp` uses `--app-data-dir antigravity-acp` |
+| `.gemini/config/mcp_config.json` | antigravity | MCP server definitions, headers, env and secrets |
+| `.gemini/antigravity-cli/log/` | antigravity | CLI and ACP server logs, which can carry request URLs, headers or errors |
+| `.gemini/antigravity-cli/crashes/` | antigravity | crash dumps and stack traces |
+| `.gemini/antigravity-acp/log/` | antigravity | ACP server logs under `--app-data-dir antigravity-acp` |
+| `.gemini/antigravity-acp/crashes/` | antigravity | crash dumps under `--app-data-dir antigravity-acp` |
 
 Not on the list, because each is the harness's settings or conversation as much as a secret. They
 are captured, and anything a person typed into them travels with the worktree:
@@ -267,6 +275,15 @@ and the state of a daemon that no longer runs. Codex rebuilds each when it next 
 | `.codex/app-server-control/` | codex | that daemon's control socket |
 | `codex-db/logs_*` | codex | Codex's logs database (`CODEX_SQLITE_HOME`), its WAL and shared memory included |
 | `codex-db/*-shm` | codex | SQLite's shared-memory index beside each Codex database, rebuilt when one opens |
+| `.gemini/antigravity-cli/builtin/` | antigravity | builtin skills and plugins unpacked from the `agy` binary on first run |
+| `.gemini/antigravity-cli/updater/` | antigravity | self-updater lock and status files (`update.lock`, `update_status.json`) |
+| `.gemini/antigravity-cli/presence/` | antigravity | per-process lock files for live conversations |
+| `.gemini/antigravity-cli/installation_id` | antigravity | machine-local installation UUID |
+| `.gemini/antigravity-cli/last_check.timestamp` | antigravity | updater last-check timestamp |
+| `.gemini/antigravity-cli/cli.log` | antigravity | symlink to the latest log on that machine |
+| `.gemini/antigravity-cli/*-shm` | antigravity | SQLite's shared-memory index beside `conversation_summaries.db`, rebuilt on open |
+| `.gemini/antigravity-cli/conversations/*-shm` | antigravity | SQLite's shared-memory index beside each conversation database, rebuilt on open |
+| `.cache/antigravity/` | antigravity | self-updater staging downloads |
 
 A `*` in a path stands for any run of characters but `/`, in its last component only.
 `codex-db/` is where Codex keeps its databases in a person's saved directory (`CODEX_SQLITE_HOME`):
