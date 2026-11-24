@@ -1,0 +1,37 @@
+[package]
+name = "sealant-egress-proxy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Per-workspace egress guard: hard-blocked destinations, validating DNS, selective TLS MITM credential brokering and durable revocation."
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "sealant-egress-proxy"
+path = "src/main.rs"
+
+[dependencies]
+clap = { workspace = true }
+getrandom = { workspace = true }
+httparse = { workspace = true }
+rcgen = { workspace = true }
+rustls = { workspace = true }
+rustls-pki-types = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+time = { workspace = true }
+tokio = { workspace = true }
+tokio-rustls = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+webpki-roots = { workspace = true }
+
+[dev-dependencies]
+futures = { workspace = true }
+tempfile = { workspace = true }
+tokio-tungstenite = { workspace = true }
