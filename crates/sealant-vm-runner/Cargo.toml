@@ -1,0 +1,32 @@
+[package]
+name = "sealant-vm-runner"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Runs one workspace microVM inside its host-vm container: tap0 and nftables while privileged, then a zero-capability Cloud Hypervisor with its vsock and egress forwarders."
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "sealant-vm-runner"
+path = "src/main.rs"
+
+[dependencies]
+clap = { workspace = true }
+getrandom = { workspace = true }
+libc = { workspace = true }
+# `net` adds SO_ORIGINAL_DST (`sockopt::OriginalDst`), which the TCP forwarders read.
+nix = { workspace = true, features = ["net"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+nix = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }

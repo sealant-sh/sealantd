@@ -12,6 +12,11 @@ if [ ! -x /usr/lib/openssh/sftp-server ] && [ ! -x /usr/libexec/openssh/sftp-ser
 fi
 # `run_as_user` runs pnpm as a person in a restored worktree (it needs the registry too).
 command -v pnpm >/dev/null || sudo npm install -g pnpm@9
+# `sealant-vm-runner` jail runs the runner in a new netns, where it installs nftables rules.
+if ! command -v nft >/dev/null; then
+  sudo apt-get update -q
+  sudo apt-get install -y --no-install-recommends nftables
+fi
 
 run_as_root() {
   local package=$1 target=$2
@@ -27,3 +32,5 @@ run_as_root sealant-capture owner_map
 # One thread: a test sets the daemon's own environment (what a person's commands must not see).
 run_as_root sealantd run_as_user --test-threads 1
 run_as_root sealantd boot_privilege_posture
+# One thread: each test starts a runner in its own netns and plays its guest.
+run_as_root sealant-vm-runner jail --test-threads 1

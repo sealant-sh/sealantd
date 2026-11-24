@@ -21,3 +21,6 @@ scripts/test-support-probe/Cargo.lock
 fuzz/corpus/
 fuzz/artifacts/
 fuzz/Cargo.lock
+
+# Kernels kernel/build-kernel.sh builds.
+/kernel/out/
