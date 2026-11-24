@@ -17,7 +17,8 @@
 //! 5. runs the same supervisor `sealantd boot` runs in a container ([`crate::boot`]), with the
 //!    control protocol on vsock port 1024 (status and final flush only on a recovery), the
 //!    capture traffic on vsock port 1025, and a graceful shutdown on the runner's shutdown
-//!    frame or the power button ([`power`]);
+//!    frame or the power button ([`power`]); no-new-privileges is off on a normal boot, so guest
+//!    `sudo` works, and on for a recovery ([`env::vm_privilege_posture`]);
 //! 6. on its way out, whatever the exit, syncs the data disk, sends the runner a
 //!    [`protocol::GuestExitStatus`] on the held connection and powers the machine off.
 //!
@@ -196,7 +197,7 @@ fn boot_with_config(
         tracing::warn!(%error, "the image's PATH could not be set on the daemon");
     }
     let config = match BootConfig::load(&vm_env) {
-        Ok(config) => env::clear_recovery_docker(config, mode),
+        Ok(config) => env::vm_privilege_posture(env::clear_recovery_docker(config, mode), mode),
         Err(error) => return Ended::failed(mode, format!("boot configuration: {error}")),
     };
     if let Some(dir) = boot

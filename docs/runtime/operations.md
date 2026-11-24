@@ -60,8 +60,10 @@ other languages from the same `.proto`.
 - `PR_SET_NO_NEW_PRIVS` is set at startup; children cannot escalate via setuid binaries. A
   per-person executor (a root daemon whose capture source carries an owner map naming at least one
   person, Mend's ADR 0016) leaves it
-  unset: every person there has passwordless `sudo`, so it is root by design, not a sandbox. Boot
-  logs the posture (`privilege posture: …`), and `runtime.getCapabilities` reports
+  unset: every person there has passwordless `sudo`, so it is root by design, not a sandbox. A
+  `host-vm` workspace's normal boot (`sealantd --vm`) leaves it unset too, whatever the source, so
+  guest `sudo` works: the guest kernel is the isolation boundary. Its recovery boot keeps it set,
+  owner map or not. Boot logs the posture (`privilege posture: …`), and `runtime.getCapabilities` reports
   `noNewPrivileges`.
 - `max_processes` / `max_sessions` are enforced; overflow is rejected with `policy-denied`.
 - Captured I/O is redacted for configured secret literals and high-confidence token shapes; masked

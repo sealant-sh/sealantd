@@ -198,6 +198,20 @@ pub fn clear_recovery_docker(
     config
 }
 
+/// A microVM boot's privilege posture, whatever the workspace source: a normal boot leaves
+/// no-new-privileges off, so `sudo` and other setuid binaries in the guest work (the guest's
+/// own kernel is the isolation boundary, not the shared kernel a container's posture guards);
+/// a recovery boot keeps it on, owner map or not, since it runs the clean base to save a disk
+/// and has no person to run as. A container boot never comes here.
+#[must_use]
+pub fn vm_privilege_posture(
+    mut config: crate::boot::BootConfig,
+    mode: VmMode,
+) -> crate::boot::BootConfig {
+    config.no_new_privileges = mode == VmMode::Recover;
+    config
+}
+
 /// The combined CA bundle: the first readable system bundle of `system_bundles`, then the
 /// executor CA. Each part ends with a newline so the PEM blocks never run together.
 ///
@@ -446,6 +460,78 @@ mod tests {
                 .as_deref(),
             Some("/workspace/.journals")
         );
+    }
+
+    /// The boot config as `sealantd --vm` loads it for `mode`: a capture source, or a clone one,
+    /// with an owner map when given one.
+    fn vm_boot_config(
+        mode: VmMode,
+        source: &str,
+        owner_map: Option<&str>,
+    ) -> crate::boot::BootConfig {
+        let mut runner = boot(mode);
+        let (key, value) = match source {
+            "clone" => ("SEALANT_WORKSPACE_REPO_URL", "git@github.com:o/r.git"),
+            _ => ("SEALANT_CAPTURE_ENDPOINT", "http://mend:3106/channel"),
+        };
+        runner.boot_env.extend([
+            ("SEALANT_WORKSPACE_SOURCE".to_owned(), source.to_owned()),
+            (key.to_owned(), value.to_owned()),
+            (
+                "SEALANT_HARNESS_LAUNCH_COMMAND".to_owned(),
+                "claude".to_owned(),
+            ),
+            ("SEALANT_OS_FAMILY".to_owned(), "ubuntu".to_owned()),
+        ]);
+        if let Some(map) = owner_map {
+            runner
+                .boot_env
+                .insert("SEALANT_CAPTURE_OWNER_MAP".to_owned(), map.to_owned());
+        }
+        let env = assemble(&runner, &Extras::default());
+        crate::boot::BootConfig::load(&env).expect("vm boot config")
+    }
+
+    const OWNER_MAP: &str = r#"{"gid":40000,"worktree":40012,"people":{"acct_a":40012}}"#;
+
+    /// A normal microVM boot leaves no-new-privileges off whatever its source, so guest `sudo`
+    /// works: a standalone clone, a capture with no owner map, a per-person capture.
+    #[test]
+    fn a_normal_vm_boot_leaves_no_new_privileges_off_for_every_source() {
+        for (source, owner_map) in [
+            ("clone", None),
+            ("capture", None),
+            ("capture", Some(OWNER_MAP)),
+        ] {
+            let loaded = vm_boot_config(VmMode::Normal, source, owner_map);
+            let config = vm_privilege_posture(
+                clear_recovery_docker(loaded, VmMode::Normal),
+                VmMode::Normal,
+            );
+            assert!(!config.no_new_privileges, "{source} {owner_map:?}");
+        }
+    }
+
+    /// A recovery boot keeps no-new-privileges on, even under an owner map and even when the
+    /// container posture had left it off (a root daemon loading a per-person capture does).
+    #[test]
+    fn a_recovery_vm_boot_keeps_no_new_privileges_on_even_with_an_owner_map() {
+        let mut per_person = vm_boot_config(VmMode::Recover, "capture", Some(OWNER_MAP));
+        assert!(per_person.recovery);
+        assert!(matches!(
+            &per_person.source,
+            crate::boot::config::WorkspaceSource::Capture(c) if c.owners.is_some()
+        ));
+        per_person.no_new_privileges = false;
+        let config = vm_privilege_posture(
+            clear_recovery_docker(per_person, VmMode::Recover),
+            VmMode::Recover,
+        );
+        assert!(config.no_new_privileges);
+        assert_eq!(config.workspace_docker, None);
+
+        let plain = vm_boot_config(VmMode::Recover, "capture", None);
+        assert!(vm_privilege_posture(plain, VmMode::Recover).no_new_privileges);
     }
 
     #[test]
