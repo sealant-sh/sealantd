@@ -1,20 +1,24 @@
-# Release: a vX.Y.Z tag releases sealantd: the image ghcr.io/sealant-sh/sealantd:<version>, amd64
-# and arm64, and @sealant/runtime-protocol and @sealant/runtime-client on npm. In order:
+# Release: a vX.Y.Z tag releases sealantd: three images, amd64 and arm64, each at <version>
+# (ghcr.io/sealant-sh/sealantd from docker/Dockerfile, ghcr.io/sealant-sh/vm-runner from
+# docker/vm-runner.Dockerfile, ghcr.io/sealant-sh/egress-proxy from docker/egress-proxy.Dockerfile),
+# and @sealant/runtime-protocol and @sealant/runtime-client on npm. Every image job below runs once
+# per image (a matrix), so all three go through the same steps. In order:
 #
 # 1. stable-tag refuses anything but a stable tag of a commit whose `ci` push run on main passed.
 # 2. build pushes each platform by digest, untagged; merge stages the index under this run's own
-#    tag, staging-<run>-<attempt>. pack builds and packs the two npm packages with no credential.
-#    release-manifest records every digest and each tarball's sha512.
+#    tag, staging-<run>-<attempt>, one index per image. pack builds and packs the two npm packages
+#    with no credential. release-manifest records every image's digests and each tarball's sha512.
 # 3. identity resolves each platform through the staged index on its own arch, requires the index to
 #    map it to that arch's build, pulls it and checks it is this release's build: the image ID it
-#    runs, its labels, and `sealantd --version`. Identity checks, not acceptance: a sealantd image
-#    is accepted by sealant, which pins it by digest and runs its workspace e2e against exactly
+#    runs, its labels, and its binary's `--version`. Identity checks, not acceptance: the images
+#    are accepted by sealant, which pins it by digest and runs its workspace e2e against exactly
 #    that digest before sealant releases (docs/runtime/integration.md, Stable releases).
-# 4. finalize-images writes :<version>, once, from the checked index; then npm publishes exactly the
-#    packed tarballs, under the stable floor.
+# 4. finalize-images writes each image's :<version>, once, from its checked index; then, once all
+#    three exist, npm publishes exactly the packed tarballs, under the stable floor.
 #
 # Only finalize-images writes :<version>, and nothing writes :X.Y or :latest: those stay at 0.19.0,
-# where the old pipeline left them, and are not a supported way to consume sealantd. There is no
+# where the old pipeline left them (sealantd's; vm-runner and egress-proxy never had them), and are
+# not a supported way to consume sealantd. There is no
 # GitHub release. finalize-images and npm queue on one lock, sealantd-release-channel. Re-running
 # failed jobs is safe: every write first reads what is there.
 # A dispatch with dry_run is a dry run: version <packages/runtime-client version>-dryrun.<run
@@ -237,20 +241,25 @@ jobs:
             run();
           ' -- "${GITHUB_API_URL:-https://api.github.com}" "$GITHUB_REPOSITORY" "$GITHUB_SHA" "${GH_TOKEN:-}" "$verdict"
 
-  # Each platform on its own native runner, pushed by digest with no tag at all: nothing pulls it
-  # until the identity check names it by that digest.
+  # Each image and platform on its own native runner, pushed by digest with no tag at all: nothing
+  # pulls it until the identity check names it by that digest. vm-runner compiles its guest kernel
+  # besides its Rust binary, so it gets more time.
   build:
-    name: Image (${{ matrix.platform.arch }})
+    name: Image ${{ matrix.image.name }} (${{ matrix.platform.arch }})
     needs: stable-tag
     if: needs.stable-tag.outputs.target == 'ghcr'
     strategy:
       fail-fast: false
       matrix:
+        image:
+          - { name: sealantd, dockerfile: docker/Dockerfile, timeout: 60 }
+          - { name: vm-runner, dockerfile: docker/vm-runner.Dockerfile, timeout: 90 }
+          - { name: egress-proxy, dockerfile: docker/egress-proxy.Dockerfile, timeout: 60 }
         platform:
           - { arch: amd64, runner: ubuntu-24.04 }
           - { arch: arm64, runner: ubuntu-24.04-arm }
     runs-on: ${{ matrix.platform.runner }}
-    timeout-minutes: 60
+    timeout-minutes: ${{ matrix.image.timeout }}
     permissions:
       contents: read
       packages: write
@@ -284,7 +293,7 @@ jobs:
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: .
-          file: docker/Dockerfile
+          file: ${{ matrix.image.dockerfile }}
           platforms: linux/${{ matrix.platform.arch }}
           provenance: false
           labels: |
@@ -292,7 +301,7 @@ jobs:
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.version=${{ needs.stable-tag.outputs.version }}
           outputs:
-            type=image,name=ghcr.io/${{ github.repository }},push-by-digest=true,name-canonical=true,push=true
+            type=image,name=ghcr.io/${{ github.repository_owner }}/${{ matrix.image.name }},push-by-digest=true,name-canonical=true,push=true
       - name: Export digest
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
@@ -301,7 +310,7 @@ jobs:
           touch "/tmp/digests/${DIGEST#sha256:}"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: digests-sealantd--${{ matrix.platform.arch }}
+          name: digests-${{ matrix.image.name }}--${{ matrix.platform.arch }}
           path: /tmp/digests/*
           if-no-files-found: error
           retention-days: 1
@@ -311,17 +320,21 @@ jobs:
   # Docker's classic image store needs to load an archive. No attestations, so index.json names the
   # platform manifest itself, the digest the identity check checks.
   archive-build:
-    name: Image archive (${{ matrix.platform.arch }})
+    name: Image archive ${{ matrix.image.name }} (${{ matrix.platform.arch }})
     needs: stable-tag
     if: needs.stable-tag.outputs.target == 'archive'
     strategy:
       fail-fast: false
       matrix:
+        image:
+          - { name: sealantd, dockerfile: docker/Dockerfile, timeout: 60 }
+          - { name: vm-runner, dockerfile: docker/vm-runner.Dockerfile, timeout: 90 }
+          - { name: egress-proxy, dockerfile: docker/egress-proxy.Dockerfile, timeout: 60 }
         platform:
           - { arch: amd64, runner: ubuntu-24.04 }
           - { arch: arm64, runner: ubuntu-24.04-arm }
     runs-on: ${{ matrix.platform.runner }}
-    timeout-minutes: 60
+    timeout-minutes: ${{ matrix.image.timeout }}
     permissions:
       contents: read
     steps:
@@ -342,7 +355,7 @@ jobs:
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: .
-          file: docker/Dockerfile
+          file: ${{ matrix.image.dockerfile }}
           platforms: linux/${{ matrix.platform.arch }}
           provenance: false
           sbom: false
@@ -350,13 +363,13 @@ jobs:
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.version=${{ needs.stable-tag.outputs.version }}
-          outputs: type=docker,dest=${{ runner.temp }}/archive/sealantd.tar
+          outputs: type=docker,dest=${{ runner.temp }}/archive/${{ matrix.image.name }}.tar
       # The digest is computed from the archive itself and must be the one BuildKit reports, so the
       # manifest records what the file holds.
       # scripts/release-manifest.test.mjs runs this step as written.
       - name: Record the platform digest from the archive
         env:
-          ARCHIVE: ${{ runner.temp }}/archive/sealantd.tar
+          ARCHIVE: ${{ runner.temp }}/archive/${{ matrix.image.name }}.tar
           DIGEST: ${{ steps.build.outputs.digest }}
         run: |
           set -euo pipefail
@@ -369,25 +382,29 @@ jobs:
           touch "/tmp/digests/${platform#sha256:}"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: digests-sealantd--${{ matrix.platform.arch }}
+          name: digests-${{ matrix.image.name }}--${{ matrix.platform.arch }}
           path: /tmp/digests/*
           if-no-files-found: error
           retention-days: 1
       # Layers are compressed already. They expire after a day.
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: archive-sealantd--${{ matrix.platform.arch }}
-          path: ${{ runner.temp }}/archive/sealantd.tar
+          name: archive-${{ matrix.image.name }}--${{ matrix.platform.arch }}
+          path: ${{ runner.temp }}/archive/${{ matrix.image.name }}.tar
           if-no-files-found: error
           retention-days: 1
           compression-level: 0
 
-  # Both platforms as one index, under this run's own tag. :<version> is what every consumer of the
-  # version pulls, so only finalize-images writes it, after the identity checks.
+  # Both platforms of each image as one index, under this run's own tag. :<version> is what every
+  # consumer of the version pulls, so only finalize-images writes it, after the identity checks.
   merge:
-    name: Stage the index
+    name: Stage the ${{ matrix.image }} index
     needs: [stable-tag, build]
     if: needs.stable-tag.outputs.target == 'ghcr'
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [sealantd, vm-runner, egress-proxy]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -417,11 +434,12 @@ jobs:
           # setup-node v6 restores a package-manager cache by itself when packageManager names npm.
           package-manager-cache: false
           node-version: 24
-      # One directory per build, named for its arch: which digest is which arch's build is kept.
+      # One directory per build, named for its image and arch: which digest is which arch's build
+      # is kept.
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: /tmp/digests
-          pattern: digests-sealantd--*
+          pattern: digests-${{ matrix.image }}--*
       - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
@@ -430,16 +448,17 @@ jobs:
       # scripts/release-publication.test.mjs runs this step as written, against a stand-in docker.
       - name: Stage the multi-arch index under this run's tag
         env:
-          REPOSITORY: ghcr.io/${{ github.repository }}
+          IMAGE: ${{ matrix.image }}
+          REPOSITORY: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}
         run: |
           set -euo pipefail
           tag=staging-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT
           sources=()
           for arch in amd64 arm64; do
-            built=(/tmp/digests/digests-sealantd--"$arch"/*)
+            built=(/tmp/digests/digests-"$IMAGE"--"$arch"/*)
             digest=${built[0]##*/}
             if [[ ${#built[@]} -ne 1 || ! $digest =~ ^[0-9a-f]{64}$ ]]; then
-              echo "::error::The $arch digests artifact holds '${built[*]##*/}', not one image digest."
+              echo "::error::The $IMAGE $arch digests artifact holds '${built[*]##*/}', not one image digest."
               exit 1
             fi
             sources+=("$REPOSITORY@sha256:$digest")
@@ -455,7 +474,8 @@ jobs:
       - name: Check and record the index digest
         working-directory: ${{ runner.temp }}/index
         env:
-          REPOSITORY: ghcr.io/${{ github.repository }}
+          IMAGE: ${{ matrix.image }}
+          REPOSITORY: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}
         run: |
           set -euo pipefail
           digest=$(jq -r '."containerimage.digest" // ."containerimage.descriptor".digest // ""' create.json)
@@ -466,7 +486,7 @@ jobs:
           docker buildx imagetools inspect "$REPOSITORY@$digest" --raw >index.json
           sources=()
           for arch in amd64 arm64; do
-            source=$(cd "/tmp/digests/digests-sealantd--$arch" && ls)
+            source=$(cd "/tmp/digests/digests-$IMAGE--$arch" && ls)
             docker buildx imagetools inspect "$REPOSITORY@sha256:$source" --raw >"source-$source.json"
             sources+=("$arch=sha256:$source=source-$source.json")
           done
@@ -474,7 +494,7 @@ jobs:
             index.json "${sources[@]}" >digest
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: index-sealantd
+          name: index-${{ matrix.image }}
           path: ${{ runner.temp }}/index/digest
           if-no-files-found: error
           retention-days: 1
@@ -483,9 +503,13 @@ jobs:
   # it proves both arches' archives make one index, and gives the manifest that index's digest.
   # Nothing leaves the runner.
   archive-merge:
-    name: Assemble the index
+    name: Assemble the ${{ matrix.image }} index
     needs: [stable-tag, archive-build]
     if: needs.stable-tag.outputs.target == 'archive'
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [sealantd, vm-runner, egress-proxy]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -505,11 +529,11 @@ jobs:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: /tmp/archives
-          pattern: archive-sealantd--*
+          pattern: archive-${{ matrix.image }}--*
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: /tmp/digests
-          pattern: digests-sealantd--*
+          pattern: digests-${{ matrix.image }}--*
       # Pinned by its index digest: the registry:2 index (registry 2.8.3) read on 2026-10-17. Nothing
       # it holds leaves the runner, but the dry run's index digest is computed through it.
       - name: Start a registry on loopback inside this job
@@ -527,7 +551,8 @@ jobs:
       # archive was recorded under; the inspect proves it.
       - name: Push both arches' archives to it
         env:
-          REPOSITORY: 127.0.0.1:5000/sealantd
+          IMAGE: ${{ matrix.image }}
+          REPOSITORY: 127.0.0.1:5000/${{ matrix.image }}
         run: |
           set -euo pipefail
           command -v skopeo >/dev/null || {
@@ -535,20 +560,21 @@ jobs:
             exit 1
           }
           for arch in amd64 arm64; do
-            digest=$(cd "/tmp/digests/digests-sealantd--$arch" && ls)
+            digest=$(cd "/tmp/digests/digests-$IMAGE--$arch" && ls)
             skopeo copy --preserve-digests --dest-tls-verify=false \
-              "oci-archive:/tmp/archives/archive-sealantd--$arch/sealantd.tar" "docker://$REPOSITORY:$arch"
+              "oci-archive:/tmp/archives/archive-$IMAGE--$arch/$IMAGE.tar" "docker://$REPOSITORY:$arch"
             docker buildx imagetools inspect "$REPOSITORY@sha256:$digest" >/dev/null
           done
       - name: Create and inspect the multi-arch index in the job's registry
         env:
-          REPOSITORY: 127.0.0.1:5000/sealantd
+          IMAGE: ${{ matrix.image }}
+          REPOSITORY: 127.0.0.1:5000/${{ matrix.image }}
           VERSION: ${{ needs.stable-tag.outputs.version }}
         run: |
           set -euo pipefail
           sources=()
           for arch in amd64 arm64; do
-            sources+=("$REPOSITORY@sha256:$(cd "/tmp/digests/digests-sealantd--$arch" && ls)")
+            sources+=("$REPOSITORY@sha256:$(cd "/tmp/digests/digests-$IMAGE--$arch" && ls)")
           done
           mkdir -p "$RUNNER_TEMP/index"
           docker buildx imagetools create --metadata-file "$RUNNER_TEMP/index/create.json" \
@@ -559,7 +585,8 @@ jobs:
       - name: Check and record the index digest
         working-directory: ${{ runner.temp }}/index
         env:
-          REPOSITORY: 127.0.0.1:5000/sealantd
+          IMAGE: ${{ matrix.image }}
+          REPOSITORY: 127.0.0.1:5000/${{ matrix.image }}
         run: |
           set -euo pipefail
           digest=$(jq -r '."containerimage.digest" // ."containerimage.descriptor".digest // ""' create.json)
@@ -570,7 +597,7 @@ jobs:
           docker buildx imagetools inspect "$REPOSITORY@$digest" --raw >index.json
           sources=()
           for arch in amd64 arm64; do
-            source=$(cd "/tmp/digests/digests-sealantd--$arch" && ls)
+            source=$(cd "/tmp/digests/digests-$IMAGE--$arch" && ls)
             docker buildx imagetools inspect "$REPOSITORY@sha256:$source" --raw >"source-$source.json"
             sources+=("$arch=sha256:$source=source-$source.json")
           done
@@ -578,7 +605,7 @@ jobs:
             index.json "${sources[@]}" >digest
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: index-sealantd
+          name: index-${{ matrix.image }}
           path: ${{ runner.temp }}/index/digest
           if-no-files-found: error
           retention-days: 1
@@ -669,7 +696,7 @@ jobs:
           if-no-files-found: error
           retention-days: 90
 
-  # One record of what this run built: the image by its index and platform digests, and each npm
+  # One record of what this run built: each image by its index and platform digests, and each npm
   # tarball by its sha512. Every later job reads it from this run and nowhere else. Kept 90 days, so
   # failed jobs can be re-run.
   release-manifest:
@@ -728,7 +755,7 @@ jobs:
   # source as labels, and its daemon must report the version the tagged commit's Cargo.toml gives.
   # A mislabelled, swapped or broken index stops here, before :<version> exists.
   identity:
-    name: Identity check (${{ matrix.platform.arch }})
+    name: Identity check ${{ matrix.image.name }} (${{ matrix.platform.arch }})
     needs: [stable-tag, release-manifest]
     # A job whose if names no status function also needs every job above it to have succeeded, and
     # the other target's jobs above release-manifest are skipped: so the needs are checked by hand.
@@ -738,6 +765,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # Each image's entrypoint binary, which answers --version as `<binary> <Cargo version>`.
+        image:
+          - { name: sealantd, binary: sealantd }
+          - { name: vm-runner, binary: sealant-vm-runner }
+          - { name: egress-proxy, binary: sealant-egress-proxy }
         platform:
           - { arch: amd64, runner: ubuntu-24.04 }
           - { arch: arm64, runner: ubuntu-24.04-arm }
@@ -746,7 +778,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      # The workspace version the daemon reports, and the manifest reader.
+      # The workspace version the binary reports, and the manifest reader.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -767,7 +799,7 @@ jobs:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         if: needs.stable-tag.outputs.target == 'ghcr'
         with:
-          name: digests-sealantd--${{ matrix.platform.arch }}
+          name: digests-${{ matrix.image.name }}--${{ matrix.platform.arch }}
           path: ${{ runner.temp }}/built
       # The platform is resolved through the index, as a consumer of :<version> resolves it: the
       # index is read by the digest the manifest records, and the digest it maps this arch's platform
@@ -777,14 +809,15 @@ jobs:
       - name: Pull this run's image by digest
         if: needs.stable-tag.outputs.target == 'ghcr'
         env:
-          REPOSITORY: ghcr.io/${{ github.repository }}
+          IMAGE: ${{ matrix.image.name }}
+          REPOSITORY: ghcr.io/${{ github.repository_owner }}/${{ matrix.image.name }}
           MANIFEST: ${{ runner.temp }}/release/release-manifest.json
           BUILT: ${{ runner.temp }}/built
           ARCH: ${{ matrix.platform.arch }}
         run: |
           set -euo pipefail
-          receipt=$(node scripts/release-manifest.mjs digest "$MANIFEST" sealantd "$ARCH")
-          index=$(jq -r '.images.sealantd.index' "$MANIFEST")
+          receipt=$(node scripts/release-manifest.mjs digest "$MANIFEST" "$IMAGE" "$ARCH")
+          index=$(jq -r --arg image "$IMAGE" '.images[$image].index' "$MANIFEST")
           built=("$BUILT"/*)
           build=sha256:${built[0]##*/}
           if [[ ${#built[@]} -ne 1 || ! $build =~ ^sha256:[0-9a-f]{64}$ ]]; then
@@ -807,17 +840,18 @@ jobs:
         if: needs.stable-tag.outputs.target == 'archive'
         with:
           path: ${{ runner.temp }}/archives
-          pattern: archive-sealantd--${{ matrix.platform.arch }}
+          pattern: archive-${{ matrix.image.name }}--${{ matrix.platform.arch }}
       # scripts/release-manifest.test.mjs runs this step as written, against a stand-in docker.
       - name: Load this run's image from its archive
         if: needs.stable-tag.outputs.target == 'archive'
         env:
+          IMAGE: ${{ matrix.image.name }}
           MANIFEST: ${{ runner.temp }}/release/release-manifest.json
           ARCH: ${{ matrix.platform.arch }}
         run: |
           set -euo pipefail
-          archive=$RUNNER_TEMP/archives/archive-sealantd--$ARCH/sealantd.tar
-          ids=$(node scripts/release-manifest.mjs check-archive "$MANIFEST" sealantd "$ARCH" "$archive")
+          archive=$RUNNER_TEMP/archives/archive-$IMAGE--$ARCH/$IMAGE.tar
+          ids=$(node scripts/release-manifest.mjs check-archive "$MANIFEST" "$IMAGE" "$ARCH" "$archive")
           docker load --input "$archive"
           id=
           for candidate in $ids; do
@@ -827,17 +861,20 @@ jobs:
             fi
           done
           if [[ -z $id ]]; then
-            echo "::error::sealantd did not load as its config digest or its manifest digest ($ids)."
+            echo "::error::$IMAGE did not load as its config digest or its manifest digest ($ids)."
             exit 1
           fi
           printf '%s\n' "$id" >"$RUNNER_TEMP/image-id"
-      # sealantd reports Cargo's workspace version, which the release flow does not stamp: while
-      # Cargo.toml says 0.0.0 the daemon reports 0.0.0, and the version label is what names the
-      # release. Cargo.toml saying any version but 0.0.0 or this release's X.Y.Z is refused.
+      # Each image's binary (sealantd, sealant-vm-runner, sealant-egress-proxy) reports Cargo's
+      # workspace version, which the release flow does not stamp: while Cargo.toml says 0.0.0 it
+      # reports 0.0.0, and the version label is what names the release. Cargo.toml saying any
+      # version but 0.0.0 or this release's X.Y.Z is refused.
       # scripts/release-publication.test.mjs runs this step as written, against a stand-in docker.
       - name: Check this arch's image is this release's
         env:
           VERSION: ${{ needs.stable-tag.outputs.version }}
+          IMAGE: ${{ matrix.image.name }}
+          BINARY: ${{ matrix.image.binary }}
           ARCH: ${{ matrix.platform.arch }}
         run: |
           set -euo pipefail
@@ -875,10 +912,10 @@ jobs:
           fi
           if ((${#problems[@]} > 0)); then
             printf -v joined '%s; ' "${problems[@]}"
-            echo "::error::The $ARCH image $id is not this release's: ${joined%; }. Nothing was published."
+            echo "::error::The $IMAGE $ARCH image $id is not this release's: ${joined%; }. Nothing was published."
             exit 1
           fi
-          # The daemon itself, in a container of exactly that ID.
+          # The binary itself, in a container of exactly that ID.
           container=$(docker create "$id" --version)
           running=$(docker inspect "$container" --format '{{.Image}}')
           status=0
@@ -888,27 +925,32 @@ jobs:
             echo "::error::The container runs $running, not $id, the image pulled or loaded."
             exit 1
           fi
-          if ((status != 0)) || [[ $reported != "sealantd $cargo" ]]; then
-            echo "::error::sealantd --version exited $status and reported '$reported', not 'sealantd $cargo'."
+          if ((status != 0)) || [[ $reported != "$BINARY $cargo" ]]; then
+            echo "::error::$BINARY --version exited $status and reported '$reported', not '$BINARY $cargo'."
             exit 1
           fi
-          echo "$ARCH: $id is $VERSION from $GITHUB_SHA, and its daemon reports '$reported'."
+          echo "$IMAGE $ARCH: $id is $VERSION from $GITHUB_SHA, and $BINARY reports '$reported'."
 
-  # Writes :<version>, once, from the index digest this run checked. A version is spent once its tag
-  # exists: re-running failed jobs finds it at this run's digest and is done, re-running all jobs
-  # builds another index and is refused.
+  # Writes each image's :<version>, once, from the index digest this run checked. A version is
+  # spent once its tag exists: re-running failed jobs finds it at this run's digest and is done,
+  # re-running all jobs builds another index and is refused. fail-fast is off: one image's failure
+  # never cancels another's write half-way.
   finalize-images:
-    name: Publish the checked image under its version
+    name: Publish the checked ${{ matrix.image }} image under its version
     needs: [stable-tag, identity]
     if: >-
       ${{ !cancelled() && github.event_name == 'push' && needs.stable-tag.result == 'success' &&
       needs.identity.result == 'success' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [sealantd, vm-runner, egress-proxy]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
       contents: read
       packages: write
-    # The release channel's lock: this job queues behind any other run's finalize or npm, never
+    # The release channel's lock: each image's job queues behind any other finalize or npm, never
     # cancelled. Each job is serialized on its own; the lock is not held across a whole release.
     # Job-level `queue: max` holds every pending job instead of only the newest (proven in
     # sealant-sh/mend runs 38897026470, 38897041709 and 38897056028). actionlint does not know
@@ -957,7 +999,8 @@ jobs:
       # scripts/release-publication.test.mjs runs this step as written, against a stand-in docker.
       - name: Publish the checked index as its version
         env:
-          REPOSITORY: ghcr.io/${{ github.repository }}
+          IMAGE: ${{ matrix.image }}
+          REPOSITORY: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}
           MANIFEST: ${{ github.workspace }}/release/release-manifest.json
           VERSION: ${{ needs.stable-tag.outputs.version }}
         run: |
@@ -994,9 +1037,9 @@ jobs:
             return 1
           }
           ref=$REPOSITORY:$VERSION
-          index=$(jq -r '.images.sealantd.index // ""' "$MANIFEST")
+          index=$(jq -r --arg image "$IMAGE" '.images[$image].index // ""' "$MANIFEST")
           if [[ ! $index =~ ^sha256:[0-9a-f]{64}$ ]]; then
-            echo "::error::The release manifest records no index digest for sealantd."
+            echo "::error::The release manifest records no index digest for $IMAGE."
             exit 1
           fi
           # The index read by that digest must map each arch's platform, once and in a variant that
@@ -1005,7 +1048,7 @@ jobs:
           # so a re-run of this job can still check it.
           docker buildx imagetools inspect "$REPOSITORY@$index" --raw >"$RUNNER_TEMP/index.json"
           for arch in amd64 arm64; do
-            build=$(node "$GITHUB_WORKSPACE/scripts/release-manifest.mjs" digest "$MANIFEST" sealantd "$arch")
+            build=$(node "$GITHUB_WORKSPACE/scripts/release-manifest.mjs" digest "$MANIFEST" "$IMAGE" "$arch")
             mapped=$(node "$GITHUB_WORKSPACE/scripts/release-manifest.mjs" select "$RUNNER_TEMP/index.json" "$index" "$arch")
             if [[ $mapped != "$build" ]]; then
               echo "::error::The index $index maps linux/$arch to $mapped, not $build, the $arch build. Nothing was written."
@@ -1039,14 +1082,15 @@ jobs:
             fi
           fi
           {
-            echo "## sealantd $VERSION"
+            echo "## $IMAGE $VERSION"
             echo
-            echo "- \`$ref\` (\`$index\`)"
+            echo "- \`$ref@$index\`"
           } >>"$GITHUB_STEP_SUMMARY"
 
   # Holds the npm credential and runs nothing from the repository: no checkout, no install, no
   # build. It publishes exactly the tarballs the pack job made and the release manifest records,
-  # after :<version> exists, so every stable runtime package has its daemon.
+  # after every image's :<version> exists (`needs: finalize-images` waits for each image's job), so
+  # every stable runtime package has its daemon, its host-vm runner and its egress proxy.
   npm:
     name: Publish npm packages
     needs: [stable-tag, pack, finalize-images]

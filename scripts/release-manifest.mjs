@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 /**
- * The release manifest: what one stable release run (.github/workflows/release.yml) built, by
- * digest, and the two npm tarballs its pack job made, by sha512. Every job after the build reads it
+ * The release manifest: what one stable release run (.github/workflows/release.yml) built, each
+ * image by digest, and the two npm tarballs its pack job made, by sha512. Every job after the build
+ * reads it
  * from its own run's `release-manifest` artifact, never from a tag, which another writer can move.
  *
  *   write <out>                    from the run's digests-* and index-* records (env below)
@@ -28,8 +29,8 @@
  * download-artifact lays them out), INDEXES (index-<image>/digest) and PACKAGES (the pack job's
  * {<name>: {file, sha512, integrity}}).
  *
- * The rules are sealant-sh/mend's and sealant-sh/sealant's scripts/release-manifest.mjs; the one
- * image is sealantd's.
+ * The rules are sealant-sh/mend's and sealant-sh/sealant's scripts/release-manifest.mjs; the images
+ * are sealantd's three: the daemon, the host-vm runner and the egress proxy.
  */
 import { createHash } from "node:crypto";
 import {
@@ -44,7 +45,9 @@ import {
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-export const IMAGES = ["sealantd"];
+/** Every image a release builds, by its GHCR name under the repository's owner, in release.yml's
+ * matrix order. */
+export const IMAGES = ["sealantd", "vm-runner", "egress-proxy"];
 export const ARCHES = ["amd64", "arm64"];
 /** The npm packages a release publishes, in the order it publishes them: the client depends on the
  * protocol at exactly this version. */

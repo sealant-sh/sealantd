@@ -1,7 +1,8 @@
 // release.yml's steps that decide what a stable release writes, run as written against stand-in
 // docker commands and a stub GitHub API; and the job graph they sit in, push and dry run. Ported from
 // sealant-sh/sealant tooling/scripts/release-publication.test.mjs (itself from sealant-sh/mend), for
-// sealantd's one image, its identity checks and its ci check. npm's step is release-npm.test.mjs's.
+// sealantd's three images (the daemon, the host-vm runner and the egress proxy), their identity
+// checks and the ci check. npm's step is release-npm.test.mjs's.
 import assert from "node:assert/strict";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -22,6 +23,8 @@ import path from "node:path";
 import test from "node:test";
 
 import { parse } from "yaml";
+
+import { IMAGES } from "./release-manifest.mjs";
 
 const root = execFileSync("git", ["rev-parse", "--show-toplevel"], { encoding: "utf8" }).trim();
 const releaseText = readFileSync(path.join(root, ".github/workflows/release.yml"), "utf8");
@@ -113,11 +116,32 @@ const tarballRecord = (name, version) => {
     integrity: `sha512-${digest.toString("base64")}`,
   };
 };
+/**
+ * Every image's manifest entry: `image` records `entry`, and each other image digests of its own,
+ * so a step that read another image's entry would see a digest it was not given.
+ */
+const imagesWith = (entry, image = "sealantd") =>
+  Object.fromEntries(
+    IMAGES.map((name) => [
+      name,
+      name === image
+        ? entry
+        : {
+            index: `sha256:${createHash("sha256").update(`${name}/index`).digest("hex")}`,
+            platforms: Object.fromEntries(
+              ["amd64", "arm64"].map((arch) => [
+                arch,
+                `sha256:${createHash("sha256").update(`${name}/${arch}`).digest("hex")}`,
+              ]),
+            ),
+          },
+    ]),
+  );
 const manifestJson = (version, extra = {}) =>
   JSON.stringify({
     version,
     commit: COMMIT,
-    images: { sealantd: { index: INDEX, platforms: PLATFORMS } },
+    images: imagesWith({ index: INDEX, platforms: PLATFORMS }),
     packages: Object.fromEntries(
       ["@sealant/runtime-protocol", "@sealant/runtime-client"].map((name) => [
         name,
@@ -137,13 +161,13 @@ test("merge stages the index under this run's own tag, never :<version>", (t) =>
   );
   assert.deepEqual(
     downloads.map((entry) => entry.with),
-    [{ path: "/tmp/digests", pattern: "digests-sealantd--*" }],
+    [{ path: "/tmp/digests", pattern: "digests-${{ matrix.image }}--*" }],
   );
   assert.ok(
     releaseJobs.identity.steps.some(
       (entry) =>
         entry.uses?.startsWith("actions/download-artifact@") &&
-        entry.with?.name === "digests-sealantd--${{ matrix.platform.arch }}",
+        entry.with?.name === "digests-${{ matrix.image.name }}--${{ matrix.platform.arch }}",
     ),
   );
   const directory = scratch(t, "sealantd-merge-");
@@ -178,6 +202,7 @@ process.exit(args[2] === "inspect" && process.env.FAIL_INSPECT ? 74 : 0);
       env: {
         PATH: `${path.join(directory, "bin")}:${process.env.PATH}`,
         RUNNER_TEMP: path.join(directory, "tmp"),
+        IMAGE: "sealantd",
         REPOSITORY,
         GITHUB_RUN_ID: "38923041738",
         GITHUB_RUN_ATTEMPT: "2",
@@ -208,13 +233,34 @@ process.exit(args[2] === "inspect" && process.env.FAIL_INSPECT ? 74 : 0);
   writeFileSync(path.join(digests, "digests-sealantd--arm64", "latest"), "");
   const stray = run();
   assert.equal(stray.status, 1);
-  assert.match(stray.stdout, /The arm64 digests artifact holds '.*latest.*', not one image digest/);
+  assert.match(
+    stray.stdout,
+    /The sealantd arm64 digests artifact holds '.*latest.*', not one image digest/,
+  );
   assert.deepEqual(stray.calls, []);
   rmSync(path.join(digests, "digests-sealantd--arm64"), { recursive: true });
   const missing = run();
   assert.equal(missing.status, 1);
-  assert.match(missing.stdout, /The arm64 digests artifact holds '\*', not one image digest/);
+  assert.match(
+    missing.stdout,
+    /The sealantd arm64 digests artifact holds '\*', not one image digest/,
+  );
   assert.deepEqual(missing.calls, []);
+  // Another image's leg reads only its own image's directories: sealantd's are not vm-runner's.
+  const vmRunner = run({ IMAGE: "vm-runner", REPOSITORY: "ghcr.io/sealant-ci/vm-runner" });
+  assert.equal(vmRunner.status, 1);
+  assert.match(vmRunner.stdout, /The vm-runner amd64 digests artifact holds '\*'/);
+  for (const [at, arch] of ["amd64", "arm64"].entries()) {
+    mkdirSync(path.join(digests, `digests-vm-runner--${arch}`));
+    writeFileSync(path.join(digests, `digests-vm-runner--${arch}`, platforms[at]), "");
+  }
+  const staged2 = run({ IMAGE: "vm-runner", REPOSITORY: "ghcr.io/sealant-ci/vm-runner" });
+  assert.equal(staged2.status, 0, staged2.stderr);
+  assert.deepEqual(staged2.calls[0].slice(5), [
+    "--tag",
+    "ghcr.io/sealant-ci/vm-runner:staging-38923041738-2",
+    ...platforms.map((digest) => `ghcr.io/sealant-ci/vm-runner@sha256:${digest}`),
+  ]);
 });
 
 // --- finalize-images ---
@@ -230,7 +276,15 @@ process.exit(args[2] === "inspect" && process.env.FAIL_INSPECT ? 74 : 0);
  */
 const finalize = (
   t,
-  { tags = {}, unreadable = [], onCreate, manifest = {}, answers = {}, index = STAGED } = {},
+  {
+    tags = {},
+    unreadable = [],
+    onCreate,
+    manifest = {},
+    answers = {},
+    index = STAGED,
+    image = "sealantd",
+  } = {},
 ) => {
   const directory = scratch(t, "sealantd-finalize-");
   writeFileSync(path.join(directory, "staged-index"), index.bytes);
@@ -293,7 +347,7 @@ process.exit(79);
   writeFileSync(
     file,
     manifestJson("1.2.3", {
-      images: { sealantd: { index: index.digest, platforms: PLATFORMS } },
+      images: imagesWith({ index: index.digest, platforms: PLATFORMS }, image),
       ...manifest,
     }),
   );
@@ -304,6 +358,7 @@ process.exit(79);
       RUNNER_TEMP: directory,
       GITHUB_SHA: COMMIT,
       GITHUB_STEP_SUMMARY: path.join(directory, "summary.md"),
+      IMAGE: image,
       REPOSITORY,
       MANIFEST: file,
       VERSION: "1.2.3",
@@ -312,6 +367,9 @@ process.exit(79);
   return {
     ...result,
     output: result.stdout + result.stderr,
+    summary: existsSync(path.join(directory, "summary.md"))
+      ? readFileSync(path.join(directory, "summary.md"), "utf8")
+      : "",
     registry: JSON.parse(readFileSync(state, "utf8")),
     calls: readCalls(calls),
   };
@@ -331,6 +389,26 @@ test("finalize reads :<version>, then creates it from the checked index when abs
     ["buildx", "imagetools", "inspect", FINAL, "--format", "{{json .Manifest}}"],
   ]);
   assert.deepEqual(result.registry.tags, { [FINAL]: INDEX });
+  // The ref sealant pins, tag and index digest together.
+  assert.match(result.summary, new RegExp(`^## sealantd 1\\.2\\.3$`, "m"));
+  assert.ok(result.summary.includes(`\`${FINAL}@${INDEX}\``), result.summary);
+});
+
+test("finalize tags each image from that image's own manifest entry", (t) => {
+  for (const image of ["vm-runner", "egress-proxy"]) {
+    const result = finalize(t, { image });
+    assert.equal(result.status, 0, `${image}: ${result.output}`);
+    assert.deepEqual(result.registry.tags, { [FINAL]: INDEX }, image);
+    assert.match(result.summary, new RegExp(`^## ${image} 1\\.2\\.3$`, "m"));
+  }
+  // An image whose entry records another index is read by that index, which this registry does not
+  // serve: nothing is written. The step read vm-runner's entry, not sealantd's.
+  const elsewhere = finalize(t, {
+    manifest: { images: imagesWith({ index: FOREIGN, platforms: PLATFORMS }, "vm-runner") },
+    image: "vm-runner",
+  });
+  assert.equal(elsewhere.status, 1);
+  assert.deepEqual(creates(elsewhere), []);
 });
 
 test("finalize binds the index's platforms again, and writes nothing for a swapped, duplicated or wrong-variant one", (t) => {
@@ -380,7 +458,7 @@ test("finalize binds the index's platforms again, and writes nothing for a swapp
   }
   // An index the registry cannot serve by the recorded digest writes nothing either.
   const unserved = finalize(t, {
-    manifest: { images: { sealantd: { index: FOREIGN, platforms: PLATFORMS } } },
+    manifest: { images: imagesWith({ index: FOREIGN, platforms: PLATFORMS }) },
   });
   assert.equal(unserved.status, 1);
   assert.deepEqual(creates(unserved), []);
@@ -526,6 +604,12 @@ const identity = (t, fixture = {}) => {
     path.join(checkout, "scripts/release-manifest.mjs"),
   );
   const version = fixture.version ?? "1.2.3";
+  const image = fixture.image ?? "sealantd";
+  const binary = {
+    sealantd: "sealantd",
+    "vm-runner": "sealant-vm-runner",
+    "egress-proxy": "sealant-egress-proxy",
+  }[image];
   writeFileSync(
     path.join(checkout, "Cargo.toml"),
     `[workspace]\nmembers = ["crates/*"]\n\n[workspace.package]\nversion = "${fixture.cargo ?? "0.0.0"}"\nedition = "2024"\n\n[workspace.lints.rust]\n`,
@@ -549,7 +633,7 @@ const identity = (t, fixture = {}) => {
       "org.opencontainers.image.revision": COMMIT,
       "org.opencontainers.image.version": version,
     },
-    reported: `sealantd ${fixture.cargo ?? "0.0.0"}`,
+    reported: `${binary} ${fixture.cargo ?? "0.0.0"}`,
     exit: 0,
     ...fixture.docker,
   };
@@ -595,7 +679,7 @@ process.exit(79);
   writeFileSync(
     file,
     manifestJson(version, {
-      images: { sealantd: { index: index.digest, platforms: PLATFORMS } },
+      images: imagesWith({ index: index.digest, platforms: PLATFORMS }, image),
     }),
   );
   const env = {
@@ -608,6 +692,8 @@ process.exit(79);
     MANIFEST: file,
     BUILT: built,
     VERSION: version,
+    IMAGE: image,
+    BINARY: fixture.binary ?? binary,
     ARCH: arch,
   };
   const pulled = bashStep(stepRun("identity", "Pull this run's image by digest"), {
@@ -644,7 +730,7 @@ test("identity pulls its own arch's digest from the manifest and runs exactly th
     assert.match(
       result.output,
       new RegExp(
-        `${arch}: ${id} is 1\\.2\\.3 from f{40}, and its daemon reports 'sealantd 0\\.0\\.0'`,
+        `sealantd ${arch}: ${id} is 1\\.2\\.3 from f{40}, and sealantd reports 'sealantd 0\\.0\\.0'`,
       ),
     );
   }
@@ -652,12 +738,33 @@ test("identity pulls its own arch's digest from the manifest and runs exactly th
   const stamped = identity(t, { cargo: "1.2.3" });
   assert.equal(stamped.status, 0, stamped.output);
   assert.match(stamped.output, /reports 'sealantd 1\.2\.3'/);
+  // vm-runner and egress-proxy are checked the same way, each by its own entrypoint binary.
+  for (const [image, binary] of [
+    ["vm-runner", "sealant-vm-runner"],
+    ["egress-proxy", "sealant-egress-proxy"],
+  ]) {
+    const result = identity(t, { image, arch: "arm64" });
+    assert.equal(result.status, 0, `${image}: ${result.output}`);
+    assert.match(
+      result.output,
+      new RegExp(
+        `${image} arm64: sha256:1{64} is 1\\.2\\.3 from f{40}, and ${binary} reports '${binary} 0\\.0\\.0'`,
+      ),
+    );
+    // Another image's binary answering is not this image.
+    const wrong = identity(t, { image, docker: { reported: "sealantd 0.0.0" } });
+    assert.equal(wrong.status, 1, image);
+    assert.match(
+      wrong.output,
+      new RegExp(`${binary} --version exited 0 and reported 'sealantd 0\\.0\\.0'`),
+    );
+  }
   // A dry run's label is its whole version; the daemon reports the X.Y.Z it stamps.
   const dry = identity(t, { version: "1.2.3-dryrun.9.1", cargo: "1.2.3" });
   assert.equal(dry.status, 0, dry.output);
   assert.match(
     dry.output,
-    /is 1\.2\.3-dryrun\.9\.1 from f{40}, and its daemon reports 'sealantd 1\.2\.3'/,
+    /is 1\.2\.3-dryrun\.9\.1 from f{40}, and sealantd reports 'sealantd 1\.2\.3'/,
   );
 });
 
@@ -825,7 +932,7 @@ test("identity refuses a wrong image ID, label, platform or --version, naming wh
     [
       "another --version",
       { docker: { reported: "sealantd 0.19.0" } },
-      /exited 0 and reported 'sealantd 0\.19\.0', not 'sealantd 0\.0\.0'/,
+      /sealantd --version exited 0 and reported 'sealantd 0\.19\.0', not 'sealantd 0\.0\.0'/,
     ],
     [
       "a --version that fails",
@@ -851,7 +958,7 @@ test("identity refuses a wrong image ID, label, platform or --version, naming wh
     const result = identity(t, fixture);
     assert.equal(result.status, 1, `${label}: ${result.output}`);
     assert.match(result.output, problem, label);
-    assert.doesNotMatch(result.output, /and its daemon reports/, label);
+    assert.doesNotMatch(result.output, /and sealantd reports/, label);
   }
 });
 
@@ -1147,7 +1254,8 @@ test("only finalize writes :<version> to GHCR, and nothing writes :latest or :X.
   // archive-merge writes only to the registry it starts on loopback, inside the job.
   const loopback = registryWrites.filter(({ at }) => at === "archive-merge");
   assert.ok(loopback.length >= 2);
-  for (const { entry } of loopback) assert.equal(entry.env.REPOSITORY, "127.0.0.1:5000/sealantd");
+  for (const { entry } of loopback)
+    assert.equal(entry.env.REPOSITORY, "127.0.0.1:5000/${{ matrix.image }}");
   for (const name of ["archive-build", "archive-merge"]) {
     assert.deepEqual(releaseJobs[name].permissions, { contents: "read" }, name);
     for (const step of releaseJobs[name].steps)
@@ -1984,6 +2092,141 @@ test("finalize waits for the identity checks on both arches, and npm for finaliz
   assert.deepEqual(releaseJobs.identity.permissions, { contents: "read" });
   for (const entry of releaseJobs.identity.steps)
     assert.doesNotMatch(entry.uses ?? "", /login-action/);
+});
+
+// --- the three images ---
+
+/** Each image's Dockerfile, as both workflows build it. */
+const DOCKERFILES = {
+  sealantd: "docker/Dockerfile",
+  "vm-runner": "docker/vm-runner.Dockerfile",
+  "egress-proxy": "docker/egress-proxy.Dockerfile",
+};
+
+test("every image job runs once per image in both workflows, each from its own Dockerfile", () => {
+  const next = workflow("next.yml").jobs;
+  assert.deepEqual(Object.keys(DOCKERFILES), IMAGES);
+  const builds = [
+    ["next.yml image", next.image],
+    ["release.yml build", releaseJobs.build],
+    ["release.yml archive-build", releaseJobs["archive-build"]],
+  ];
+  for (const [label, job] of builds) {
+    const images = job.strategy.matrix.image;
+    assert.deepEqual(
+      images.map(({ name, dockerfile }) => [name, dockerfile]),
+      Object.entries(DOCKERFILES),
+      label,
+    );
+    // vm-runner compiles its guest kernel as well: it gets more time than the others.
+    assert.deepEqual(
+      images.map(({ timeout }) => timeout),
+      [60, 90, 60],
+      label,
+    );
+    assert.equal(job["timeout-minutes"], "${{ matrix.image.timeout }}", label);
+    const build = job.steps.find((step) => step.id === "build");
+    assert.equal(build.with.file, "${{ matrix.image.dockerfile }}", label);
+    assert.deepEqual(job.strategy.matrix.platform, [
+      { arch: "amd64", runner: "ubuntu-24.04" },
+      { arch: "arm64", runner: "ubuntu-24.04-arm" },
+    ]);
+  }
+  for (const file of Object.values(DOCKERFILES)) assert.ok(existsSync(path.join(root, file)), file);
+  // Each image goes to its own GHCR name under the owner: <name>-next from next, <name> from a tag.
+  assert.match(
+    next.image.steps.find((step) => step.id === "build").with.outputs,
+    /^type=image,name=ghcr\.io\/\$\{\{ github\.repository_owner \}\}\/\$\{\{ matrix\.image\.name \}\}-next,push-by-digest=true,/,
+  );
+  assert.match(
+    releaseJobs.build.steps.find((step) => step.id === "build").with.outputs,
+    /^type=image,name=ghcr\.io\/\$\{\{ github\.repository_owner \}\}\/\$\{\{ matrix\.image\.name \}\},push-by-digest=true,/,
+  );
+  for (const [label, job] of [
+    ["next.yml image-tag", next["image-tag"]],
+    ["release.yml merge", releaseJobs.merge],
+    ["release.yml archive-merge", releaseJobs["archive-merge"]],
+    ["release.yml finalize-images", releaseJobs["finalize-images"]],
+  ])
+    assert.deepEqual(job.strategy.matrix.image, IMAGES, label);
+  // A tag write is never cancelled half-way because another image failed.
+  for (const job of [next["image-tag"], releaseJobs["finalize-images"]])
+    assert.equal(job.strategy["fail-fast"], false);
+  // Identity runs each image's entrypoint binary: the one its Dockerfile names.
+  const identities = releaseJobs.identity.strategy.matrix.image;
+  assert.deepEqual(
+    identities.map(({ name }) => name),
+    IMAGES,
+  );
+  for (const { name, binary } of identities) {
+    const dockerfile = readFileSync(path.join(root, DOCKERFILES[name]), "utf8");
+    assert.match(
+      dockerfile,
+      new RegExp(`^ENTRYPOINT \\["/usr/local/bin/${binary}"\\]$`, "m"),
+      `${name} runs ${binary}`,
+    );
+  }
+});
+
+test("next publishes to npm only once every image is tagged, and prints each pinned ref", (t) => {
+  const next = workflow("next.yml").jobs;
+  for (const job of ["pack", "publish"]) assert.ok(next[job].needs.includes("image-tag"), job);
+  assert.ok(next["image-tag"].needs.includes("image"));
+  assert.deepEqual(
+    next["image-tag"].outputs,
+    Object.fromEntries(
+      IMAGES.map((image) => [`${image}-digest`, `\${{ steps.record.outputs.${image}-digest }}`]),
+    ),
+  );
+  const publish = next.publish.steps.find((step) => step.name === "Rebuild and publish under next");
+  for (const [variable, image] of [
+    ["SEALANTD_DIGEST", "sealantd"],
+    ["VM_RUNNER_DIGEST", "vm-runner"],
+    ["EGRESS_PROXY_DIGEST", "egress-proxy"],
+  ])
+    assert.equal(publish.env[variable], `\${{ needs.image-tag.outputs.${image}-digest }}`);
+  // The guard before the republish block: every digest, or nothing is published.
+  const guard = publish.run.slice(0, publish.run.indexOf("# --- republish ---"));
+  const good = `sha256:${"a".repeat(64)}`;
+  const env = {
+    PATH: process.env.PATH,
+    SEALANTD_DIGEST: good,
+    VM_RUNNER_DIGEST: good,
+    EGRESS_PROXY_DIGEST: good,
+  };
+  assert.equal(bashStep(guard, { env }).status, 0);
+  for (const variable of ["SEALANTD_DIGEST", "VM_RUNNER_DIGEST", "EGRESS_PROXY_DIGEST"])
+    for (const value of ["", "latest", `sha256:${"a".repeat(63)}`]) {
+      const refused = bashStep(guard, { env: { ...env, [variable]: value } });
+      assert.equal(refused.status, 1, `${variable}=${value}`);
+      assert.match(refused.stdout, /not an index digest.*Nothing was published/);
+    }
+  // Each image-tag leg records its own output and the ref sealant pins.
+  const record = next["image-tag"].steps.find((step) => step.name === "Record the tagged index");
+  assert.equal(record.env.DIGEST, "${{ steps.tag.outputs.digest }}");
+  const directory = scratch(t, "next-record-");
+  const output = path.join(directory, "output");
+  const summary = path.join(directory, "summary");
+  const recorded = bashStep(record.run, {
+    env: {
+      PATH: process.env.PATH,
+      IMAGE: "vm-runner",
+      REF: "ghcr.io/sealant-sh/vm-runner-next:1.2.3-next.4",
+      DIGEST: good,
+      GITHUB_OUTPUT: output,
+      GITHUB_STEP_SUMMARY: summary,
+    },
+  });
+  assert.equal(recorded.status, 0, recorded.stderr);
+  assert.equal(readFileSync(output, "utf8"), `vm-runner-digest=${good}\n`);
+  assert.equal(
+    readFileSync(summary, "utf8"),
+    `- \`ghcr.io/sealant-sh/vm-runner-next:1.2.3-next.4@${good}\`\n`,
+  );
+  const empty = bashStep(record.run, {
+    env: { PATH: process.env.PATH, IMAGE: "vm-runner", DIGEST: "", GITHUB_OUTPUT: output },
+  });
+  assert.equal(empty.status, 1);
 });
 
 /** Actions a job holding an id-token may use: none checks out or runs repository code. */
