@@ -86,16 +86,49 @@ pub fn process_env(env: &VmEnv) -> Vec<(String, String)> {
 /// The hosts file a guest needs when `docker export` left none (or an empty one).
 pub const DEFAULT_HOSTS: &str = "127.0.0.1 localhost\n::1 localhost\n";
 
-/// Write [`DEFAULT_HOSTS`] to `path` when it is missing or empty; whether it wrote.
+/// The guest's hostname, set by PID 1 at boot. The kernel starts with `(none)`, and `sudo`
+/// printed `unable to resolve host (none)` on every command (SLNT-1324). Docker gives a
+/// container its id; a microVM has no runtime to do it, and the image's `/etc/hostname` is the
+/// empty file `docker export` leaves where Docker mounts its own.
+pub const GUEST_HOSTNAME: &str = "workspace";
+
+/// Whether a line of the hosts file `text` maps `hostname` (any address; names are compared
+/// as the resolver compares them, without regard to case).
+#[must_use]
+pub fn hosts_name(text: &str, hostname: &str) -> bool {
+    text.lines().any(|line| {
+        let line = line.split('#').next().unwrap_or_default();
+        line.split_whitespace()
+            .skip(1)
+            .any(|name| name.eq_ignore_ascii_case(hostname))
+    })
+}
+
+/// Make `path`, the guest's hosts file, resolve `localhost` and `hostname`: [`DEFAULT_HOSTS`]
+/// and `127.0.1.1 <hostname>` when it is missing or empty (`docker export` leaves an empty one),
+/// else the user's file with that line added when no line maps `hostname` already. Whether it
+/// wrote.
 ///
 /// # Errors
 /// The write failed.
-pub fn ensure_hosts(path: &Path) -> std::io::Result<bool> {
+pub fn ensure_hosts(path: &Path, hostname: &str) -> std::io::Result<bool> {
+    let name_line = format!("127.0.1.1 {hostname}\n");
     match std::fs::read_to_string(path) {
-        Ok(text) if !text.trim().is_empty() => Ok(false),
+        Ok(text) if !text.trim().is_empty() => {
+            if hosts_name(&text, hostname) {
+                return Ok(false);
+            }
+            let mut text = text;
+            if !text.ends_with('\n') {
+                text.push('\n');
+            }
+            text.push_str(&name_line);
+            std::fs::write(path, text)?;
+            Ok(true)
+        }
         _ => {
             let _ = std::fs::remove_file(path);
-            std::fs::write(path, DEFAULT_HOSTS)?;
+            std::fs::write(path, format!("{DEFAULT_HOSTS}{name_line}"))?;
             Ok(true)
         }
     }
@@ -565,22 +598,57 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_or_empty_hosts_file_is_filled_and_a_real_one_kept() {
+    fn a_missing_or_empty_hosts_file_is_filled_with_localhost_and_the_hostname() {
         let dir = tempfile::tempdir().expect("tempdir");
         let hosts = dir.path().join("hosts");
-        assert!(ensure_hosts(&hosts).expect("missing"));
-        assert_eq!(
-            std::fs::read_to_string(&hosts).expect("hosts"),
-            DEFAULT_HOSTS
-        );
+        let filled = format!("{DEFAULT_HOSTS}127.0.1.1 {GUEST_HOSTNAME}\n");
+        assert!(ensure_hosts(&hosts, GUEST_HOSTNAME).expect("missing"));
+        assert_eq!(std::fs::read_to_string(&hosts).expect("hosts"), filled);
         std::fs::write(&hosts, "  \n").expect("empty");
-        assert!(ensure_hosts(&hosts).expect("empty"));
-        std::fs::write(&hosts, "10.0.0.1 db\n").expect("real");
-        assert!(!ensure_hosts(&hosts).expect("kept"));
+        assert!(ensure_hosts(&hosts, GUEST_HOSTNAME).expect("empty"));
+        assert_eq!(std::fs::read_to_string(&hosts).expect("hosts"), filled);
+        // Once it resolves, the file is left alone.
+        assert!(!ensure_hosts(&hosts, GUEST_HOSTNAME).expect("again"));
+        assert_eq!(std::fs::read_to_string(&hosts).expect("hosts"), filled);
+    }
+
+    /// The user's own hosts file keeps every line, and gains the hostname only when no line
+    /// maps it already.
+    #[test]
+    fn a_real_hosts_file_is_kept_and_gains_the_hostname_once() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let hosts = dir.path().join("hosts");
+        std::fs::write(&hosts, "10.0.0.1 db").expect("real");
+        assert!(ensure_hosts(&hosts, GUEST_HOSTNAME).expect("added"));
         assert_eq!(
             std::fs::read_to_string(&hosts).expect("hosts"),
-            "10.0.0.1 db\n"
+            format!("10.0.0.1 db\n127.0.1.1 {GUEST_HOSTNAME}\n")
         );
+        assert!(!ensure_hosts(&hosts, GUEST_HOSTNAME).expect("kept"));
+        let own = "127.0.0.1 localhost Workspace\n";
+        std::fs::write(&hosts, own).expect("own");
+        assert!(!ensure_hosts(&hosts, GUEST_HOSTNAME).expect("own kept"));
+        assert_eq!(std::fs::read_to_string(&hosts).expect("hosts"), own);
+    }
+
+    #[test]
+    fn a_hostname_is_mapped_by_a_name_column_only_and_not_in_a_comment() {
+        assert!(hosts_name("127.0.1.1\tworkspace\n", "workspace"));
+        assert!(hosts_name(
+            "::1 localhost ip6-localhost workspace",
+            "workspace"
+        ));
+        assert!(!hosts_name("# 127.0.1.1 workspace\n", "workspace"));
+        assert!(!hosts_name(
+            "127.0.0.1 localhost # workspace\n",
+            "workspace"
+        ));
+        assert!(
+            !hosts_name("workspace 10.0.0.1\n", "workspace"),
+            "an address column"
+        );
+        assert!(!hosts_name("127.0.0.1 workspaces\n", "workspace"));
+        assert!(!GUEST_HOSTNAME.is_empty());
     }
 
     #[test]

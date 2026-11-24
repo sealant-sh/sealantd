@@ -2677,6 +2677,12 @@ impl CaptureEngine {
                     git_packs.push(key);
                 }
                 let mut listing = self.workspace_listing(&repo, &git.closure.gitlinks)?;
+                // An index naming objects a crash lost is carried rebuilt, as the index tree
+                // (`Closure::index_rebuilt`): its bytes would restore an index naming them, and
+                // the next capture on the restored disk would fail on it.
+                if git.closure.index_rebuilt {
+                    listing.entries.remove(".git/index");
+                }
                 // Every nested repository and path git could not index is the workspace
                 // class's to carry; one on disk that its listing does not hold would be
                 // acknowledged as saved and restore as nothing.

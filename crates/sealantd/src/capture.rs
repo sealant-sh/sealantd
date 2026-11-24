@@ -3255,6 +3255,55 @@ mod tests {
         );
     }
 
+    /// Milestone 1, Gate 3: a host-vm workspace hard-killed seconds after a `git commit`. The
+    /// edited files were synced; every object the commit wrote is an empty file, and the
+    /// branch and the index name them. The recovery's final flush was `snapshot-failed`
+    /// (`pack-objects`: "object file … is empty") and the daemon exited 75 with the edit
+    /// unsaved. It is now complete, and the head restores every file byte for byte.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_final_flush_after_a_hard_kill_that_tore_a_commit_is_complete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (runtime, capture, registrar) = quiet_runtime(tmp.path());
+        let root = tmp.path().join("ws");
+        std::fs::write(root.join("src/lib.rs"), "pub fn edited() {}\n").unwrap();
+        git(&root, &["add", "src/lib.rs"]);
+        git(&root, &["commit", "-q", "-m", "two"]);
+        let listed = Proc::new("git")
+            .current_dir(&root)
+            .args(["rev-list", "--objects", "--no-object-names", "HEAD^..HEAD"])
+            .stdin(std::process::Stdio::null())
+            .output_gated()
+            .unwrap();
+        let torn = String::from_utf8(listed.stdout).unwrap();
+        assert!(torn.lines().count() >= 3, "{torn}");
+        for id in torn.lines() {
+            let path = root.join(".git/objects").join(&id[..2]).join(&id[2..]);
+            std::fs::remove_file(&path).unwrap();
+            std::fs::File::create(&path).unwrap();
+        }
+        std::fs::write(root.join("src/new.rs"), "// written after the commit\n").unwrap();
+        // The index newer than every file: its entries are clean by stat, as on a real disk.
+        std::fs::File::options()
+            .write(true)
+            .open(root.join(".git/index"))
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + Duration::from_secs(5))
+            .unwrap();
+
+        capture.start_without_harness(runtime.clone());
+        let report = runtime.final_flush(None, Some(2_000)).await.unwrap();
+        assert!(report.complete, "{report:?}");
+        let fresh = restore_head(tmp.path(), &registrar, "restored");
+        assert_eq!(
+            std::fs::read(fresh.join("src/lib.rs")).unwrap(),
+            b"pub fn edited() {}\n"
+        );
+        assert_eq!(
+            std::fs::read(fresh.join("src/new.rs")).unwrap(),
+            b"// written after the commit\n"
+        );
+    }
+
     /// A microVM recovery boot (`sealantd --vm`, `sealantd.mode=recover`) starts no `dockerd`,
     /// but the runner's boot env is the first boot's and names the guest daemon's socket. Left
     /// in place, the final flush would wait on that socket as on an active writer — up to the

@@ -64,7 +64,8 @@ other languages from the same `.proto`.
   `host-vm` workspace's normal boot (`sealantd --vm`) leaves it unset too, whatever the source, so
   guest `sudo` works: the guest kernel is the isolation boundary. Its recovery boot keeps it set,
   owner map or not. Boot logs the posture (`privilege posture: …`), and `runtime.getCapabilities` reports
-  `noNewPrivileges`.
+  `noNewPrivileges`. PID 1 names the guest `workspace` and, on a normal boot, makes `/etc/hosts`
+  resolve it, so `sudo` does not warn that it cannot resolve the host.
 - `max_processes` / `max_sessions` are enforced; overflow is rejected with `policy-denied`.
 - Captured I/O is redacted for configured secret literals and high-confidence token shapes; masked
   spans set `transform.redacted` and increment `redactedEvents`.
