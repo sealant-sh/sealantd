@@ -1303,6 +1303,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "sealant-vm-runner"
+version = "0.0.0"
+dependencies = [
+ "clap",
+ "getrandom 0.2.17",
+ "libc",
+ "nix",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "sealantctl"
 version = "0.0.0"
 dependencies = [
