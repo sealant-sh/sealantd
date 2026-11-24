@@ -98,10 +98,6 @@ impl Fixture {
         }
     }
 
-    fn config(&self) -> CaptureConfig {
-        CaptureConfig::new("wt", 1, &self.root)
-    }
-
     /// A runner over the staging the disk holds, resuming from the registered head when there
     /// is one: what a recovery boot opens.
     fn runner(&self) -> CadenceRunner {

@@ -1,13 +1,13 @@
 # What the capture staging queue model stands for. .agents/skills/capture-queue says how to keep it
 # true: its Coverage record maps each model action to the code below.
 #
-# sync: the commit whose code the model was last confirmed to describe. 2ba7d088e8 is the
-# SLNT-1333 fix on its branch (sealantd#242), checked at full bounds: its engine.rs hunks change
-# which git objects a small snap packs (the lost tips, kept out of the negatives in
-# git-lost.json) and no queue write, coalesce, hoist, repair or resume, so no action changed. Its
-# squash commit on main holds the same covered files byte for byte. Move it only as the skill's
-# step 1 and full run say.
-sync 2ba7d088e858db94aa43a70d5ea26000cf0b9881
+# sync: the commit whose code the model was last confirmed to describe. fac203c89d is the
+# SLNT-1333 fix on its branch (sealantd#242), checked at full bounds: its one engine.rs hunk
+# leaves `.git/index` out of a small snap's workspace listing when the git class carries the
+# index rebuilt, and touches no queue write, coalesce, hoist, repair or resume, so no action
+# changed. Its squash commit on main holds the same covered files byte for byte. Move it only
+# as the skill's step 1 and full run say.
+sync fac203c89dc1c5971c42413b2a108025710aed12
 
 model CaptureQueue.tla
 model check.sh
