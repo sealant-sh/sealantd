@@ -246,11 +246,28 @@ fn prepare(
     }
     // No-new-privileges (plan §18) on every executor but a per-person one: there every person
     // has passwordless sudo (Mend's ADR 0016), which no-new-privileges would break, so it is root
-    // by design, not a sandbox.
+    // by design, not a sandbox. A microVM's normal boot (`sealantd --vm`) leaves it off too: the
+    // guest's own kernel is the boundary, and guest sudo must work.
     // Decided once (`BootConfig::no_new_privileges`); the runtime reads the same field.
     if config.no_new_privileges {
         let engaged = sealant_process::platform::set_no_new_privs();
         tracing::info!(engaged, "privilege posture: no-new-privileges set");
+    } else if config::privilege_posture(&config.source, nix::unistd::geteuid().is_root()) {
+        // The container posture would have set it: only a microVM's normal boot lifts it.
+        match sealant_process::platform::no_new_privs() {
+            Some(false) => tracing::info!(
+                "privilege posture: microVM normal boot: no-new-privileges not set, so guest sudo \
+                 works"
+            ),
+            Some(true) => tracing::warn!(
+                "privilege posture: microVM normal boot, but the environment imposed \
+                 no-new-privileges: guest sudo will not work"
+            ),
+            None => tracing::warn!(
+                "privilege posture: microVM normal boot, but no-new-privileges cannot be read: \
+                 whether guest sudo works is unknown"
+            ),
+        }
     } else {
         match sealant_process::platform::no_new_privs() {
             Some(false) => tracing::info!(
@@ -1477,6 +1494,24 @@ mod tests {
             &capture(Some(map(&[("acct_a", 40012)]))),
             true
         ));
+        // A container boot keeps the posture `privilege_posture` decides: the microVM override
+        // (`vm::env::vm_privilege_posture`) runs only under `sealantd --vm`.
+        assert!(clone.no_new_privileges);
+        let per_person_env = BootConfig::load(&MapEnv::from_pairs(&[
+            ("SEALANT_WORKSPACE_SOURCE", "capture"),
+            ("SEALANT_CAPTURE_ENDPOINT", "http://mend:3106/channel"),
+            ("SEALANT_OS_FAMILY", "fedora"),
+            ("SEALANT_HARNESS_LAUNCH_COMMAND", "x"),
+            (
+                "SEALANT_CAPTURE_OWNER_MAP",
+                r#"{"gid":40000,"worktree":40012,"people":{"acct_a":40012}}"#,
+            ),
+        ]))
+        .expect("valid per-person boot config");
+        assert_eq!(
+            per_person_env.no_new_privileges,
+            config::privilege_posture(&per_person_env.source, nix::unistd::geteuid().is_root())
+        );
         let mut per_person = boot_config(&[]);
         per_person.no_new_privileges = false;
         assert!(!into_runtime_config(&per_person, &[]).no_new_privileges);

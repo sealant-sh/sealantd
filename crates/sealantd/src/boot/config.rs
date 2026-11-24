@@ -578,7 +578,8 @@ pub struct BootConfig {
     pub declared_harness_keys: Vec<String>,
     /// Whether this boot sets no-new-privileges (plan §18), decided once here and read by both
     /// places that set it (boot's preparation and the runtime): every boot but a per-person
-    /// executor's ([`privilege_posture`]).
+    /// executor's ([`privilege_posture`]). A microVM boot then overrides it: off on a normal
+    /// boot, on for a recovery (`crate::vm::env::vm_privilege_posture`).
     pub no_new_privileges: bool,
     /// The workspace's own Docker daemon (`SEALANT_WORKSPACE_DOCKER_HOST`, or a `DOCKER_HOST`
     /// sealant reserves for one): the final capture stops its containers.
