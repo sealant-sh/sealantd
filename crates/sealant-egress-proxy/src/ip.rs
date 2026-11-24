@@ -235,6 +235,11 @@ use BlockReason as R;
 const BLOCKED: &[Rule] = &[
     // IPv4
     v4(169, 254, 169, 254, 32, R::CloudMetadata),
+    // AWS ECS task metadata and EKS Pod Identity.
+    v4(169, 254, 170, 2, 32, R::CloudMetadata),
+    v4(169, 254, 170, 23, 32, R::CloudMetadata),
+    // Alibaba Cloud metadata, inside CGNAT: an operator allowing a tailnet must not open it.
+    v4(100, 100, 100, 200, 32, R::CloudMetadata),
     v4(168, 63, 129, 16, 32, R::AzureWireserver),
     v4(255, 255, 255, 255, 32, R::Broadcast),
     v4(0, 0, 0, 0, 8, R::Unspecified),
@@ -257,6 +262,17 @@ const BLOCKED: &[Rule] = &[
     v6(1, 128, R::Loopback),
     v6(
         0xfd00_0ec2_0000_0000_0000_0000_0000_0254,
+        128,
+        R::CloudMetadata,
+    ),
+    v6(
+        0xfd00_0ec2_0000_0000_0000_0000_0000_0023,
+        128,
+        R::CloudMetadata,
+    ),
+    // GCP metadata over IPv6.
+    v6(
+        0xfd20_00ce_0000_0000_0000_0000_0000_0254,
         128,
         R::CloudMetadata,
     ),
@@ -489,6 +505,25 @@ mod tests {
         assert_eq!(rules.verdict(ip("169.254.169.254")), Err(R::CloudMetadata));
         assert_eq!(rules.verdict(ip("168.63.129.16")), Err(R::AzureWireserver));
         assert_eq!(rules.verdict(ip("64:ff9b::a9fe:a9fe")), Err(R::Nat64));
+        // Every provider's metadata address stays blocked, including Alibaba's inside the
+        // CGNAT range a tailnet allowlist opens.
+        rules
+            .operator_allowed
+            .push(Cidr::parse("100.64.0.0/10").unwrap());
+        rules
+            .operator_allowed
+            .push(Cidr::parse("fc00::/7").unwrap());
+        assert_eq!(rules.verdict(ip("100.100.1.1")), Ok(ip("100.100.1.1")));
+        for text in [
+            "100.100.100.200",
+            "169.254.170.2",
+            "169.254.170.23",
+            "fd00:ec2::23",
+            "fd20:ce::254",
+            "::ffff:100.100.100.200",
+        ] {
+            assert_eq!(rules.verdict(ip(text)), Err(R::CloudMetadata), "{text}");
+        }
         assert_eq!(rules.verdict(ip("255.255.255.255")), Err(R::Broadcast));
         assert_eq!(rules.verdict(ip("0.0.0.0")), Err(R::Unspecified));
     }

@@ -106,10 +106,19 @@ pub enum StartError {
 }
 
 /// A running proxy. Dropping it stops every listener.
-#[derive(Debug)]
 pub struct RunningProxy {
     pub addrs: BoundAddrs,
     tasks: Vec<JoinHandle<()>>,
+    #[cfg_attr(not(test), allow(dead_code))]
+    shared: Arc<state::Shared>,
+}
+
+impl std::fmt::Debug for RunningProxy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RunningProxy")
+            .field("addrs", &self.addrs)
+            .finish_non_exhaustive()
+    }
 }
 
 impl RunningProxy {
@@ -212,5 +221,113 @@ pub async fn start(config: ProxyConfig) -> Result<RunningProxy, StartError> {
         }
     }));
 
-    Ok(RunningProxy { addrs, tasks })
+    Ok(RunningProxy {
+        addrs,
+        tasks,
+        shared,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream, UnixStream};
+
+    use super::*;
+
+    async fn admin(socket: &std::path::Path, method: &str, path: &str, body: &str) -> String {
+        let mut stream = UnixStream::connect(socket).await.unwrap();
+        let request = format!(
+            "{method} {path} HTTP/1.1\r\nHost: p\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut out = String::new();
+        stream.read_to_string(&mut out).await.unwrap();
+        out
+    }
+
+    async fn echo_ok(stream: &mut TcpStream, payload: &[u8]) -> bool {
+        if stream.write_all(payload).await.is_err() {
+            return false;
+        }
+        let mut buf = vec![0u8; payload.len()];
+        matches!(
+            tokio::time::timeout(Duration::from_secs(2), stream.read_exact(&mut buf)).await,
+            Ok(Ok(_))
+        ) && buf == payload
+    }
+
+    /// A revocation must not leave the old policy, and the secret values in it, alive inside a
+    /// long-lived tunnel that has nothing to do with the revoked secret.
+    #[tokio::test]
+    async fn revoke_frees_the_old_policy_while_an_unrelated_tunnel_stays_open() {
+        let echo = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_port = echo.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = echo.accept().await {
+                tokio::spawn(async move {
+                    let (mut r, mut w) = s.split();
+                    let _ = tokio::io::copy(&mut r, &mut w).await;
+                });
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("admin.sock");
+        let mut config = ProxyConfig::new(&socket, "127.0.0.1:9".parse().unwrap());
+        config.explicit_http = Some("127.0.0.1:0".parse().unwrap());
+        let proxy = start(config).await.unwrap();
+        let explicit: SocketAddr = proxy.addrs.explicit_http.unwrap();
+
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::default();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "executor");
+        let ca = params.self_signed(&key).unwrap();
+        let policy = serde_json::json!({
+            "mode": "standard", "policyHash": "h", "revocationWatermark": 1,
+            "operatorAllowedPrivateCidrs": ["127.0.0.0/8"],
+            "executorCaCertPem": ca.pem(), "executorCaKeyPem": key.serialize_pem(),
+            "brokeredSecrets": [{
+                "secretId": "s1", "placeholder": "mend_sec_abcdefghijkl", "value": "real-value",
+                "headerName": "Authorization", "bindHosts": ["api.test"]
+            }]
+        });
+        let put = admin(&socket, "PUT", "/v1/policy", &policy.to_string()).await;
+        assert!(put.starts_with("HTTP/1.1 200"), "{put}");
+
+        let mut tunnel = TcpStream::connect(explicit).await.unwrap();
+        tunnel
+            .write_all(format!("CONNECT 127.0.0.1:{echo_port} HTTP/1.1\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        let mut established = [0u8; 39];
+        tunnel.read_exact(&mut established).await.unwrap();
+        assert!(established.starts_with(b"HTTP/1.1 200"));
+        assert!(echo_ok(&mut tunnel, b"before").await);
+
+        let old = Arc::downgrade(&proxy.shared.current_policy().unwrap());
+        let revoke = admin(
+            &socket,
+            "POST",
+            "/v1/revoke",
+            r#"{"revocationWatermark":2,"revokeSecretIds":["s1"]}"#,
+        )
+        .await;
+        assert!(revoke.starts_with("HTTP/1.1 200"), "{revoke}");
+        assert!(
+            old.upgrade().is_none(),
+            "the pre-revoke policy is still referenced"
+        );
+        assert!(
+            echo_ok(&mut tunnel, b"after").await,
+            "the unrelated tunnel stays open"
+        );
+    }
 }

@@ -262,12 +262,16 @@ struct Renewed {
 }
 
 async fn heartbeat(shared: &Shared, stream: &mut UnixStream, body: &[u8]) {
-    let request: HeartbeatRequest = if body.is_empty() {
-        HeartbeatRequest::default()
-    } else {
-        match serde_json::from_slice(body) {
-            Ok(r) => r,
-            Err(e) => return send_error(stream, 400, "invalid_heartbeat", e.to_string()).await,
+    let request: HeartbeatRequest = match serde_json::from_slice(body) {
+        Ok(r) => r,
+        Err(e) => {
+            return send_error(
+                stream,
+                400,
+                "invalid_heartbeat",
+                format!("a heartbeat needs revocationWatermark: {e}"),
+            )
+            .await;
         }
     };
     match shared.heartbeat(request).await {

@@ -149,7 +149,8 @@ pub(crate) fn still_permitted(policy: &Policy, tags: &ConnTags) -> bool {
     let restricted = policy.mode == Mode::Restricted;
     match tags.kind {
         ConnKind::Mitm => tags.host.as_deref().is_some_and(|host| {
-            policy.inspects(host) && (!restricted || policy.restricted_allows(host, tags.port))
+            policy.inspects_on(host, tags.port)
+                && (!restricted || policy.restricted_allows(host, tags.port))
         }),
         ConnKind::PlainHttp | ConnKind::Passthrough | ConnKind::RawTcp => {
             !restricted
@@ -199,6 +200,39 @@ struct ConnEntry {
     done: watch::Receiver<()>,
 }
 
+/// What revocations at the current watermark removed, so a policy re-sent at that same watermark
+/// (a retry, or one computed before the revoke) cannot bring any of it back.
+#[derive(Default)]
+struct Tombstones {
+    watermark: u64,
+    all: bool,
+    hosts: std::collections::BTreeSet<String>,
+    secret_ids: std::collections::BTreeSet<String>,
+}
+
+impl Tombstones {
+    fn advance_to(&mut self, watermark: u64) {
+        if watermark > self.watermark {
+            *self = Self {
+                watermark,
+                ..Self::default()
+            };
+        }
+    }
+
+    fn apply(&self, policy: &mut Policy) {
+        if self.all {
+            policy.revoke_all();
+        }
+        for id in &self.secret_ids {
+            policy.revoke_secret(id);
+        }
+        for host in &self.hosts {
+            policy.revoke_host(host);
+        }
+    }
+}
+
 struct Inner {
     policy: Option<Arc<Policy>>,
     watermark: u64,
@@ -207,6 +241,7 @@ struct Inner {
     lease_deadline: Instant,
     lease_expired: bool,
     conns: HashMap<u64, ConnEntry>,
+    tombstones: Tombstones,
 }
 
 impl Inner {
@@ -259,11 +294,11 @@ pub(crate) struct RevokeRequest {
     pub(crate) revoke_all: bool,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct HeartbeatRequest {
-    #[serde(default)]
-    pub(crate) revocation_watermark: Option<u64>,
+    /// Required: a heartbeat that cannot say which revocations Sealant holds renews nothing.
+    pub(crate) revocation_watermark: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -296,6 +331,7 @@ impl Shared {
                 lease_deadline: Instant::now(),
                 lease_expired: true,
                 conns: HashMap::new(),
+                tombstones: Tombstones::default(),
             }),
             next_id: AtomicU64::new(1),
             events: EventHub::new(),
@@ -357,7 +393,7 @@ impl Shared {
         })
     }
 
-    pub(crate) async fn apply_policy(&self, policy: Policy) -> Result<usize, StateError> {
+    pub(crate) async fn apply_policy(&self, mut policy: Policy) -> Result<usize, StateError> {
         let closing = {
             let mut inner = self.lock();
             if policy.revocation_watermark < inner.watermark {
@@ -365,6 +401,12 @@ impl Shared {
                     requested: policy.revocation_watermark,
                     current: inner.watermark,
                 });
+            }
+            // A later watermark is Sealant's authoritative state, durable tombstones included
+            // (`revokedHosts`, `revokedSecretIds`). The same watermark keeps what was revoked at it.
+            inner.tombstones.advance_to(policy.revocation_watermark);
+            if inner.tombstones.watermark == policy.revocation_watermark {
+                inner.tombstones.apply(&mut policy);
             }
             inner.watermark = policy.revocation_watermark;
             inner.resync_required = false;
@@ -397,6 +439,14 @@ impl Shared {
                 });
             }
             let mut policy = (*current).clone();
+            inner.tombstones.advance_to(request.revocation_watermark);
+            inner.tombstones.all |= request.revoke_all;
+            inner.tombstones.secret_ids.extend(
+                request
+                    .revoke_secret_ids
+                    .iter()
+                    .map(|id| id.trim().to_string()),
+            );
             if request.revoke_all {
                 policy.revoke_all();
             }
@@ -406,6 +456,7 @@ impl Shared {
             for host in &request.revoke_hosts {
                 let host = normalize_host(host).unwrap_or_else(|| host.trim().to_ascii_lowercase());
                 policy.revoke_host(&host);
+                inner.tombstones.hosts.insert(host);
             }
             policy.revocation_watermark = request.revocation_watermark;
             inner.watermark = request.revocation_watermark;
@@ -436,23 +487,22 @@ impl Shared {
                 return Err(StateError::NotInitialized);
             };
             let mut closing = Vec::new();
-            if let Some(watermark) = request.revocation_watermark {
-                if watermark < inner.watermark {
-                    return Err(StateError::WatermarkRollback {
-                        requested: watermark,
-                        current: inner.watermark,
-                    });
-                }
-                if watermark > inner.watermark {
-                    inner.watermark = watermark;
-                    inner.resync_required = true;
-                    closing = inner.take_matching(|tags| tags.class != ConnClass::Public);
-                    self.events.emit(Event {
-                        revocation_watermark: Some(watermark),
-                        closed: Some(closing.len()),
-                        ..Event::new("resync_required")
-                    });
-                }
+            let watermark = request.revocation_watermark;
+            if watermark < inner.watermark {
+                return Err(StateError::WatermarkRollback {
+                    requested: watermark,
+                    current: inner.watermark,
+                });
+            }
+            if watermark > inner.watermark {
+                inner.watermark = watermark;
+                inner.resync_required = true;
+                closing = inner.take_matching(|tags| tags.class != ConnClass::Public);
+                self.events.emit(Event {
+                    revocation_watermark: Some(watermark),
+                    closed: Some(closing.len()),
+                    ..Event::new("resync_required")
+                });
             }
             inner.lease_deadline = Instant::now() + policy.lease_ttl;
             inner.lease_expired = false;

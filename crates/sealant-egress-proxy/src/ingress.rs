@@ -12,7 +12,7 @@ use tokio::sync::Semaphore;
 use tokio_rustls::TlsAcceptor;
 
 use crate::events::Event;
-use crate::http1::{HttpReader, parse_request, simple_response};
+use crate::http1::{HttpReader, RequestHead, parse_request, simple_response};
 use crate::io::{Prefixed, connect_any, linger, splice};
 use crate::ip::BlockReason;
 use crate::policy::{Mode, Policy, split_host_port, synthetic_resource_net};
@@ -24,6 +24,9 @@ use crate::tls::{HELLO_TIMEOUT, Hello, peek_client_hello};
 const MAX_CONNECTIONS: usize = 4096;
 const HEADER_TIMEOUT: Duration = Duration::from_secs(10);
 const FIRST_HEAD_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long the general TCP listener waits for a ClientHello on a port an inspected host uses
+/// before treating the connection as raw TCP.
+const TCP_HELLO_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Accept connections and hand each to `handler`, up to a global connection cap.
 pub(crate) async fn accept_loop<F, Fut>(
@@ -189,95 +192,328 @@ fn tags_for(
 }
 
 // ---------------------------------------------------------------------------------------------
+// Decisions
+//
+// Each decision holds a policy snapshot only while it decides, and hands back owned tags and a
+// target. Nothing that outlives the decision (a splice, a WebSocket, a kept-alive session) keeps
+// an old policy, and the secret values in it, alive after a revocation replaces it.
+
+/// A refusal: the HTTP status for the explicit proxy and the reason for telemetry.
+struct Refusal {
+    status: u16,
+    reason: String,
+}
+
+fn refuse(status: u16, reason: impl Into<String>) -> Refusal {
+    Refusal {
+        status,
+        reason: reason.into(),
+    }
+}
+
+/// `CONNECT host:port`: returns the tags, the target and whether TLS is inspected.
+async fn decide_connect(
+    shared: &Shared,
+    host: &str,
+    port: u16,
+) -> Result<(ConnTags, Target, bool), Refusal> {
+    let snapshot = shared
+        .snapshot()
+        .ok_or_else(|| refuse(503, "not_initialized"))?;
+    let policy = &snapshot.policy;
+    if policy.host_denied(host) {
+        return Err(refuse(403, "revoked"));
+    }
+    if policy.mode == Mode::Restricted && !policy.restricted_allows(host, port) {
+        return Err(refuse(403, "not_allowlisted"));
+    }
+    let target = resolve_host(shared, policy, host, port)
+        .await
+        .map_err(|r| refuse(403, r))?;
+    // Inspection, and with it a brokered secret, only on the ports the policy names for the
+    // host (443 unless `allowHosts` says otherwise); anything else passes through untouched.
+    let inspect = policy.inspects_on(host, port);
+    let kind = if inspect {
+        ConnKind::Mitm
+    } else {
+        ConnKind::Passthrough
+    };
+    let tags = tags_for(policy, kind, Some(host.to_string()), port, &target);
+    Ok((tags, target, inspect))
+}
+
+/// Absolute-form plain HTTP through the explicit proxy. Rewrites `req` to origin form with one
+/// validated Host header.
+async fn decide_plain_explicit(
+    shared: &Shared,
+    req: &mut RequestHead,
+) -> Result<(ConnTags, Target, String, u16), Refusal> {
+    let (authority, path_and_query) = split_absolute_http(&req.target)
+        .map(|(a, p)| (a.to_string(), p.to_string()))
+        .ok_or_else(|| refuse(400, "expected an absolute http:// URL"))?;
+    let (host, port) = split_host_port(&authority)
+        .map(|(h, p)| (h, p.unwrap_or(80)))
+        .ok_or_else(|| refuse(400, "bad URL authority"))?;
+    let host_headers = req
+        .headers
+        .iter()
+        .filter(|h| h.name.eq_ignore_ascii_case("host"))
+        .count();
+    match host_headers {
+        0 => req.set("Host", authority.as_bytes()),
+        1 => match req.single_host() {
+            Ok((header_host, _)) if header_host == host => {}
+            _ => return Err(refuse(400, "host_mismatch")),
+        },
+        _ => return Err(refuse(400, "bad_host_header")),
+    }
+    to_origin_form(req, path_and_query);
+    let snapshot = shared
+        .snapshot()
+        .ok_or_else(|| refuse(503, "not_initialized"))?;
+    let policy = &snapshot.policy;
+    if policy.host_denied(&host) {
+        return Err(refuse(403, "revoked"));
+    }
+    if policy.mode == Mode::Restricted && !policy.restricted_allows(&host, port) {
+        return Err(refuse(403, "not_allowlisted"));
+    }
+    let target = resolve_host(shared, policy, &host, port)
+        .await
+        .map_err(|r| refuse(403, r))?;
+    let tags = tags_for(
+        policy,
+        ConnKind::PlainHttp,
+        Some(host.clone()),
+        port,
+        &target,
+    );
+    Ok((tags, target, host, port))
+}
+
+/// Transparent plain HTTP: the one Host header names the host, and under Restricted egress the
+/// proxy's own DNS (not the guest's address) picks the destination.
+async fn decide_transparent_http(
+    shared: &Shared,
+    req: &RequestHead,
+    dst: SocketAddr,
+) -> Result<(ConnTags, Target, String), Refusal> {
+    if !req.is_origin_form() {
+        return Err(refuse(400, "target_not_origin_form"));
+    }
+    let (host, _) = req
+        .single_host()
+        .map_err(|_| refuse(400, "bad_host_header"))?;
+    let port = dst.port();
+    let snapshot = shared
+        .snapshot()
+        .ok_or_else(|| refuse(503, "not_initialized"))?;
+    let policy = &snapshot.policy;
+    let target = if policy.host_denied(&host) {
+        return Err(refuse(403, "revoked"));
+    } else if policy.mode == Mode::Restricted {
+        if !policy.restricted_allows(&host, port) {
+            return Err(refuse(403, "not_allowlisted"));
+        }
+        resolve_host(shared, policy, &host, port).await
+    } else {
+        validate_destination(shared, policy, dst).await
+    }
+    .map_err(|r| refuse(403, r))?;
+    let tags = tags_for(
+        policy,
+        ConnKind::PlainHttp,
+        Some(host.clone()),
+        port,
+        &target,
+    );
+    Ok((tags, target, host))
+}
+
+enum TlsPlan {
+    Inspect {
+        tags: ConnTags,
+        target: Target,
+        host: String,
+    },
+    Pass {
+        tags: ConnTags,
+        target: Target,
+    },
+}
+
+/// TLS whose ClientHello has been read: inspect it, pass it through, or refuse it.
+async fn decide_tls(
+    shared: &Shared,
+    sni: Option<String>,
+    dst: SocketAddr,
+) -> Result<TlsPlan, String> {
+    let port = dst.port();
+    let snapshot = shared.snapshot().ok_or("not_initialized")?;
+    let policy = &snapshot.policy;
+    let restricted = policy.mode == Mode::Restricted;
+    if sni.as_deref().is_some_and(|h| policy.host_denied(h)) {
+        return Err("revoked".into());
+    }
+    if restricted
+        && !sni
+            .as_deref()
+            .is_some_and(|h| policy.restricted_allows(h, port))
+    {
+        return Err(if sni.is_some() {
+            "not_allowlisted"
+        } else {
+            "no_sni"
+        }
+        .into());
+    }
+    if let Some(host) = sni.clone().filter(|h| policy.inspects_on(h, port)) {
+        // Inspected: the proxy's own DNS decides the destination, never the guest's address.
+        let target = resolve_host(shared, policy, &host, port).await?;
+        let tags = tags_for(policy, ConnKind::Mitm, Some(host.clone()), port, &target);
+        return Ok(TlsPlan::Inspect { tags, target, host });
+    }
+    let target = match (&sni, restricted) {
+        (Some(host), true) => resolve_host(shared, policy, host, port).await?,
+        _ => validate_destination(shared, policy, dst).await?,
+    };
+    let tags = tags_for(policy, ConnKind::Passthrough, sni, port, &target);
+    Ok(TlsPlan::Pass { tags, target })
+}
+
+/// Raw TCP from the general listener.
+async fn decide_raw_tcp(shared: &Shared, dst: SocketAddr) -> Result<(ConnTags, Target), String> {
+    let snapshot = shared.snapshot().ok_or("not_initialized")?;
+    let policy = &snapshot.policy;
+    let (host, target) = match policy.mode {
+        Mode::Standard => (None, validate_destination(shared, policy, dst).await?),
+        Mode::Restricted => restricted_tcp_rule(shared, policy, dst)
+            .await
+            .ok_or("not_allowlisted")?,
+    };
+    let tags = tags_for(policy, ConnKind::RawTcp, host, dst.port(), &target);
+    Ok((tags, target))
+}
+
+/// A synthetic worktree-resource address.
+async fn decide_resource(
+    shared: &Shared,
+    dst: SocketAddr,
+) -> Result<(ConnTags, Target), (Option<String>, String)> {
+    let port = dst.port();
+    let snapshot = shared
+        .snapshot()
+        .ok_or((None, "not_initialized".to_string()))?;
+    let policy = &snapshot.policy;
+    let guest_ip = match crate::ip::normalize(dst.ip()) {
+        Ok(IpAddr::V4(v4)) if synthetic_resource_net().contains(IpAddr::V4(v4)) => v4,
+        _ => return Err((None, "not_a_resource_address".into())),
+    };
+    let resource = policy
+        .resource_at(guest_ip, port)
+        .cloned()
+        .ok_or((None, "no_such_resource".to_string()))?;
+    let name = Some(resource.name.clone());
+    let ips = shared
+        .resolver
+        .lookup_ips(&resource.host)
+        .await
+        .map_err(|e| (name.clone(), format!("resolve_failed:{e}")))?;
+    let addrs: Vec<SocketAddr> = ips
+        .into_iter()
+        .filter_map(|ip| policy.addresses.private_target_verdict(ip).ok())
+        .map(|ip| SocketAddr::new(ip, resource.port))
+        .collect();
+    if addrs.is_empty() {
+        return Err((name, "no_address".into()));
+    }
+    let target = Target {
+        ip: addrs.first().map(SocketAddr::ip),
+        addrs,
+        mirror: None,
+    };
+    let mut tags = ConnTags::new(
+        policy,
+        ConnKind::Resource,
+        Some(resource.name.clone()),
+        port,
+    );
+    tags.ip = target.ip;
+    Ok((tags, target))
+}
+
+// ---------------------------------------------------------------------------------------------
 // Explicit proxy (:8080)
 
 pub(crate) async fn handle_explicit(shared: Arc<Shared>, stream: TcpStream) {
+    let ingress = Ingress::Explicit;
     let mut reader = HttpReader::new(stream, Vec::new());
     let head = match tokio::time::timeout(FIRST_HEAD_TIMEOUT, reader.read_head()).await {
         Ok(Ok(Some(head))) => head,
         _ => return,
     };
     let (mut stream, leftover) = reader.into_parts();
-    let respond = |status: u16, body: &str| simple_response(status, body);
     let Ok(mut req) = parse_request(&head) else {
-        let _ = stream.write_all(&respond(400, "malformed request")).await;
+        let _ = stream
+            .write_all(&simple_response(400, "malformed request"))
+            .await;
         return;
     };
-    let Some(snapshot) = shared.snapshot() else {
-        deny(&shared, Ingress::Explicit, None, 0, None, "not_initialized");
+    if shared.snapshot().is_none() {
+        deny(&shared, ingress, None, 0, None, "not_initialized");
         let _ = stream
-            .write_all(&respond(503, "egress proxy not initialized"))
+            .write_all(&simple_response(503, "egress proxy not initialized"))
             .await;
         linger(&mut stream).await;
         return;
-    };
-    let policy = snapshot.policy.clone();
-    let restricted = policy.mode == Mode::Restricted;
+    }
 
     if req.method.eq_ignore_ascii_case("CONNECT") {
         let Some((host, Some(port))) = split_host_port(&req.target) else {
             let _ = stream
-                .write_all(&respond(400, "CONNECT needs host:port"))
+                .write_all(&simple_response(400, "CONNECT needs host:port"))
                 .await;
             return;
         };
-        if policy.host_denied(&host) || (restricted && !policy.restricted_allows(&host, port)) {
-            let reason = if policy.host_denied(&host) {
-                "revoked"
-            } else {
-                "not_allowlisted"
-            };
-            deny(&shared, Ingress::Explicit, Some(&host), port, None, reason);
-            let _ = stream.write_all(&respond(403, reason)).await;
-            linger(&mut stream).await;
-            return;
-        }
-        let target = match resolve_host(&shared, &policy, &host, port).await {
-            Ok(t) => t,
-            Err(reason) => {
-                deny(&shared, Ingress::Explicit, Some(&host), port, None, &reason);
-                let _ = stream.write_all(&respond(403, &reason)).await;
+        let (tags, target, inspect) = match decide_connect(&shared, &host, port).await {
+            Ok(plan) => plan,
+            Err(r) => {
+                deny(&shared, ingress, Some(&host), port, None, &r.reason);
+                let _ = stream
+                    .write_all(&simple_response(r.status, &r.reason))
+                    .await;
                 linger(&mut stream).await;
                 return;
             }
         };
-        let inspect = policy.inspects(&host);
-        let kind = if inspect {
-            ConnKind::Mitm
-        } else {
-            ConnKind::Passthrough
-        };
-        let tags = tags_for(&policy, kind, Some(host.clone()), port, &target);
         let secret_ids = tags.secret_ids.clone();
         let guard = match shared.admit(tags) {
             Ok(guard) => guard,
             Err(denial) => {
                 deny(
                     &shared,
-                    Ingress::Explicit,
+                    ingress,
                     Some(&host),
                     port,
                     target.ip,
                     denial.as_str(),
                 );
-                let _ = stream.write_all(&respond(403, denial.as_str())).await;
+                let _ = stream
+                    .write_all(&simple_response(403, denial.as_str()))
+                    .await;
                 linger(&mut stream).await;
                 return;
             }
         };
         if inspect {
-            if stream
-                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-                .await
-                .is_err()
-            {
+            if stream.write_all(ESTABLISHED).await.is_err() {
                 return;
             }
             let client = Prefixed::new(leftover, stream);
             guard
                 .run(mitm(
                     shared.clone(),
-                    Ingress::Explicit,
+                    ingress,
                     client,
                     host,
                     port,
@@ -287,128 +523,74 @@ pub(crate) async fn handle_explicit(shared: Arc<Shared>, stream: TcpStream) {
                 .await;
             return;
         }
-        let upstream = match connect_any(&target.addrs, shared.connect_timeout).await {
-            Ok(s) => s,
-            Err(e) => {
-                deny(
-                    &shared,
-                    Ingress::Explicit,
-                    Some(&host),
-                    port,
-                    target.ip,
-                    &format!("upstream_connect:{e}"),
-                );
-                let _ = stream
-                    .write_all(&respond(502, "upstream unavailable"))
-                    .await;
-                return;
-            }
-        };
-        if stream
-            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-            .await
-            .is_err()
-        {
-            return;
-        }
-        shared.events.emit(Event {
-            ingress: Some(Ingress::Explicit.as_str()),
-            host: Some(host.clone()),
-            port: Some(port),
-            ip: target.ip.map(|ip| ip.to_string()),
-            ..Event::new("connect")
-        });
-        let client = Prefixed::new(leftover, stream);
+        // Dial inside the guard, so a revocation that lands mid-dial cancels it at once.
         let shared2 = shared.clone();
         guard
             .run(async move {
+                let upstream = match connect_any(&target.addrs, shared2.connect_timeout).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        deny(
+                            &shared2,
+                            ingress,
+                            Some(&host),
+                            port,
+                            target.ip,
+                            &format!("upstream_connect:{e}"),
+                        );
+                        let _ = stream
+                            .write_all(&simple_response(502, "upstream unavailable"))
+                            .await;
+                        return;
+                    }
+                };
+                if stream.write_all(ESTABLISHED).await.is_err() {
+                    return;
+                }
+                shared2.events.emit(Event {
+                    ingress: Some(ingress.as_str()),
+                    host: Some(host.clone()),
+                    port: Some(port),
+                    ip: target.ip.map(|ip| ip.to_string()),
+                    ..Event::new("connect")
+                });
+                let client = Prefixed::new(leftover, stream);
                 passthrough_checking_sni(&shared2, client, upstream, &host, port).await;
             })
             .await;
         return;
     }
 
-    // Plain HTTP in absolute form: `GET http://host[:port]/path HTTP/1.1`.
-    let Some((authority, path_and_query)) =
-        split_absolute_http(&req.target).map(|(a, p)| (a.to_string(), p.to_string()))
-    else {
-        let _ = stream
-            .write_all(&respond(400, "expected an absolute http:// URL"))
-            .await;
-        return;
-    };
-    let Some((host, port)) = split_host_port(&authority).map(|(h, p)| (h, p.unwrap_or(80))) else {
-        let _ = stream.write_all(&respond(400, "bad URL authority")).await;
-        return;
-    };
-    if let Some(header_host) = req
-        .header("host")
-        .and_then(|v| std::str::from_utf8(v).ok())
-        .and_then(split_host_port)
-        .map(|(h, _)| h)
-        && header_host != host
-    {
-        deny(
-            &shared,
-            Ingress::Explicit,
-            Some(&host),
-            port,
-            None,
-            "host_mismatch",
-        );
-        let _ = stream
-            .write_all(&respond(400, "Host header does not match the URL"))
-            .await;
-        return;
-    }
-    if policy.host_denied(&host) || (restricted && !policy.restricted_allows(&host, port)) {
-        let reason = if policy.host_denied(&host) {
-            "revoked"
-        } else {
-            "not_allowlisted"
-        };
-        deny(&shared, Ingress::Explicit, Some(&host), port, None, reason);
-        let _ = stream.write_all(&respond(403, reason)).await;
-        linger(&mut stream).await;
-        return;
-    }
-    let target = match resolve_host(&shared, &policy, &host, port).await {
-        Ok(t) => t,
-        Err(reason) => {
-            deny(&shared, Ingress::Explicit, Some(&host), port, None, &reason);
-            let _ = stream.write_all(&respond(403, &reason)).await;
+    let (tags, target, host, port) = match decide_plain_explicit(&shared, &mut req).await {
+        Ok(plan) => plan,
+        Err(r) => {
+            deny(&shared, ingress, None, 0, None, &r.reason);
+            let _ = stream
+                .write_all(&simple_response(r.status, &r.reason))
+                .await;
             linger(&mut stream).await;
             return;
         }
     };
-    let tags = tags_for(
-        &policy,
-        ConnKind::PlainHttp,
-        Some(host.clone()),
-        port,
-        &target,
-    );
     let guard = match shared.admit(tags) {
         Ok(guard) => guard,
         Err(denial) => {
             deny(
                 &shared,
-                Ingress::Explicit,
+                ingress,
                 Some(&host),
                 port,
                 target.ip,
                 denial.as_str(),
             );
-            let _ = stream.write_all(&respond(403, denial.as_str())).await;
+            let _ = stream
+                .write_all(&simple_response(403, denial.as_str()))
+                .await;
             return;
         }
     };
-    to_origin_form(&mut req, path_and_query);
-    if req.header("host").is_none() {
-        req.set("Host", authority.as_bytes());
-    }
     let spec = SessionSpec {
-        ingress: Ingress::Explicit,
+        ingress,
         host,
         port,
         addrs: target.addrs,
@@ -426,6 +608,8 @@ pub(crate) async fn handle_explicit(shared: Arc<Shared>, stream: TcpStream) {
         ))
         .await;
 }
+
+const ESTABLISHED: &[u8] = b"HTTP/1.1 200 Connection Established\r\n\r\n";
 
 fn split_absolute_http(target: &str) -> Option<(&str, &str)> {
     let rest = target
@@ -510,6 +694,7 @@ async fn serve_mitm<S: crate::io::Stream + 'static>(
             return;
         }
     };
+    drop(ca);
     let tls =
         match tokio::time::timeout(HELLO_TIMEOUT, TlsAcceptor::from(config).accept(client)).await {
             Ok(Ok(tls)) => tls,
@@ -592,7 +777,7 @@ async fn admit_and_splice(
     shared: &Arc<Shared>,
     ingress: Ingress,
     tags: ConnTags,
-    target: &Target,
+    target: Target,
     stream: TcpStream,
     prefix: Vec<u8>,
 ) {
@@ -612,7 +797,7 @@ async fn admit_and_splice(
             return;
         }
     };
-    let addrs = target.addrs.clone();
+    let addrs = target.addrs;
     let shared2 = shared.clone();
     guard
         .run(async move {
@@ -650,7 +835,7 @@ pub(crate) async fn handle_transparent_http(shared: Arc<Shared>, mut stream: Tcp
     let Some(dst) = read_proxy_header(&mut stream).await else {
         return;
     };
-    let Some(snapshot) = shared.snapshot() else {
+    if shared.snapshot().is_none() {
         deny(
             &shared,
             ingress,
@@ -660,7 +845,7 @@ pub(crate) async fn handle_transparent_http(shared: Arc<Shared>, mut stream: Tcp
             "not_initialized",
         );
         return;
-    };
+    }
     let mut reader = HttpReader::new(stream, Vec::new());
     let head = match tokio::time::timeout(FIRST_HEAD_TIMEOUT, reader.read_head()).await {
         Ok(Ok(Some(head))) => head,
@@ -673,45 +858,25 @@ pub(crate) async fn handle_transparent_http(shared: Arc<Shared>, mut stream: Tcp
             .await;
         return;
     };
-    let policy = snapshot.policy.clone();
-    let host = req
-        .header("host")
-        .and_then(|v| std::str::from_utf8(v).ok())
-        .and_then(split_host_port)
-        .map(|(h, _)| h);
     let port = dst.port();
-    let decision = match (&host, policy.mode) {
-        (Some(h), _) if policy.host_denied(h) => Err("revoked".to_string()),
-        (Some(h), Mode::Restricted) if policy.restricted_allows(h, port) => {
-            resolve_host(&shared, &policy, h, port).await
-        }
-        (_, Mode::Restricted) => Err("not_allowlisted".to_string()),
-        (_, Mode::Standard) => validate_destination(&shared, &policy, dst).await,
-    };
-    let target = match decision {
-        Ok(t) => t,
-        Err(reason) => {
-            deny(
-                &shared,
-                ingress,
-                host.as_deref(),
-                port,
-                Some(dst.ip()),
-                &reason,
-            );
-            let _ = stream.write_all(&simple_response(403, &reason)).await;
+    let (tags, target, host) = match decide_transparent_http(&shared, &req, dst).await {
+        Ok(plan) => plan,
+        Err(r) => {
+            deny(&shared, ingress, None, port, Some(dst.ip()), &r.reason);
+            let _ = stream
+                .write_all(&simple_response(r.status, &r.reason))
+                .await;
             linger(&mut stream).await;
             return;
         }
     };
-    let tags = tags_for(&policy, ConnKind::PlainHttp, host.clone(), port, &target);
     let guard = match shared.admit(tags) {
         Ok(guard) => guard,
         Err(denial) => {
             deny(
                 &shared,
                 ingress,
-                host.as_deref(),
+                Some(&host),
                 port,
                 target.ip,
                 denial.as_str(),
@@ -724,7 +889,7 @@ pub(crate) async fn handle_transparent_http(shared: Arc<Shared>, mut stream: Tcp
     };
     let spec = SessionSpec {
         ingress,
-        host: host.unwrap_or_else(|| dst.ip().to_string()),
+        host,
         port,
         addrs: target.addrs,
         inspect: false,
@@ -740,6 +905,60 @@ pub(crate) async fn handle_transparent_http(shared: Arc<Shared>, mut stream: Tcp
             Some(req),
         ))
         .await;
+}
+
+/// Inspect, pass through or refuse a TLS connection whose ClientHello is in `hello`.
+async fn dispatch_tls(
+    shared: Arc<Shared>,
+    ingress: Ingress,
+    stream: TcpStream,
+    hello: Vec<u8>,
+    sni: Option<String>,
+    dst: SocketAddr,
+) {
+    let port = dst.port();
+    match decide_tls(&shared, sni.clone(), dst).await {
+        Err(reason) => deny(
+            &shared,
+            ingress,
+            sni.as_deref(),
+            port,
+            Some(dst.ip()),
+            &reason,
+        ),
+        Ok(TlsPlan::Inspect { tags, target, host }) => {
+            let secret_ids = tags.secret_ids.clone();
+            let guard = match shared.admit(tags) {
+                Ok(guard) => guard,
+                Err(denial) => {
+                    deny(
+                        &shared,
+                        ingress,
+                        Some(&host),
+                        port,
+                        target.ip,
+                        denial.as_str(),
+                    );
+                    return;
+                }
+            };
+            let client = Prefixed::new(hello, stream);
+            guard
+                .run(serve_mitm(
+                    shared.clone(),
+                    ingress,
+                    client,
+                    host,
+                    port,
+                    target,
+                    secret_ids,
+                ))
+                .await;
+        }
+        Ok(TlsPlan::Pass { tags, target }) => {
+            admit_and_splice(&shared, ingress, tags, target, stream, hello).await;
+        }
+    }
 }
 
 pub(crate) async fn handle_transparent_https(shared: Arc<Shared>, mut stream: TcpStream) {
@@ -769,104 +988,7 @@ pub(crate) async fn handle_transparent_https(shared: Arc<Shared>, mut stream: Tc
             }
             _ => return,
         };
-    // Re-read the policy after the (possibly slow) ClientHello.
-    let Some(snapshot) = shared.snapshot() else {
-        return;
-    };
-    let policy = snapshot.policy.clone();
-    let restricted = policy.mode == Mode::Restricted;
-    if let Some(host) = &sni
-        && policy.host_denied(host)
-    {
-        deny(
-            &shared,
-            ingress,
-            Some(host),
-            port,
-            Some(dst.ip()),
-            "revoked",
-        );
-        return;
-    }
-    if restricted
-        && !sni
-            .as_deref()
-            .is_some_and(|h| policy.restricted_allows(h, port))
-    {
-        let reason = if sni.is_some() {
-            "not_allowlisted"
-        } else {
-            "no_sni"
-        };
-        deny(
-            &shared,
-            ingress,
-            sni.as_deref(),
-            port,
-            Some(dst.ip()),
-            reason,
-        );
-        return;
-    }
-    if let Some(host) = sni.clone().filter(|h| policy.inspects(h)) {
-        // Inspected: the proxy's own DNS decides the destination, never the guest's address.
-        let target = match resolve_host(&shared, &policy, &host, port).await {
-            Ok(t) => t,
-            Err(reason) => {
-                deny(&shared, ingress, Some(&host), port, None, &reason);
-                return;
-            }
-        };
-        let tags = tags_for(&policy, ConnKind::Mitm, Some(host.clone()), port, &target);
-        let secret_ids = tags.secret_ids.clone();
-        let guard = match shared.admit(tags) {
-            Ok(guard) => guard,
-            Err(denial) => {
-                deny(
-                    &shared,
-                    ingress,
-                    Some(&host),
-                    port,
-                    target.ip,
-                    denial.as_str(),
-                );
-                return;
-            }
-        };
-        let client = Prefixed::new(buf, stream);
-        guard
-            .run(serve_mitm(
-                shared.clone(),
-                ingress,
-                client,
-                host,
-                port,
-                target,
-                secret_ids,
-            ))
-            .await;
-        return;
-    }
-    let decision = match (&sni, restricted) {
-        (Some(host), true) => resolve_host(&shared, &policy, host, port).await,
-        _ => validate_destination(&shared, &policy, dst).await,
-    };
-    let target = match decision {
-        Ok(t) => t,
-        Err(reason) => {
-            deny(
-                &shared,
-                ingress,
-                sni.as_deref(),
-                port,
-                Some(dst.ip()),
-                &reason,
-            );
-            return;
-        }
-    };
-    let tags = tags_for(&policy, ConnKind::Passthrough, sni, port, &target);
-    admit_and_splice(&shared, ingress, tags, &target, stream, buf).await;
+    dispatch_tls(shared, ingress, stream, buf, sni, dst).await;
 }
 
 pub(crate) async fn handle_transparent_tcp(shared: Arc<Shared>, mut stream: TcpStream) {
@@ -875,7 +997,7 @@ pub(crate) async fn handle_transparent_tcp(shared: Arc<Shared>, mut stream: TcpS
         return;
     };
     let port = dst.port();
-    let Some(snapshot) = shared.snapshot() else {
+    let Some(inspected_port) = shared.snapshot().map(|s| s.policy.inspects_any_on(port)) else {
         deny(
             &shared,
             ingress,
@@ -886,32 +1008,37 @@ pub(crate) async fn handle_transparent_tcp(shared: Arc<Shared>, mut stream: TcpS
         );
         return;
     };
-    let policy = snapshot.policy.clone();
-    let (host, target) = match policy.mode {
-        Mode::Standard => match validate_destination(&shared, &policy, dst).await {
-            Ok(target) => (None, target),
-            Err(reason) => {
-                deny(&shared, ingress, None, port, Some(dst.ip()), &reason);
+    // A port an inspected host uses (a custom TLS port, or 443 when the runner sends everything
+    // here): read the ClientHello, and broker it when its SNI is that host. Anything else, the
+    // bytes read included, goes on as raw TCP.
+    let mut prefix = Vec::new();
+    if inspected_port {
+        let hello = tokio::time::timeout(
+            TCP_HELLO_TIMEOUT,
+            peek_client_hello(&mut stream, &mut prefix),
+        )
+        .await;
+        match hello {
+            Ok(Ok(Hello::Tls { sni: Some(sni) }))
+                if shared
+                    .snapshot()
+                    .is_some_and(|s| s.policy.inspects_on(&sni, port)) =>
+            {
+                dispatch_tls(shared, ingress, stream, prefix, Some(sni), dst).await;
                 return;
             }
-        },
-        Mode::Restricted => match restricted_tcp_rule(&shared, &policy, dst).await {
-            Some(found) => found,
-            None => {
-                deny(
-                    &shared,
-                    ingress,
-                    None,
-                    port,
-                    Some(dst.ip()),
-                    "not_allowlisted",
-                );
-                return;
-            }
-        },
+            Ok(Err(_)) => return,
+            _ => {}
+        }
+    }
+    let (tags, target) = match decide_raw_tcp(&shared, dst).await {
+        Ok(plan) => plan,
+        Err(reason) => {
+            deny(&shared, ingress, None, port, Some(dst.ip()), &reason);
+            return;
+        }
     };
-    let tags = tags_for(&policy, ConnKind::RawTcp, host, port, &target);
-    admit_and_splice(&shared, ingress, tags, &target, stream, Vec::new()).await;
+    admit_and_splice(&shared, ingress, tags, target, stream, prefix).await;
 }
 
 /// Under Restricted egress, raw TCP is allowed only to an allowlisted host on one of its ports
@@ -951,84 +1078,17 @@ pub(crate) async fn handle_transparent_resource(shared: Arc<Shared>, mut stream:
         return;
     };
     let port = dst.port();
-    let Some(snapshot) = shared.snapshot() else {
-        deny(
+    match decide_resource(&shared, dst).await {
+        Ok((tags, target)) => {
+            admit_and_splice(&shared, ingress, tags, target, stream, Vec::new()).await
+        }
+        Err((name, reason)) => deny(
             &shared,
             ingress,
-            None,
+            name.as_deref(),
             port,
             Some(dst.ip()),
-            "not_initialized",
-        );
-        return;
-    };
-    let policy = snapshot.policy.clone();
-    let guest_ip = match crate::ip::normalize(dst.ip()) {
-        Ok(IpAddr::V4(v4)) if synthetic_resource_net().contains(IpAddr::V4(v4)) => v4,
-        _ => {
-            deny(
-                &shared,
-                ingress,
-                None,
-                port,
-                Some(dst.ip()),
-                "not_a_resource_address",
-            );
-            return;
-        }
-    };
-    let Some(resource) = policy.resource_at(guest_ip, port).cloned() else {
-        deny(
-            &shared,
-            ingress,
-            None,
-            port,
-            Some(dst.ip()),
-            "no_such_resource",
-        );
-        return;
-    };
-    let ips = match shared.resolver.lookup_ips(&resource.host).await {
-        Ok(ips) => ips,
-        Err(e) => {
-            deny(
-                &shared,
-                ingress,
-                Some(&resource.name),
-                port,
-                None,
-                &format!("resolve_failed:{e}"),
-            );
-            return;
-        }
-    };
-    let addrs: Vec<SocketAddr> = ips
-        .into_iter()
-        .filter_map(|ip| policy.addresses.private_target_verdict(ip).ok())
-        .map(|ip| SocketAddr::new(ip, resource.port))
-        .collect();
-    if addrs.is_empty() {
-        deny(
-            &shared,
-            ingress,
-            Some(&resource.name),
-            port,
-            None,
-            "no_address",
-        );
-        return;
+            &reason,
+        ),
     }
-    let target = Target {
-        ip: addrs.first().map(SocketAddr::ip),
-        addrs,
-        mirror: None,
-    };
-    let mut tags = ConnTags::new(
-        &policy,
-        ConnKind::Resource,
-        Some(resource.name.clone()),
-        port,
-    );
-    tags.ip = target.ip;
-    admit_and_splice(&shared, ingress, tags, &target, stream, Vec::new()).await;
 }

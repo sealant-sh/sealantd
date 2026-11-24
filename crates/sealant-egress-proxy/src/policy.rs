@@ -13,7 +13,9 @@ use crate::tls::MitmAuthority;
 
 /// The disconnected lease when the policy names none (architecture §7.3).
 pub const DEFAULT_LEASE_TTL_SECS: u64 = 120;
-const MAX_LEASE_TTL_SECS: u64 = 3600;
+/// The lease never outlasts the architecture's 120 s bound: a dead control plane fails closed
+/// within two minutes whatever a policy asks for.
+const MAX_LEASE_TTL_SECS: u64 = DEFAULT_LEASE_TTL_SECS;
 
 /// The synthetic guest range worktree resources are answered from.
 pub(crate) fn synthetic_resource_net() -> Cidr {
@@ -44,6 +46,12 @@ pub struct SecretValue(String);
 impl SecretValue {
     pub(crate) fn expose(&self) -> &str {
         &self.0
+    }
+}
+
+impl PartialEq for SecretValue {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
     }
 }
 
@@ -81,6 +89,12 @@ pub struct PolicyDocument {
     pub executor_ca_cert_pem: Option<String>,
     #[serde(default)]
     pub executor_ca_key_pem: Option<SecretValue>,
+    /// Durable host tombstones Sealant holds: refused in every mode, whatever else the policy says.
+    #[serde(default)]
+    pub revoked_hosts: Vec<String>,
+    /// Durable secret tombstones Sealant holds: never loaded, whatever else the policy says.
+    #[serde(default)]
+    pub revoked_secret_ids: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -219,7 +233,7 @@ pub struct Policy {
     pub denied_hosts: BTreeSet<String>,
     pub ca: Option<Arc<MitmAuthority>>,
     /// The PEM the CA was built from, so an unchanged CA keeps its minted-leaf cache.
-    pub(crate) ca_source: Option<(String, String)>,
+    pub(crate) ca_source: Option<(String, SecretValue)>,
 }
 
 impl Policy {
@@ -336,6 +350,15 @@ impl Policy {
                     "brokeredSecrets `{id}`: value must be a non-empty single-line header value"
                 )));
             }
+            if FORBIDDEN_SECRET_HEADERS
+                .iter()
+                .any(|h| h.eq_ignore_ascii_case(entry.header_name.trim()))
+            {
+                return Err(invalid(format!(
+                    "brokeredSecrets `{id}`: headerName `{}` frames or routes the request and cannot carry a secret",
+                    entry.header_name
+                )));
+            }
             if !is_header_token(&entry.header_name) {
                 return Err(invalid(format!(
                     "brokeredSecrets `{id}`: headerName must be one HTTP header name"
@@ -370,7 +393,7 @@ impl Policy {
         let needs_ca = !secrets.is_empty() || allow_hosts.iter().any(|h| h.inspect_tls);
         let (ca, ca_source) = match (doc.executor_ca_cert_pem, doc.executor_ca_key_pem) {
             (Some(cert), Some(key)) => {
-                let source = (cert, key.expose().to_string());
+                let source = (cert, key);
                 let reused = previous.and_then(|p| match (&p.ca, &p.ca_source) {
                     (Some(ca), Some(prev)) if *prev == source => Some(ca.clone()),
                     _ => None,
@@ -378,7 +401,7 @@ impl Policy {
                 let ca = match reused {
                     Some(ca) => ca,
                     None => Arc::new(
-                        MitmAuthority::from_pem(&source.0, &source.1)
+                        MitmAuthority::from_pem(&source.0, source.1.expose())
                             .map_err(|e| PolicyError::Ca(e.to_string()))?,
                     ),
                 };
@@ -397,7 +420,7 @@ impl Policy {
             ));
         }
 
-        Ok(Self {
+        let mut policy = Self {
             mode: doc.mode,
             policy_hash: doc.policy_hash,
             revocation_watermark: doc.revocation_watermark,
@@ -410,7 +433,16 @@ impl Policy {
             denied_hosts: BTreeSet::new(),
             ca,
             ca_source,
-        })
+        };
+        for id in &doc.revoked_secret_ids {
+            policy.revoke_secret(id.trim());
+        }
+        for host in &doc.revoked_hosts {
+            let host = normalize_host(host)
+                .ok_or_else(|| invalid(format!("revokedHosts: `{host}` is not a hostname")))?;
+            policy.revoke_host(&host);
+        }
+        Ok(policy)
     }
 
     pub(crate) fn host_denied(&self, host: &str) -> bool {
@@ -459,6 +491,41 @@ impl Policy {
                 .any(|h| h.host == host && h.inspect_tls)
     }
 
+    /// The ports TLS to an inspected `host` is terminated on: its `allowHosts` ports, else 443.
+    fn inspection_ports(&self, host: &str) -> Vec<u16> {
+        let configured: Vec<u16> = self
+            .allow_hosts
+            .iter()
+            .filter(|h| h.host == host)
+            .flat_map(|h| h.ports.iter().copied())
+            .collect();
+        if configured.is_empty() {
+            vec![443]
+        } else {
+            configured
+        }
+    }
+
+    /// Whether TLS to `(host, port)` is terminated and inspected. A brokered host on a port the
+    /// policy never named is passed through untouched, so no secret goes to an arbitrary port.
+    pub(crate) fn inspects_on(&self, host: &str, port: u16) -> bool {
+        self.inspects(host) && self.inspection_ports(host).contains(&port)
+    }
+
+    /// Whether any inspected host is inspected on `port`.
+    pub(crate) fn inspects_any_on(&self, port: u16) -> bool {
+        self.secrets
+            .iter()
+            .flat_map(|s| s.bind_hosts.iter())
+            .chain(
+                self.allow_hosts
+                    .iter()
+                    .filter(|h| h.inspect_tls)
+                    .map(|h| &h.host),
+            )
+            .any(|host| self.inspects_on(host, port))
+    }
+
     pub(crate) fn secrets_for<'a>(
         &'a self,
         host: &'a str,
@@ -477,11 +544,12 @@ impl Policy {
         ids
     }
 
-    /// The inspection rule for an inspected host, when one names methods or path prefixes.
+    /// The `allowHosts` rule for an inspected `(host, port)`, whether inspection comes from
+    /// `inspectTls` or from a brokered secret, so its methods and path prefixes always apply.
     pub(crate) fn inspect_rule(&self, host: &str, port: u16) -> Option<&AllowHost> {
         self.allow_hosts
             .iter()
-            .find(|h| h.host == host && h.inspect_tls && h.ports.contains(&port))
+            .find(|h| h.host == host && h.ports.contains(&port))
     }
 
     pub(crate) fn mirror_for(&self, host: &str, port: u16) -> Option<&Mirror> {
@@ -538,6 +606,20 @@ impl Policy {
         self.secrets.clear();
     }
 }
+
+/// Headers that frame, route or authenticate the request to the proxy itself.
+const FORBIDDEN_SECRET_HEADERS: &[&str] = &[
+    "host",
+    "content-length",
+    "transfer-encoding",
+    "connection",
+    "upgrade",
+    "te",
+    "trailer",
+    "keep-alive",
+    "proxy-authorization",
+    "proxy-connection",
+];
 
 fn is_visible_ascii(b: u8) -> bool {
     (0x21..=0x7e).contains(&b)
@@ -742,6 +824,97 @@ mod tests {
         bad["headerName"] = "Authorization: x".into();
         let err = Policy::from_document(base(bad), None).unwrap_err();
         assert!(err.to_string().contains("headerName"), "{err}");
+    }
+
+    #[test]
+    fn the_lease_never_outlasts_120_seconds() {
+        for ttl in [0, 121, 3600] {
+            let err = Policy::from_document(
+                doc(serde_json::json!({
+                    "mode": "standard", "policyHash": "h", "revocationWatermark": 0,
+                    "leaseTtlSecs": ttl
+                })),
+                None,
+            )
+            .unwrap_err();
+            assert!(err.to_string().contains("leaseTtlSecs"), "{ttl}: {err}");
+        }
+    }
+
+    #[test]
+    fn framing_and_routing_headers_cannot_carry_a_secret() {
+        for header in [
+            "Host",
+            "content-length",
+            "Transfer-Encoding",
+            "Connection",
+            "Upgrade",
+            "TE",
+            "Proxy-Authorization",
+            "Proxy-Connection",
+        ] {
+            let err = Policy::from_document(
+                doc(serde_json::json!({
+                    "mode": "standard", "policyHash": "h", "revocationWatermark": 0,
+                    "brokeredSecrets": [{
+                        "secretId": "s1", "placeholder": "mend_sec_abcdefgh", "value": "real",
+                        "headerName": header, "bindHosts": ["api.example.com"]
+                    }]
+                })),
+                None,
+            )
+            .unwrap_err();
+            assert!(
+                err.to_string().contains("cannot carry a secret"),
+                "{header}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn durable_tombstones_in_the_policy_win_over_its_grants() {
+        let policy = Policy::from_document(
+            doc(serde_json::json!({
+                "mode": "restricted", "policyHash": "h", "revocationWatermark": 4,
+                "allowHosts": [{ "host": "a.example.com" }, { "host": "b.example.com" }],
+                "revokedHosts": ["A.example.com"],
+                "revokedSecretIds": ["gone"]
+            })),
+            None,
+        )
+        .unwrap();
+        assert!(!policy.restricted_allows("a.example.com", 443));
+        assert!(policy.host_denied("a.example.com"));
+        assert!(policy.restricted_allows("b.example.com", 443));
+    }
+
+    #[test]
+    fn brokered_hosts_are_inspected_only_on_their_ports() {
+        let mut policy = Policy::from_document(
+            doc(serde_json::json!({
+                "mode": "standard", "policyHash": "h", "revocationWatermark": 0,
+                "allowHosts": [{ "host": "custom.example.com", "ports": [8443] }]
+            })),
+            None,
+        )
+        .unwrap();
+        policy.allow_hosts[0].inspect_tls = true;
+        assert!(policy.inspects_on("custom.example.com", 8443));
+        assert!(!policy.inspects_on("custom.example.com", 443));
+        assert!(policy.inspects_any_on(8443));
+        assert!(!policy.inspects_any_on(443));
+        // A bindHost with no allowHosts entry: 443 only.
+        policy.secrets.push(BrokeredSecret {
+            secret_id: "s".into(),
+            placeholder: "mend_sec_abcdefgh".into(),
+            value: serde_json::from_str("\"v\"").unwrap(),
+            header_name: "authorization".into(),
+            bind_hosts: vec!["api.example.com".into()],
+            methods: None,
+            path_prefixes: None,
+        });
+        assert!(policy.inspects_on("api.example.com", 443));
+        assert!(!policy.inspects_on("api.example.com", 8443));
     }
 
     #[test]

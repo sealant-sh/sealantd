@@ -280,19 +280,22 @@ async fn brokered_secret_is_substituted_only_in_its_header_on_its_host() {
         public.roots(),
     )
     .await;
-    let policy = with_broker(
-        base_policy(1),
-        &executor,
-        json!([
-            secret("s1", PLACEHOLDER, SECRET, "Authorization", &["api.test"]),
-            secret(
-                "s2",
-                "mend_sec_evilevilevilevilevil",
-                "evil-real",
-                "Authorization",
-                &["evil.test"]
-            ),
-        ]),
+    let policy = on_ports(
+        &[("api.test", port), ("evil.test", evil_port)],
+        with_broker(
+            base_policy(1),
+            &executor,
+            json!([
+                secret("s1", PLACEHOLDER, SECRET, "Authorization", &["api.test"]),
+                secret(
+                    "s2",
+                    "mend_sec_evilevilevilevilevil",
+                    "evil-real",
+                    "Authorization",
+                    &["evil.test"]
+                ),
+            ]),
+        ),
     );
     assert_eq!(h.put_policy(&policy).await.0, 200);
 
@@ -364,16 +367,19 @@ async fn transparent_listeners_relay_by_the_proxy_v2_destination() {
         public.roots(),
     )
     .await;
-    let mut policy = with_broker(
-        base_policy(1),
-        &executor,
-        json!([secret(
-            "s1",
-            PLACEHOLDER,
-            SECRET,
-            "Authorization",
-            &["api.test"]
-        )]),
+    let mut policy = on_ports(
+        &[("api.test", tls_port)],
+        with_broker(
+            base_policy(1),
+            &executor,
+            json!([secret(
+                "s1",
+                PLACEHOLDER,
+                SECRET,
+                "Authorization",
+                &["api.test"]
+            )]),
+        ),
     );
     policy["allowResources"] =
         json!([{ "name": "db", "host": "db-real.test", "port": echo, "guestIp": "10.201.0.7" }]);
@@ -490,16 +496,19 @@ async fn revoke_closes_a_live_websocket_before_it_answers() {
     let executor = Ca::new("executor");
     let (port, auth_seen) = wss_echo(public.server_config(&["ws.test"])).await;
     let h = Harness::start(records(&[("ws.test", localhost())]), public.roots()).await;
-    let policy = with_broker(
-        base_policy(1),
-        &executor,
-        json!([secret(
-            "ws-secret",
-            WS_PLACEHOLDER,
-            WS_SECRET,
-            "Authorization",
-            &["ws.test"]
-        )]),
+    let policy = on_ports(
+        &[("ws.test", port)],
+        with_broker(
+            base_policy(1),
+            &executor,
+            json!([secret(
+                "ws-secret",
+                WS_PLACEHOLDER,
+                WS_SECRET,
+                "Authorization",
+                &["ws.test"]
+            )]),
+        ),
     );
     assert_eq!(h.put_policy(&policy).await.0, 200);
 
@@ -565,16 +574,19 @@ async fn lease_expiry_closes_brokered_streams_while_standard_ones_ride_through()
         public.roots(),
     )
     .await;
-    let mut policy = with_broker(
-        base_policy(1),
-        &executor,
-        json!([secret(
-            "s1",
-            PLACEHOLDER,
-            SECRET,
-            "Authorization",
-            &["api.test"]
-        )]),
+    let mut policy = on_ports(
+        &[("api.test", port)],
+        with_broker(
+            base_policy(1),
+            &executor,
+            json!([secret(
+                "s1",
+                PLACEHOLDER,
+                SECRET,
+                "Authorization",
+                &["api.test"]
+            )]),
+        ),
     );
     policy["leaseTtlSecs"] = json!(1);
     assert_eq!(h.put_policy(&policy).await.0, 200);
@@ -656,16 +668,19 @@ async fn revocation_watermark_never_rolls_back() {
     let (port, _) = https_echo(public.server_config(&["api.test"])).await;
     let h = Harness::start(records(&[("api.test", localhost())]), public.roots()).await;
     let policy = |wm: u64| {
-        with_broker(
-            base_policy(wm),
-            &executor,
-            json!([secret(
-                "s1",
-                PLACEHOLDER,
-                SECRET,
-                "Authorization",
-                &["api.test"]
-            )]),
+        on_ports(
+            &[("api.test", port)],
+            with_broker(
+                base_policy(wm),
+                &executor,
+                json!([secret(
+                    "s1",
+                    PLACEHOLDER,
+                    SECRET,
+                    "Authorization",
+                    &["api.test"]
+                )]),
+            ),
         )
     };
     assert_eq!(h.put_policy(&policy(5)).await.0, 200);
@@ -728,16 +743,19 @@ async fn a_policy_that_drops_a_secret_closes_its_streams() {
     let executor = Ca::new("executor");
     let (port, _) = https_echo(public.server_config(&["api.test"])).await;
     let h = Harness::start(records(&[("api.test", localhost())]), public.roots()).await;
-    let policy = with_broker(
-        base_policy(1),
-        &executor,
-        json!([secret(
-            "s1",
-            PLACEHOLDER,
-            SECRET,
-            "Authorization",
-            &["api.test"]
-        )]),
+    let policy = on_ports(
+        &[("api.test", port)],
+        with_broker(
+            base_policy(1),
+            &executor,
+            json!([secret(
+                "s1",
+                PLACEHOLDER,
+                SECRET,
+                "Authorization",
+                &["api.test"]
+            )]),
+        ),
     );
     assert_eq!(h.put_policy(&policy).await.0, 200);
     let (tunnel, _) = connect_tunnel(h.explicit(), "api.test", port).await;

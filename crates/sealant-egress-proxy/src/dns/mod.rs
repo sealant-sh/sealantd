@@ -332,9 +332,17 @@ async fn forward_filtered(shared: &Shared, policy: &Policy, ctx: &Ctx<'_>, name:
     ctx.reply(rcode, &answers)
 }
 
-/// Bind the UDP and TCP sockets on the same address (the same port when `addr` names port 0).
+/// Bind the UDP and TCP sockets on the same address. With port 0 the TCP port matching the
+/// UDP one the kernel picked can be taken, so that case tries a few times.
 pub(crate) async fn bind(addr: SocketAddr) -> std::io::Result<(UdpSocket, TcpListener)> {
-    let udp = UdpSocket::bind(addr).await?;
-    let tcp = TcpListener::bind(udp.local_addr()?).await?;
-    Ok((udp, tcp))
+    let attempts = if addr.port() == 0 { 16 } else { 1 };
+    let mut last = None;
+    for _ in 0..attempts {
+        let udp = UdpSocket::bind(addr).await?;
+        match TcpListener::bind(udp.local_addr()?).await {
+            Ok(tcp) => return Ok((udp, tcp)),
+            Err(e) => last = Some(e),
+        }
+    }
+    Err(last.unwrap_or_else(|| std::io::Error::from(std::io::ErrorKind::AddrInUse)))
 }

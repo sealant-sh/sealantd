@@ -519,6 +519,17 @@ pub(crate) fn with_broker(mut policy: Value, ca: &Ca, secrets: Value) -> Value {
     policy
 }
 
+/// Name the ports TLS to each host is inspected (and brokered) on: 443 is the default, and the
+/// test upstreams listen on ephemeral ports.
+pub(crate) fn on_ports(ports: &[(&str, u16)], mut policy: Value) -> Value {
+    let mut entries = policy["allowHosts"].as_array().cloned().unwrap_or_default();
+    for (host, port) in ports {
+        entries.push(json!({ "host": host, "ports": [port] }));
+    }
+    policy["allowHosts"] = Value::Array(entries);
+    policy
+}
+
 pub(crate) fn secret(
     id: &str,
     placeholder: &str,

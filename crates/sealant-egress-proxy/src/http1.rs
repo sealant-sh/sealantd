@@ -16,6 +16,9 @@ pub(crate) enum HttpError {
     Malformed(&'static str),
     #[error("HTTP head larger than {MAX_HEAD} bytes")]
     HeadTooLarge,
+    /// A reused upstream closed before sending a byte of the response.
+    #[error("upstream closed before responding")]
+    UpstreamClosedEarly,
 }
 
 /// A reader that keeps what it read past the current message for the next one.
@@ -30,6 +33,11 @@ impl<R: AsyncRead + Unpin> HttpReader<R> {
             inner,
             buf: initial,
         }
+    }
+
+    /// Read once more into the buffer. Used to notice an idle peer closing or misbehaving.
+    pub(crate) async fn fill_once(&mut self) -> io::Result<usize> {
+        self.fill().await
     }
 
     async fn fill(&mut self) -> io::Result<usize> {
@@ -230,7 +238,12 @@ pub(crate) fn parse_request(head: &[u8]) -> Result<RequestHead, HttpError> {
     let mut storage = [httparse::EMPTY_HEADER; MAX_HEADERS];
     let mut req = httparse::Request::new(&mut storage);
     match req.parse(head) {
-        Ok(httparse::Status::Complete(_)) => {}
+        // A head httparse ends before the blank line `read_head` found (bare LFs) would leave
+        // bytes that one side reads as a second message and the other as this one's body.
+        Ok(httparse::Status::Complete(n)) if n == head.len() => {}
+        Ok(httparse::Status::Complete(_)) => {
+            return Err(HttpError::Malformed("head ends before its CRLF blank line"));
+        }
         Ok(httparse::Status::Partial) => {
             return Err(HttpError::Malformed("incomplete request head"));
         }
@@ -251,7 +264,12 @@ pub(crate) fn parse_response(head: &[u8]) -> Result<ResponseHead, HttpError> {
     let mut storage = [httparse::EMPTY_HEADER; MAX_HEADERS];
     let mut res = httparse::Response::new(&mut storage);
     match res.parse(head) {
-        Ok(httparse::Status::Complete(_)) => {}
+        // A head httparse ends before the blank line `read_head` found (bare LFs) would leave
+        // bytes that one side reads as a second message and the other as this one's body.
+        Ok(httparse::Status::Complete(n)) if n == head.len() => {}
+        Ok(httparse::Status::Complete(_)) => {
+            return Err(HttpError::Malformed("head ends before its CRLF blank line"));
+        }
         Ok(httparse::Status::Partial) => {
             return Err(HttpError::Malformed("incomplete response head"));
         }
@@ -321,6 +339,29 @@ fn chunked_last(headers: &[Header]) -> Option<bool> {
 }
 
 impl RequestHead {
+    /// The one `Host` header, normalized, with its port. Missing, repeated or malformed is an
+    /// error: a second Host is the classic way to make two parsers disagree on the target.
+    pub(crate) fn single_host(&self) -> Result<(String, Option<u16>), HttpError> {
+        let mut hosts = self
+            .headers
+            .iter()
+            .filter(|h| h.name.eq_ignore_ascii_case("host"));
+        let (Some(only), None) = (hosts.next(), hosts.next()) else {
+            return Err(HttpError::Malformed("exactly one Host header is required"));
+        };
+        std::str::from_utf8(&only.value)
+            .ok()
+            .filter(|v| !v.is_empty() && !v.contains(['@', '/', '\\', ' ', ',']))
+            .and_then(crate::policy::split_host_port)
+            .ok_or(HttpError::Malformed("malformed Host header"))
+    }
+
+    /// Whether the target is origin-form (`/path`), or `*` for OPTIONS. Anything else names an
+    /// authority of its own that an origin would prefer over Host (RFC 9112 §3.2.2).
+    pub(crate) fn is_origin_form(&self) -> bool {
+        self.target.starts_with('/') || (self.target == "*" && self.method == "OPTIONS")
+    }
+
     pub(crate) fn header(&self, name: &str) -> Option<&[u8]> {
         header(&self.headers, name)
     }
@@ -519,6 +560,47 @@ mod tests {
             Framing::Chunked
         );
         assert_eq!(req("").framing().unwrap(), Framing::None);
+    }
+
+    #[test]
+    fn a_head_that_ends_before_its_crlf_blank_line_is_refused() {
+        let head = b"GET /a HTTP/1.1\nHost: a\n\nGET /b HTTP/1.1\r\nHost: a\r\n\r\n";
+        assert!(parse_request(head).is_err());
+        assert!(parse_request(b"GET /a HTTP/1.1\r\nHost: a\r\n\r\n").is_ok());
+    }
+
+    #[test]
+    fn exactly_one_well_formed_host_is_required() {
+        let host = |extra: &str| {
+            parse_request(format!("GET / HTTP/1.1\r\n{extra}\r\n").as_bytes())
+                .unwrap()
+                .single_host()
+        };
+        assert_eq!(
+            host("Host: API.test:8443\r\n").unwrap(),
+            ("api.test".into(), Some(8443))
+        );
+        assert!(host("").is_err());
+        assert!(host("Host: a.test\r\nHost: b.test\r\n").is_err());
+        assert!(host("Host: a.test\r\nhost: a.test\r\n").is_err());
+        assert!(host("Host: user@a.test\r\n").is_err());
+        assert!(host("Host: a.test/x\r\n").is_err());
+        assert!(host("Host: a.test, b.test\r\n").is_err());
+    }
+
+    #[test]
+    fn only_origin_form_targets_are_origin_form() {
+        let form = |line: &str| {
+            parse_request(format!("{line} HTTP/1.1\r\nHost: a\r\n\r\n").as_bytes())
+                .unwrap()
+                .is_origin_form()
+        };
+        assert!(form("GET /v1"));
+        assert!(form("OPTIONS *"));
+        assert!(!form("GET *"));
+        assert!(!form("GET HTTPS://evil.test/steal"));
+        assert!(!form("GET foo://evil.test/x"));
+        assert!(!form("GET evil.test:443"));
     }
 
     #[test]

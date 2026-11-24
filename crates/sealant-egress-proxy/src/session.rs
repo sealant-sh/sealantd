@@ -21,7 +21,7 @@ use crate::http1::{
     Framing, HttpError, HttpReader, RequestHead, parse_request, parse_response, simple_response,
 };
 use crate::io::{BoxStream, Stream, connect_any, splice_halves};
-use crate::policy::{BrokeredSecret, scope_permits, split_host_port};
+use crate::policy::{BrokeredSecret, scope_permits};
 use crate::state::{Ingress, Shared};
 
 const FIRST_HEAD_TIMEOUT: Duration = Duration::from_secs(30);
@@ -68,7 +68,7 @@ pub(crate) async fn run<C: Stream + 'static>(
                 } else {
                     IDLE_TIMEOUT
                 };
-                let head = match tokio::time::timeout(wait, creader.read_head()).await {
+                let head = match next_head(&mut creader, &mut upstream, wait).await {
                     Ok(Ok(Some(head))) => head,
                     Ok(Ok(None)) | Err(_) => break,
                     Ok(Err(e)) => {
@@ -114,46 +114,65 @@ pub(crate) async fn run<C: Stream + 'static>(
         if spec.single_request && !upgrade {
             req.set("Connection", b"close");
         }
+        let head = req.encode();
 
-        if upstream.is_none() {
-            match dial(&shared, &spec).await {
-                Ok(stream) => {
-                    let (ur, uw) = tokio::io::split(stream);
-                    upstream = Some((HttpReader::new(ur, Vec::new()), uw));
-                }
-                Err(reason) => {
-                    shared.events.emit(Event {
-                        ingress: Some(spec.ingress.as_str()),
-                        host: Some(spec.host.clone()),
-                        port: Some(spec.port),
-                        reason: Some(reason.clone()),
-                        ..Event::new("upstream_error")
-                    });
-                    reject(&mut cw, 502, "upstream unavailable").await;
-                    break;
+        // A reused upstream can close between our idle check and our write. A request with no
+        // body is safe to send again, once, on a fresh connection.
+        let mut retried = false;
+        let relay = loop {
+            let reused = upstream.is_some();
+            if upstream.is_none() {
+                match dial(&shared, &spec).await {
+                    Ok(stream) => {
+                        let (ur, uw) = tokio::io::split(stream);
+                        upstream = Some((HttpReader::new(ur, Vec::new()), uw));
+                    }
+                    Err(reason) => {
+                        shared.events.emit(Event {
+                            ingress: Some(spec.ingress.as_str()),
+                            host: Some(spec.host.clone()),
+                            port: Some(spec.port),
+                            reason: Some(reason.clone()),
+                            ..Event::new("upstream_error")
+                        });
+                        reject(&mut cw, 502, "upstream unavailable").await;
+                        break None;
+                    }
                 }
             }
-        }
-        let Some((ureader, uw)) = upstream.as_mut() else {
-            break;
+            let Some((ureader, uw)) = upstream.as_mut() else {
+                break None;
+            };
+            let result = match uw.write_all(&head).await {
+                Ok(()) => tokio::try_join!(
+                    async {
+                        creader.copy_body(framing, uw).await?;
+                        uw.flush().await?;
+                        Ok::<_, HttpError>(())
+                    },
+                    relay_response(ureader, &mut cw, &req.method, upgrade, spec.single_request),
+                ),
+                Err(_) => Err(HttpError::UpstreamClosedEarly),
+            };
+            match result {
+                Err(HttpError::UpstreamClosedEarly)
+                    if reused
+                        && !retried
+                        && matches!(framing, Framing::None | Framing::Length(0)) =>
+                {
+                    retried = true;
+                    upstream = None;
+                }
+                other => break Some(other),
+            }
         };
-        if uw.write_all(&req.encode()).await.is_err() {
-            break;
-        }
-        let relay = tokio::try_join!(
-            async {
-                creader.copy_body(framing, uw).await?;
-                uw.flush().await?;
-                Ok::<_, HttpError>(())
-            },
-            relay_response(ureader, &mut cw, &req.method, upgrade, spec.single_request),
-        );
         let (outcome, status) = match relay {
-            Ok(((), result)) => result,
-            Err(e) => {
+            Some(Ok(((), result))) => result,
+            Some(Err(e)) => {
                 tracing::debug!(host = %spec.host, error = %e, "relay ended");
                 break;
             }
+            None => break,
         };
         shared.events.emit(Event {
             ingress: Some(spec.ingress.as_str()),
@@ -182,6 +201,8 @@ pub(crate) async fn run<C: Stream + 'static>(
                 return;
             }
             Outcome::Done { keep_alive } => {
+                // A response delimited by close, or one that says it closes, ends the client
+                // connection too: the client was told so and reads it that way.
                 if spec.single_request || !keep_alive || !req.keep_alive() {
                     break;
                 }
@@ -191,6 +212,26 @@ pub(crate) async fn run<C: Stream + 'static>(
     let _ = cw.shutdown().await;
 }
 
+/// Wait for the client's next head. While idle, an upstream that closes, errors or sends bytes
+/// nobody asked for is dropped, so the next request dials a fresh connection.
+async fn next_head<R: tokio::io::AsyncRead + Unpin>(
+    creader: &mut HttpReader<R>,
+    upstream: &mut Option<Upstream>,
+    wait: Duration,
+) -> Result<Result<Option<Vec<u8>>, HttpError>, tokio::time::error::Elapsed> {
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        let Some((ureader, _)) = upstream.as_mut() else {
+            return tokio::time::timeout_at(deadline, creader.read_head()).await;
+        };
+        tokio::select! {
+            head = tokio::time::timeout_at(deadline, creader.read_head()) => return head,
+            _ = ureader.fill_once() => {}
+        }
+        *upstream = None;
+    }
+}
+
 /// The per-request checks on an inspected host. Returns the secret IDs substituted.
 fn check_inspected(
     shared: &Shared,
@@ -198,17 +239,14 @@ fn check_inspected(
     req: &mut RequestHead,
     path: &str,
 ) -> Result<Vec<String>, (u16, String)> {
-    let host_header = req
-        .header("host")
-        .and_then(|v| std::str::from_utf8(v).ok())
-        .and_then(split_host_port)
-        .map(|(host, _)| host);
-    if host_header.as_deref() != Some(spec.host.as_str()) {
-        return Err((403, "sni_host_mismatch".into()));
+    if !req.is_origin_form() {
+        return Err((400, "target_not_origin_form".into()));
     }
-    if let Some(authority) = absolute_authority(&req.target)
-        && split_host_port(authority).map(|(h, _)| h).as_deref() != Some(spec.host.as_str())
-    {
+    let host = match req.single_host() {
+        Ok((host, _)) => host,
+        Err(_) => return Err((400, "bad_host_header".into())),
+    };
+    if host != spec.host {
         return Err((403, "sni_host_mismatch".into()));
     }
     let Some(snapshot) = shared.snapshot() else {
@@ -316,13 +354,14 @@ pub(crate) fn request_path(target: &str) -> String {
     }
 }
 
-/// No dot segments, empty segments, backslashes or encoded dots and slashes, so a path prefix
+/// No dot segments, empty segments, `;` parameters, backslashes or encoded dots and slashes, so a path prefix
 /// check cannot be stepped around.
 fn path_is_canonical(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
     path.starts_with('/')
         && !path.contains('\\')
         && !path.contains("//")
+        && !path.contains(';')
         && !["%2e", "%2f", "%5c"].iter().any(|e| lower.contains(e))
         && !path.split('/').any(|seg| seg == "." || seg == "..")
 }
@@ -340,7 +379,7 @@ where
 {
     loop {
         let Some(head) = ureader.read_head().await? else {
-            return Err(HttpError::Malformed("upstream closed before responding"));
+            return Err(HttpError::UpstreamClosedEarly);
         };
         let resp = parse_response(&head)?;
         if resp.status == 101 {
@@ -485,6 +524,8 @@ mod tests {
             "/v1//x",
             "/v1\\x",
             "/v1/%2F",
+            "/v1/..;/admin",
+            "/v1;x=1/y",
         ] {
             assert!(!path_is_canonical(bad), "{bad}");
         }
