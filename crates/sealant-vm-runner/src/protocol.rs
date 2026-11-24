@@ -1,9 +1,14 @@
-//! The `vsock:1026` boot handoff and exit status (§5.3, §6.1, §6.2).
+//! The `vsock:1026` boot handoff and exit status (§5.3, §6.1, §6.2), shared with `sealantd --vm`.
 //!
-//! Newline-delimited JSON, one object per line, each carrying `version: 1`. On every guest
-//! connection to port 1026 the runner writes one [`VmBootConfig`] line, then reads lines until the
-//! guest closes; each valid [`GuestExitStatus`] line is recorded (the last one wins). The guest may
-//! keep one connection for both, or connect again at shutdown to send its exit status.
+//! Newline-delimited JSON, one object per line, each carrying `"version": 1`. The runner accepts
+//! exactly one connection on port 1026, the one PID 1 makes at boot, and at once closes and unlinks
+//! its listener, so no later guest process can dial 2:1026 to read the secret environment or forge
+//! an exit status. On that connection, which stays open for the VM's life:
+//!
+//! - runner → guest, at once: one [`VmBootConfig`] line;
+//! - runner → guest, on SIGTERM/SIGINT: `{"version":1,"type":"shutdown"}`;
+//! - guest → runner, after `sync()`: `{"version":1,"type":"exit","exitCode":…,"synced":…,"reason":…}`;
+//! - runner → guest, once that status is recorded: `{"version":1,"type":"exitAck","accepted":true}`.
 //!
 //! The runner assembles the boot config from files Sealant stages before it starts the container:
 //! the image's saved OCI config (`<digest>.config.json`), the launch material (`boot-env.json`, or
@@ -67,6 +72,8 @@ pub struct ImageConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GuestNetworkConfig {
+    /// `eth0`.
+    pub interface: String,
     /// `10.200.0.2/30`.
     pub address: String,
     pub gateway: String,
@@ -78,6 +85,7 @@ pub struct GuestNetworkConfig {
 impl GuestNetworkConfig {
     pub fn for_mac(mac: &str) -> Self {
         Self {
+            interface: "eth0".to_owned(),
             address: format!("{GUEST_IP}/{PREFIX_LEN}"),
             gateway: HOST_IP.to_string(),
             dns: vec![HOST_IP.to_string()],
@@ -87,7 +95,24 @@ impl GuestNetworkConfig {
     }
 }
 
-/// Runner → guest, once per connection on `vsock:1026`.
+/// A caller-provided dotfiles archive directory, carried inline: each file by name.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DotfilesArchive {
+    /// File name → base64 contents.
+    pub files: BTreeMap<String, String>,
+}
+
+/// File names only.
+impl fmt::Debug for DotfilesArchive {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DotfilesArchive")
+            .field("files", &self.files.keys().collect::<Vec<_>>())
+            .finish()
+    }
+}
+
+/// Runner → guest, once, on the boot connection.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VmBootConfig {
@@ -98,16 +123,18 @@ pub struct VmBootConfig {
     pub boot_env: BTreeMap<String, String>,
     #[serde(default)]
     pub secret_env: BTreeMap<String, String>,
-    /// The dotfiles archive as Sealant staged it (opaque to the runner).
+    /// Start the guest's own `dockerd`. Always false in recovery.
+    #[serde(default)]
+    pub dockerd: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub dotfiles_archive: Option<String>,
+    pub dotfiles_archive: Option<DotfilesArchive>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub executor_ca_pem: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network_config: Option<GuestNetworkConfig>,
 }
 
-/// Names only: secret values never reach a log line.
+/// Names only: neither secret values, boot env values nor file contents reach a log line.
 impl fmt::Debug for VmBootConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("VmBootConfig")
@@ -116,24 +143,34 @@ impl fmt::Debug for VmBootConfig {
             .field("config", &self.config)
             .field("boot_env", &self.boot_env.keys().collect::<Vec<_>>())
             .field("secret_env", &self.secret_env.keys().collect::<Vec<_>>())
-            .field(
-                "dotfiles_archive",
-                &self.dotfiles_archive.as_ref().map(String::len),
-            )
+            .field("dockerd", &self.dockerd)
+            .field("dotfiles_archive", &self.dotfiles_archive)
             .field("executor_ca_pem", &self.executor_ca_pem.is_some())
             .field("network_config", &self.network_config)
             .finish()
     }
 }
 
-/// Guest → runner on `vsock:1026`, after `sealantd` has `sync()`ed `/dev/vdb`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// What the guest reported on its way out, after `sealantd` has `sync()`ed `/dev/vdb`.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GuestExitStatus {
     pub version: u32,
     pub exit_code: i32,
     pub synced: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+}
+
+/// The exit frame as it travels.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExitFrame {
+    version: u32,
+    #[serde(rename = "type")]
+    kind: String,
+    exit_code: i32,
+    synced: bool,
+    #[serde(default)]
+    reason: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -142,17 +179,60 @@ pub enum FrameError {
     Json(#[from] serde_json::Error),
     #[error("frame version {0}, expected {PROTOCOL_VERSION}")]
     Version(u32),
+    #[error("frame type {0:?}, expected \"exit\"")]
+    Type(String),
 }
 
 impl GuestExitStatus {
-    /// One line from the guest. A frame of another version is refused, not guessed at.
+    /// One line from the guest. A frame of another version or type is refused, not guessed at.
     pub fn parse_frame(line: &str) -> Result<Self, FrameError> {
-        let status: Self = serde_json::from_str(line.trim())?;
-        if status.version != PROTOCOL_VERSION {
-            return Err(FrameError::Version(status.version));
+        let frame: ExitFrame = serde_json::from_str(line.trim())?;
+        if frame.version != PROTOCOL_VERSION {
+            return Err(FrameError::Version(frame.version));
         }
-        Ok(status)
+        if frame.kind != "exit" {
+            return Err(FrameError::Type(frame.kind));
+        }
+        Ok(Self {
+            version: frame.version,
+            exit_code: frame.exit_code,
+            synced: frame.synced,
+            reason: frame.reason,
+        })
     }
+}
+
+/// A runner → guest control line, `version` first.
+#[derive(Serialize)]
+struct ControlFrame {
+    version: u32,
+    #[serde(rename = "type")]
+    kind: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    accepted: Option<bool>,
+}
+
+fn control_line(kind: &'static str, accepted: Option<bool>) -> String {
+    let frame = ControlFrame {
+        version: PROTOCOL_VERSION,
+        kind,
+        accepted,
+    };
+    // A struct of a number, a static string and a bool always serializes.
+    let mut line = serde_json::to_string(&frame).unwrap_or_default();
+    line.push('\n');
+    line
+}
+
+/// `{"version":1,"type":"shutdown"}`: power off in order.
+pub fn shutdown_line() -> String {
+    control_line("shutdown", None)
+}
+
+/// `{"version":1,"type":"exitAck","accepted":true}`: the status is recorded; the guest may power
+/// off.
+pub fn exit_ack_line() -> String {
+    control_line("exitAck", Some(true))
 }
 
 impl VmBootConfig {
@@ -175,7 +255,9 @@ struct StagedLaunch {
     #[serde(default)]
     secret_env: BTreeMap<String, String>,
     #[serde(default)]
-    dotfiles_archive: Option<String>,
+    dockerd: bool,
+    #[serde(default)]
+    dotfiles_archive: Option<DotfilesArchive>,
 }
 
 /// Where the staged files are.
@@ -276,6 +358,7 @@ pub fn load_boot_config(
         config,
         boot_env: launch.boot_env,
         secret_env: launch.secret_env,
+        dockerd: mode == BootMode::Normal && launch.dockerd,
         dotfiles_archive: launch.dotfiles_archive,
         executor_ca_pem,
         network_config: match mode {
@@ -324,7 +407,7 @@ mod tests {
         .unwrap();
         std::fs::write(
             tmp.path().join("boot-env.json"),
-            r#"{"bootEnv":{"MEND_X":"1"},"secretEnv":{"TOKEN":"s3cret"},"dotfilesArchive":"dGFy"}"#,
+            r#"{"bootEnv":{"MEND_X":"1"},"secretEnv":{"TOKEN":"s3cret"},"dockerd":true,"dotfilesArchive":{"files":{"manifest.json":"e30=","home.tar":"c2VjcmV0LWZpbGU="}}}"#,
         )
         .unwrap();
         std::fs::write(
@@ -351,7 +434,9 @@ mod tests {
         assert!(json["config"].get("Labels").is_none());
         assert_eq!(json["bootEnv"]["MEND_X"], "1");
         assert_eq!(json["secretEnv"]["TOKEN"], "s3cret");
-        assert_eq!(json["dotfilesArchive"], "dGFy");
+        assert_eq!(json["dockerd"], true);
+        assert_eq!(json["dotfilesArchive"]["files"]["manifest.json"], "e30=");
+        assert_eq!(json["networkConfig"]["interface"], "eth0");
         assert!(
             json["executorCaPem"]
                 .as_str()
@@ -366,6 +451,10 @@ mod tests {
         let debug = format!("{config:?}");
         assert!(
             debug.contains("TOKEN") && !debug.contains("s3cret"),
+            "{debug}"
+        );
+        assert!(
+            debug.contains("home.tar") && !debug.contains("c2VjcmV0LWZpbGU="),
             "{debug}"
         );
     }
@@ -386,7 +475,7 @@ mod tests {
         .unwrap();
         std::fs::write(
             tmp.path().join("recovery-env.json"),
-            r#"{"mode":"recover","secretEnv":{"A":"capture-only"}}"#,
+            r#"{"mode":"recover","secretEnv":{"A":"capture-only"},"dockerd":true}"#,
         )
         .unwrap();
         let config = load_boot_config(
@@ -399,6 +488,7 @@ mod tests {
         assert_eq!(config.secret_env["A"], "capture-only");
         assert_eq!(config.network_config, None);
         assert_eq!(config.executor_ca_pem, None);
+        assert!(!config.dockerd, "recovery never starts the guest's dockerd");
     }
 
     #[test]
@@ -429,23 +519,48 @@ mod tests {
     }
 
     #[test]
-    fn guest_exit_frames_must_be_version_1() {
-        let ok =
-            GuestExitStatus::parse_frame(r#"{"version":1,"exit_code":76,"synced":true}"#).unwrap();
+    fn guest_exit_frames_must_be_version_1_and_type_exit() {
+        let ok = GuestExitStatus::parse_frame(
+            r#"{"version":1,"type":"exit","exitCode":76,"synced":true,"reason":"never claimed"}"#,
+        )
+        .unwrap();
         assert_eq!(
             ok,
             GuestExitStatus {
                 version: 1,
                 exit_code: 76,
                 synced: true,
-                reason: None
+                reason: Some("never claimed".to_owned())
             }
         );
         assert!(matches!(
-            GuestExitStatus::parse_frame(r#"{"version":2,"exit_code":76,"synced":true}"#),
+            GuestExitStatus::parse_frame(
+                r#"{"version":2,"type":"exit","exitCode":76,"synced":true}"#
+            ),
             Err(FrameError::Version(2))
         ));
-        assert!(GuestExitStatus::parse_frame(r#"{"version":1,"exit_code":76}"#).is_err());
+        assert!(matches!(
+            GuestExitStatus::parse_frame(
+                r#"{"version":1,"type":"shutdown","exitCode":76,"synced":true}"#
+            ),
+            Err(FrameError::Type(_))
+        ));
+        // The snake_case untagged shape is not this protocol.
+        assert!(
+            GuestExitStatus::parse_frame(r#"{"version":1,"exit_code":76,"synced":true}"#).is_err()
+        );
+        assert!(
+            GuestExitStatus::parse_frame(r#"{"version":1,"type":"exit","exitCode":76}"#).is_err()
+        );
         assert!(GuestExitStatus::parse_frame("garbage").is_err());
+    }
+
+    #[test]
+    fn control_lines_put_the_version_first() {
+        assert_eq!(shutdown_line(), "{\"version\":1,\"type\":\"shutdown\"}\n");
+        assert_eq!(
+            exit_ack_line(),
+            "{\"version\":1,\"type\":\"exitAck\",\"accepted\":true}\n"
+        );
     }
 }

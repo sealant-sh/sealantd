@@ -15,6 +15,7 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::Semaphore;
 
 use crate::proxy_v2;
+use crate::retry::after_accept_error;
 
 /// How long one DNS query over UDP waits for the proxy's answer.
 const DNS_TIMEOUT: Duration = Duration::from_secs(10);
@@ -60,7 +61,13 @@ pub async fn serve_tcp(
 ) -> std::io::Result<()> {
     let local = listener.local_addr()?;
     loop {
-        let (guest, peer) = listener.accept().await?;
+        let (guest, peer) = match listener.accept().await {
+            Ok(accepted) => accepted,
+            Err(e) => {
+                after_accept_error("tcp forwarder", &e).await;
+                continue;
+            }
+        };
         tokio::spawn(async move {
             if let Err(e) = relay_tcp(guest, peer, local, upstream, lookup).await {
                 tracing::debug!(%peer, %local, "tcp relay ended: {e}");
@@ -95,7 +102,13 @@ async fn relay_tcp(
 /// Relays DNS over TCP: each guest connection to one connection to the proxy's resolver.
 pub async fn serve_dns_tcp(listener: TcpListener, upstream: SocketAddr) -> std::io::Result<()> {
     loop {
-        let (mut guest, peer) = listener.accept().await?;
+        let (mut guest, peer) = match listener.accept().await {
+            Ok(accepted) => accepted,
+            Err(e) => {
+                after_accept_error("dns/tcp forwarder", &e).await;
+                continue;
+            }
+        };
         tokio::spawn(async move {
             let result = async {
                 let mut proxy = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(upstream))
@@ -118,7 +131,13 @@ pub async fn serve_dns_udp(socket: UdpSocket, upstream: SocketAddr) -> std::io::
     let slots = Arc::new(Semaphore::new(DNS_IN_FLIGHT));
     let mut buf = vec![0u8; DNS_MAX];
     loop {
-        let (len, peer) = socket.recv_from(&mut buf).await?;
+        let (len, peer) = match socket.recv_from(&mut buf).await {
+            Ok(received) => received,
+            Err(e) => {
+                after_accept_error("dns/udp forwarder", &e).await;
+                continue;
+            }
+        };
         let Ok(permit) = Arc::clone(&slots).try_acquire_owned() else {
             tracing::debug!(%peer, "dns/udp: too many queries in flight, dropping one");
             continue;

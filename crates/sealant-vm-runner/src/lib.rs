@@ -23,6 +23,7 @@ pub mod net;
 pub mod nft;
 pub mod protocol;
 pub mod proxy_v2;
+mod retry;
 pub mod selftest;
 pub mod tap;
 pub mod vmm;

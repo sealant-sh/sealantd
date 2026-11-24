@@ -13,12 +13,15 @@ use std::process::Command;
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 
+use crate::jail::JAIL_UID;
 use crate::sys;
 
 /// The Cloud Hypervisor release the runner's flags are verified against.
 pub const CLOUD_HYPERVISOR_MAJOR: u32 = 54;
 /// `KVM_GET_API_VERSION` has answered 12 since Linux 2.6.22.
 const KVM_API_VERSION: i32 = 12;
+/// Cloud Hypervisor v54 requires Landlock ABI 3 (Linux 6.2) when `--landlock` is on.
+pub const LANDLOCK_REQUIRED_ABI: i64 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Probes {
@@ -87,8 +90,11 @@ fn check_kvm(path: &Path) -> Check {
         }
     };
     let gid = meta.gid();
-    let mode = format!("{:04o}", meta.mode() & 0o7777);
-    let mut facts = json!({ "path": shown, "gid": gid, "mode": mode });
+    let mode_bits = meta.mode() & 0o7777;
+    let mode = format!("{mode_bits:04o}");
+    let jail_can_open = jail_can_open(meta.uid(), gid, mode_bits);
+    let mut facts =
+        json!({ "path": shown, "gid": gid, "mode": mode, "jailCanOpen": jail_can_open });
     if !meta.file_type().is_char_device() {
         return Check::new(
             "kvm",
@@ -115,9 +121,18 @@ fn check_kvm(path: &Path) -> Check {
                         .to_owned(),
                 );
             }
+            if !jail_can_open {
+                problems.push(format!(
+                    "mode {mode} lets neither UID {JAIL_UID} nor group {gid} read and write it, so \
+                     the VMM could not open it after the privilege drop"
+                ));
+            }
             let ok = problems.is_empty();
             let observed = if ok {
-                format!("{shown} opened read-write, KVM API {version}, group {gid}, mode {mode}")
+                format!(
+                    "{shown} opened read-write, KVM API {version}, group {gid}, mode {mode}: \
+                     UID {JAIL_UID} with group {gid} can open it"
+                )
             } else {
                 format!("{shown}: {}", problems.join("; "))
             };
@@ -130,6 +145,13 @@ fn check_kvm(path: &Path) -> Check {
             facts,
         ),
     }
+}
+
+/// Whether UID 65532, keeping `gid` as its only supplementary group, may open a device with this
+/// owner and mode read-write: by the owner bits, the group bits, or the other bits.
+fn jail_can_open(owner: u32, gid: u32, mode: u32) -> bool {
+    let rw = |bits: u32| bits & 0o6 == 0o6;
+    (owner == JAIL_UID && rw(mode >> 6)) || (gid != 0 && rw(mode >> 3)) || rw(mode)
 }
 
 fn check_tun(path: &Path) -> Check {
@@ -212,18 +234,29 @@ fn check_nft(nft: &str) -> Check {
 }
 
 fn check_landlock() -> Check {
-    match sys::landlock_abi_version() {
+    landlock_check(sys::landlock_abi_version())
+}
+
+fn landlock_check(abi: std::io::Result<i64>) -> Check {
+    let required = LANDLOCK_REQUIRED_ABI;
+    match abi {
+        Ok(abi) if abi >= required => Check::new(
+            "landlock",
+            true,
+            format!("Landlock ABI {abi} (Cloud Hypervisor needs {required})"),
+            json!({ "observedAbi": abi, "requiredAbi": required }),
+        ),
         Ok(abi) => Check::new(
             "landlock",
-            abi >= 1,
-            format!("Landlock ABI {abi}"),
-            json!({ "abi": abi }),
+            false,
+            format!("Landlock ABI {abi}, but Cloud Hypervisor needs {required} (Linux 6.2+)"),
+            json!({ "observedAbi": abi, "requiredAbi": required }),
         ),
         Err(e) => Check::new(
             "landlock",
             false,
             format!("Landlock unavailable: {e}"),
-            json!({ "abi": null }),
+            json!({ "observedAbi": null, "requiredAbi": required }),
         ),
     }
 }
@@ -392,6 +425,35 @@ mod tests {
         );
         assert!(check(&report, "cloudHypervisor").ok);
         assert!(!report.ok, "kvm and tun are missing");
+    }
+
+    #[test]
+    fn landlock_below_abi_3_fails() {
+        let old = landlock_check(Ok(2));
+        assert!(!old.ok && old.observed.contains("needs 3"), "{old:?}");
+        assert_eq!(old.facts["observedAbi"], 2);
+        assert_eq!(old.facts["requiredAbi"], 3);
+        assert!(landlock_check(Ok(3)).ok);
+        assert!(landlock_check(Ok(6)).ok);
+        let none = landlock_check(Err(std::io::Error::from_raw_os_error(libc::EOPNOTSUPP)));
+        assert!(!none.ok);
+        assert_eq!(none.facts["observedAbi"], Value::Null);
+    }
+
+    #[test]
+    fn the_jailed_identity_must_be_able_to_open_kvm() {
+        // root:kvm 0660, the usual host: the kept group opens it.
+        assert!(jail_can_open(0, 108, 0o660));
+        // root:root 0660: only root could, and the runner refuses group 0 anyway.
+        assert!(!jail_can_open(0, 0, 0o660));
+        // root:kvm 0600: the group bits give the jail nothing.
+        assert!(!jail_can_open(0, 108, 0o600));
+        // World read-write, as some distributions ship it.
+        assert!(jail_can_open(0, 0, 0o666));
+        // Owned by 65532 itself.
+        assert!(jail_can_open(65532, 0, 0o600));
+        // Read-only for the group is not enough.
+        assert!(!jail_can_open(0, 108, 0o640));
     }
 
     #[test]

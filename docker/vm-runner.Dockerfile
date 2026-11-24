@@ -68,7 +68,7 @@ RUN apt-get update \
 COPY kernel/build-kernel.sh kernel/linux-6.12-microvm.x86_64.config \
      kernel/linux-6.12-microvm.aarch64.config /kernel/
 ARG TARGETARCH
-RUN --mount=type=cache,id=sealant-kernel-tarball,target=/cache \
+RUN --mount=type=cache,id=sealant-kernel-tarball-${TARGETARCH},target=/cache \
     set -eux; \
     case "$TARGETARCH" in \
       amd64) arch=x86_64; image=vmlinux ;; \
@@ -76,7 +76,8 @@ RUN --mount=type=cache,id=sealant-kernel-tarball,target=/cache \
       *) echo "unsupported arch $TARGETARCH" >&2; exit 1 ;; \
     esac; \
     KERNEL_CACHE=/cache /kernel/build-kernel.sh "$arch" /build; \
-    mkdir /out; cp "/build/$image" /out/kernel; cp /build/config /build/SHA256SUMS /out/
+    mkdir /out; cp "/build/$image" /out/kernel; cp /build/config /out/config; \
+    cd /out && sha256sum kernel config > SHA256SUMS
 
 # A kernel built beforehand with kernel/build-kernel.sh.
 FROM alpine:3.22 AS kernel-prebuilt
@@ -89,7 +90,8 @@ RUN set -eux; \
       *) echo "unsupported arch $TARGETARCH" >&2; exit 1 ;; \
     esac; \
     (cd "$src" && sha256sum -c SHA256SUMS); \
-    mkdir /out; cp "$src/$image" /out/kernel; cp "$src/config" "$src/SHA256SUMS" /out/
+    mkdir /out; cp "$src/$image" /out/kernel; cp "$src/config" /out/config; \
+    cd /out && sha256sum kernel config > SHA256SUMS
 
 FROM kernel-${KERNEL_SOURCE} AS kernel
 
@@ -104,5 +106,5 @@ RUN set -eux; \
     /usr/local/bin/sealant-vm-runner --version; \
     /usr/local/bin/cloud-hypervisor --version | grep -q '^cloud-hypervisor v54\.'; \
     /usr/sbin/nft --version; \
-    test -s /usr/share/sealant/vm/kernel
+    (cd /usr/share/sealant/vm && sha256sum -c SHA256SUMS)
 ENTRYPOINT ["/usr/local/bin/sealant-vm-runner"]

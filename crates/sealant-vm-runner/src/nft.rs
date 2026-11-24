@@ -7,14 +7,16 @@
 //!
 //! - `forward` has policy `drop`: nothing is routed between `tap0` and `eth0` at L3.
 //! - `prerouting` redirects guest DNS and TCP into the local forwarders on `10.200.0.1`.
-//! - `input` accepts from `tap0` only those forwarder ports, and rejects everything else.
+//! - `input` accepts from `tap0` only redirected packets (`ct status dnat`) from the guest's own
+//!   address to those forwarder ports, and rejects everything else: a guest dialling a forwarder
+//!   port directly, or spoofing another source, is refused.
 
 use std::io::Write;
 use std::process::{Command, Stdio};
 
 use crate::net::{
-    DNS_PORT, HOST_IP, HTTP_PORT, HTTPS_PORT, RESOURCE_NET, RESOURCE_PORT, RESOURCE_PREFIX_LEN,
-    TAP_NAME, TCP_PORT,
+    DNS_PORT, GUEST_IP, HOST_IP, HTTP_PORT, HTTPS_PORT, RESOURCE_NET, RESOURCE_PORT,
+    RESOURCE_PREFIX_LEN, TAP_NAME, TCP_PORT,
 };
 use crate::protocol::BootMode;
 
@@ -24,7 +26,8 @@ pub const TABLE: &str = "sealant_vm";
 /// How guest TCP leaves the VM, from the worktree's Access policy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Egress {
-    /// Every public TCP port, through the general forwarder (`SO_ORIGINAL_DST`).
+    /// Every public TCP port: 80 and 443 through their own forwarders (so HTTPS reaches the
+    /// proxy's brokering and inspection), every other port through the general forwarder.
     Standard,
     /// Ports 80 and 443 through their own forwarders, plus the policy's extra TCP ports through
     /// the general one; every other port is rejected.
@@ -45,11 +48,10 @@ impl Policy {
         if self.mode == BootMode::Recover {
             return Vec::new();
         }
-        let mut ports = vec![DNS_PORT, RESOURCE_PORT];
+        let mut ports = vec![DNS_PORT, RESOURCE_PORT, HTTP_PORT, HTTPS_PORT];
         match &self.egress {
             Egress::Standard => ports.push(TCP_PORT),
             Egress::Restricted { .. } => {
-                ports.extend([HTTP_PORT, HTTPS_PORT]);
                 if !self.extra_tcp_ports().is_empty() {
                     ports.push(TCP_PORT);
                 }
@@ -87,13 +89,13 @@ pub fn ruleset(policy: &Policy) -> String {
         prerouting.push(format!(
             "{v4} ip daddr {RESOURCE_NET}/{RESOURCE_PREFIX_LEN} meta l4proto tcp redirect to :{RESOURCE_PORT}"
         ));
+        prerouting.push(format!("{v4} tcp dport 80 redirect to :{HTTP_PORT}"));
+        prerouting.push(format!("{v4} tcp dport 443 redirect to :{HTTPS_PORT}"));
         match &policy.egress {
             Egress::Standard => {
                 prerouting.push(format!("{v4} meta l4proto tcp redirect to :{TCP_PORT}"));
             }
             Egress::Restricted { .. } => {
-                prerouting.push(format!("{v4} tcp dport 80 redirect to :{HTTP_PORT}"));
-                prerouting.push(format!("{v4} tcp dport 443 redirect to :{HTTPS_PORT}"));
                 let extra = policy.extra_tcp_ports();
                 if !extra.is_empty() {
                     prerouting.push(format!(
@@ -107,16 +109,13 @@ pub fn ruleset(policy: &Policy) -> String {
 
     let mut input = Vec::new();
     let ports = policy.forwarder_ports();
+    let redirected =
+        format!("iifname \"{tap}\" ip saddr {GUEST_IP} ip daddr {HOST_IP} ct status dnat");
     if ports.contains(&DNS_PORT) {
-        input.push(format!(
-            "iifname \"{tap}\" ip daddr {HOST_IP} udp dport {DNS_PORT} accept"
-        ));
+        input.push(format!("{redirected} udp dport {DNS_PORT} accept"));
     }
     if !ports.is_empty() {
-        input.push(format!(
-            "iifname \"{tap}\" ip daddr {HOST_IP} tcp dport {} accept",
-            nft_set(&ports)
-        ));
+        input.push(format!("{redirected} tcp dport {} accept", nft_set(&ports)));
     }
     input.push(format!(
         "iifname \"{tap}\" meta l4proto tcp reject with tcp reset"
@@ -250,26 +249,31 @@ mod tests {
     }
 
     const V4: &str = "iifname \"tap0\" meta nfproto ipv4";
+    const REDIRECTED: &str =
+        "iifname \"tap0\" ip saddr 10.200.0.2 ip daddr 10.200.0.1 ct status dnat";
 
     #[test]
-    fn standard_sends_dns_resources_and_every_other_tcp_port_to_its_forwarder() {
+    fn standard_sends_http_and_https_to_their_forwarders_and_every_other_tcp_port_to_15444() {
         let rules = ruleset(&policy(BootMode::Normal, Egress::Standard));
         assert_forward_drops(&rules);
+        // 80 and 443 come before the catch-all: HTTPS must reach the proxy's :15443 handler
+        // (brokering, inspection, revocation), not the plain TCP relay.
         assert_eq!(
             chain(&rules, "prerouting"),
             vec![
                 format!("{V4} udp dport 53 redirect to :15053"),
                 format!("{V4} tcp dport 53 redirect to :15053"),
                 format!("{V4} ip daddr 10.201.0.0/16 meta l4proto tcp redirect to :15100"),
+                format!("{V4} tcp dport 80 redirect to :15080"),
+                format!("{V4} tcp dport 443 redirect to :15443"),
                 format!("{V4} meta l4proto tcp redirect to :15444"),
             ]
         );
         assert_eq!(
             chain(&rules, "input"),
             vec![
-                "iifname \"tap0\" ip daddr 10.200.0.1 udp dport 15053 accept".to_owned(),
-                "iifname \"tap0\" ip daddr 10.200.0.1 tcp dport { 15053, 15100, 15444 } accept"
-                    .to_owned(),
+                format!("{REDIRECTED} udp dport 15053 accept"),
+                format!("{REDIRECTED} tcp dport {{ 15053, 15080, 15100, 15443, 15444 }} accept"),
                 "iifname \"tap0\" meta l4proto tcp reject with tcp reset".to_owned(),
                 "iifname \"tap0\" reject".to_owned(),
             ]
@@ -298,7 +302,7 @@ mod tests {
         let input = chain(&rules, "input");
         assert_eq!(
             input[1],
-            "iifname \"tap0\" ip daddr 10.200.0.1 tcp dport { 15053, 15080, 15100, 15443 } accept"
+            format!("{REDIRECTED} tcp dport {{ 15053, 15080, 15100, 15443 }} accept")
         );
         assert!(
             !rules.contains("15444"),
@@ -330,7 +334,7 @@ mod tests {
         );
         assert_eq!(
             chain(&rules, "input")[1],
-            "iifname \"tap0\" ip daddr 10.200.0.1 tcp dport { 15053, 15080, 15100, 15443, 15444 } accept"
+            format!("{REDIRECTED} tcp dport {{ 15053, 15080, 15100, 15443, 15444 }} accept")
         );
 
         let one = ruleset(&policy(

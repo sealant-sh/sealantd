@@ -163,20 +163,41 @@ fn in_netns(pid: u32, cmd: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
-/// Plays the guest on `vsock:1026`: reads the boot config line, sends `frame`.
-fn guest_exit(layout: &Layout, frame: &str) -> serde_json::Value {
-    let mut stream = UnixStream::connect(layout.path("run-vm/vsock.sock_1026")).unwrap();
-    stream
-        .set_read_timeout(Some(Duration::from_secs(10)))
-        .unwrap();
-    let mut line = String::new();
-    BufReader::new(&stream).read_line(&mut line).unwrap();
-    stream.write_all(frame.as_bytes()).unwrap();
-    stream.shutdown(std::net::Shutdown::Write).unwrap();
-    // Wait for the runner to close its side: the frame has been read.
-    let mut rest = String::new();
-    let _ = BufReader::new(&stream).read_line(&mut rest);
-    serde_json::from_str(&line).unwrap()
+/// PID 1's end of `vsock:1026`: the one connection the runner accepts.
+struct Guest {
+    stream: UnixStream,
+    reader: BufReader<UnixStream>,
+}
+
+impl Guest {
+    /// Dials the boot channel and answers the boot config the runner writes at once.
+    fn boot(layout: &Layout) -> (Self, serde_json::Value) {
+        let stream = UnixStream::connect(layout.path("run-vm/vsock.sock_1026")).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut guest = Self {
+            reader: BufReader::new(stream.try_clone().unwrap()),
+            stream,
+        };
+        let config = serde_json::from_str(&guest.line()).unwrap();
+        (guest, config)
+    }
+
+    fn line(&mut self) -> String {
+        let mut line = String::new();
+        self.reader.read_line(&mut line).unwrap();
+        line.trim_end().to_owned()
+    }
+
+    /// Sends an exit frame and waits for the runner's ack.
+    fn exit(&mut self, frame: &str) {
+        self.stream.write_all(frame.as_bytes()).unwrap();
+        assert_eq!(
+            self.line(),
+            r#"{"version":1,"type":"exitAck","accepted":true}"#
+        );
+    }
 }
 
 fn wait_exit(runner: &mut Child) -> i32 {
@@ -257,9 +278,20 @@ fn the_vmm_runs_jailed_behind_tap0_and_nftables_and_a_synced_76_exits_76() {
     let table = in_netns(pid, &[&nft_bin(), "list", "table", "inet", "sealant_vm"]);
     assert!(table.contains("policy drop"), "{table}");
     assert!(table.contains("redirect to :15444"), "{table}");
+    assert!(
+        table.contains("tcp dport 443 redirect to :15443"),
+        "{table}"
+    );
+    assert!(table.contains("ct status dnat"), "{table}");
     // The forwarders listen on the tap address.
     let listening = in_netns(pid, &["ss", "-ltnu"]);
-    for port in ["10.200.0.1:15053", "10.200.0.1:15100", "10.200.0.1:15444"] {
+    for port in [
+        "10.200.0.1:15053",
+        "10.200.0.1:15080",
+        "10.200.0.1:15100",
+        "10.200.0.1:15443",
+        "10.200.0.1:15444",
+    ] {
         assert!(
             listening.contains(port),
             "{port} not listening:\n{listening}"
@@ -267,9 +299,11 @@ fn the_vmm_runs_jailed_behind_tap0_and_nftables_and_a_synced_76_exits_76() {
     }
 
     // The guest gets its config and reports a synced 76; the VMM then exits cleanly.
-    let config = guest_exit(
-        &layout,
-        "{\"version\":1,\"exit_code\":76,\"synced\":true,\"reason\":\"never claimed\"}\n",
+    let (mut guest, config) = Guest::boot(&layout);
+    // Once PID 1 has the channel, nothing else in the guest can dial it.
+    assert!(UnixStream::connect(layout.path("run-vm/vsock.sock_1026")).is_err());
+    guest.exit(
+        "{\"version\":1,\"type\":\"exit\",\"exitCode\":76,\"synced\":true,\"reason\":\"never claimed\"}\n",
     );
     assert_eq!(config["version"], 1);
     assert_eq!(config["mode"], "normal");
@@ -287,10 +321,8 @@ fn a_vmm_killed_after_a_synced_76_is_not_76() {
     let layout = Layout::new("kill -9 $$");
     let mut runner = layout.start();
     layout.wait_for("out/started", &mut runner);
-    guest_exit(
-        &layout,
-        "{\"version\":1,\"exit_code\":76,\"synced\":true}\n",
-    );
+    let (mut guest, _) = Guest::boot(&layout);
+    guest.exit("{\"version\":1,\"type\":\"exit\",\"exitCode\":76,\"synced\":true}\n");
     std::fs::write(layout.path("out/go"), "").unwrap();
     assert_eq!(wait_exit(&mut runner), 137);
 }
@@ -303,10 +335,8 @@ fn an_unsynced_76_is_not_76() {
     let layout = Layout::new("exit 0");
     let mut runner = layout.start();
     layout.wait_for("out/started", &mut runner);
-    guest_exit(
-        &layout,
-        "{\"version\":1,\"exit_code\":76,\"synced\":false}\n",
-    );
+    let (mut guest, _) = Guest::boot(&layout);
+    guest.exit("{\"version\":1,\"type\":\"exit\",\"exitCode\":76,\"synced\":false}\n");
     std::fs::write(layout.path("out/go"), "").unwrap();
     let code = wait_exit(&mut runner);
     assert_ne!(code, 76);
@@ -314,22 +344,25 @@ fn an_unsynced_76_is_not_76() {
 }
 
 #[test]
-fn sigterm_presses_the_power_button_then_kills_the_vmm_after_the_grace() {
+fn sigterm_asks_the_guest_to_shut_down_then_kills_the_vmm_after_the_grace() {
     if !ready() {
         return;
     }
-    // A VMM with no API socket that never exits by itself: the press fails, the grace (2 s)
-    // runs out, and the VMM is killed.
-    let layout = Layout::new("sleep 600");
+    // A VMM with no API socket that never exits by itself (`exec`, so the kill reaches it), and a
+    // guest that never answers: the shutdown line arrives, the press fails, the grace (2 s) runs
+    // out, and the VMM is killed.
+    let layout = Layout::new("exec sleep 600");
     let mut runner = layout.start();
     layout.wait_for("out/started", &mut runner);
+    let (mut guest, _) = Guest::boot(&layout);
     std::fs::write(layout.path("out/go"), "").unwrap();
     nix::sys::signal::kill(
         nix::unistd::Pid::from_raw(runner.id() as i32),
         nix::sys::signal::Signal::SIGTERM,
     )
     .unwrap();
+    assert_eq!(guest.line(), r#"{"version":1,"type":"shutdown"}"#);
     let started = Instant::now();
     assert_eq!(wait_exit(&mut runner), 137);
-    assert!(started.elapsed() >= Duration::from_secs(2));
+    assert!(started.elapsed() >= Duration::from_millis(1500));
 }

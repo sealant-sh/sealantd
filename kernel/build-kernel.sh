@@ -4,6 +4,7 @@
 #
 #   kernel/build-kernel.sh x86_64  [out-dir]   # -> out-dir/vmlinux       (Cloud Hypervisor PVH)
 #   kernel/build-kernel.sh aarch64 [out-dir]   # -> out-dir/Image
+#   kernel/build-kernel.sh --config-only <arch> [out-dir]   # check the config, write only it
 #
 # The config is `allnoconfig` plus the fragment beside this script
 # (linux-6.12-microvm.<arch>.config). Every line of the fragment must survive into the final
@@ -27,6 +28,10 @@ KERNEL_SHA256=143b287965acb9e270095b95894e59e2eba306d7e1f6b260d4ba74fca70c0333
 # Fixed build metadata, and the release date of $KERNEL_VERSION as the timestamp.
 BUILD_EPOCH=1795392000 # 2026-11-23T00:00:00Z
 
+if [ "${1:-}" = --config-only ]; then
+  CONFIG_ONLY=1
+  shift
+fi
 arch=${1:-}
 case "$arch" in
   x86_64)
@@ -40,7 +45,7 @@ case "$arch" in
     artifact=arch/arm64/boot/Image
     ;;
   *)
-    echo "usage: $0 x86_64|aarch64 [out-dir]" >&2
+    echo "usage: $0 [--config-only] x86_64|aarch64 [out-dir]" >&2
     exit 2
     ;;
 esac
@@ -58,16 +63,20 @@ if [ "$(uname -m)" != "$arch" ] && [ -z "${CROSS_COMPILE:-}" ] && [ -z "${LLVM:-
 fi
 
 mkdir -p "$cache"
+work=$(mktemp -d "${TMPDIR:-/tmp}/sealant-kernel-$arch.XXXXXX")
+trap 'rm -rf "$work"' EXIT
+# Two builds (x86_64 and aarch64 in one multi-platform build) may share the cache: each downloads
+# into its own work dir and checks it before an atomic rename, so neither sees the other's
+# half-written file.
 if ! echo "$KERNEL_SHA256  $tarball" | sha256sum -c --status - 2>/dev/null; then
-  rm -f "$tarball"
-  curl -fsSL --retry 3 -o "$tarball.part" \
+  curl -fsSL --retry 3 -o "$work/download.tar.xz" \
     "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-$KERNEL_VERSION.tar.xz"
-  mv "$tarball.part" "$tarball"
+  echo "$KERNEL_SHA256  $work/download.tar.xz" | sha256sum -c -
+  mv -f "$work/download.tar.xz" "$tarball.$arch.$$"
+  mv -f "$tarball.$arch.$$" "$tarball"
 fi
 echo "$KERNEL_SHA256  $tarball" | sha256sum -c -
 
-work=$(mktemp -d)
-trap 'rm -rf "$work"' EXIT
 tar -xJf "$tarball" -C "$work"
 src="$work/linux-$KERNEL_VERSION"
 

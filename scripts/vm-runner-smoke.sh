@@ -2,12 +2,13 @@
 # Boots real microVMs through a vm-runner image, started with the flags HostVmRuntimeAdapter uses
 # (workspace-isolation-architecture.md §4.2), and checks what a person running Mend would rely on:
 #
-#   1. a normal boot: the guest gets its boot config over vsock:1026, reports a synced 76, powers
-#      off, and the runner exits 76;
-#   2. `docker stop`: the runner presses the guest's power button, the guest reports and powers
-#      off within the grace, and the runner exits 76; meanwhile the live Cloud Hypervisor's
-#      /proc/<pid>/status shows UID/GID 65532, only the KVM group, NoNewPrivs 1 and all five
-#      capability masks zero (Milestone 1 Gate 1's posture check);
+#   1. a normal boot: init gets `--vm`, the guest gets its boot config over vsock:1026, a second
+#      dial to 1026 is refused, 1027 is accepted, the guest reports a synced 76, the runner acks
+#      it, the guest powers off, and the runner exits 76;
+#   2. `docker stop`: the runner sends the shutdown line on the boot connection (and presses the
+#      power button), the guest reports and powers off within the grace, and the runner exits 76;
+#      meanwhile the live Cloud Hypervisor's /proc/<pid>/status shows UID/GID 65532, only the KVM
+#      group, NoNewPrivs 1 and all five capability masks zero (Milestone 1 Gate 1's posture check);
 #   3. a recovery boot: same handshake, and nothing listens for the session channel (vsock:1027).
 #
 # The guest is not sealantd but scripts/vm-runner-smoke/init.c, which plays only the guest side of
@@ -46,8 +47,8 @@ docker run --rm -v "$here/vm-runner-smoke":/src:ro -v "$work":/work debian:bookw
   done
   truncate -s 256M /work/data/data.img
   mkfs.ext4 -q -F /work/data/data.img
-  echo "{\"bootEnv\":{\"SMOKE\":\"1\"},\"secretEnv\":{\"SMOKE_TOKEN\":\"not-a-secret\"}}" > /work/run/boot-env.json
-  echo "{\"mode\":\"recover\",\"secretEnv\":{\"SMOKE_TOKEN\":\"capture-only\"}}" > /work/run/recovery-env.json
+  echo "{\"bootEnv\":{\"SMOKE\":\"1\"},\"secretEnv\":{\"SMOKE_TOKEN\":\"not-a-secret\"},\"dockerd\":true,\"dotfilesArchive\":{\"files\":{\"manifest.json\":\"e30=\"}}}" > /work/run/boot-env.json
+  echo "{\"mode\":\"recover\",\"secretEnv\":{\"SMOKE_TOKEN\":\"capture-only\"},\"dockerd\":true}" > /work/run/recovery-env.json
   chmod 0644 /work/images/* /work/run/*.json
   chown -R 65532:65532 /work/data /work/run
 '
@@ -93,15 +94,25 @@ expect_exit() {
   docker rm "$name" >/dev/null
 }
 
+# Each argument must appear in the last run's logs.
+expect_logs() {
+  local want
+  for want in "$@"; do
+    echo "$logs" | grep -qF -- "$want" || { echo "FAIL: the logs lack: $want" >&2; exit 1; }
+  done
+}
+
 echo "== 1. normal boot, guest reports a synced 76"
 start --image-digest sha256-smoke-exit
 expect_exit 76
-echo "$logs" | grep -q "1027: accepted" \
-  || { echo "FAIL: the host refused vsock:1027 in a normal boot" >&2; exit 1; }
+# Fragments short enough to survive the serial console interleaving with the runner's log.
+expect_logs "argv has --vm: yes" "1026 dial: refused" "1027: accepted" '"dockerd":true' \
+  '"dotfilesArchive":{"files":{"manifest.json":"e30="}}' '"interface":"eth0"' \
+  "exit acknowledged"
 
-echo "== 2. docker stop presses the power button; the live VMM holds the jail"
+echo "== 2. docker stop sends the guest the shutdown line; the live VMM holds the jail"
 start --image-digest sha256-smoke-wait
-wait_log "waiting for the power button"
+wait_log "waiting for shutdown"
 pid=$(docker exec "$name" pgrep -f /usr/local/bin/cloud-hypervisor | head -1)
 status=$(docker exec "$name" cat "/proc/$pid/status")
 echo "$status" | grep -E '^(Uid|Gid|Groups|NoNewPrivs|Seccomp|Cap(Inh|Prm|Eff|Bnd|Amb)):'
@@ -115,11 +126,16 @@ kvm_gid=$(docker exec "$name" stat -c %g /dev/kvm)
   || { echo "FAIL: VMM groups are not exactly the KVM group $kvm_gid" >&2; exit 1; }
 docker stop -t 40 "$name" >/dev/null
 expect_exit 76
+expect_logs 'shutdown frame received: {"version":1,"type":"shutdown"}' "exit acknowledged"
 
 echo "== 3. recovery boot: no session channel"
 start --image-digest sha256-smoke-exit --mode recover
 expect_exit 76
-echo "$logs" | grep -q "1027: refused" \
-  || { echo "FAIL: the host accepted vsock:1027 in recovery" >&2; exit 1; }
+expect_logs '"mode":"recover"' '"dockerd":false' "1026 dial: refused" "1027: refused" \
+  "exit acknowledged"
+if echo "$logs" | grep -q '"networkConfig"'; then
+  echo "FAIL: recovery gave the guest a network config" >&2
+  exit 1
+fi
 
 echo "PASS"

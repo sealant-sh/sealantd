@@ -100,9 +100,10 @@ pub struct VmmSpec {
 
 impl VmmSpec {
     /// The guest kernel command line: no initramfs, the read-only base as root, `sealantd` as init.
+    /// What follows `--` the kernel passes to init as its arguments: `sealantd --vm`.
     pub fn cmdline(&self) -> String {
         format!(
-            "console={} root=/dev/vda ro init={GUEST_INIT} sealantd.mode={}",
+            "console={} root=/dev/vda ro init={GUEST_INIT} sealantd.mode={} -- --vm",
             self.arch.serial_console(),
             self.mode.as_str()
         )
@@ -201,12 +202,14 @@ pub async fn press_power_button(api_socket: &Path) -> std::io::Result<()> {
     }
 }
 
-/// Waits for the VMM to exit. On SIGTERM or SIGINT, presses the guest's power button and gives
-/// it `grace` to power off; a second signal, or the grace running out, kills the VMM.
+/// Waits for the VMM to exit. On SIGTERM or SIGINT, asks the guest to shut down twice over (a
+/// shutdown line on the boot connection, through `shutdown`, and the power button) and gives it
+/// `grace` to power off; a second signal, or the grace running out, kills the VMM.
 pub async fn supervise(
     child: &mut Child,
     api_socket: &Path,
     grace: Duration,
+    shutdown: &tokio::sync::watch::Sender<bool>,
 ) -> std::io::Result<VmmExit> {
     let mut term = signal(SignalKind::terminate())?;
     let mut int = signal(SignalKind::interrupt())?;
@@ -215,6 +218,7 @@ pub async fn supervise(
         _ = term.recv() => tracing::info!("SIGTERM: shutting the guest down"),
         _ = int.recv() => tracing::info!("SIGINT: shutting the guest down"),
     }
+    shutdown.send_replace(true);
     if let Err(e) = press_power_button(api_socket).await {
         tracing::warn!("could not press the guest's power button: {e}");
     }
@@ -314,13 +318,13 @@ mod tests {
     fn the_kernel_command_line_names_the_mode_and_the_arch_console() {
         assert_eq!(
             spec(BootMode::Normal).cmdline(),
-            "console=ttyS0 root=/dev/vda ro init=/usr/local/bin/sealantd sealantd.mode=normal"
+            "console=ttyS0 root=/dev/vda ro init=/usr/local/bin/sealantd sealantd.mode=normal -- --vm"
         );
         let mut recover = spec(BootMode::Recover);
         recover.arch = Arch::Aarch64;
         assert_eq!(
             recover.cmdline(),
-            "console=ttyAMA0 root=/dev/vda ro init=/usr/local/bin/sealantd sealantd.mode=recover"
+            "console=ttyAMA0 root=/dev/vda ro init=/usr/local/bin/sealantd sealantd.mode=recover -- --vm"
         );
         let a = args(&recover);
         assert_eq!(values(&a, "--cmdline"), [recover.cmdline().as_str()]);

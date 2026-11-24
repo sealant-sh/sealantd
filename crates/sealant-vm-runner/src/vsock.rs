@@ -10,19 +10,20 @@
 //! | :--- | :--- | :--- |
 //! | 1024 | host → guest | `/run/sealant/control.sock`: each connection there is bridged to guest port 1024 |
 //! | 1025 | guest → host | `vsock.sock_1025` → `/run/sealant/capture.sock` |
-//! | 1026 | guest → host | `vsock.sock_1026`, answered in the runner: boot config out, exit status in |
+//! | 1026 | guest → host | `vsock.sock_1026`, answered in the runner, one connection only: boot config out, shutdown out, exit status in, ack out |
 //! | 1027 | guest → host | `vsock.sock_1027` → `/run/sealant/session.sock`, normal boots only |
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::{mpsc, watch};
 
 use crate::exit::ExitRecorder;
-use crate::protocol::GuestExitStatus;
+use crate::protocol::{self, GuestExitStatus};
+use crate::retry::after_accept_error;
 
 pub const CONTROL_PORT: u32 = 1024;
 pub const CAPTURE_PORT: u32 = 1025;
@@ -115,7 +116,13 @@ pub async fn serve_host_to_guest(
     port: u32,
 ) -> std::io::Result<()> {
     loop {
-        let (mut client, _) = listener.accept().await?;
+        let mut client = match listener.accept().await {
+            Ok((client, _)) => client,
+            Err(e) => {
+                after_accept_error("control bridge", &e).await;
+                continue;
+            }
+        };
         let mux = mux.clone();
         tokio::spawn(async move {
             match mux.connect(port).await {
@@ -134,7 +141,13 @@ pub async fn serve_host_to_guest(
 /// socket `target` (Mend's `capture.sock` or `session.sock`).
 pub async fn serve_guest_to_host(listener: UnixListener, target: PathBuf) -> std::io::Result<()> {
     loop {
-        let (mut guest, _) = listener.accept().await?;
+        let mut guest = match listener.accept().await {
+            Ok((guest, _)) => guest,
+            Err(e) => {
+                after_accept_error("guest→host bridge", &e).await;
+                continue;
+            }
+        };
         let target = target.clone();
         tokio::spawn(async move {
             match UnixStream::connect(&target).await {
@@ -151,57 +164,106 @@ pub async fn serve_guest_to_host(listener: UnixListener, target: PathBuf) -> std
     }
 }
 
-/// Port 1026: on each guest connection, writes `boot_frame` (one [`crate::protocol::VmBootConfig`]
-/// line), then records every valid [`GuestExitStatus`] line the guest sends until it closes.
+/// Port 1026. Accepts exactly one guest connection (PID 1's, at boot), then closes the listener
+/// and unlinks `path`, so nothing else in the guest can reach this port. On that connection it
+/// writes `boot_frame` (one [`crate::protocol::VmBootConfig`] line), sends a shutdown line when
+/// `shutdown` turns true, and records each valid exit line the guest sends before acknowledging
+/// it. Returns when the guest closes the connection.
 pub async fn serve_boot(
     listener: UnixListener,
-    boot_frame: Arc<String>,
+    path: PathBuf,
+    boot_frame: String,
     exits: ExitRecorder,
+    mut shutdown: watch::Receiver<bool>,
 ) -> std::io::Result<()> {
-    loop {
-        let (guest, _) = listener.accept().await?;
-        let frame = Arc::clone(&boot_frame);
-        let exits = exits.clone();
-        tokio::spawn(async move {
-            if let Err(e) = boot_session(guest, &frame, &exits).await {
-                tracing::warn!("boot channel connection ended: {e}");
-            }
-        });
+    let guest = loop {
+        match listener.accept().await {
+            Ok((guest, _)) => break guest,
+            Err(e) => after_accept_error("boot channel", &e).await,
+        }
+    };
+    drop(listener);
+    match std::fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => tracing::warn!(path = %path.display(), "could not unlink the boot listener: {e}"),
     }
-}
 
-async fn boot_session(guest: UnixStream, frame: &str, exits: &ExitRecorder) -> std::io::Result<()> {
     let (read, mut write) = guest.into_split();
-    write.write_all(frame.as_bytes()).await?;
+    write.write_all(boot_frame.as_bytes()).await?;
     write.flush().await?;
-    let mut reader = BufReader::new(read);
-    let mut line = String::new();
-    loop {
-        line.clear();
-        let n = (&mut reader)
-            .take(MAX_FRAME as u64 + 1)
-            .read_line(&mut line)
-            .await?;
-        if n == 0 {
-            return Ok(());
-        }
-        if n > MAX_FRAME {
-            return Err(std::io::Error::other("boot channel frame too long"));
-        }
-        if line.trim().is_empty() {
-            continue;
-        }
-        match GuestExitStatus::parse_frame(&line) {
-            Ok(status) => {
-                tracing::info!(
-                    exit_code = status.exit_code,
-                    synced = status.synced,
-                    reason = status.reason.as_deref().unwrap_or(""),
-                    "guest exit status"
-                );
-                exits.record(status);
+
+    // Lines are read on their own task: `read_line` loses data when a select! drops it midway.
+    let (lines_tx, mut lines) = mpsc::channel::<std::io::Result<String>>(4);
+    tokio::spawn(async move {
+        let mut reader = BufReader::new(read);
+        loop {
+            let mut line = String::new();
+            let read = (&mut reader)
+                .take(MAX_FRAME as u64 + 1)
+                .read_line(&mut line)
+                .await;
+            let done = match &read {
+                Ok(0) => true,
+                Ok(n) if *n > MAX_FRAME => {
+                    let _ = lines_tx
+                        .send(Err(std::io::Error::other("boot channel frame too long")))
+                        .await;
+                    true
+                }
+                Ok(_) => false,
+                Err(_) => true,
+            };
+            if done {
+                if let Err(e) = read {
+                    let _ = lines_tx.send(Err(e)).await;
+                }
+                return;
             }
-            Err(e) => tracing::warn!("ignoring a boot channel frame: {e}"),
+            if lines_tx.send(Ok(line)).await.is_err() {
+                return;
+            }
+        }
+    });
+
+    let mut shutdown_pending = true;
+    loop {
+        tokio::select! {
+            line = lines.recv() => {
+                let line = match line {
+                    None => return Ok(()),
+                    Some(line) => line?,
+                };
+                if line.trim().is_empty() {
+                    continue;
+                }
+                match GuestExitStatus::parse_frame(&line) {
+                    Ok(status) => {
+                        tracing::info!(
+                            exit_code = status.exit_code,
+                            synced = status.synced,
+                            reason = status.reason.as_deref().unwrap_or(""),
+                            "guest exit status"
+                        );
+                        // Recorded before the ack: once acknowledged the guest powers off.
+                        exits.record(status);
+                        write.write_all(protocol::exit_ack_line().as_bytes()).await?;
+                        write.flush().await?;
+                    }
+                    Err(e) => tracing::warn!("ignoring a boot channel frame: {e}"),
+                }
+            }
+            changed = shutdown.changed(), if shutdown_pending => {
+                match changed {
+                    Ok(()) if *shutdown.borrow() => {
+                        shutdown_pending = false;
+                        write.write_all(protocol::shutdown_line().as_bytes()).await?;
+                        write.flush().await?;
+                    }
+                    Ok(()) => {}
+                    Err(_) => shutdown_pending = false,
+                }
+            }
         }
     }
 }
@@ -333,46 +395,67 @@ mod tests {
         assert!(bind_unix(&path, 0o600).is_ok());
     }
 
+    async fn next_line(
+        lines: &mut tokio::io::Lines<BufReader<tokio::net::unix::OwnedReadHalf>>,
+    ) -> Option<String> {
+        tokio::time::timeout(Duration::from_secs(5), lines.next_line())
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
     #[tokio::test]
-    async fn the_boot_channel_sends_the_config_and_records_the_exit_status() {
+    async fn the_boot_channel_serves_one_connection_and_acks_the_exit_status() {
         let tmp = tempfile::tempdir().unwrap();
         let mux = Mux::new(tmp.path().join("vsock.sock"));
         let path = mux.guest_listener_path(BOOT_PORT);
         let exits = ExitRecorder::default();
-        let frame = Arc::new("{\"version\":1,\"mode\":\"normal\"}\n".to_owned());
-        tokio::spawn(serve_boot(
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let task = tokio::spawn(serve_boot(
             bind_unix(&path, 0o600).unwrap(),
-            frame,
+            path.clone(),
+            "{\"version\":1,\"mode\":\"normal\"}\n".to_owned(),
             exits.clone(),
+            shutdown_rx,
         ));
 
-        // First connection: boot. The guest reads its config and closes.
-        let guest = UnixStream::connect(&path).await.unwrap();
-        let mut lines = BufReader::new(guest).lines();
+        // PID 1's connection gets the config at once.
+        let (read, mut write) = UnixStream::connect(&path).await.unwrap().into_split();
+        let mut lines = BufReader::new(read).lines();
         assert_eq!(
-            lines.next_line().await.unwrap().unwrap(),
+            next_line(&mut lines).await.unwrap(),
             "{\"version\":1,\"mode\":\"normal\"}"
         );
-        drop(lines);
 
-        // Second connection at shutdown: a garbage line and a wrong version are ignored, the
-        // valid frame is recorded.
-        let (read, mut write) = UnixStream::connect(&path).await.unwrap().into_split();
-        let mut config = String::new();
-        BufReader::new(read).read_line(&mut config).await.unwrap();
-        assert!(config.ends_with('\n'));
+        // Nothing else in the guest can reach the port now: the listener is gone.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while path.exists() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(!path.exists(), "the boot listener is still there");
+        assert!(UnixStream::connect(&path).await.is_err());
+
+        // SIGTERM reaches the guest as a shutdown line.
+        shutdown_tx.send_replace(true);
+        assert_eq!(
+            next_line(&mut lines).await.unwrap(),
+            "{\"version\":1,\"type\":\"shutdown\"}"
+        );
+
+        // Garbage, another version and the old untagged shape are ignored and not acked; a
+        // valid exit frame is recorded, then acknowledged.
         write
             .write_all(
-                b"not json\n{\"version\":2,\"exit_code\":0,\"synced\":true}\n\
-                  {\"version\":1,\"exit_code\":76,\"synced\":true,\"reason\":\"never claimed\"}\n",
+                b"not json\n{\"version\":2,\"type\":\"exit\",\"exitCode\":0,\"synced\":true}\n\
+                  {\"version\":1,\"exit_code\":0,\"synced\":true}\n\
+                  {\"version\":1,\"type\":\"exit\",\"exitCode\":76,\"synced\":true,\"reason\":\"never claimed\"}\n",
             )
             .await
             .unwrap();
-        write.shutdown().await.unwrap();
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        while exits.latest().is_none() && tokio::time::Instant::now() < deadline {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        assert_eq!(
+            next_line(&mut lines).await.unwrap(),
+            "{\"version\":1,\"type\":\"exitAck\",\"accepted\":true}"
+        );
         assert_eq!(
             exits.latest(),
             Some(GuestExitStatus {
@@ -382,5 +465,14 @@ mod tests {
                 reason: Some("never claimed".to_owned())
             })
         );
+
+        // The guest powering off closes the connection, and the channel ends.
+        write.shutdown().await.unwrap();
+        drop(write);
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
     }
 }

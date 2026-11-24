@@ -6,7 +6,6 @@
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::Arc;
 use std::time::Duration;
 
 use clap::{Parser, ValueEnum};
@@ -25,6 +24,11 @@ use sealant_vm_runner::vsock::{self, Mux};
 use sealant_vm_runner::{forward, jail, selftest};
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
+
+/// How long the boot channel may take to finish after the VMM exits.
+const BOOT_CHANNEL_DRAIN: Duration = Duration::from_secs(2);
+/// The descriptor ceiling the runner asks for: every forwarded connection holds two.
+const NOFILE_TARGET: u64 = 65_536;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum EgressMode {
@@ -184,6 +188,7 @@ fn setup(args: &Args) -> Result<Ready, Error> {
         nft::TABLE
     );
 
+    raise_nofile();
     jail::drop_privileges(kvm_gid)?;
     let status = jail::verify(Path::new("/proc/self/status"), kvm_gid)?;
     tracing::info!(
@@ -200,6 +205,23 @@ fn setup(args: &Args) -> Result<Ready, Error> {
         digest,
         upstreams,
     })
+}
+
+/// Raises the soft `RLIMIT_NOFILE` to the hard limit, up to [`NOFILE_TARGET`]. Best effort: the
+/// runner works at the default, it only accepts fewer connections at once.
+fn raise_nofile() {
+    use nix::sys::resource::{Resource, getrlimit, setrlimit};
+    match getrlimit(Resource::RLIMIT_NOFILE) {
+        Ok((soft, hard)) => {
+            let target = hard.min(NOFILE_TARGET);
+            if soft < target
+                && let Err(e) = setrlimit(Resource::RLIMIT_NOFILE, target, hard)
+            {
+                tracing::warn!("could not raise RLIMIT_NOFILE to {target}: {e}");
+            }
+        }
+        Err(e) => tracing::warn!("could not read RLIMIT_NOFILE: {e}"),
+    }
 }
 
 /// A digest names files in the images directory: no path separators, no leading dot.
@@ -263,11 +285,16 @@ async fn serve(args: &Args, ready: Ready, boot: VmBootConfig) -> Result<u8, Erro
         vsock::serve_guest_to_host(capture, args.sealant_run_dir.join("capture.sock")),
     );
     let exits = ExitRecorder::default();
-    let boot_listener = vsock::bind_unix(&mux.guest_listener_path(vsock::BOOT_PORT), 0o600)?;
-    spawn_logged(
-        "boot channel (vsock:1026)",
-        vsock::serve_boot(boot_listener, Arc::new(boot.to_frame()?), exits.clone()),
-    );
+    let (shutdown, shutdown_rx) = tokio::sync::watch::channel(false);
+    let boot_path = mux.guest_listener_path(vsock::BOOT_PORT);
+    let boot_listener = vsock::bind_unix(&boot_path, 0o600)?;
+    let boot_channel = tokio::spawn(vsock::serve_boot(
+        boot_listener,
+        boot_path,
+        boot.to_frame()?,
+        exits.clone(),
+        shutdown_rx,
+    ));
     // Recovery has no session channel at all: nothing listens on 1027.
     if args.mode == BootMode::Normal {
         let session = vsock::bind_unix(&mux.guest_listener_path(vsock::SESSION_PORT), 0o600)?;
@@ -277,6 +304,7 @@ async fn serve(args: &Args, ready: Ready, boot: VmBootConfig) -> Result<u8, Erro
         );
     }
 
+    let base_image = args.images_dir.join(format!("{}.img", ready.digest));
     let spec = VmmSpec {
         binary: args.cloud_hypervisor.clone(),
         kernel: args.kernel.clone(),
@@ -290,10 +318,11 @@ async fn serve(args: &Args, ready: Ready, boot: VmBootConfig) -> Result<u8, Erro
         }),
         vsock_socket: mux.socket().to_owned(),
         api_socket: api_socket.clone(),
-        base_image: args.images_dir.join(format!("{}.img", ready.digest)),
+        base_image: base_image.clone(),
         data_image: args.data_dir.join("data.img"),
+        // The VMM reads only this executor's base image, not its siblings.
         landlock_rules: vec![
-            rule(&args.images_dir, Access::Read),
+            rule(&base_image, Access::Read),
             rule(&args.data_dir, Access::ReadWrite),
             rule(&args.vm_run_dir, Access::ReadWrite),
             rule(&args.kvm, Access::ReadWrite),
@@ -314,8 +343,20 @@ async fn serve(args: &Args, ready: Ready, boot: VmBootConfig) -> Result<u8, Erro
         &mut child,
         &api_socket,
         Duration::from_secs(args.shutdown_grace_secs),
+        &shutdown,
     )
     .await?;
+    // The guest's exit line is acknowledged before it powers off, so it is normally recorded
+    // already; let the channel finish reading what the closed connection still holds.
+    match tokio::time::timeout(BOOT_CHANNEL_DRAIN, boot_channel).await {
+        Ok(Ok(Ok(()))) => {}
+        Ok(Ok(Err(e))) => tracing::warn!("boot channel ended: {e}"),
+        Ok(Err(e)) => tracing::warn!("boot channel task failed: {e}"),
+        Err(_) => tracing::warn!(
+            ?BOOT_CHANNEL_DRAIN,
+            "boot channel still open after the VM ended"
+        ),
+    }
     let guest = exits.latest();
     let code = exit::runner_exit_code(vmm_exit, guest.as_ref());
     tracing::info!(?vmm_exit, ?guest, code, "VM ended");
