@@ -2,19 +2,24 @@
 # commit whose `ci` run passed publishes, under one version B-next.N (scripts/next-version.mjs: N is
 # the commit's whole history, B never below a base already published since the last stable tag):
 #
-# - ghcr.io/sealant-sh/sealantd-next:<version>, amd64 and arm64, each built natively;
+# - three images, amd64 and arm64, each built natively: ghcr.io/sealant-sh/sealantd-next:<version>
+#   (docker/Dockerfile), ghcr.io/sealant-sh/vm-runner-next:<version> (docker/vm-runner.Dockerfile)
+#   and ghcr.io/sealant-sh/egress-proxy-next:<version> (docker/egress-proxy.Dockerfile);
 # - @sealant/runtime-protocol-next and @sealant/runtime-client-next <version> on npm's `next`
-#   dist-tag, after the image exists, so every SDK prerelease has its daemon.
+#   dist-tag, after all three images exist, so every SDK prerelease has its daemon, its host-vm
+#   runner and its egress proxy.
 #
 # Prereleases live under separate names, package and image alike. The `next` trusted publisher is
 # registered only on the two -next packages, so even a fully compromised run cannot publish
 # @sealant/runtime-* or move their `latest`. Images have no such boundary: the token the image jobs
 # hold (`packages: write`) can push ghcr.io/sealant-sh/sealantd too, GHCR cannot scope it per image,
-# and any writer can run a branch workflow that requests it, code-owner review or not. Every action
+# and any writer can run a branch workflow that requests it, code-owner review or not; the same
+# holds for vm-runner and egress-proxy and their -next images. Every action
 # and BuildKit image in those jobs is pinned and no cache other jobs write is restored. Every job runs
 # on a GitHub-hosted runner, a fresh VM: the box's runner VMs keep state between jobs, so code from an
-# earlier pull request could change what a job there builds or pushes. sealant pins
-# sealantd as `tag@sha256:…`, which keeps out a tag moved after the pin (ADR 0015, Known gaps).
+# earlier pull request could change what a job there builds or pushes. sealant pins each image
+# as `tag@sha256:…`, which keeps out a tag moved after the pin (ADR 0015, Known gaps); each
+# image-tag job and the publish job print every ref with its index digest in the run summary.
 #
 # SECURITY: `workflow_run` runs this file as it is on main, never a pull request's copy, and the
 # guard below accepts only a push to this repository's main, not a fork's branch that happens to be
@@ -112,16 +117,23 @@ jobs:
             echo "publish=$publish"
           } >> "$GITHUB_OUTPUT"
 
+  # Every image on each arch's own runner. vm-runner compiles its guest kernel (Linux 6.12, a
+  # minimal allnoconfig build) besides its Rust binary, so it gets more time than the other two.
   image:
+    name: Image ${{ matrix.image.name }} (${{ matrix.platform.arch }})
     needs: plan
     if: needs.plan.outputs.publish == 'true'
     strategy:
       matrix:
+        image:
+          - { name: sealantd, dockerfile: docker/Dockerfile, timeout: 60 }
+          - { name: vm-runner, dockerfile: docker/vm-runner.Dockerfile, timeout: 90 }
+          - { name: egress-proxy, dockerfile: docker/egress-proxy.Dockerfile, timeout: 60 }
         platform:
           - { arch: amd64, runner: ubuntu-24.04 }
           - { arch: arm64, runner: ubuntu-24.04-arm }
     runs-on: ${{ matrix.platform.runner }}
-    timeout-minutes: 60
+    timeout-minutes: ${{ matrix.image.timeout }}
     permissions:
       contents: read
       packages: write
@@ -148,7 +160,7 @@ jobs:
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: .
-          file: docker/Dockerfile
+          file: ${{ matrix.image.dockerfile }}
           platforms: linux/${{ matrix.platform.arch }}
           provenance: false
           labels: |
@@ -156,7 +168,7 @@ jobs:
             org.opencontainers.image.revision=${{ needs.plan.outputs.sha }}
             org.opencontainers.image.version=${{ needs.plan.outputs.version }}
           outputs:
-            type=image,name=ghcr.io/${{ github.repository }}-next,push-by-digest=true,name-canonical=true,push=true
+            type=image,name=ghcr.io/${{ github.repository_owner }}/${{ matrix.image.name }}-next,push-by-digest=true,name-canonical=true,push=true
       - name: Export digest
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
@@ -165,7 +177,7 @@ jobs:
           touch "/tmp/digests/${DIGEST#sha256:}"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: next-digests--${{ matrix.platform.arch }}
+          name: next-digests-${{ matrix.image.name }}--${{ matrix.platform.arch }}
           path: /tmp/digests/*
           if-no-files-found: error
           retention-days: 1
@@ -189,20 +201,31 @@ jobs:
           echo "$report" >>"$GITHUB_STEP_SUMMARY" ||
             echo "::warning::Could not write the disk report to the step summary"
 
+  # One leg per image, each tagging its own index. `needs: image-tag` waits for every leg, so
+  # nothing below runs until all three images are tagged. Each leg sets only its own image's
+  # output, so the job's outputs hold all three digests. fail-fast is off: one image's failure
+  # never cancels another's tag write half-way.
   image-tag:
+    name: Tag ${{ matrix.image }}
     needs: [plan, image]
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [sealantd, vm-runner, egress-proxy]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
       contents: read
       packages: write
     outputs:
-      digest: ${{ steps.tag.outputs.digest }}
+      sealantd-digest: ${{ steps.record.outputs.sealantd-digest }}
+      vm-runner-digest: ${{ steps.record.outputs.vm-runner-digest }}
+      egress-proxy-digest: ${{ steps.record.outputs.egress-proxy-digest }}
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: /tmp/digests
-          pattern: next-digests--*
+          pattern: next-digests-${{ matrix.image }}--*
           merge-multiple: true
       - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
@@ -219,7 +242,7 @@ jobs:
         id: tag
         working-directory: /tmp/digests
         env:
-          REPOSITORY: ghcr.io/${{ github.repository }}-next
+          REPOSITORY: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}-next
           VERSION: ${{ needs.plan.outputs.version }}
         run: |
           set -euo pipefail
@@ -227,6 +250,12 @@ jobs:
           ref=$REPOSITORY:$VERSION
           sources=()
           for digest in *; do sources+=("$REPOSITORY@sha256:$digest"); done
+          # One build per arch, amd64 and arm64: a partial or stray artifact never tags an index.
+          hex='^[0-9a-f]{64}$'
+          if ((${#sources[@]} != 2)) || [[ ! ${sources[0]##*:} =~ $hex || ! ${sources[1]##*:} =~ $hex ]]; then
+            echo "::error::The digests artifacts hold '${sources[*]##*@sha256:}', not one image digest per arch; nothing was written."
+            exit 1
+          fi
           # This run's index digest, known before anything is written: --dry-run prints the exact
           # bytes create pushes, plus one newline, and the index digest is theirs.
           docker buildx imagetools create --dry-run --tag "$ref" "${sources[@]}" >"$RUNNER_TEMP/index.json"
@@ -302,6 +331,21 @@ jobs:
             fi
           fi
           echo "digest=$index" >>"$GITHUB_OUTPUT"
+      # The job output named for this leg's image, and the ref sealant pins, in the run summary.
+      - name: Record the tagged index
+        id: record
+        env:
+          IMAGE: ${{ matrix.image }}
+          REF: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}-next:${{ needs.plan.outputs.version }}
+          DIGEST: ${{ steps.tag.outputs.digest }}
+        run: |
+          set -euo pipefail
+          if [[ ! $DIGEST =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::The tag step reported '$DIGEST' for $IMAGE, not an index digest."
+            exit 1
+          fi
+          echo "$IMAGE-digest=$DIGEST" >>"$GITHUB_OUTPUT"
+          echo "- \`$REF@$DIGEST\`" >>"$GITHUB_STEP_SUMMARY"
 
   # Builds and packs the two packages. No id-token here: nothing this job runs, the dependencies'
   # build tools included, can reach the npm credential.
@@ -385,9 +429,44 @@ jobs:
         env:
           VERSION: ${{ needs.plan.outputs.version }}
           SHA: ${{ needs.plan.outputs.sha }}
-          DIGEST: ${{ needs.image-tag.outputs.digest }}
+          OWNER: ${{ github.repository_owner }}
+          SEALANTD_DIGEST: ${{ needs.image-tag.outputs.sealantd-digest }}
+          VM_RUNNER_DIGEST: ${{ needs.image-tag.outputs.vm-runner-digest }}
+          EGRESS_PROXY_DIGEST: ${{ needs.image-tag.outputs.egress-proxy-digest }}
         run: |
           set -euo pipefail
+          # Every image of this version is tagged before any package publishes: a missing digest
+          # (a leg that set no output) stops here, before npm is touched.
+          for digest in "$SEALANTD_DIGEST" "$VM_RUNNER_DIGEST" "$EGRESS_PROXY_DIGEST"; do
+            if [[ ! $digest =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "::error::image-tag reported '$digest', not an index digest, for one of the three images. Nothing was published."
+              exit 1
+            fi
+          done
+          # Each :<version> must resolve, read anonymously as sealant and every consumer read it,
+          # to the index image-tag wrote. image-tag wrote with this repository's token, so a package
+          # GHCR created private (a new package's first push) passes there and fails here, by name:
+          # make it public, then re-run this job. A read that fails, or a digest that differs,
+          # stops the job before npm is touched.
+          anonymous=$(mktemp -d)
+          inspect_err=$(mktemp)
+          for entry in "sealantd=$SEALANTD_DIGEST" "vm-runner=$VM_RUNNER_DIGEST" \
+            "egress-proxy=$EGRESS_PROXY_DIGEST"; do
+            image=${entry%%=*}
+            digest=${entry#*=}
+            ref=ghcr.io/$OWNER/$image-next:$VERSION
+            status=0
+            served=
+            out=$(DOCKER_CONFIG=$anonymous docker buildx imagetools inspect "$ref" \
+              --format '{{json .Manifest}}' 2>"$inspect_err") || status=$?
+            if ((status == 0)); then served=$(jq -r '.digest // ""' <<<"$out" 2>/dev/null) || served=; fi
+            if [[ $served != "$digest" ]]; then
+              cat "$inspect_err" >&2
+              echo "::error::$ref reads anonymously as '${served:-nothing}' (exit $status), not $digest, the index image-tag wrote. If the $image-next package on GHCR is private, make it public, then re-run this job. Nothing was published."
+              exit 1
+            fi
+            echo "$ref reads anonymously as $digest."
+          done
           # --- republish ---
           # republish.test.mjs runs this block as written, against a stub registry. The callers check the
           # downloaded artifact directory first (check_artifacts), then run every npm command from a fresh
@@ -576,6 +655,8 @@ jobs:
             echo
             echo "From \`$SHA\`."
             echo
-            echo "- \`ghcr.io/$GITHUB_REPOSITORY-next:$VERSION\` (\`$DIGEST\`)"
+            echo "- \`ghcr.io/$OWNER/sealantd-next:$VERSION@$SEALANTD_DIGEST\`"
+            echo "- \`ghcr.io/$OWNER/vm-runner-next:$VERSION@$VM_RUNNER_DIGEST\`"
+            echo "- \`ghcr.io/$OWNER/egress-proxy-next:$VERSION@$EGRESS_PROXY_DIGEST\`"
             echo "- \`@sealant/runtime-protocol-next@$VERSION\`, \`@sealant/runtime-client-next@$VERSION\` on npm \`next\`"
           } >> "$GITHUB_STEP_SUMMARY"

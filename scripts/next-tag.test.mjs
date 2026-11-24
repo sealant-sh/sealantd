@@ -100,11 +100,11 @@ const INDEX = `sha256:${createHash("sha256")
   .digest("hex")}`;
 
 /** Runs the step with the registry holding `tags`, scripted `reads`, and a `create` behaviour. */
-const runStep = (t, { tags = {}, reads = [], create = "ok" } = {}) => {
+const runStep = (t, { tags = {}, reads = [], create = "ok", sources = SOURCES } = {}) => {
   const dir = mkdtempSync(path.join(tmpdir(), "next-tag-"));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   for (const sub of ["bin", "digests", "state", "temp"]) mkdirSync(path.join(dir, sub));
-  for (const source of SOURCES) writeFileSync(path.join(dir, "digests", source), "");
+  for (const source of sources) writeFileSync(path.join(dir, "digests", source), "");
   const state = path.join(dir, "state");
   writeFileSync(path.join(state, "registry"), JSON.stringify(tags));
   writeFileSync(path.join(state, "reads"), JSON.stringify(reads));
@@ -124,9 +124,10 @@ const runStep = (t, { tags = {}, reads = [], create = "ok" } = {}) => {
       GITHUB_OUTPUT: output,
     },
   });
-  const commands = readFileSync(path.join(state, "commands"), "utf8")
-    .trim()
+  const called = path.join(state, "commands");
+  const commands = (existsSync(called) ? readFileSync(called, "utf8") : "")
     .split("\n")
+    .filter(Boolean)
     .map((line) => JSON.parse(line));
   return {
     status: result.status,
@@ -151,6 +152,22 @@ test("exact not-found creates the tag from this run's index", (t) => {
   assert.deepEqual(run.creates[0].slice(-2), SOURCES.map((s) => `${REPOSITORY}@sha256:${s}`));
   assert.deepEqual(run.registry, { [REF]: INDEX });
   assert.equal(run.output, `digest=${INDEX}\n`);
+});
+
+test("anything but one digest per arch is refused before docker runs", (t) => {
+  for (const [label, sources] of [
+    ["one arch's digest", [SOURCES[0]]],
+    ["a third file", [...SOURCES, "d".repeat(64)]],
+    ["a stray name", [SOURCES[0], "latest"]],
+    ["none", []],
+  ]) {
+    const run = runStep(t, { sources });
+    assert.equal(run.status, 1, `${label}: ${run.log}`);
+    assert.match(run.log, /not one image digest per arch; nothing was written/, label);
+    assert.deepEqual(run.creates, [], label);
+    assert.deepEqual(run.registry, {}, label);
+    assert.equal(run.output, "", label);
+  }
 });
 
 test("not-found with extra trailing newlines is still absent", (t) => {
