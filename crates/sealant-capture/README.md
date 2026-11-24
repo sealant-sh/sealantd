@@ -581,12 +581,15 @@ restore, byte for byte, so the user never notices the compute changed.
   reaches a lost object (a branch or reflog entry naming the lost commit, an index tree naming the
   lost blob) is found by halving `rev-list --objects` checks and left out of the pack, with a
   warning. The capture names nothing the packs do not hold: a ref naming a lost tip is not in
-  `refs` and a lost index tree is not `index_tree` (a restore takes the index's own bytes), and the
-  engine keeps the lost tips (`git-lost.json`) out of every later pack's negatives, so one whose
-  objects come back is packed then. A tip is packed whole or not at all: `pack-objects
-  --missing=allow-any` keeps a tip with missing blobs but still dies on a missing commit, and a tip
-  with a hole would be a negative hiding the hole for good. A worktree tree that still cannot be
-  made whole fails the snap as before; the evidence goes once a build finds the repository whole.
+  `refs`; an index naming a lost object is carried rebuilt (its lost entries read again from their
+  files, the rest as staged) as `index_tree`, and its bytes are left out of the workspace class, so
+  the restored disk's next capture does not fail on them; and a `HEAD` detached at a lost commit,
+  for which nothing can stand in, fails the build as before. Nothing lost is ever a later pack's
+  negative, so a tip whose objects come back is packed then. A tip is packed whole or not at all:
+  `pack-objects --missing=allow-any` keeps a tip with missing blobs but still dies on a missing
+  commit, and a tip with a hole would be a negative hiding the hole for good. A worktree tree that
+  still cannot be made whole fails the snap as before; the evidence goes once a build finds the
+  repository whole.
   Without it, a missing object fails the build as it always did. The git the capture runs flushes
   the loose objects, index and refs it writes (`core.fsync=loose-object,pack,pack-metadata,reference,index`,
   `core.fsyncMethod=batch`, per command and never in `.git/config`), so a capture leaves no torn

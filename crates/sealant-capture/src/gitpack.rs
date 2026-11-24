@@ -2425,8 +2425,8 @@ impl GitRepo {
     /// before writeback) leaves an entry whose stat still matches the file: `git add` trusts it,
     /// keeps the lost blob, and `write-tree` refuses the index ("invalid object"), so no file
     /// of the worktree was saved. Gitlinks name another repository's commit and are left as
-    /// they are. The number of entries given back to `git add`.
-    fn reenter_lost_blobs(&self, index: &Path) -> Result<usize, GitError> {
+    /// they are. The paths of the entries given back to `git add`.
+    fn reenter_lost_blobs(&self, index: &Path) -> Result<Vec<Vec<u8>>, GitError> {
         let ls = ["ls-files", "-s", "-z"];
         let listed = check(
             &ls,
@@ -2444,15 +2444,15 @@ impl GitRepo {
         blobs.dedup();
         let present: BTreeSet<String> = self.existing(&blobs)?.into_iter().collect();
         let mut info: Vec<u8> = Vec::new();
-        let mut lost = 0;
+        let mut lost: Vec<Vec<u8>> = Vec::new();
         for e in entries.iter().filter(|e| !present.contains(&e.sha)) {
             info.extend_from_slice(format!("{} {} {}\t", e.mode, e.sha, e.stage).as_bytes());
             info.extend_from_slice(&e.path);
             info.push(0);
-            lost += 1;
+            lost.push(e.path.clone());
         }
-        if lost == 0 {
-            return Ok(0);
+        if lost.is_empty() {
+            return Ok(lost);
         }
         // An entry `--index-info` writes has no stat data: `git add` cannot take it as clean.
         let args = ["update-index", "-z", "--index-info"];
@@ -2465,10 +2465,66 @@ impl GitRepo {
             .spawn_bounded()?;
         check(&args, child.communicate(Some(info))?)?;
         tracing::warn!(
-            entries = lost,
+            entries = lost.len(),
             "index entries name blobs a crash lost; their files are read again"
         );
         Ok(lost)
+    }
+
+    /// The index as a tree the object store holds whole, when the index names objects a crash
+    /// lost: `None` (outer) when it names none. Then its bytes cannot come back as they are: a
+    /// restore of them named the lost blob, and the next capture on the restored disk, which
+    /// knows of no crash, failed (`pack-objects: bad object`). Each entry whose blob is gone is
+    /// read again from its file (or removed, when the file is gone too), every other entry is
+    /// as staged, and the tree is the index a restore makes. `Some(None)` when that tree cannot
+    /// be written or is not whole (an unmerged index): the restore then makes no index.
+    pub fn index_rebuilt_without_lost(
+        &self,
+        scratch_dir: &Path,
+    ) -> Result<Option<Option<String>>, GitError> {
+        let real_index = self.git_dir.join("index");
+        if !real_index.exists() {
+            return Ok(None);
+        }
+        fs::create_dir_all(scratch_dir).map_err(at("mkdir -p", scratch_dir))?;
+        let tmp_index = scratch_dir.join("index-rebuilt");
+        remove_scratch(&tmp_index);
+        fs::copy(&real_index, &tmp_index).map_err(at("copy into", &tmp_index))?;
+        let rebuilt = (|| -> Result<Option<Option<String>>, GitError> {
+            let lost = self.reenter_lost_blobs(&tmp_index)?;
+            if lost.is_empty() {
+                return Ok(None);
+            }
+            let mut paths: Vec<u8> = Vec::new();
+            for p in &lost {
+                paths.extend_from_slice(p);
+                paths.push(0);
+            }
+            let args = ["update-index", "--add", "--remove", "-z", "--stdin"];
+            let child = git_command(&self.root)?
+                .env("GIT_INDEX_FILE", &tmp_index)
+                .args(args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn_bounded()?;
+            let updated = child.communicate(Some(paths))?;
+            if !updated.status.success() {
+                tracing::warn!(stderr = %String::from_utf8_lossy(&updated.stderr).trim(), "the index's lost entries could not be read again; the restore makes no index");
+                return Ok(Some(None));
+            }
+            let out = git_command(&self.root)?
+                .env("GIT_INDEX_FILE", &tmp_index)
+                .args(["write-tree"])
+                .output_bounded()?;
+            let tree = out.status.success().then(|| stdout_string(&out));
+            Ok(Some(match tree {
+                Some(t) if self.reaches_whole(std::slice::from_ref(&t), &[])? => Some(t),
+                _ => None,
+            }))
+        })();
+        remove_scratch(&tmp_index);
+        rebuilt
     }
 
     /// Whether everything `tips` reach, short of `negatives`, is in the object store: `git
@@ -3270,10 +3326,14 @@ pub struct Closure {
     /// here ([`GitRepo::unrestorable_ref_links`]).
     pub unrestorable_ref_links: Vec<String>,
     /// Tips a torn build left out of the pack: they reach objects a crash lost
-    /// ([`read_for_pack`]). No ref of `refs` names one, `index_tree` is none when it was one,
-    /// and none is in `tips`: nothing a capture names is missing from its packs, so none ever
-    /// becomes a negative of a later pack. Sorted.
+    /// ([`read_for_pack`]). No ref of `refs` names one, `index_tree` is never one, `head` is
+    /// never one (the build fails instead), and none is in `tips`: nothing a capture names is
+    /// missing from its packs, so none ever becomes a negative of a later pack. Sorted.
     pub lost: Vec<String>,
+    /// The index names objects a crash lost: its bytes are not the capture's to carry (the
+    /// workspace class leaves `.git/index` out), and `index_tree` is the index rebuilt without
+    /// them ([`GitRepo::index_rebuilt_without_lost`]), the index a restore makes.
+    pub index_rebuilt: bool,
 }
 
 /// Read the closure (refs, `HEAD`, index, stash, reflog, worktree) in that order. `excludes` are
@@ -3396,6 +3456,7 @@ fn read_closure_torn(
         ref_format,
         unrestorable_ref_links,
         lost: Vec::new(),
+        index_rebuilt: false,
     })
 }
 
@@ -3707,9 +3768,10 @@ impl GitRepo {
 /// [`read_closure_torn`], and with `torn` the closure's tips cut to the ones whose objects the
 /// store holds whole ([`GitRepo::split_whole_tips`]): a ref, a reflog entry or an index blob
 /// that names what a crash lost is left out of the pack ([`Closure::lost`]), and the capture
-/// holds everything else. An index tree that is lost is not named (the workspace class carries
-/// the index's bytes). The worktree tree and the raw tree are the files on disk, read again:
-/// one that is still not whole fails the read.
+/// holds everything else. An index naming a lost object is carried rebuilt
+/// ([`Closure::index_rebuilt`]). The worktree tree and the raw tree are the files on disk, read
+/// again, and a detached `HEAD` has nothing to stand in for it: one of them that is still not
+/// whole fails the read.
 fn read_for_pack(
     repo: &GitRepo,
     scratch_dir: &Path,
@@ -3722,10 +3784,14 @@ fn read_for_pack(
     if !torn {
         return Ok(closure);
     }
-    let (whole, lost) = repo.split_whole_tips(&closure.tips, negatives)?;
-    if lost.is_empty() {
-        return Ok(closure);
+    // An index naming what a crash lost comes back rebuilt, never as its bytes.
+    let rebuilt = repo.index_rebuilt_without_lost(scratch_dir)?;
+    if let Some(Some(tree)) = &rebuilt {
+        closure.tips.push(tree.clone());
+        closure.tips.sort();
+        closure.tips.dedup();
     }
+    let (whole, lost) = repo.split_whole_tips(&closure.tips, negatives)?;
     for tree in [&closure.worktree_tree, &closure.raw_tree] {
         if lost.contains(tree) {
             return Err(GitError::Command {
@@ -3736,8 +3802,35 @@ fn read_for_pack(
             });
         }
     }
-    // A restore reads the index tree into the index: one the packs do not hold fails it.
-    let lost_index = closure.index_tree.take_if(|t| lost.contains(t));
+    // A detached `HEAD` is named whatever it is, and nothing can stand in for it: a capture
+    // naming one its packs do not hold would restore a `HEAD` that resolves to nothing (and
+    // that `update-ref` refuses). Not complete, as before this fix.
+    if !closure.head.starts_with("refs/") && lost.contains(&closure.head) {
+        return Err(GitError::Command {
+            args: "rev-list --objects".to_owned(),
+            stderr: format!(
+                "HEAD is detached at {}, which reaches objects a crash lost",
+                closure.head
+            ),
+        });
+    }
+    match rebuilt {
+        Some(tree) => {
+            closure.index_tree = tree.filter(|t| !lost.contains(t));
+            closure.index_rebuilt = true;
+            tracing::warn!(
+                index_tree = ?closure.index_tree,
+                "the index names objects a crash lost; the capture carries it rebuilt from the files"
+            );
+        }
+        // A restore reads the index tree into the index: one the packs do not hold fails it.
+        None => {
+            closure.index_tree.take_if(|t| lost.contains(t));
+        }
+    }
+    if lost.is_empty() {
+        return Ok(closure);
+    }
     // Whole or not at all: a tip packed with a hole (`pack-objects --missing=allow-any`, which
     // still dies on a missing commit) would restore an object no walk of its history completes,
     // and as a later pack's negative keep the missing object out should it come back. A tip the
@@ -3746,7 +3839,6 @@ fn read_for_pack(
     tracing::warn!(
         lost = lost.len(),
         readable = readable.len(),
-        index_tree = ?lost_index,
         tips = %lost.join(" "),
         "these tips (refs, reflog entries, the index) reach objects a crash lost; they are left \
          out of the pack, and the capture holds the worktree and everything else"
@@ -4937,6 +5029,28 @@ mod tests {
         tear(&clone, &blob);
         packed("a crash tore an object");
         assert!(torn_mark(&clone).exists());
+    }
+
+    /// R2 review of #242: `HEAD` detached at a commit a crash tore. Nothing can stand in for
+    /// it, so the torn build fails, as before the fix, rather than make a capture whose `HEAD`
+    /// its packs do not hold; and any build that succeeds names a `HEAD` its tips hold.
+    #[test]
+    fn a_detached_head_at_a_lost_commit_fails_the_build() {
+        let (dir, repo) = fixture();
+        fs::write(repo.root.join("a"), "two\n").unwrap();
+        repo.run(&["commit", "-q", "-am", "two"]).unwrap();
+        repo.run(&["checkout", "-q", "--detach"]).unwrap();
+        let lost = stdout_string(&repo.run(&["rev-parse", "HEAD"]).unwrap());
+        let scratch = dir.path().join("scratch");
+        let whole = build_git_pack(&repo, &scratch, &[], &[]).unwrap();
+        assert_eq!(whole.closure.head, lost);
+        assert!(
+            whole.closure.tips.contains(&lost),
+            "a detached HEAD is packed"
+        );
+        tear(&repo, &lost);
+        let error = build_git_pack(&repo, &scratch, &[], &[]).unwrap_err();
+        assert!(error.to_string().contains("HEAD is detached"), "{error}");
     }
 
     /// The evidence a torn build needs outlives the process that removed the objects (a

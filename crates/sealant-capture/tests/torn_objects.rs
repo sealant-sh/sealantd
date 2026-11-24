@@ -105,8 +105,13 @@ impl Fixture {
     /// A runner over the staging the disk holds, resuming from the registered head when there
     /// is one: what a recovery boot opens.
     fn runner(&self) -> CadenceRunner {
+        self.runner_at(&self.root)
+    }
+
+    /// [`Self::runner`] over the workspace at `root`: a restored disk picked up.
+    fn runner_at(&self, root: &Path) -> CadenceRunner {
         let previous = self.registrar.head().map(|h| h.manifest.encode());
-        let engine = CaptureEngine::open(self.config(), previous).unwrap();
+        let engine = CaptureEngine::open(CaptureConfig::new("wt", 1, root), previous).unwrap();
         let registrar: Arc<dyn Registrar> = self.registrar.clone();
         let shipper = Arc::new(engine.shipper(self.store.clone(), registrar));
         CadenceRunner::new(engine, shipper)
@@ -227,12 +232,14 @@ fn a_recovery_final_flush_after_a_hard_kill_restores_every_file() {
     }
 }
 
-/// R1 review of #242 (both reviewers): a commit the kill left whole whose blob it tore, the
-/// file edited again since. The index (its cache tree) still names the commit's tree, which
-/// reaches the lost blob: a capture that named it as its index tree made every restore fail
-/// (`git read-tree …: failed to unpack tree object`). The index tree is now left out with the
-/// tips that reach the lost blob, the final flush completes, and the head restores the latest
-/// edit byte for byte.
+/// R1 and R2 reviews of #242: a commit the kill left whole whose blob it tore, the file edited
+/// again since. The index (its cache tree, and its entry for the file) still names the lost
+/// blob. A capture that named the commit's tree as its index tree made every restore fail
+/// (`git read-tree …: failed to unpack tree object`); one that carried the index's bytes gave
+/// the restored disk an index naming the lost blob, and its next capture, knowing of no crash,
+/// failed (`pack-objects: bad object`). The index is now carried rebuilt from the files, the
+/// final flush completes, the head restores the latest edit byte for byte, and the restored
+/// workspace captures new work that a second restore brings back.
 #[test]
 fn a_lost_index_tree_is_not_named_and_the_head_restores() {
     let fx = Fixture::new();
@@ -245,6 +252,7 @@ fn a_lost_index_tree_is_not_named_and_the_head_restores() {
     git(&fx.root, &["add", "src/edit.txt"]);
     git(&fx.root, &["commit", "-q", "-m", "two"]);
     let committed = git(&fx.root, &["rev-parse", "HEAD:src/edit.txt"]);
+    let lost_tree = git(&fx.root, &["rev-parse", "HEAD^{tree}"]);
     fs::write(
         fx.root.join("src/edit.txt"),
         "edited again after the commit\n",
@@ -256,9 +264,12 @@ fn a_lost_index_tree_is_not_named_and_the_head_restores() {
     let recovery = fx.runner();
     let flushed = recovery.flush_final(None);
     assert!(flushed.complete(), "{flushed:?}");
+    recovery.stop();
+    drop(recovery);
     let git_section = fx.registrar.head().unwrap().manifest.sections.git;
-    assert_eq!(
-        git_section.index_tree, None,
+    assert_ne!(
+        git_section.index_tree.as_deref(),
+        Some(lost_tree.as_str()),
         "the lost index tree is not named"
     );
     let restored = fx.restore("restored");
@@ -267,13 +278,38 @@ fn a_lost_index_tree_is_not_named_and_the_head_restores() {
         fs::read(restored.join("src/edit.txt")).unwrap(),
         b"edited again after the commit\n"
     );
+    // The restored index names only what the store holds.
+    let staged = git(&restored, &["ls-files", "-s", "src/edit.txt"]);
+    let blob = staged.split_whitespace().nth(1).unwrap().to_owned();
+    assert_ne!(blob, committed, "{staged}");
+    assert_eq!(git(&restored, &["cat-file", "-t", &blob]), "blob");
+
+    // The restored disk, picked up: new work is captured and comes back.
+    fs::write(
+        restored.join("src/second.txt"),
+        "written after the restore\n",
+    )
+    .unwrap();
+    let picked_up = fx.runner_at(&restored);
+    picked_up.flush(CaptureKind::Checkpoint, None).unwrap();
+    picked_up.stop();
+    let again = fx.restore("restored-again");
+    assert_eq!(files(&again), files(&restored));
+    assert_eq!(
+        fs::read(again.join("src/edit.txt")).unwrap(),
+        b"edited again after the commit\n"
+    );
+    assert_eq!(
+        fs::read(again.join("src/second.txt")).unwrap(),
+        b"written after the restore\n"
+    );
 }
 
-/// R1 review of #242 (Astra #2): a tip a torn pack left out is no negative of a later one. The
-/// lost commit's objects come back (fetched again, written again); the next capture, in a
-/// process of its own, packs them, and its head restores the commit, detached `HEAD` and all.
-/// Taken for a negative (the capture names a detached `HEAD` whatever it is), the commit would
-/// stay out of every pack while the capture named it.
+/// R1 review of #242 (Astra #2): a tip a torn pack left out is no negative of a later one. A
+/// side branch's commit is lost; the capture names no ref to it. Its objects come back
+/// (fetched again, written again), and the next capture, in a process of its own, packs the
+/// commit and names the branch again. Named while it was lost, it would have been a negative
+/// of that pack and stayed out of every pack while the capture named it.
 #[test]
 fn a_lost_tip_that_comes_back_is_packed_not_taken_for_a_negative() {
     let fx = Fixture::new();
@@ -282,15 +318,15 @@ fn a_lost_tip_that_comes_back_is_packed_not_taken_for_a_negative() {
     running.stop();
     drop(running);
 
+    git(&fx.root, &["checkout", "-q", "-b", "side"]);
     fs::write(fx.root.join("src/edit.txt"), "committed, lost, back\n").unwrap();
-    git(&fx.root, &["add", "src/edit.txt"]);
-    git(&fx.root, &["commit", "-q", "-m", "two"]);
-    git(&fx.root, &["checkout", "-q", "--detach"]);
+    git(&fx.root, &["commit", "-q", "-am", "two"]);
     let lost = git(&fx.root, &["rev-parse", "HEAD"]);
     let ids = git(
         &fx.root,
         &["rev-list", "--objects", "--no-object-names", "HEAD^..HEAD"],
     );
+    git(&fx.root, &["checkout", "-q", "main"]);
     let saved: Vec<(PathBuf, Vec<u8>)> = ids
         .lines()
         .map(|id| {
@@ -299,7 +335,6 @@ fn a_lost_tip_that_comes_back_is_packed_not_taken_for_a_negative() {
             (path, bytes)
         })
         .collect();
-    fx.index_after_the_files();
     for id in ids.lines() {
         tear(&fx.root, id);
     }
@@ -310,7 +345,7 @@ fn a_lost_tip_that_comes_back_is_packed_not_taken_for_a_negative() {
     drop(torn);
     let head = fx.registrar.head().unwrap().manifest.sections.git;
     assert!(
-        head.refs.values().all(|v| *v != lost),
+        !head.refs.contains_key("refs/heads/side") && head.refs.values().all(|v| *v != lost),
         "no ref names the lost commit: {:?}",
         head.refs
     );
@@ -324,8 +359,12 @@ fn a_lost_tip_that_comes_back_is_packed_not_taken_for_a_negative() {
     later.flush(CaptureKind::Checkpoint, None).unwrap();
     later.stop();
     let head = fx.registrar.head().unwrap().manifest.sections.git;
-    assert_eq!(head.head, lost, "HEAD is detached at the commit");
-    assert!(head.refs.values().any(|v| *v == lost), "{:?}", head.refs);
+    assert_eq!(
+        head.refs.get("refs/heads/side"),
+        Some(&lost),
+        "{:?}",
+        head.refs
+    );
     let restored = fx.restore("restored");
     assert_eq!(
         git(&restored, &["cat-file", "-t", &lost]),
@@ -333,7 +372,7 @@ fn a_lost_tip_that_comes_back_is_packed_not_taken_for_a_negative() {
         "the commit came back with the capture"
     );
     assert_eq!(
-        fs::read(restored.join("src/edit.txt")).unwrap(),
-        b"committed, lost, back\n"
+        git(&restored, &["show", &format!("{lost}:src/edit.txt")]),
+        "committed, lost, back"
     );
 }

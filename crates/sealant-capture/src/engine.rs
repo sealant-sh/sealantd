@@ -906,11 +906,6 @@ pub struct CaptureEngine {
     /// the negatives of the next pack. The manifest only carries refs, so reflog-only history
     /// would otherwise be packed again on every snap.
     last_tips: Vec<String>,
-    /// Tips a torn git pack left out ([`gitpack::Closure::lost`]: they reach objects a crash
-    /// lost), never negatives of a later pack: one that comes back whole (fetched again, or
-    /// written again from a file) is packed then. A capture names none of them as a ref, but a
-    /// detached `HEAD` is named whatever it is. Sorted.
-    lost_tips: Vec<String>,
     /// The worktree metadata overlay the last small snap read, in memory: an automatic snap
     /// keeps its entry for a tracked path whose metadata it cannot read (git carries the path's
     /// content). Empty after a restart, when such a path's metadata is left out and the path is
@@ -1092,10 +1087,6 @@ impl CaptureEngine {
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok())
             .unwrap_or_default();
-        let lost_tips: Vec<String> = fs::read(index_dir.join("git-lost.json"))
-            .ok()
-            .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or_default();
         // The tips of captures staged under another identity (the lease moved to a new epoch
         // while the daemon was down) are not the chain's: those captures never register, and
         // negatives taken from them would leave their objects out of every later pack.
@@ -1133,7 +1124,6 @@ impl CaptureEngine {
             chunks,
             dirs,
             last_tips,
-            lost_tips,
             last_meta: None,
             shared_outside: false,
             links_deferred: false,
@@ -1634,7 +1624,6 @@ impl CaptureEngine {
             ("chunks", serde_json::to_vec(&self.chunks)?),
             ("dirs", serde_json::to_vec(&self.dirs)?),
             ("git-tips", serde_json::to_vec(&self.last_tips)?),
-            ("git-lost", serde_json::to_vec(&self.lost_tips)?),
         ] {
             let tmp = dir.join(format!("{name}.tmp"));
             fs::write(&tmp, bytes).at("write", &tmp)?;
@@ -2581,8 +2570,6 @@ impl CaptureEngine {
                 previous_tips.extend(self.last_tips.iter().cloned());
                 previous_tips.sort();
                 previous_tips.dedup();
-                // What a pack left out is no negative: the store does not hold it.
-                previous_tips.retain(|t| self.lost_tips.binary_search(t).is_err());
                 // A git pack the registrar says is missing: pack every object again.
                 if self.repair_git.is_some() {
                     previous_tips.clear();
@@ -2690,6 +2677,12 @@ impl CaptureEngine {
                     git_packs.push(key);
                 }
                 let mut listing = self.workspace_listing(&repo, &git.closure.gitlinks)?;
+                // An index naming objects a crash lost is carried rebuilt, as the index tree
+                // (`Closure::index_rebuilt`): its bytes would restore an index naming them, and
+                // the next capture on the restored disk would fail on it.
+                if git.closure.index_rebuilt {
+                    listing.entries.remove(".git/index");
+                }
                 // Every nested repository and path git could not index is the workspace
                 // class's to carry; one on disk that its listing does not hold would be
                 // acknowledged as saved and restore as nothing.
@@ -3002,12 +2995,6 @@ impl CaptureEngine {
                 self.last_tips.extend(borrowed);
                 self.last_tips.sort();
                 self.last_tips.dedup();
-                // Lost until a pack holds them.
-                self.lost_tips
-                    .retain(|t| self.last_tips.binary_search(t).is_err());
-                self.lost_tips.extend(git.closure.lost.iter().cloned());
-                self.lost_tips.sort();
-                self.lost_tips.dedup();
                 self.last_meta.clone_from(&meta_doc);
                 self.repair_git = None;
                 let closure = git.closure;
