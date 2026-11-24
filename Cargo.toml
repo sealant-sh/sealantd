@@ -33,6 +33,12 @@ rustls-pemfile = "2"
 rustls-pki-types = "1"
 tokio-tungstenite = { version = "0.27", default-features = false, features = ["handshake"] }
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+# Public roots the egress proxy verifies brokered upstreams against (never the executor CA).
+webpki-roots = "1"
+# Validity windows for the egress proxy's minted leaf certificates (rcgen's own date type).
+time = "0.3"
+# HTTP/1.1 head parsing for the egress proxy's explicit, transparent and MITM paths.
+httparse = "1"
 # serde / schema
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
