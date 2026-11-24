@@ -1,10 +1,18 @@
 //! The boot and exit protocol on vsock port 1026, shared with `sealant-vm-runner`.
 //!
-//! Newline-delimited JSON, one object per line, each with `"version": 1`. At boot the guest
-//! dials the host (CID 2, port 1026) and reads one [`VmBootConfig`]. On its way out, after the
-//! data disk is synced, it dials again, writes one [`GuestExitStatus`] and reads one
-//! [`ExitAck`] before it powers off: the runner exits 76 (nothing to save) only on a status that
-//! says so, so the status must reach it before the VM is gone.
+//! Newline-delimited JSON, one object per line, each with `"version": 1`, over **one**
+//! connection PID 1 opens to the host (CID 2, port 1026) at boot and holds for its lifetime. The
+//! runner stops accepting on the port once it has that connection, so no process in the guest
+//! can read the secret environment or forge an exit status after it.
+//!
+//! - runner → guest, first: one [`VmBootConfig`];
+//! - runner → guest, later and at most once: [`RunnerFrame::Shutdown`]
+//!   (`{"version":1,"type":"shutdown"}`), on the runner's `SIGTERM` / `SIGINT`;
+//! - guest → runner, on the way out after the data disk is synced: one [`GuestExitStatus`]
+//!   (`{"version":1,"type":"exit","exitCode":…,"synced":…,"reason":…}`);
+//! - runner → guest, last: one [`ExitAck`] (`{"version":1,"type":"exitAck","accepted":true}`),
+//!   after which the guest powers off. The runner exits 76 (nothing to save) only on a status
+//!   that says so, so the status must reach it before the VM is gone.
 
 use std::collections::BTreeMap;
 
@@ -44,8 +52,8 @@ impl VmMode {
 /// OCI field names.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct ImageConfig {
-    /// `KEY=VALUE` entries, `PATH` among them.
-    #[serde(rename = "Env", default)]
+    /// `KEY=VALUE` entries, `PATH` among them (`null` reads as none).
+    #[serde(rename = "Env", default, deserialize_with = "null_as_empty")]
     pub env: Vec<String>,
     /// The image's user. Informational: the daemon runs as root and runs each process as the
     /// person its request names.
@@ -69,6 +77,13 @@ pub struct ImageConfig {
     /// Informational, as `Entrypoint`.
     #[serde(rename = "Cmd", default, skip_serializing_if = "Option::is_none")]
     pub cmd: Option<Vec<String>>,
+}
+
+fn null_as_empty<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<Vec<String>>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 impl ImageConfig {
@@ -192,25 +207,69 @@ impl std::fmt::Debug for VmBootConfig {
     }
 }
 
-/// What the guest sends on its way out, after `sync()`.
+/// What the guest sends on its way out, after `sync()` and `syncfs` on the data disk.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename = "exit", rename_all = "camelCase")]
 pub struct GuestExitStatus {
     /// [`PROTOCOL_VERSION`].
     pub version: u32,
     /// The daemon's exit code: 0, 75 (capture incomplete), 76 (nothing to save), …
     pub exit_code: i32,
-    /// Whether the data disk was synced before this was sent.
+    /// Whether the data disk's `syncfs` completed before this was sent.
     pub synced: bool,
     /// Why, when the exit is not a clean one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub reason: Option<String>,
 }
 
-/// The runner's answer to a [`GuestExitStatus`]: it has the status, and the guest may power off.
+/// The runner's answer to a [`GuestExitStatus`]: it recorded the status, and the guest may
+/// power off. Strict: nothing but exactly this frame reads as an acknowledgement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename = "exitAck", try_from = "RawExitAck")]
 pub struct ExitAck {
     /// [`PROTOCOL_VERSION`].
     pub version: u32,
+    /// Must be `true`.
+    pub accepted: bool,
+}
+
+/// [`ExitAck`] as read: exactly these three fields (serde's tagged structs cannot also refuse
+/// unknown fields).
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawExitAck {
+    version: u32,
+    #[serde(rename = "type")]
+    kind: String,
+    accepted: bool,
+}
+
+impl TryFrom<RawExitAck> for ExitAck {
+    type Error = String;
+
+    fn try_from(raw: RawExitAck) -> Result<Self, Self::Error> {
+        if raw.kind != "exitAck" {
+            return Err(format!(
+                "a {:?} frame is not an exit acknowledgement",
+                raw.kind
+            ));
+        }
+        Ok(Self {
+            version: raw.version,
+            accepted: raw.accepted,
+        })
+    }
+}
+
+/// A frame the runner sends after the boot config.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase", deny_unknown_fields)]
+pub enum RunnerFrame {
+    /// Shut down gracefully, as on `SIGTERM`: final flush, sync, exit status, power off.
+    Shutdown {
+        /// [`PROTOCOL_VERSION`].
+        version: u32,
+    },
 }
 
 /// Why a frame could not be read or written.
@@ -252,6 +311,13 @@ impl Versioned for GuestExitStatus {
 impl Versioned for ExitAck {
     fn version(&self) -> u32 {
         self.version
+    }
+}
+impl Versioned for RunnerFrame {
+    fn version(&self) -> u32 {
+        match self {
+            Self::Shutdown { version } => *version,
+        }
     }
 }
 
@@ -427,8 +493,78 @@ mod tests {
         .expect("json");
         assert_eq!(
             status,
-            serde_json::json!({ "version": 1, "exit_code": 75, "synced": true })
+            serde_json::json!({
+                "version": 1, "type": "exit", "exitCode": 75, "synced": true, "reason": null
+            })
         );
+        assert_eq!(
+            serde_json::to_value(ExitAck {
+                version: 1,
+                accepted: true
+            })
+            .expect("json"),
+            serde_json::json!({ "version": 1, "type": "exitAck", "accepted": true })
+        );
+        assert_eq!(
+            serde_json::to_value(RunnerFrame::Shutdown { version: 1 }).expect("json"),
+            serde_json::json!({ "version": 1, "type": "shutdown" })
+        );
+    }
+
+    #[tokio::test]
+    async fn nothing_but_an_exit_ack_reads_as_one() {
+        let ack = |line: &'static str| async move {
+            let mut reader = BufReader::new(line.as_bytes());
+            read_frame::<_, ExitAck>(&mut reader).await
+        };
+        assert_eq!(
+            ack("{\"version\":1,\"type\":\"exitAck\",\"accepted\":true}\n")
+                .await
+                .expect("an ack"),
+            ExitAck {
+                version: 1,
+                accepted: true
+            }
+        );
+        for bogus in [
+            // A boot frame, a shutdown, an exit status echoed back, an ack with a stray field,
+            // an ack without its tag.
+            "{\"version\":1,\"mode\":\"normal\"}\n",
+            "{\"version\":1,\"type\":\"shutdown\"}\n",
+            "{\"version\":1,\"type\":\"exit\",\"exitCode\":76,\"synced\":true}\n",
+            "{\"version\":1,\"type\":\"exitAck\",\"accepted\":true,\"mode\":\"normal\"}\n",
+            "{\"version\":1,\"accepted\":true}\n",
+        ] {
+            assert!(ack(bogus).await.is_err(), "{bogus}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_shutdown_frame_reads_and_anything_else_does_not() {
+        let mut reader = BufReader::new(&b"{\"version\":1,\"type\":\"shutdown\"}\n"[..]);
+        assert_eq!(
+            read_frame::<_, RunnerFrame>(&mut reader)
+                .await
+                .expect("shutdown"),
+            RunnerFrame::Shutdown { version: 1 }
+        );
+        let mut reader = BufReader::new(&b"{\"version\":1,\"type\":\"reboot\"}\n"[..]);
+        assert!(read_frame::<_, RunnerFrame>(&mut reader).await.is_err());
+    }
+
+    #[test]
+    fn the_runners_boot_frame_variations_parse() {
+        // `Env` null, a network config with the runner's `mac` and no interface.
+        let parsed: VmBootConfig = serde_json::from_str(
+            r#"{"version":1,"mode":"normal","config":{"Env":null},
+                "networkConfig":{"address":"10.200.0.2/30","gateway":"10.200.0.1",
+                "dns":["10.200.0.1"],"mtu":1500,"mac":"02:00:00:00:00:01"}}"#,
+        )
+        .expect("parse");
+        assert!(parsed.config.env.is_empty());
+        let network = parsed.network_config.expect("network");
+        assert_eq!(network.interface, "eth0");
+        assert_eq!(network.mtu, Some(1500));
     }
 
     #[test]

@@ -334,9 +334,10 @@ fn ssh_runtime_dir(config: &BootConfig) -> PathBuf {
     config.workspace.workspace_root.join(SSH_RUNTIME_SUBDIR)
 }
 
-/// Step 3: create the standard directories and chdir into the workspace root. The harness child's
-/// identity/PATH are injected via `child_env` (see [`harness_child_env`]), not the process env.
-fn prepare_workspace(config: &BootConfig) -> Result<(), BootError> {
+/// The directories step 3 creates. A recovery boot makes no `/root`: it runs no harness, and
+/// on a microVM's read-only base disk the directory could not be made.
+#[must_use]
+pub fn workspace_dirs(config: &BootConfig) -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = vec![
         config.workspace.workspace_root.clone(),
         ssh_runtime_dir(config),
@@ -345,7 +346,7 @@ fn prepare_workspace(config: &BootConfig) -> Result<(), BootError> {
         config.control.session_journal_dir.clone(),
     ];
     // Root's home (the harness's `HOME`): a daemon that is not root cannot create it.
-    if nix::unistd::geteuid().is_root() {
+    if nix::unistd::geteuid().is_root() && !config.recovery {
         dirs.push(PathBuf::from("/root"));
     }
     if let Some(parent) = config.control.socket.parent() {
@@ -356,7 +357,13 @@ fn prepare_workspace(config: &BootConfig) -> Result<(), BootError> {
     if !matches!(config.source, WorkspaceSource::Standby(_)) {
         dirs.push(config.workspace.working_directory.clone());
     }
-    for dir in &dirs {
+    dirs
+}
+
+/// Step 3: create the standard directories and chdir into the workspace root. The harness child's
+/// identity/PATH are injected via `child_env` (see [`harness_child_env`]), not the process env.
+fn prepare_workspace(config: &BootConfig) -> Result<(), BootError> {
+    for dir in &workspace_dirs(config) {
         std::fs::create_dir_all(dir).map_err(|e| BootError::io_path("mkdir -p", dir, e))?;
     }
 

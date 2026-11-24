@@ -3163,6 +3163,98 @@ mod tests {
         );
     }
 
+    /// Whether `pid` is a live process (not gone, not a zombie).
+    fn alive(pid: i32) -> bool {
+        std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|line| crate::sweep::parse_stat(&line))
+            .is_some_and(|info| info.state != 'Z')
+    }
+
+    /// A Docker API on `socket` that answers only while `daemon` holds a live pid: no
+    /// container running. Gone, it closes each connection unanswered, as a dead `dockerd`'s
+    /// socket would leave the client.
+    fn docker_api_of(socket: &Path, daemon: Arc<std::sync::atomic::AtomicI32>) {
+        use std::sync::atomic::Ordering;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::UnixListener::bind(socket).unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut conn, _)) = listener.accept().await {
+                let pid = daemon.load(Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    let _ = conn.read(&mut buf).await;
+                    if pid > 0 && alive(pid) {
+                        let _ = conn
+                            .write_all(
+                                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n[]",
+                            )
+                            .await;
+                    }
+                });
+            }
+        });
+    }
+
+    /// A microVM guest's own `dockerd` is a service of the daemon, not a managed process: the
+    /// final flush stops its containers, terminates every writer while sparing the daemon and
+    /// its tree, asks it a second time, and only then stops it — complete. Run as a managed
+    /// process (as before), the daemon died with the writers, the second check found its
+    /// socket dead, counted that as a writer still running and called the flush incomplete.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_guest_owned_docker_daemon_lives_through_the_second_container_check() {
+        use std::sync::atomic::{AtomicI32, Ordering};
+        // The daemon stand-in: a parent with a child of its own, as dockerd with containerd.
+        const DAEMON: &str = "sleep 600 & wait";
+        let mark = format!("docker-service-{}", std::process::id());
+
+        // As a service: complete, and the daemon is gone after.
+        let tmp = tempfile::tempdir().unwrap();
+        let (runtime, capture, _registrar) = quiet_runtime(tmp.path());
+        runtime.set_sweep_mark(Some(mark.clone()));
+        capture.start_without_harness(runtime.clone());
+        let daemon = Arc::new(AtomicI32::new(0));
+        let socket = tmp.path().join("docker.sock");
+        docker_api_of(&socket, daemon.clone());
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command
+            .args(["-c", DAEMON])
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .env(crate::runtime::SWEEP_MARK_ENV, &mark);
+        let pid = runtime.start_docker_service(&mut command).unwrap();
+        daemon.store(pid, Ordering::SeqCst);
+        runtime.set_workspace_docker(Some(crate::docker::DockerEndpoint::Unix(socket)));
+        let report = runtime.final_flush(None, Some(1_000)).await.unwrap();
+        assert!(report.complete, "{report:?}");
+        assert!(
+            !alive(pid),
+            "the service is stopped once the containers are checked"
+        );
+
+        // As a managed process: the sweep kills it before the second check.
+        let tmp = tempfile::tempdir().unwrap();
+        let (runtime, capture, _registrar) = quiet_runtime(tmp.path());
+        runtime.set_sweep_mark(Some(mark.clone()));
+        capture.start_without_harness(runtime.clone());
+        let daemon = Arc::new(AtomicI32::new(0));
+        let socket = tmp.path().join("docker.sock");
+        docker_api_of(&socket, daemon.clone());
+        let mut args = sh(DAEMON, tmp.path());
+        args.env.push(sealant_protocol::EnvVar {
+            key: crate::runtime::SWEEP_MARK_ENV.to_owned(),
+            value: mark.clone(),
+        });
+        let managed = runtime.spawn_managed(args).unwrap();
+        daemon.store(managed.pid, Ordering::SeqCst);
+        runtime.set_workspace_docker(Some(crate::docker::DockerEndpoint::Unix(socket)));
+        let report = runtime.final_flush(None, Some(1_000)).await.unwrap();
+        assert!(!report.complete, "{report:?}");
+        assert_eq!(
+            report.incomplete_reason.as_deref(),
+            Some("processes-remain")
+        );
+    }
+
     /// A microVM recovery boot (`sealantd --vm`, `sealantd.mode=recover`) starts no `dockerd`,
     /// but the runner's boot env is the first boot's and names the guest daemon's socket. Left
     /// in place, the final flush would wait on that socket as on an active writer — up to the

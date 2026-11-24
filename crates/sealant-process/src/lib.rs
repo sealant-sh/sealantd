@@ -12,6 +12,7 @@
 pub mod activity;
 pub mod identity;
 pub mod platform;
+pub mod process_env;
 pub mod registry;
 pub mod runtime;
 pub mod secret_env;

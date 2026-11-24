@@ -46,6 +46,61 @@ const RECOVERY_DROPPED: &[&str] = &[
     "MEND_SESSION_ENDPOINT",
 ];
 
+/// Where a recovery boot keeps session journals: the writable `/run` tmpfs (it opens no
+/// session, but the boot prepares the directory).
+pub const RECOVERY_JOURNAL_DIR: &str = "/run/sealant/session-journals";
+
+/// Where a recovery boot may create directories: the tmpfs mounts and the data disk's binds.
+/// Everything else is the read-only base disk.
+pub const RECOVERY_WRITABLE: [&str; 4] = ["/run", "/tmp", "/workspace", "/home"];
+
+/// Keys PID 1 copies from the boot environment into its own process environment — the ones
+/// the daemon reads from it rather than from its configuration (`git` and `chezmoi` found on
+/// the image's `PATH`, the capture bounds, the SFTP server, the dotfiles caps). Never a secret.
+const PROCESS_ENV_KEYS: &[&str] = &[
+    "PATH",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TZ",
+    "TERM",
+    "SEALANT_SFTP_SERVER_PATH",
+    "SEALANT_DOTFILES_MAX_UNPACKED_BYTES",
+    "SEALANT_DOTFILES_MAX_FILE_BYTES",
+];
+
+/// The entries of `env` PID 1 sets in its own process environment ([`PROCESS_ENV_KEYS`], and
+/// `SEALANT_CAPTURE_*_SECS`).
+#[must_use]
+pub fn process_env(env: &VmEnv) -> Vec<(String, String)> {
+    env.0
+        .iter()
+        .filter(|(key, _)| {
+            PROCESS_ENV_KEYS.contains(&key.as_str())
+                || (key.starts_with("SEALANT_CAPTURE_") && key.ends_with("_SECS"))
+        })
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
+}
+
+/// The hosts file a guest needs when `docker export` left none (or an empty one).
+pub const DEFAULT_HOSTS: &str = "127.0.0.1 localhost\n::1 localhost\n";
+
+/// Write [`DEFAULT_HOSTS`] to `path` when it is missing or empty; whether it wrote.
+///
+/// # Errors
+/// The write failed.
+pub fn ensure_hosts(path: &Path) -> std::io::Result<bool> {
+    match std::fs::read_to_string(path) {
+        Ok(text) if !text.trim().is_empty() => Ok(false),
+        _ => {
+            let _ = std::fs::remove_file(path);
+            std::fs::write(path, DEFAULT_HOSTS)?;
+            Ok(true)
+        }
+    }
+}
+
 /// The boot environment as an [`EnvSource`]: what `sealantd boot` reads from its process
 /// environment on the `docker` runtime, assembled in memory (this crate never mutates its own
 /// environment).
@@ -113,6 +168,9 @@ pub fn assemble(boot: &VmBootConfig, extras: &Extras) -> VmEnv {
                 env.remove(*key);
             }
             env.insert("SEALANT_RECOVERY".to_owned(), "1".to_owned());
+            // The base disk is read-only: the journals' default under /var/lib cannot be made.
+            env.entry("SEALANT_SESSION_JOURNAL_DIR".to_owned())
+                .or_insert_with(|| RECOVERY_JOURNAL_DIR.to_owned());
         }
     }
     VmEnv(env)
@@ -340,6 +398,102 @@ mod tests {
                 env.get("DOCKER_HOST").as_deref(),
             ),
             None
+        );
+    }
+
+    /// A recovery boot runs on the read-only base disk: every directory its preparation makes
+    /// is on a tmpfs or the data disk, never under `/var`, `/etc`, `/root` or anywhere else of
+    /// the base's.
+    #[test]
+    fn a_recovery_boot_makes_no_directory_on_the_read_only_base() {
+        let mut runner = boot(VmMode::Recover);
+        runner.boot_env.extend([
+            (
+                "SEALANT_CAPTURE_ENDPOINT".to_owned(),
+                "http://mend:3106/channel".to_owned(),
+            ),
+            (
+                "SEALANT_HARNESS_LAUNCH_COMMAND".to_owned(),
+                "claude".to_owned(),
+            ),
+            ("SEALANT_OS_FAMILY".to_owned(), "ubuntu".to_owned()),
+        ]);
+        let env = assemble(&runner, &Extras::default());
+        assert_eq!(
+            env.get("SEALANT_SESSION_JOURNAL_DIR").as_deref(),
+            Some(RECOVERY_JOURNAL_DIR)
+        );
+        let config = crate::boot::BootConfig::load(&env).expect("recovery config");
+        assert!(config.recovery);
+        let dirs = crate::boot::workspace_dirs(&config);
+        assert!(!dirs.is_empty());
+        for dir in &dirs {
+            assert!(
+                RECOVERY_WRITABLE.iter().any(|root| dir.starts_with(root)),
+                "{} is on the read-only base",
+                dir.display()
+            );
+        }
+        // A journal directory the runner named is kept as named.
+        let mut named = runner.clone();
+        named.boot_env.insert(
+            "SEALANT_SESSION_JOURNAL_DIR".to_owned(),
+            "/workspace/.journals".to_owned(),
+        );
+        assert_eq!(
+            assemble(&named, &Extras::default())
+                .get("SEALANT_SESSION_JOURNAL_DIR")
+                .as_deref(),
+            Some("/workspace/.journals")
+        );
+    }
+
+    #[test]
+    fn only_settings_the_daemon_reads_reach_its_own_environment() {
+        let mut runner = boot(VmMode::Normal);
+        runner.boot_env.extend([
+            (
+                "SEALANT_CAPTURE_GIT_LIMIT_SECS".to_owned(),
+                "1200".to_owned(),
+            ),
+            (
+                "SEALANT_SFTP_SERVER_PATH".to_owned(),
+                "/usr/lib/sftp".to_owned(),
+            ),
+            ("SEALANT_CAPTURE_TOKEN".to_owned(), "secret".to_owned()),
+            ("GITHUB_TOKEN".to_owned(), "secret".to_owned()),
+        ]);
+        let set = process_env(&assemble(&runner, &extras()));
+        let keys: Vec<&str> = set.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(
+            keys,
+            [
+                "LANG",
+                "PATH",
+                "SEALANT_CAPTURE_GIT_LIMIT_SECS",
+                "SEALANT_SFTP_SERVER_PATH"
+            ]
+        );
+        assert!(set.contains(&("PATH".to_owned(), "/opt/image/bin:/usr/bin".to_owned())));
+        assert!(!set.iter().any(|(_, v)| v == "secret"));
+    }
+
+    #[test]
+    fn a_missing_or_empty_hosts_file_is_filled_and_a_real_one_kept() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let hosts = dir.path().join("hosts");
+        assert!(ensure_hosts(&hosts).expect("missing"));
+        assert_eq!(
+            std::fs::read_to_string(&hosts).expect("hosts"),
+            DEFAULT_HOSTS
+        );
+        std::fs::write(&hosts, "  \n").expect("empty");
+        assert!(ensure_hosts(&hosts).expect("empty"));
+        std::fs::write(&hosts, "10.0.0.1 db\n").expect("real");
+        assert!(!ensure_hosts(&hosts).expect("kept"));
+        assert_eq!(
+            std::fs::read_to_string(&hosts).expect("hosts"),
+            "10.0.0.1 db\n"
         );
     }
 

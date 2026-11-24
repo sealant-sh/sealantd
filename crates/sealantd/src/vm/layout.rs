@@ -57,6 +57,13 @@ pub enum Step {
         /// Where it goes.
         to: PathBuf,
     },
+    /// `ln -s target link`, unless `link` already exists.
+    Symlink {
+        /// What the link points at.
+        target: PathBuf,
+        /// The link.
+        link: PathBuf,
+    },
     /// Make `new_root` the root (`pivot_root(".", ".")` from inside it) and detach the old one.
     PivotRoot(PathBuf),
 }
@@ -91,6 +98,13 @@ fn mount(source: &str, target: &str, fstype: &str, flags: Flags, data: Option<&s
     }
 }
 
+fn symlink(target: &str, link: &str) -> Step {
+    Step::Symlink {
+        target: PathBuf::from(target),
+        link: PathBuf::from(link),
+    }
+}
+
 /// The kernel and runtime filesystems every boot mounts first, idempotently.
 #[must_use]
 pub fn early() -> Vec<Step> {
@@ -106,6 +120,24 @@ pub fn early() -> Vec<Step> {
                 ..Flags::default()
             },
             Some("mode=0755"),
+        ),
+        // What devtmpfs does not make and programs expect: the descriptor links (bash process
+        // substitution, `/dev/stdin`) and a shared-memory tmpfs (POSIX semaphores, Chromium).
+        symlink("/proc/self/fd", "/dev/fd"),
+        symlink("/proc/self/fd/0", "/dev/stdin"),
+        symlink("/proc/self/fd/1", "/dev/stdout"),
+        symlink("/proc/self/fd/2", "/dev/stderr"),
+        Step::Mkdir(PathBuf::from("/dev/shm")),
+        mount(
+            "tmpfs",
+            "/dev/shm",
+            "tmpfs",
+            Flags {
+                nosuid: true,
+                nodev: true,
+                ..Flags::default()
+            },
+            Some("mode=1777"),
         ),
         Step::Mkdir(PathBuf::from("/dev/pts")),
         mount(
@@ -347,6 +379,13 @@ pub fn apply(steps: &[Step]) -> Result<(), LayoutError> {
                 )
                 .map_err(|e| LayoutError::new("move", to, e))?;
             }
+            Step::Symlink { target, link } => {
+                if std::fs::symlink_metadata(link).is_ok() {
+                    continue;
+                }
+                std::os::unix::fs::symlink(target, link)
+                    .map_err(|e| LayoutError::new("symlink", link, e))?;
+            }
             Step::PivotRoot(new_root) => {
                 std::env::set_current_dir(new_root)
                     .map_err(|e| LayoutError::new("chdir", new_root, e))?;
@@ -409,6 +448,53 @@ mod tests {
                 assert!(targets.contains(&Path::new(path)), "{path}");
             }
         }
+    }
+
+    #[test]
+    fn every_boot_has_shared_memory_and_the_descriptor_links_after_devtmpfs() {
+        for steps in [normal(), recovery()] {
+            let devtmpfs = steps
+                .iter()
+                .position(|s| matches!(s, Step::Mount { fstype, .. } if fstype == "devtmpfs"))
+                .expect("devtmpfs");
+            let at = |wanted: &Step| {
+                steps
+                    .iter()
+                    .position(|s| s == wanted)
+                    .unwrap_or_else(|| panic!("{wanted:?} missing"))
+            };
+            for (target, link) in [
+                ("/proc/self/fd", "/dev/fd"),
+                ("/proc/self/fd/0", "/dev/stdin"),
+                ("/proc/self/fd/1", "/dev/stdout"),
+                ("/proc/self/fd/2", "/dev/stderr"),
+            ] {
+                assert!(at(&symlink(target, link)) > devtmpfs, "{link}");
+            }
+            let shm = mounts(&steps)
+                .into_iter()
+                .find(|m| m.1 == Path::new("/dev/shm"))
+                .expect("/dev/shm");
+            assert_eq!(shm.2, Some("mode=1777"));
+            assert!(shm.3.nosuid && shm.3.nodev && !shm.3.read_only);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_symlink_step_is_made_once_and_left_alone_after() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let link = dir.path().join("fd");
+        let step = Step::Symlink {
+            target: PathBuf::from("/proc/self/fd"),
+            link: link.clone(),
+        };
+        apply(std::slice::from_ref(&step)).expect("made");
+        apply(std::slice::from_ref(&step)).expect("idempotent");
+        assert_eq!(
+            std::fs::read_link(&link).expect("link"),
+            Path::new("/proc/self/fd")
+        );
     }
 
     #[test]

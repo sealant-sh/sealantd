@@ -146,11 +146,22 @@ mod linux {
     }
 
     impl VsockStream {
-        fn from_socket(socket: Socket) -> io::Result<Self> {
+        /// Wrap a connected vsock socket (made non-blocking) on the current Tokio runtime.
+        ///
+        /// # Errors
+        /// The socket could not be registered with the runtime.
+        pub fn from_socket(socket: Socket) -> io::Result<Self> {
             socket.set_nonblocking(true)?;
             Ok(Self {
                 fd: AsyncFd::new(socket)?,
             })
+        }
+
+        /// The socket back, deregistered from this runtime, to carry a connection from one
+        /// runtime to another (it stays non-blocking).
+        #[must_use]
+        pub fn into_socket(self) -> Socket {
+            self.fd.into_inner()
         }
 
         /// Connect to `port` on the machine with context id `cid`.
@@ -185,6 +196,12 @@ mod linux {
                 .peer_addr()?
                 .as_vsock_address()
                 .ok_or_else(|| io::Error::other("peer is not a vsock address"))
+        }
+    }
+
+    impl std::os::fd::AsFd for VsockStream {
+        fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+            self.fd.get_ref().as_fd()
         }
     }
 
@@ -506,6 +523,9 @@ mod tests {
             }
             Err(error) => panic!("SEALANTD_REQUIRE_VSOCK=1 but vsock loopback failed: {error}"),
         };
+        // Close-on-exec: no process the daemon starts inherits the connection.
+        let flags = nix::fcntl::fcntl(&client, nix::fcntl::FcntlArg::F_GETFD).expect("F_GETFD");
+        assert_ne!(flags & nix::fcntl::FdFlag::FD_CLOEXEC.bits(), 0);
         assert!(
             round_trip(&mut client, Command::RuntimeHealth)
                 .await
