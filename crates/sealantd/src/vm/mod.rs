@@ -19,8 +19,11 @@
 //!    capture traffic on vsock port 1025, and a graceful shutdown on the runner's shutdown
 //!    frame or the power button ([`power`]); no-new-privileges is off on a normal boot, so guest
 //!    `sudo` works, and on for a recovery ([`env::vm_privilege_posture`]);
-//! 6. on its way out, whatever the exit, syncs the data disk, sends the runner a
-//!    [`protocol::GuestExitStatus`] on the held connection and powers the machine off.
+//! 6. on its way out, whatever the exit, syncs the data disk, remounts it read-only so its
+//!    journal is clean ([`power::settle`]), sends the runner a [`protocol::GuestExitStatus`] on
+//!    the held connection and powers the machine off.
+//!
+//! PID 1 also names the guest ([`env::GUEST_HOSTNAME`]), so `sudo` can resolve it.
 //!
 //! Outside PID 1 (`sealantd --vm` run by hand) the layout and the power-off are skipped.
 
@@ -154,6 +157,9 @@ fn boot_with_config(
     }
     tracing::info!(?boot, "boot config received");
 
+    if pid1 {
+        set_hostname(env::GUEST_HOSTNAME);
+    }
     let mut extras = env::Extras::default();
     let mut session_listener = None;
     if mode == VmMode::Normal {
@@ -167,8 +173,11 @@ fn boot_with_config(
                 }
             }
         }
-        match env::ensure_hosts(Path::new("/etc/hosts")) {
-            Ok(true) => tracing::info!("/etc/hosts was missing or empty; wrote localhost"),
+        match env::ensure_hosts(Path::new("/etc/hosts"), env::GUEST_HOSTNAME) {
+            Ok(true) => tracing::info!(
+                hostname = env::GUEST_HOSTNAME,
+                "/etc/hosts now resolves localhost and the hostname"
+            ),
             Ok(false) => {}
             Err(error) => tracing::warn!(%error, "/etc/hosts could not be written"),
         }
@@ -269,6 +278,16 @@ fn configure_network(boot: &VmBootConfig) {
     }
     #[cfg(not(target_os = "linux"))]
     let _ = config;
+}
+
+/// Give the guest its hostname ([`env::GUEST_HOSTNAME`]). PID 1 only: `sealantd --vm` run by
+/// hand leaves the host's alone.
+fn set_hostname(name: &str) {
+    match nix::unistd::sethostname(name) {
+        Ok(()) => tracing::info!(hostname = name, "hostname set"),
+        // `sudo` warns that it cannot resolve the host; nothing fails.
+        Err(error) => tracing::warn!(%error, "the hostname could not be set"),
+    }
 }
 
 fn bind_session_listener() -> std::io::Result<(std::net::TcpListener, String)> {
@@ -429,10 +448,19 @@ async fn supervise_nix_daemon(
     tracing::error!("nix-daemon keeps exiting; not restarted again");
 }
 
-/// Sync the data disk, report the exit to the runner on the held connection, and power off
-/// when PID 1.
+/// Sync the data disk, remount it read-only when PID 1, report the exit to the runner on the
+/// held connection, and power off when PID 1.
 fn finish(mode: VmMode, ended: Ended, channel: Option<BootChannel>, pid1: bool) -> ExitCode {
     let synced = sync_data_disk(Path::new(layout::DATA_MOUNT), &[Path::new("/workspace")]);
+    if pid1 {
+        // The overlay root first (its upper layer is on the data disk), then the disk itself.
+        // On a recovery `/` is the read-only base disk already, and stays so.
+        power::settle(
+            &[Path::new("/"), Path::new(layout::DATA_MOUNT)],
+            layout::is_mount_point,
+            power::remount_read_only,
+        );
+    }
     let status = GuestExitStatus {
         version: PROTOCOL_VERSION,
         exit_code: i32::from(ended.code),

@@ -295,9 +295,16 @@ pub struct GitRepo {
 /// the link's target, and a sealed capture restored the file as a symlink: review 2026-09-28,
 /// fifth pass, #6). No hook runs (`post-index-change` fires on every index git writes), and a
 /// line-end conversion git cannot reverse is converted all the same instead of failing the snap
-/// (`core.safecrlf`). Passed as `GIT_CONFIG_COUNT` entries: the repository's `.git/config` is
-/// never written, and a restore gets the user's configuration back byte for byte.
-const CAPTURE_VIEW: [(&str, &str); 8] = [
+/// (`core.safecrlf`). What git writes, it flushes to disk before it says it is done
+/// (`core.fsync`; git 2.36 and later, older ones ignore it): a hard kill seconds after a snap,
+/// before the kernel wrote back the blobs `git add` had just made, left them as empty files
+/// that git then took as present and never wrote again, and every later pack failed on them
+/// (Milestone 1, Gate 3; [`remove_torn_objects`] clears what an older capture left). `batch`
+/// flushes a command's loose objects with one disk flush rather than one each (git 2.37 and
+/// later). A git that only reads writes nothing for either to flush. Passed as
+/// `GIT_CONFIG_COUNT` entries: the repository's `.git/config` is never written, and a restore
+/// gets the user's configuration back byte for byte.
+const CAPTURE_VIEW: [(&str, &str); 10] = [
     ("core.ignorecase", "false"),
     ("core.fsmonitor", "false"),
     ("core.untrackedCache", "false"),
@@ -306,6 +313,11 @@ const CAPTURE_VIEW: [(&str, &str); 8] = [
     ("core.symlinks", "true"),
     ("core.hooksPath", "/dev/null"),
     ("core.safecrlf", "false"),
+    (
+        "core.fsync",
+        "loose-object,pack,pack-metadata,reference,index",
+    ),
+    ("core.fsyncMethod", "batch"),
 ];
 
 /// Run git with a clean environment (no inherited `GIT_DIR`/`GIT_WORK_TREE`/`GIT_INDEX_FILE`),
@@ -1984,6 +1996,19 @@ impl GitRepo {
         excludes: &[String],
         options: TreeOptions<'_>,
     ) -> Result<WorktreeTree, GitError> {
+        self.worktree_tree_torn(scratch_dir, excludes, options, false)
+    }
+
+    /// [`Self::worktree_tree_with`]; with `torn` (a crash may have lost objects the index
+    /// names), every index entry whose blob is gone is read again from its file
+    /// ([`Self::reenter_lost_blobs`]).
+    fn worktree_tree_torn(
+        &self,
+        scratch_dir: &Path,
+        excludes: &[String],
+        options: TreeOptions<'_>,
+        torn: bool,
+    ) -> Result<WorktreeTree, GitError> {
         fs::create_dir_all(scratch_dir).map_err(at("mkdir -p", scratch_dir))?;
         let tmp_index = scratch_dir.join("snap-index");
         let real_index = self.git_dir.join("index");
@@ -1992,6 +2017,9 @@ impl GitRepo {
             if let Ok(real) = fs::metadata(&real_index) {
                 fs::copy(&real_index, tmp_index).map_err(at("copy into", tmp_index))?;
                 self.clear_index_shortcuts(tmp_index)?;
+                if torn {
+                    self.reenter_lost_blobs(tmp_index)?;
+                }
                 // Git trusts an entry's stat data only when the index was written after the file
                 // changed (an entry as new as the index is "racily clean" and re-read): the copy
                 // keeps the real index's mtime, so it is exactly as trusting as the user's own.
@@ -2389,6 +2417,121 @@ impl GitRepo {
             }
         }
         carried
+    }
+
+    /// In `index` (a scratch copy of the user's), give every entry whose blob the object store
+    /// does not hold empty stat data, so the `git add` after it reads the file again and writes
+    /// its blob. A crash that tore a blob the index names (a `git add` or `git commit` killed
+    /// before writeback) leaves an entry whose stat still matches the file: `git add` trusts it,
+    /// keeps the lost blob, and `write-tree` refuses the index ("invalid object"), so no file
+    /// of the worktree was saved. Gitlinks name another repository's commit and are left as
+    /// they are. The number of entries given back to `git add`.
+    fn reenter_lost_blobs(&self, index: &Path) -> Result<usize, GitError> {
+        let ls = ["ls-files", "-s", "-z"];
+        let listed = check(
+            &ls,
+            git_command(&self.root)?
+                .env("GIT_INDEX_FILE", index)
+                .args(ls)
+                .output_bounded()?,
+        )?;
+        let entries: Vec<IndexEntry> = index_entries(&listed.stdout)
+            .into_iter()
+            .filter(|e| e.mode != "160000")
+            .collect();
+        let mut blobs: Vec<String> = entries.iter().map(|e| e.sha.clone()).collect();
+        blobs.sort();
+        blobs.dedup();
+        let present: BTreeSet<String> = self.existing(&blobs)?.into_iter().collect();
+        let mut info: Vec<u8> = Vec::new();
+        let mut lost = 0;
+        for e in entries.iter().filter(|e| !present.contains(&e.sha)) {
+            info.extend_from_slice(format!("{} {} {}\t", e.mode, e.sha, e.stage).as_bytes());
+            info.extend_from_slice(&e.path);
+            info.push(0);
+            lost += 1;
+        }
+        if lost == 0 {
+            return Ok(0);
+        }
+        // An entry `--index-info` writes has no stat data: `git add` cannot take it as clean.
+        let args = ["update-index", "-z", "--index-info"];
+        let child = git_command(&self.root)?
+            .env("GIT_INDEX_FILE", index)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn_bounded()?;
+        check(&args, child.communicate(Some(info))?)?;
+        tracing::warn!(
+            entries = lost,
+            "index entries name blobs a crash lost; their files are read again"
+        );
+        Ok(lost)
+    }
+
+    /// Whether everything `tips` reach, short of `negatives`, is in the object store: `git
+    /// rev-list --objects` walks it (a missing commit, tree or blob fails it).
+    fn reaches_whole(&self, tips: &[String], negatives: &[String]) -> Result<bool, GitError> {
+        let mut input = String::new();
+        for t in tips {
+            input.push_str(t);
+            input.push('\n');
+        }
+        for n in negatives {
+            input.push('^');
+            input.push_str(n);
+            input.push('\n');
+        }
+        let child = git_command(&self.root)?
+            .args(["rev-list", "--objects", "--quiet", "--stdin"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn_bounded()?;
+        Ok(child
+            .communicate(Some(input.into_bytes()))?
+            .status
+            .success())
+    }
+
+    /// `tips` split into the ones whose closure (short of `negatives`) the object store holds
+    /// whole, and the ones it does not: missing themselves, or reaching an object that is
+    /// ([`Self::reaches_whole`]). Halved until each broken tip stands alone, so the few a
+    /// crash broke cost a handful of walks among thousands that are whole. Both sorted.
+    pub fn split_whole_tips(
+        &self,
+        tips: &[String],
+        negatives: &[String],
+    ) -> Result<(Vec<String>, Vec<String>), GitError> {
+        let present: BTreeSet<String> = self.existing(tips)?.into_iter().collect();
+        let mut broken: Vec<String> = tips
+            .iter()
+            .filter(|t| !present.contains(*t))
+            .cloned()
+            .collect();
+        let present: Vec<String> = present.into_iter().collect();
+        let mut whole: Vec<String> = Vec::new();
+        let mut groups: Vec<&[String]> = vec![&present];
+        while let Some(group) = groups.pop() {
+            if group.is_empty() {
+                continue;
+            }
+            if self.reaches_whole(group, negatives)? {
+                whole.extend_from_slice(group);
+            } else if let [only] = group {
+                broken.push(only.clone());
+            } else {
+                let (a, b) = group.split_at(group.len() / 2);
+                groups.push(a);
+                groups.push(b);
+            }
+        }
+        whole.sort();
+        broken.sort();
+        broken.dedup();
+        Ok((whole, broken))
     }
 
     /// Filter `shas` to the ones the object store holds.
@@ -3164,6 +3307,18 @@ pub fn read_closure_with(
     excludes: &[String],
     options: TreeOptions<'_>,
 ) -> Result<Closure, GitError> {
+    read_closure_torn(repo, scratch_dir, excludes, options, false)
+}
+
+/// [`read_closure_with`]; with `torn` (a crash may have lost objects), the worktree tree reads
+/// again every file whose blob is gone ([`GitRepo::worktree_tree_torn`]).
+fn read_closure_torn(
+    repo: &GitRepo,
+    scratch_dir: &Path,
+    excludes: &[String],
+    options: TreeOptions<'_>,
+    torn: bool,
+) -> Result<Closure, GitError> {
     let ref_format = repo.ref_format()?;
     let refs = repo.refs()?;
     let symrefs = repo.symrefs_in(&ref_format)?;
@@ -3216,7 +3371,7 @@ pub fn read_closure_with(
         gitlinks,
         unreadable,
         carried,
-    } = repo.worktree_tree_with(scratch_dir, excludes, options)?;
+    } = repo.worktree_tree_torn(scratch_dir, excludes, options, torn)?;
     tips.push(worktree_tree.clone());
     tips.push(raw_tree.clone());
     tips.sort();
@@ -3360,10 +3515,154 @@ fn pack_once(
     }))
 }
 
+/// Whether `name`, a file under `objects/<two hex digits>/`, is named as a loose object: the
+/// rest of a SHA-1 (38) or SHA-256 (62) id, in lower-case hex.
+fn is_loose_object_name(name: &[u8]) -> bool {
+    matches!(name.len(), 38 | 62) && is_lower_hex(name)
+}
+
+fn is_lower_hex(bytes: &[u8]) -> bool {
+    bytes.iter().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Remove every empty loose object under `objects` (a repository's `objects` directory), and
+/// say which: the ids, sorted.
+///
+/// A loose object is never empty (even the empty blob is a zlib stream of some bytes). Git
+/// writes one to a temporary file and links it in under its id, so an empty file under an id
+/// is one whose name reached the disk and whose bytes did not: ext4 allocates blocks late, and
+/// a hard kill before writeback (`docker kill` of a microVM seconds after a `git add`, a `git
+/// commit` or a snap) leaves exactly that. Git takes it as present: `git add` of the same bytes
+/// never writes it again, and every `pack-objects` that reaches it fails ("object file … is
+/// empty"), which made a recovery's final flush fail (Milestone 1, Gate 3). Gone, git writes
+/// the object again from the file that holds its bytes, and a tip that needs it and has no file
+/// is left out of the pack ([`build_git_pack_with`]). Best effort: a directory that cannot be
+/// read, or a file that cannot be removed, is logged and passed over.
+pub fn remove_torn_objects(objects: &Path) -> Vec<String> {
+    let mut removed = Vec::new();
+    let Ok(dirs) = fs::read_dir(objects) else {
+        return removed;
+    };
+    for dir in dirs.flatten() {
+        let prefix = dir.file_name();
+        let prefix = prefix.as_bytes();
+        if prefix.len() != 2 || !is_lower_hex(prefix) {
+            continue;
+        }
+        if !dir.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        let entries = match fs::read_dir(dir.path()) {
+            Ok(entries) => entries,
+            Err(error) => {
+                tracing::warn!(dir = %dir.path().display(), %error, "cannot list loose objects to look for empty ones");
+                continue;
+            }
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            if !is_loose_object_name(name.as_bytes()) {
+                continue;
+            }
+            // Not followed: a symlink is not a loose object git wrote.
+            if !entry.metadata().is_ok_and(|m| m.is_file() && m.len() == 0) {
+                continue;
+            }
+            let id = format!(
+                "{}{}",
+                String::from_utf8_lossy(prefix),
+                name.to_string_lossy()
+            );
+            let path = entry.path();
+            match fs::remove_file(&path) {
+                Ok(()) => {
+                    tracing::warn!(
+                        object = %id,
+                        path = %path.display(),
+                        "removed an empty loose object, which a crash left before its bytes \
+                         reached the disk"
+                    );
+                    removed.push(id);
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    tracing::warn!(path = %path.display(), %error, "cannot remove an empty loose object");
+                }
+            }
+        }
+    }
+    removed.sort();
+    removed
+}
+
+/// The object stores this process has looked through for empty loose objects, resolved.
+static SWEPT: std::sync::Mutex<BTreeSet<PathBuf>> = std::sync::Mutex::new(BTreeSet::new());
+
+/// [`remove_torn_objects`] on `repo`'s object store (its common directory's, so a linked
+/// worktree's is the repository's), the first time this process asks, and again whenever
+/// `again`. A torn object exists only after a crash, so once a boot has looked, only a failure
+/// is a reason to look again.
+fn sweep_torn(repo: &GitRepo, again: bool) -> Vec<String> {
+    let first = SWEPT
+        .lock()
+        .map_or(true, |mut swept| swept.insert(resolved(&repo.common_dir)));
+    if !first && !again {
+        return Vec::new();
+    }
+    remove_torn_objects(&repo.common_dir.join("objects"))
+}
+
+/// [`read_closure_torn`], and with `torn` the closure's tips cut to the ones whose objects the
+/// store holds whole ([`GitRepo::split_whole_tips`]): a ref, a reflog entry or an index blob
+/// that names what a crash lost is left out of the pack, and the capture holds everything else.
+/// The refs themselves are kept as they are: a restore brings back the repository the disk
+/// holds, naming the same lost commit. The worktree tree and the raw tree are the files on
+/// disk, read again: one that is still not whole fails the read.
+fn read_for_pack(
+    repo: &GitRepo,
+    scratch_dir: &Path,
+    excludes: &[String],
+    options: TreeOptions<'_>,
+    torn: bool,
+    negatives: &[String],
+) -> Result<Closure, GitError> {
+    let mut closure = read_closure_torn(repo, scratch_dir, excludes, options, torn)?;
+    if !torn {
+        return Ok(closure);
+    }
+    let (whole, lost) = repo.split_whole_tips(&closure.tips, negatives)?;
+    if lost.is_empty() {
+        return Ok(closure);
+    }
+    for tree in [&closure.worktree_tree, &closure.raw_tree] {
+        if lost.contains(tree) {
+            return Err(GitError::Command {
+                args: "rev-list --objects".to_owned(),
+                stderr: format!(
+                    "the worktree tree {tree} reaches objects the object store does not hold"
+                ),
+            });
+        }
+    }
+    tracing::warn!(
+        lost = lost.len(),
+        tips = %lost.join(" "),
+        "these tips (refs, reflog entries, index blobs) reach objects a crash lost; they are \
+         left out of the pack, and the capture holds the worktree and everything else"
+    );
+    closure.tips = whole;
+    Ok(closure)
+}
+
 /// Build the git class: read the closure, pack it against `previous_tips`, re-read refs and
 /// retry if anything moved or an object went missing, bounded to [`PACK_ATTEMPTS`]; after that,
 /// ship the last pack with `fsck = unverified`. `excludes` are root-relative paths left out of
 /// the worktree tree.
+///
+/// Empty loose objects a crash left are removed first ([`sweep_torn`]), and again when a read
+/// or a pack fails. From then on the build is *torn*: index entries whose blobs are gone are
+/// read again from their files, and tips that reach lost objects are left out of the pack
+/// ([`read_for_pack`]), so a final flush after a hard kill still saves every file.
 pub fn build_git_pack(
     repo: &GitRepo,
     out_dir: &Path,
@@ -3403,14 +3702,37 @@ pub fn build_git_pack_with(
     options: TreeOptions<'_>,
 ) -> Result<GitPackResult, GitError> {
     fs::create_dir_all(out_dir).map_err(at("mkdir -p", out_dir))?;
-    let negatives = repo.existing(previous_tips)?;
+    let mut torn = !sweep_torn(repo, false).is_empty();
+    let mut negatives = repo.existing(previous_tips)?;
     let mut last: Option<(Option<FinishedGitPack>, Closure)> = None;
+    // Look again for torn objects; a negative it removed would fail every pack (`bad object`).
+    let go_torn = |negatives: &mut Vec<String>| -> Result<(), GitError> {
+        if !sweep_torn(repo, true).is_empty() {
+            *negatives = repo.existing(previous_tips)?;
+        }
+        Ok(())
+    };
     for attempt in 1..=PACK_ATTEMPTS {
-        let closure = read_closure_with(repo, out_dir, excludes, options)?;
+        let closure = match read_for_pack(repo, out_dir, excludes, options, torn, &negatives) {
+            Ok(c) => c,
+            // Once, read again as torn: an index entry naming a blob a crash lost fails the
+            // worktree tree's `write-tree`. Anything else fails the same way twice.
+            Err(e) if !torn => {
+                tracing::warn!(attempt, error = %e, "reading the git closure failed; looking for objects a crash lost");
+                go_torn(&mut negatives)?;
+                torn = true;
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
         let packed = match pack_once(repo, out_dir, &closure.tips, &negatives, attempt) {
             Ok(p) => p,
             Err(e) => {
                 tracing::warn!(attempt, error = %e, "pack-objects failed; re-reading refs");
+                if !torn {
+                    go_torn(&mut negatives)?;
+                    torn = true;
+                }
                 continue;
             }
         };
@@ -3439,7 +3761,7 @@ pub fn build_git_pack_with(
     // Retries exhausted: the last closure is packed once more, shipped unverified.
     let closure = match last {
         Some((_, c)) => c,
-        None => read_closure_with(repo, out_dir, excludes, options)?,
+        None => read_for_pack(repo, out_dir, excludes, options, torn, &negatives)?,
     };
     let packed = pack_once(repo, out_dir, &closure.tips, &negatives, PACK_ATTEMPTS + 1)?;
     Ok(GitPackResult {
@@ -4199,6 +4521,223 @@ mod tests {
         repo.run(&["add", "a"]).unwrap();
         repo.run(&["commit", "-q", "-m", "one"]).unwrap();
         (dir, repo)
+    }
+
+    /// Replace the loose object `id` of `repo` with an empty file, as a hard kill before
+    /// writeback leaves it.
+    fn tear(repo: &GitRepo, id: &str) {
+        let path = repo
+            .common_dir
+            .join("objects")
+            .join(&id[..2])
+            .join(&id[2..]);
+        fs::remove_file(&path).unwrap_or_else(|e| panic!("{id} is not loose: {e}"));
+        File::create(&path).unwrap();
+    }
+
+    fn loose_path(repo: &GitRepo, id: &str) -> PathBuf {
+        repo.common_dir
+            .join("objects")
+            .join(&id[..2])
+            .join(&id[2..])
+    }
+
+    /// Restore `r` into a fresh repository under `dir` as materialize does (packs, refs, HEAD,
+    /// the worktree tree checked out), and return it.
+    fn restore(dir: &Path, packs: &[&FinishedGitPack], r: &GitPackResult) -> GitRepo {
+        let fresh = GitRepo::init(&dir.join("fresh")).unwrap();
+        for pack in packs {
+            install_pack(&fresh, &pack.sha256, &fs::read(&pack.path).unwrap(), None).unwrap();
+        }
+        write_packed_refs(&fresh, &r.closure.refs, &r.closure.symrefs).unwrap();
+        write_head(&fresh, &r.closure.head).unwrap();
+        checkout_tree(
+            &fresh,
+            &r.closure.worktree_tree,
+            &dir.join("restore-scratch"),
+            true,
+        )
+        .unwrap();
+        fresh
+    }
+
+    /// Only an empty file named as a loose object, in a two-hex-digit directory, is removed:
+    /// not a loose object with bytes, not git's temporary files, not a pack, not a symlink.
+    #[test]
+    fn only_empty_loose_objects_are_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let objects = dir.path().join("objects");
+        let sha1 = "a".repeat(38);
+        let sha256 = "b".repeat(62);
+        for sub in ["ab", "cd", "pack", "info", "XY"] {
+            fs::create_dir_all(objects.join(sub)).unwrap();
+        }
+        File::create(objects.join("ab").join(&sha1)).unwrap();
+        File::create(objects.join("cd").join(&sha256)).unwrap();
+        let kept = [
+            objects.join("ab").join("c".repeat(38)),
+            objects.join("ab").join("tmp_obj_Xa1b2c"),
+            objects.join("ab").join("A".repeat(38)),
+            objects.join("pack").join("d".repeat(38)),
+            objects.join("XY").join("e".repeat(38)),
+        ];
+        fs::write(&kept[0], b"x\x01").unwrap();
+        for path in &kept[1..] {
+            File::create(path).unwrap();
+        }
+        let link = objects.join("cd").join("f".repeat(38));
+        std::os::unix::fs::symlink(objects.join("absent"), &link).unwrap();
+        let removed = remove_torn_objects(&objects);
+        assert_eq!(removed, [format!("ab{sha1}"), format!("cd{sha256}")]);
+        assert!(!objects.join("ab").join(&sha1).exists());
+        assert!(!objects.join("cd").join(&sha256).exists());
+        for path in &kept {
+            assert!(path.exists(), "{} kept", path.display());
+        }
+        assert!(fs::symlink_metadata(&link).is_ok(), "a symlink is kept");
+        assert!(remove_torn_objects(&dir.path().join("absent")).is_empty());
+    }
+
+    /// Gate 3, the capture's own blob: a snap's `git add` wrote the edit's blob, a hard kill
+    /// left it empty, and the next process's first pack of the repository removes it, so `git
+    /// add` writes it again and the pack holds the edit.
+    #[test]
+    fn a_blob_left_empty_by_a_crash_is_removed_before_the_first_pack() {
+        let (dir, repo) = fixture();
+        fs::write(repo.root.join("a"), "edited\n").unwrap();
+        let blob = stdout_string(&repo.run(&["hash-object", "-w", "a"]).unwrap());
+        tear(&repo, &blob);
+        let scratch = dir.path().join("scratch");
+        let r = build_git_pack(&repo, &scratch, &[], &[]).unwrap();
+        assert_eq!(r.attempts, 1, "removed up front, nothing failed");
+        assert!(
+            fs::metadata(loose_path(&repo, &blob)).unwrap().len() > 0,
+            "written again"
+        );
+        let fresh = restore(dir.path(), &[r.pack.as_ref().unwrap()], &r);
+        assert_eq!(fs::read(fresh.root.join("a")).unwrap(), b"edited\n");
+    }
+
+    /// The same blob torn while this process already looked once (a crash it did not see, or
+    /// one an older capture left in a repository it opened again): the pack fails on it, the
+    /// store is looked through again, and the next attempt packs the edit.
+    #[test]
+    fn a_pack_that_fails_on_an_empty_object_looks_again_and_packs() {
+        let (dir, repo) = fixture();
+        let scratch = dir.path().join("scratch");
+        let first = build_git_pack(&repo, &scratch, &[], &[]).unwrap();
+        fs::write(repo.root.join("a"), "edited after\n").unwrap();
+        let blob = stdout_string(&repo.run(&["hash-object", "-w", "a"]).unwrap());
+        tear(&repo, &blob);
+        let r = build_git_pack(&repo, &scratch, &first.closure.tips, &[]).unwrap();
+        assert!(r.attempts > 1, "the first pack failed on the empty object");
+        let pack = r.pack.as_ref().unwrap();
+        let fresh = restore(dir.path(), &[first.pack.as_ref().unwrap(), pack], &r);
+        assert_eq!(fs::read(fresh.root.join("a")).unwrap(), b"edited after\n");
+    }
+
+    /// Gate 3, the user's commit: a `git commit` hard-killed before writeback left every object
+    /// it wrote empty, while the edited files themselves were synced. The ref and the index
+    /// name objects that are gone and the index's stat data still matches the files (so `git
+    /// add` would trust the lost blob). The capture still saves every file of the worktree,
+    /// byte for byte, modified and untracked ones included; the lost commit is left out of the
+    /// pack and the ref comes back naming it, as the disk does.
+    #[test]
+    fn a_commit_torn_by_a_crash_still_leaves_every_file_saved() {
+        let (dir, repo) = fixture();
+        let root = repo.root.clone();
+        fs::write(root.join("keep"), "kept\n").unwrap();
+        repo.run(&["add", "keep"]).unwrap();
+        repo.run(&["commit", "-q", "-m", "two"]).unwrap();
+        let before = stdout_string(&repo.run(&["rev-parse", "HEAD"]).unwrap());
+        fs::write(root.join("a"), "committed, then torn\n").unwrap();
+        repo.run(&["add", "a"]).unwrap();
+        repo.run(&["commit", "-q", "-m", "three"]).unwrap();
+        let lost = stdout_string(&repo.run(&["rev-parse", "HEAD"]).unwrap());
+        let torn = stdout_string(
+            &repo
+                .run(&["rev-list", "--objects", "--no-object-names", "HEAD^..HEAD"])
+                .unwrap(),
+        );
+        for id in torn.lines() {
+            tear(&repo, id);
+        }
+        // After the commit, before the kill: an edit to a tracked file and a new file.
+        fs::write(root.join("keep"), "kept, then edited\n").unwrap();
+        fs::write(root.join("untracked"), b"new \x00 bytes\n").unwrap();
+        // The index newer than every file: its entry for `a` is clean by stat, not racy.
+        let later =
+            crate::index::mtime_ns(&fs::metadata(root.join("untracked")).unwrap()) + 5_000_000_000;
+        longpath::set_mtime_nofollow(&repo.git_dir.join("index"), later).unwrap();
+
+        let scratch = dir.path().join("scratch");
+        let r = build_git_pack(&repo, &scratch, &[], &[]).unwrap();
+        assert!(
+            torn.lines().all(|id| !loose_path(&repo, id).exists()
+                || fs::metadata(loose_path(&repo, id)).unwrap().len() > 0),
+            "no empty object is left"
+        );
+        assert_eq!(
+            r.closure.refs.values().filter(|v| **v == lost).count(),
+            1,
+            "the ref still names the lost commit"
+        );
+        assert!(
+            !r.closure.tips.contains(&lost),
+            "the lost commit is not packed"
+        );
+        assert!(r.closure.tips.contains(&before), "the commit before it is");
+        let fresh = restore(dir.path(), &[r.pack.as_ref().unwrap()], &r);
+        assert_eq!(
+            fs::read(fresh.root.join("a")).unwrap(),
+            b"committed, then torn\n"
+        );
+        assert_eq!(
+            fs::read(fresh.root.join("keep")).unwrap(),
+            b"kept, then edited\n"
+        );
+        assert_eq!(
+            fs::read(fresh.root.join("untracked")).unwrap(),
+            b"new \x00 bytes\n"
+        );
+        // The commit before the lost one came along whole.
+        assert!(fresh.existing(std::slice::from_ref(&before)).unwrap() == [before.clone()]);
+
+        // The next snap, with this one's tips as negatives, packs without failing again.
+        fs::write(root.join("untracked"), "changed again\n").unwrap();
+        let next = build_git_pack(&repo, &scratch, &r.closure.tips, &[]).unwrap();
+        assert!(next.pack.is_some());
+    }
+
+    /// Tips split into whole and broken: a missing tip, and a present commit whose parent is
+    /// gone, are broken; the rest are whole, found without walking each alone.
+    #[test]
+    fn tips_whose_history_is_broken_are_told_from_whole_ones() {
+        let (_dir, repo) = fixture();
+        let one = stdout_string(&repo.run(&["rev-parse", "HEAD"]).unwrap());
+        let mut commits = vec![one.clone()];
+        for n in 2..=5 {
+            fs::write(repo.root.join("a"), format!("{n}\n")).unwrap();
+            repo.run(&["commit", "-q", "-am", &n.to_string()]).unwrap();
+            commits.push(stdout_string(&repo.run(&["rev-parse", "HEAD"]).unwrap()));
+        }
+        // Commit 3 is lost: 3, 4 and 5 are broken (4 and 5 reach it); 1 and 2 are whole.
+        fs::remove_file(loose_path(&repo, &commits[2])).unwrap();
+        let absent = "0".repeat(40);
+        let mut tips = commits.clone();
+        tips.push(absent.clone());
+        let (whole, broken) = repo.split_whole_tips(&tips, &[]).unwrap();
+        let mut want_whole = commits[..2].to_vec();
+        want_whole.sort();
+        let mut want_broken = vec![
+            commits[2].clone(),
+            commits[3].clone(),
+            commits[4].clone(),
+            absent,
+        ];
+        want_broken.sort();
+        assert_eq!(whole, want_whole);
+        assert_eq!(broken, want_broken);
     }
 
     /// A repository with no reflog (nothing ever updated a ref through git) has no tips, and

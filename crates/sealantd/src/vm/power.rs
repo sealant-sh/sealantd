@@ -1,12 +1,92 @@
-//! The power button: Cloud Hypervisor's ACPI power button press reaches the guest as a
-//! `KEY_POWER` key event on an evdev device. A press asks for the same graceful shutdown as the
-//! runner's shutdown frame ([`super::channel`]), so a host that can only press the button still
-//! gets a final flush and a synced disk.
+//! The power button, and the data disk left clean for the power-off.
+//!
+//! Cloud Hypervisor's ACPI power button press reaches the guest as a `KEY_POWER` key event on
+//! an evdev device. A press asks for the same graceful shutdown as the runner's shutdown frame
+//! ([`super::channel`]), so a host that can only press the button still gets a final flush and
+//! a synced disk. Before the power-off the data disk is remounted read-only ([`settle`]).
 
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
+use nix::errno::Errno;
 use tokio::sync::mpsc;
+
+/// What [`settle`] made of one mount.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Settled {
+    /// Remounted read-only: its journal is written out and the filesystem marked clean.
+    ReadOnly,
+    /// Not a mount point (the layout never got that far): left alone.
+    NotMounted,
+    /// Still in use (`EBUSY`: a file open for writing on it), left read-write. It was synced;
+    /// the next mount replays its journal, losing nothing.
+    Busy,
+    /// The remount failed otherwise, and it is left as it is.
+    Failed(Errno),
+}
+
+/// Remount each of `mounts` read-only, in order, before the power-off (SLNT-1325). `sync`
+/// makes the data durable but leaves an ext4 mounted read-write marked as needing recovery, so
+/// `e2fsck -fn data.img` after every power-off found a journal to replay. Remounted read-only,
+/// ext4 writes its journal out and marks itself clean. A mount `is_mounted` says is not there
+/// is passed over; one still busy, or one whose remount fails, is logged and the power-off goes
+/// on. What each came to, in order.
+pub fn settle(
+    mounts: &[&Path],
+    is_mounted: impl Fn(&Path) -> bool,
+    mut remount: impl FnMut(&Path) -> Result<(), Errno>,
+) -> Vec<Settled> {
+    mounts
+        .iter()
+        .map(|path| {
+            if !is_mounted(path) {
+                return Settled::NotMounted;
+            }
+            match remount(path) {
+                Ok(()) => {
+                    tracing::info!(path = %path.display(), "remounted read-only for the power-off");
+                    Settled::ReadOnly
+                }
+                Err(Errno::EBUSY) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        "still in use, left read-write for the power-off; it was synced, and \
+                         its journal replays at the next mount"
+                    );
+                    Settled::Busy
+                }
+                Err(error) => {
+                    tracing::warn!(path = %path.display(), %error, "could not remount read-only for the power-off");
+                    Settled::Failed(error)
+                }
+            }
+        })
+        .collect()
+}
+
+/// `mount -o remount,ro <path>`: the filesystem under `path` (its superblock, so every bind
+/// of it too) made read-only.
+///
+/// # Errors
+/// The kernel's.
+pub fn remount_read_only(path: &Path) -> Result<(), Errno> {
+    #[cfg(target_os = "linux")]
+    {
+        use nix::mount::{MsFlags, mount};
+        mount(
+            None::<&str>,
+            path,
+            None::<&str>,
+            MsFlags::MS_REMOUNT | MsFlags::MS_RDONLY,
+            None::<&str>,
+        )
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = path;
+        Err(Errno::ENOSYS)
+    }
+}
 
 /// `EV_KEY` (`linux/input-event-codes.h`).
 const EV_KEY: u16 = 1;
@@ -106,6 +186,60 @@ mod tests {
         assert!(!holds_power_press(&event(EV_KEY, KEY_POWER, 2)));
         // A truncated record is ignored.
         assert!(!holds_power_press(&event(EV_KEY, KEY_POWER, 1)[..20]));
+    }
+
+    /// Every mount is tried in order; a busy one, or one that fails otherwise, does not stop
+    /// the rest; one that is not mounted is never remounted.
+    #[test]
+    fn a_busy_or_failed_remount_is_reported_and_the_rest_still_settle() {
+        let mut tried: Vec<PathBuf> = Vec::new();
+        let settled = settle(
+            &[
+                Path::new("/"),
+                Path::new("/mnt/data"),
+                Path::new("/mnt/absent"),
+                Path::new("/mnt/other"),
+            ],
+            |path| path != Path::new("/mnt/absent"),
+            |path| {
+                tried.push(path.to_path_buf());
+                match path.to_str() {
+                    Some("/") => Err(Errno::EBUSY),
+                    Some("/mnt/other") => Err(Errno::EINVAL),
+                    _ => Ok(()),
+                }
+            },
+        );
+        assert_eq!(
+            settled,
+            [
+                Settled::Busy,
+                Settled::ReadOnly,
+                Settled::NotMounted,
+                Settled::Failed(Errno::EINVAL),
+            ]
+        );
+        assert_eq!(
+            tried,
+            [
+                PathBuf::from("/"),
+                PathBuf::from("/mnt/data"),
+                PathBuf::from("/mnt/other")
+            ]
+        );
+    }
+
+    /// A remount without the privilege for it (any process but root) is refused, and reported
+    /// as a failure, not taken for done.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_unprivileged_remount_is_refused_not_taken_for_done() {
+        if nix::unistd::geteuid().is_root() {
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let settled = settle(&[dir.path()], |_| true, remount_read_only);
+        assert!(matches!(settled[..], [Settled::Failed(_)]), "{settled:?}");
     }
 
     #[test]

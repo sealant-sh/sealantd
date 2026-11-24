@@ -566,6 +566,22 @@ restore, byte for byte, so the user never notices the compute changed.
 - **`"pending"` is not "nothing".** A head whose bulk section is `"pending"` restores the other
   classes and leaves the bulk directories on disk as they are — never swept — and the next bulk
   snap captures them.
+- **Objects a crash tore never stop a snap** (`gitpack.rs`; Milestone 1, Gate 3). A hard kill
+  before ext4 wrote back the newest loose objects (a microVM `docker kill`ed seconds after a `git
+  commit`, or after a snap's own `git add`) leaves them as empty files while the edited files
+  themselves are on disk. Git takes an empty object as present, never writes it again, and every
+  `pack-objects` that reaches it fails (`object file … is empty`): the recovery's final flush was
+  `snapshot-failed`. The first pack of a repository in each process, and every pack after a read
+  or a `pack-objects` fails, removes the empty loose objects first (an empty file is never a valid
+  object; the log names each one). From then on the build is *torn*: an index entry whose blob is
+  gone is given back to `git add` with no stat data, so the file is read and its blob written
+  again, and a tip that reaches a lost object (a branch or a reflog entry naming the lost commit)
+  is found by halving `rev-list --objects` checks and left out of the pack, with a warning. The
+  refs are kept as they are: a restore brings back what the disk held, naming the same lost
+  commit. A worktree tree that still cannot be made whole fails the snap as before. Every git the
+  capture runs flushes what it writes (`core.fsync=loose-object,pack,pack-metadata,reference,index`,
+  `core.fsyncMethod=batch`, per command and never in `.git/config`), so a capture leaves no torn
+  object of its own.
 - **A `final` flush stops the writers, then snaps, then finishes.** `capture.flush {kind:
   final}` and the SIGTERM / SIGINT / `runtime.gracefulShutdown` / harness-exit paths run
   `Runtime::final_flush` (`crates/sealantd/src/runtime.rs`), in this order:
