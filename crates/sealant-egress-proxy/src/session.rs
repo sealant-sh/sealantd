@@ -239,7 +239,7 @@ fn check_inspected(
     req: &mut RequestHead,
     path: &str,
 ) -> Result<Vec<String>, (u16, String)> {
-    if !req.is_origin_form() {
+    if !target_is_acceptable(&req.target, &req.method) {
         return Err((400, "target_not_origin_form".into()));
     }
     let host = match req.single_host() {
@@ -277,6 +277,12 @@ fn check_inspected(
         return Err((403, "method_or_path_not_allowed".into()));
     }
     substitute(req, &secrets, path).map_err(|id| (403, format!("secret_scope:{id}")))
+}
+
+/// Origin form only, and no `#`: a fragment never belongs on the wire, and an origin that
+/// reads one oddly could step past a path-prefix check (`/v1/x#/../../admin`).
+fn target_is_acceptable(target: &str, method: &str) -> bool {
+    (target.starts_with('/') || (target == "*" && method == "OPTIONS")) && !target.contains('#')
 }
 
 /// Swap each secret's placeholder for its value, inside that secret's one header only.
@@ -510,6 +516,15 @@ mod tests {
             substitute(&mut req, &[&s], "/v1/x").unwrap(),
             vec!["s1".to_string()]
         );
+    }
+
+    #[test]
+    fn inspected_targets_are_origin_form_without_fragments() {
+        assert!(target_is_acceptable("/v1/x?y=1", "GET"));
+        assert!(target_is_acceptable("*", "OPTIONS"));
+        assert!(!target_is_acceptable("/v1/x#/../../admin", "GET"));
+        assert!(!target_is_acceptable("https://api.test/v1", "GET"));
+        assert!(!target_is_acceptable("*", "GET"));
     }
 
     #[test]

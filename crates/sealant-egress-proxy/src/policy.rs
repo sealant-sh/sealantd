@@ -231,6 +231,11 @@ pub struct Policy {
     pub secrets: Vec<BrokeredSecret>,
     /// Hosts revoked since this policy loaded; refused in every mode until the next policy.
     pub denied_hosts: BTreeSet<String>,
+    /// Secrets revoked since this policy loaded (or named in `revokedSecretIds`).
+    pub revoked_secret_ids: BTreeSet<String>,
+    /// Ports a revoked inspected host was inspected on. The general TCP listener keeps reading
+    /// ClientHellos there, so the revoked SNI is refused rather than passed through.
+    pub revoked_inspection_ports: BTreeSet<u16>,
     pub ca: Option<Arc<MitmAuthority>>,
     /// The PEM the CA was built from, so an unchanged CA keeps its minted-leaf cache.
     pub(crate) ca_source: Option<(String, SecretValue)>,
@@ -431,6 +436,8 @@ impl Policy {
             resources,
             secrets,
             denied_hosts: BTreeSet::new(),
+            revoked_secret_ids: BTreeSet::new(),
+            revoked_inspection_ports: BTreeSet::new(),
             ca,
             ca_source,
         };
@@ -461,7 +468,10 @@ impl Policy {
                 .mirrors
                 .iter()
                 .any(|m| m.host == host && m.port == port)
+            // A bindHost with no `allowHosts` entry is allowed on 443 only; an entry that names
+            // its ports replaces that default, as it does for inspection.
             || (port == 443
+                && !self.allow_hosts.iter().any(|h| h.host == host)
                 && self
                     .secrets
                     .iter()
@@ -526,6 +536,12 @@ impl Policy {
             .any(|host| self.inspects_on(host, port))
     }
 
+    /// Whether the general TCP listener reads ClientHellos on `port`: an inspected host uses it,
+    /// or a revoked one did.
+    pub(crate) fn peeks_tls_on(&self, port: u16) -> bool {
+        self.inspects_any_on(port) || self.revoked_inspection_ports.contains(&port)
+    }
+
     pub(crate) fn secrets_for<'a>(
         &'a self,
         host: &'a str,
@@ -576,11 +592,16 @@ impl Policy {
     pub(crate) fn revoke_secret(&mut self, id: &str) -> bool {
         let before = self.secrets.len();
         self.secrets.retain(|s| s.secret_id != id);
+        self.revoked_secret_ids.insert(id.to_string());
         before != self.secrets.len()
     }
 
     /// Revoke a host: drop its grants and refuse it in every mode until the next policy.
     pub(crate) fn revoke_host(&mut self, host: &str) {
+        if self.inspects(host) {
+            let ports = self.inspection_ports(host);
+            self.revoked_inspection_ports.extend(ports);
+        }
         self.allow_hosts.retain(|h| h.host != host);
         self.mirrors.retain(|m| m.host != host);
         self.resources.retain(|r| r.name != host && r.host != host);
@@ -599,6 +620,14 @@ impl Policy {
             .map(|h| h.host.clone())
             .chain(self.secrets.iter().flat_map(|s| s.bind_hosts.clone()))
             .collect();
+        for host in &hosts {
+            if self.inspects(host) {
+                let ports = self.inspection_ports(host);
+                self.revoked_inspection_ports.extend(ports);
+            }
+        }
+        let ids: Vec<String> = self.secrets.iter().map(|s| s.secret_id.clone()).collect();
+        self.revoked_secret_ids.extend(ids);
         self.denied_hosts.extend(hosts);
         self.allow_hosts.clear();
         self.mirrors.clear();
@@ -915,6 +944,33 @@ mod tests {
         });
         assert!(policy.inspects_on("api.example.com", 443));
         assert!(!policy.inspects_on("api.example.com", 8443));
+    }
+
+    #[test]
+    fn restricted_bind_hosts_get_443_only_when_allow_hosts_names_no_ports() {
+        let mut policy = Policy::from_document(
+            doc(serde_json::json!({
+                "mode": "restricted", "policyHash": "h", "revocationWatermark": 0,
+                "allowHosts": [{ "host": "api.example.com", "ports": [8443] }]
+            })),
+            None,
+        )
+        .unwrap();
+        for host in ["api.example.com", "other.example.com"] {
+            policy.secrets.push(BrokeredSecret {
+                secret_id: host.into(),
+                placeholder: "mend_sec_abcdefgh".into(),
+                value: serde_json::from_str("\"v\"").unwrap(),
+                header_name: "authorization".into(),
+                bind_hosts: vec![host.into()],
+                methods: None,
+                path_prefixes: None,
+            });
+        }
+        assert!(policy.restricted_allows("api.example.com", 8443));
+        assert!(!policy.restricted_allows("api.example.com", 443));
+        assert!(policy.restricted_allows("other.example.com", 443));
+        assert!(!policy.restricted_allows("other.example.com", 8443));
     }
 
     #[test]

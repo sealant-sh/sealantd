@@ -997,7 +997,7 @@ pub(crate) async fn handle_transparent_tcp(shared: Arc<Shared>, mut stream: TcpS
         return;
     };
     let port = dst.port();
-    let Some(inspected_port) = shared.snapshot().map(|s| s.policy.inspects_any_on(port)) else {
+    let Some(peek_tls) = shared.snapshot().map(|s| s.policy.peeks_tls_on(port)) else {
         deny(
             &shared,
             ingress,
@@ -1012,13 +1012,28 @@ pub(crate) async fn handle_transparent_tcp(shared: Arc<Shared>, mut stream: TcpS
     // here): read the ClientHello, and broker it when its SNI is that host. Anything else, the
     // bytes read included, goes on as raw TCP.
     let mut prefix = Vec::new();
-    if inspected_port {
+    if peek_tls {
         let hello = tokio::time::timeout(
             TCP_HELLO_TIMEOUT,
             peek_client_hello(&mut stream, &mut prefix),
         )
         .await;
         match hello {
+            Ok(Ok(Hello::Tls { sni: Some(sni) }))
+                if shared
+                    .snapshot()
+                    .is_some_and(|s| s.policy.host_denied(&sni)) =>
+            {
+                deny(
+                    &shared,
+                    ingress,
+                    Some(&sni),
+                    port,
+                    Some(dst.ip()),
+                    "revoked",
+                );
+                return;
+            }
             Ok(Ok(Hello::Tls { sni: Some(sni) }))
                 if shared
                     .snapshot()

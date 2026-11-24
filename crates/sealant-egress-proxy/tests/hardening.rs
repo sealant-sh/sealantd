@@ -74,6 +74,9 @@ async fn inspected_requests_need_origin_form_and_one_host() {
         format!(
             "GET / HTTP/1.1\r\nHost: api.test@evil.test\r\nAuthorization: Bearer {PLACEHOLDER}\r\n\r\n"
         ),
+        format!(
+            "GET /v1/x#/../../admin HTTP/1.1\r\nHost: api.test\r\nAuthorization: Bearer {PLACEHOLDER}\r\n\r\n"
+        ),
     ] {
         let (status, _) = brokered_request(&h, &executor, port, &request)
             .await
@@ -443,4 +446,77 @@ async fn restricted_plain_http_cannot_be_fronted_through_an_allowed_host() {
         .await
         .unwrap();
     assert_eq!(status, 200);
+}
+
+#[tokio::test]
+async fn tombstones_from_a_restart_survive_a_retry_that_omits_them() {
+    let public = Ca::new("public");
+    let executor = Ca::new("executor");
+    let (port, seen) = https_echo(public.server_config(&["api.test", "web.test"])).await;
+    let h = Harness::start(
+        records(&[("api.test", localhost()), ("web.test", localhost())]),
+        public.roots(),
+    )
+    .await;
+    let mut with_tombstones = brokered(5, &executor, port);
+    with_tombstones["revokedSecretIds"] = json!(["s1"]);
+    with_tombstones["revokedHosts"] = json!(["web.test"]);
+    assert_eq!(h.put_policy(&with_tombstones).await.0, 200);
+    // A retry at the same watermark that leaves the tombstones out.
+    assert_eq!(h.put_policy(&brokered(5, &executor, port)).await.0, 200);
+
+    let (tunnel, _) = connect_tunnel(h.explicit(), "api.test", port).await;
+    let mut tls = tls_connect(tunnel, public.roots(), "api.test")
+        .await
+        .unwrap();
+    let request =
+        format!("GET / HTTP/1.1\r\nHost: api.test\r\nAuthorization: Bearer {PLACEHOLDER}\r\n\r\n");
+    assert_eq!(http_exchange(&mut tls, &request).await.unwrap().0, 200);
+    assert!(
+        !seen
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|head| head.contains(SECRET))
+    );
+    let (_, status) = connect_tunnel(h.explicit(), "web.test", port).await;
+    assert_eq!(status, 403);
+
+    // A later watermark is authoritative again.
+    assert_eq!(h.put_policy(&brokered(6, &executor, port)).await.0, 200);
+    let (_, status) = connect_tunnel(h.explicit(), "web.test", port).await;
+    assert_eq!(status, 200);
+}
+
+#[tokio::test]
+async fn a_revoked_custom_port_host_is_refused_by_sni_on_15444() {
+    let public = Ca::new("public");
+    let executor = Ca::new("executor");
+    let (port, seen) = https_echo(public.server_config(&["api.test", "other.test"])).await;
+    let h = Harness::start(records(&[("api.test", localhost())]), public.roots()).await;
+    assert_eq!(h.put_policy(&brokered(1, &executor, port)).await.0, 200);
+    let (status, _) = h
+        .admin(
+            "POST",
+            "/v1/revoke",
+            Some(&json!({ "revocationWatermark": 2, "revokeHosts": ["api.test"] })),
+        )
+        .await;
+    assert_eq!(status, 200);
+    let tcp = h.proxy.addrs.transparent_tcp.unwrap();
+
+    let mut s = TcpStream::connect(tcp).await.unwrap();
+    s.write_all(&proxy_v2(loopback(port))).await.unwrap();
+    assert!(
+        tls_connect(s, public.roots(), "api.test").await.is_err(),
+        "revoked SNI refused"
+    );
+    assert!(seen.lock().unwrap().is_empty());
+
+    // Other TLS on that port still passes through as raw TCP.
+    let mut s = TcpStream::connect(tcp).await.unwrap();
+    s.write_all(&proxy_v2(loopback(port))).await.unwrap();
+    let mut tls = tls_connect(s, public.roots(), "other.test").await.unwrap();
+    let request = "GET / HTTP/1.1\r\nHost: other.test\r\n\r\n";
+    assert_eq!(http_exchange(&mut tls, request).await.unwrap().0, 200);
 }

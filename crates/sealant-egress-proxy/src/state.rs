@@ -208,6 +208,7 @@ struct Tombstones {
     all: bool,
     hosts: std::collections::BTreeSet<String>,
     secret_ids: std::collections::BTreeSet<String>,
+    inspection_ports: std::collections::BTreeSet<u16>,
 }
 
 impl Tombstones {
@@ -230,6 +231,18 @@ impl Tombstones {
         for host in &self.hosts {
             policy.revoke_host(host);
         }
+        policy
+            .revoked_inspection_ports
+            .extend(self.inspection_ports.iter().copied());
+    }
+
+    /// Record everything `policy` has revoked: its own tombstones and any applied to it.
+    fn absorb(&mut self, policy: &Policy) {
+        self.hosts.extend(policy.denied_hosts.iter().cloned());
+        self.secret_ids
+            .extend(policy.revoked_secret_ids.iter().cloned());
+        self.inspection_ports
+            .extend(policy.revoked_inspection_ports.iter().copied());
     }
 }
 
@@ -405,8 +418,11 @@ impl Shared {
             // A later watermark is Sealant's authoritative state, durable tombstones included
             // (`revokedHosts`, `revokedSecretIds`). The same watermark keeps what was revoked at it.
             inner.tombstones.advance_to(policy.revocation_watermark);
+            // Tombstones a policy carries (`revokedHosts`, `revokedSecretIds`) join the ones held at
+            // its watermark, so a retry at that watermark that omits them cannot undo them.
             if inner.tombstones.watermark == policy.revocation_watermark {
                 inner.tombstones.apply(&mut policy);
+                inner.tombstones.absorb(&policy);
             }
             inner.watermark = policy.revocation_watermark;
             inner.resync_required = false;
@@ -459,6 +475,7 @@ impl Shared {
                 inner.tombstones.hosts.insert(host);
             }
             policy.revocation_watermark = request.revocation_watermark;
+            inner.tombstones.absorb(&policy);
             inner.watermark = request.revocation_watermark;
             let closing = inner.take_matching(|tags| {
                 (request.revoke_all && tags.class != ConnClass::Public)
