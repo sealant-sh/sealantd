@@ -25,6 +25,9 @@ tracing = { workspace = true }
 walkdir = { workspace = true }
 nix = { workspace = true, features = ["dir"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+socket2 = { workspace = true }
+
 [features]
 # The manual clock (`ManualClock`) and `CaptureConfig::clock`, which injects it: for tests only.
 # Only this crate's own tests enable it (the dev-dependency below); no build of the daemon may

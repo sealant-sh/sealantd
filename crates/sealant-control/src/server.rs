@@ -343,6 +343,14 @@ pub async fn serve_unix<S: ControlService>(
     // Stop accepting first, then drain: connections unwind on the signal they already hold.
     drop(listener);
     let _ = std::fs::remove_file(path);
+    drain_connections(connections).await;
+    tracing::info!("control socket closed");
+    Ok(())
+}
+
+/// Let live connections unwind on the shutdown signal they already hold, then abort whatever
+/// is left after [`CONNECTION_DRAIN`] and join it all.
+pub(crate) async fn drain_connections(mut connections: JoinSet<()>) {
     let grace = tokio::time::sleep(CONNECTION_DRAIN);
     tokio::pin!(grace);
     loop {
@@ -357,8 +365,6 @@ pub async fn serve_unix<S: ControlService>(
     }
     connections.abort_all();
     while connections.join_next().await.is_some() {}
-    tracing::info!("control socket closed");
-    Ok(())
 }
 
 /// Serve a single connection over stdio (protocol on stdin/stdout; diagnostics stay on stderr).

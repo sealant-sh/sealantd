@@ -1201,6 +1201,12 @@ impl Runtime {
         }
     }
 
+    /// How many interactive sessions (PTYs) are open: what the idle reclaimer reads as a person
+    /// at work.
+    pub(crate) fn active_sessions(&self) -> usize {
+        self.sessions.registry.len()
+    }
+
     pub(crate) async fn dispatch(&self, request: ControlRequest) -> ControlResponse {
         let rid = request.request_id.clone();
         if matches!(

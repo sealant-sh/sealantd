@@ -79,6 +79,7 @@ const CONSUMED_KEYS: &[&str] = &[
     "SEALANT_CAPTURE_OBJECT_CA_FILE",
     "SEALANT_CAPTURE_LAUNCH_ID",
     "SEALANT_CAPTURE_OWNER_MAP",
+    "SEALANT_CAPTURE_DIAL",
     "SEALANT_SWEEP_EXEMPT_FILE",
     "SEALANT_WORKSPACE_MOUNT_HOST_PATH",
     "SEALANT_MOUNT_ALLOWED_STORE_ROOTS",
@@ -293,10 +294,17 @@ pub struct CaptureSourceConfig {
     /// [`sealant_capture::owners`]): `{"gid":…,"worktree":…,"people":{"<account id>":uid}}`.
     /// Unset, everything is restored as before, root's at the recorded modes.
     pub owners: Option<sealant_capture::owners::OwnerMap>,
+    /// `SEALANT_CAPTURE_DIAL`: how the channel and object URLs are reached — `tcp` (the
+    /// default), `unix:/run/sealant/capture.sock` (the `docker` runtime's capture relay) or
+    /// `vsock:2:1025` (the host's relay, `host-vm`). Over a local socket every request keeps its
+    /// URL's `Host` header, so presigned signatures verify.
+    pub dial: sealant_capture::Dial,
 }
 
 /// How the workspace working directory is provisioned.
 #[derive(Debug, Clone)]
+// Built once per boot and never copied in bulk: the size difference costs nothing.
+#[allow(clippy::large_enum_variant)]
 pub enum WorkspaceSource {
     /// Clone a remote repository into the working directory at boot (the default).
     Clone(RepoConfig),
@@ -960,6 +968,10 @@ impl BootConfig {
                             })
                         })
                         .transpose()?,
+                    dial: sealant_capture::Dial::parse(
+                        &env.get("SEALANT_CAPTURE_DIAL").unwrap_or_default(),
+                    )
+                    .map_err(|e| BootError::config(format!("SEALANT_CAPTURE_DIAL: {e}")))?,
                 }))
             }
             Some(other) => Err(BootError::config(format!(

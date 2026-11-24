@@ -18,6 +18,7 @@ pub mod secret_env;
 pub mod sftp;
 pub mod signals;
 pub mod spawn;
+pub mod trim;
 
 pub use registry::{ProcessEntry, ProcessRegistry};
 

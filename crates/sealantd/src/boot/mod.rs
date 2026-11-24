@@ -85,7 +85,41 @@ pub fn run_boot(log_level: &str, recovery: bool) -> ExitCode {
             }
         },
     };
+    boot_with(config, secret_env, BootExtras::default())
+}
 
+/// Services a microVM guest starts on the daemon's runtime ([`BootExtras::on_healthy`]).
+pub type OnHealthy = Box<dyn FnOnce(Arc<Runtime>, watch::Receiver<bool>) + Send>;
+
+/// What a boot adds when it is PID 1 of a microVM (`sealantd --vm`) rather than of a container.
+#[derive(Default)]
+pub struct BootExtras {
+    /// Also serve the control protocol on this vsock port, to the host (CID 2) only.
+    pub vsock_control_port: Option<u32>,
+    /// Run on the async runtime once the daemon is healthy and the initial binds are in place,
+    /// before the capture engine, dotfiles, lifecycle steps or the harness: the guest's own
+    /// services (the session forwarder, `dockerd`, the idle reclaimer). The receiver turns true
+    /// when the daemon stops.
+    pub on_healthy: Option<OnHealthy>,
+}
+
+impl std::fmt::Debug for BootExtras {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BootExtras")
+            .field("vsock_control_port", &self.vsock_control_port)
+            .field("on_healthy", &self.on_healthy.is_some())
+            .finish()
+    }
+}
+
+/// A boot from a configuration and secret environment already in hand: prepare, then run the
+/// daemon and supervise. [`run_boot`] reads both from the process; `sealantd --vm` from the
+/// runner's boot frame.
+pub fn boot_with(
+    config: BootConfig,
+    secret_env: Vec<(String, String)>,
+    extras: BootExtras,
+) -> ExitCode {
     // Held until this function returns: the process's lifetime.
     let (capture_boot, _disk_lock) = match prepare(&config, &secret_env) {
         Ok(prepared) => prepared,
@@ -101,7 +135,7 @@ pub fn run_boot(log_level: &str, recovery: bool) -> ExitCode {
     if let Some(reason) = sealant_process::identity::fowner_withheld() {
         tracing::info!(%reason, "processes run as a person hold no CAP_FOWNER");
     }
-    run_supervised(config, secret_env, capture_boot)
+    run_supervised_inner(config, secret_env, capture_boot, |_| {}, extras)
 }
 
 /// The exit code of a boot whose preparation failed with `error`.
@@ -145,7 +179,7 @@ fn prepare_exit_code(error: &BootError, recovery: bool) -> u8 {
     }
 }
 
-fn init_tracing(log_level: &str) {
+pub(crate) fn init_tracing(log_level: &str) {
     let filter = tracing_subscriber::EnvFilter::try_new(log_level)
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     let _ = tracing_subscriber::fmt()
@@ -513,6 +547,22 @@ pub fn run_supervised_with(
     capture_boot: Option<capture::CaptureBoot>,
     prepare: impl FnOnce(&Runtime),
 ) -> ExitCode {
+    run_supervised_inner(
+        config,
+        secret_env,
+        capture_boot,
+        prepare,
+        BootExtras::default(),
+    )
+}
+
+fn run_supervised_inner(
+    config: BootConfig,
+    secret_env: Vec<(String, String)>,
+    capture_boot: Option<capture::CaptureBoot>,
+    prepare: impl FnOnce(&Runtime),
+    extras: BootExtras,
+) -> ExitCode {
     let runtime_config = into_runtime_config(&config, &secret_env);
     // Nothing downstream needs the values in this form; the runtime config owns them now.
     drop(secret_env);
@@ -536,7 +586,7 @@ pub fn run_supervised_with(
         }
     };
 
-    let code = tokio_runtime.block_on(boot_serve(runtime, config, capture_boot));
+    let code = tokio_runtime.block_on(boot_serve(runtime, config, capture_boot, extras));
     // A final flush the shutdown's deadline gave up on may still be snapping on a blocking
     // thread: the exit is decided (75), and it must not wait for it.
     tokio_runtime.shutdown_timeout(std::time::Duration::from_secs(1));
@@ -548,6 +598,7 @@ async fn boot_serve(
     runtime: Arc<Runtime>,
     config: BootConfig,
     capture_boot: Option<capture::CaptureBoot>,
+    extras: BootExtras,
 ) -> ExitCode {
     let (serve_tx, serve_rx) = watch::channel(false);
 
@@ -577,6 +628,11 @@ async fn boot_serve(
     // may write to the disk being saved — and nothing below runs but the capture engine.
     if config.recovery {
         runtime.close_admission();
+    }
+
+    // Step 11b': a microVM guest's own services, before anything a user wrote runs.
+    if let Some(on_healthy) = extras.on_healthy {
+        on_healthy(runtime.clone(), serve_rx.clone());
     }
 
     // Step 11c: the capture engine starts now, on the disk as materialized — before dotfiles,
@@ -635,15 +691,23 @@ async fn boot_serve(
             }
         },
     };
-    let control_runtime = runtime.clone();
     let unix = crate::control_frontends::UnixFrontend {
-        path: control_runtime.socket_path(),
-        allowed_peer_uids: control_runtime.allowed_peer_uids(),
+        path: runtime.socket_path(),
+        allowed_peer_uids: runtime.allowed_peer_uids(),
     };
+    // A recovery boot answers status and the final flush only, on every frontend: admission is
+    // closed in the runtime as well, and the transport refuses the rest before it gets there.
+    let scope = if config.recovery {
+        sealant_control::ControlScope::Recovery
+    } else {
+        sealant_control::ControlScope::Full
+    };
+    let control_service = Arc::new(sealant_control::ScopedService::new(runtime.clone(), scope));
     let mut control_handle = crate::control_frontends::spawn_control_frontends(
-        control_runtime,
+        control_service,
         unix,
         wss_listener,
+        extras.vsock_control_port,
         serve_rx,
     );
 
@@ -1386,6 +1450,7 @@ mod tests {
                 recovery: false,
                 launch_id: None,
                 owners,
+                dial: sealant_capture::Dial::Tcp,
             })
         };
         let map = |people: &[(&str, u32)]| sealant_capture::owners::OwnerMap {
