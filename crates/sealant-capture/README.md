@@ -573,13 +573,22 @@ restore, byte for byte, so the user never notices the compute changed.
   `pack-objects` that reaches it fails (`object file … is empty`): the recovery's final flush was
   `snapshot-failed`. The first pack of a repository in each process, and every pack after a read
   or a `pack-objects` fails, removes the empty loose objects first (an empty file is never a valid
-  object; the log names each one). From then on the build is *torn*: an index entry whose blob is
-  gone is given back to `git add` with no stat data, so the file is read and its blob written
-  again, and a tip that reaches a lost object (a branch or a reflog entry naming the lost commit)
-  is found by halving `rev-list --objects` checks and left out of the pack, with a warning. The
-  refs are kept as they are: a restore brings back what the disk held, naming the same lost
-  commit. A worktree tree that still cannot be made whole fails the snap as before. Every git the
-  capture runs flushes what it writes (`core.fsync=loose-object,pack,pack-metadata,reference,index`,
+  object; the log names each one), and records the ids in `objects/info/sealant-torn-objects`
+  (under `objects/`, so no capture class carries it), the crash evidence a recovery asked again
+  still has. With that evidence, and never in a partial clone (a promisor remote's missing
+  objects are not a crash's), the build is *torn*: an index entry whose blob is gone is given back
+  to `git add` with no stat data, so the file is read and its blob written again, and a tip that
+  reaches a lost object (a branch or reflog entry naming the lost commit, an index tree naming the
+  lost blob) is found by halving `rev-list --objects` checks and left out of the pack, with a
+  warning. The capture names nothing the packs do not hold: a ref naming a lost tip is not in
+  `refs` and a lost index tree is not `index_tree` (a restore takes the index's own bytes), and the
+  engine keeps the lost tips (`git-lost.json`) out of every later pack's negatives, so one whose
+  objects come back is packed then. A tip is packed whole or not at all: `pack-objects
+  --missing=allow-any` keeps a tip with missing blobs but still dies on a missing commit, and a tip
+  with a hole would be a negative hiding the hole for good. A worktree tree that still cannot be
+  made whole fails the snap as before; the evidence goes once a build finds the repository whole.
+  Without it, a missing object fails the build as it always did. The git the capture runs flushes
+  the loose objects, index and refs it writes (`core.fsync=loose-object,pack,pack-metadata,reference,index`,
   `core.fsyncMethod=batch`, per command and never in `.git/config`), so a capture leaves no torn
   object of its own.
 - **A `final` flush stops the writers, then snaps, then finishes.** `capture.flush {kind:

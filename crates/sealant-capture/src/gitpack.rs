@@ -3269,6 +3269,11 @@ pub struct Closure {
     /// Symlinks standing for `HEAD` or a ref that a restore cannot make resolve as they do
     /// here ([`GitRepo::unrestorable_ref_links`]).
     pub unrestorable_ref_links: Vec<String>,
+    /// Tips a torn build left out of the pack: they reach objects a crash lost
+    /// ([`read_for_pack`]). No ref of `refs` names one, `index_tree` is none when it was one,
+    /// and none is in `tips`: nothing a capture names is missing from its packs, so none ever
+    /// becomes a negative of a later pack. Sorted.
+    pub lost: Vec<String>,
 }
 
 /// Read the closure (refs, `HEAD`, index, stash, reflog, worktree) in that order. `excludes` are
@@ -3390,6 +3395,7 @@ fn read_closure_torn(
         unresolved_operations,
         ref_format,
         unrestorable_ref_links,
+        lost: Vec::new(),
     })
 }
 
@@ -3598,10 +3604,21 @@ pub fn remove_torn_objects(objects: &Path) -> Vec<String> {
 /// The object stores this process has looked through for empty loose objects, resolved.
 static SWEPT: std::sync::Mutex<BTreeSet<PathBuf>> = std::sync::Mutex::new(BTreeSet::new());
 
+/// Where a repository keeps the ids of the empty loose objects the capture removed: the crash
+/// evidence a torn build needs ([`torn_allowed`]). Under `objects/`, which no capture class
+/// carries, so a restore never brings it back; git ignores a file it does not know there.
+fn torn_mark(repo: &GitRepo) -> PathBuf {
+    repo.common_dir
+        .join("objects")
+        .join("info")
+        .join("sealant-torn-objects")
+}
+
 /// [`remove_torn_objects`] on `repo`'s object store (its common directory's, so a linked
 /// worktree's is the repository's), the first time this process asks, and again whenever
 /// `again`. A torn object exists only after a crash, so once a boot has looked, only a failure
-/// is a reason to look again.
+/// is a reason to look again. What it removed is added to [`torn_mark`]: the next process, a
+/// recovery boot asked again, still knows the repository lost objects to a crash.
 fn sweep_torn(repo: &GitRepo, again: bool) -> Vec<String> {
     let first = SWEPT
         .lock()
@@ -3609,15 +3626,90 @@ fn sweep_torn(repo: &GitRepo, again: bool) -> Vec<String> {
     if !first && !again {
         return Vec::new();
     }
-    remove_torn_objects(&repo.common_dir.join("objects"))
+    let removed = remove_torn_objects(&repo.common_dir.join("objects"));
+    if !removed.is_empty() {
+        let mark = torn_mark(repo);
+        let written = mark
+            .parent()
+            .map_or(Ok(()), fs::create_dir_all)
+            .and_then(|()| {
+                let mut file = fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&mark)?;
+                file.write_all(format!("{}\n", removed.join("\n")).as_bytes())?;
+                file.sync_all()
+            });
+        if let Err(error) = written {
+            tracing::warn!(path = %mark.display(), %error, "cannot record the objects a crash tore");
+        }
+    }
+    removed
+}
+
+/// Whether a build of `repo` may leave out the tips that reach missing objects: only when a
+/// crash is known to have torn objects of it ([`torn_mark`]), and never in a partial clone, whose
+/// missing objects are the promisor remote's to give, not a crash's to have lost. Anywhere else
+/// a missing object fails the build as it always did, and nothing readable is left out unsaid.
+fn torn_allowed(repo: &GitRepo) -> bool {
+    if !fs::metadata(torn_mark(repo)).is_ok_and(|m| m.len() > 0) {
+        return false;
+    }
+    if repo.is_partial_clone() {
+        tracing::warn!(
+            root = %repo.root.display(),
+            "a crash tore objects of a partial clone; its missing objects are not left out"
+        );
+        return false;
+    }
+    true
+}
+
+impl GitRepo {
+    /// Whether the repository is a partial clone: `extensions.partialClone` or a promisor remote
+    /// configured, or a promisor pack in its store. Taken for one when its configuration cannot
+    /// be read.
+    #[must_use]
+    pub fn is_partial_clone(&self) -> bool {
+        let promisor_pack =
+            fs::read_dir(self.common_dir.join("objects").join("pack")).is_ok_and(|dir| {
+                dir.flatten()
+                    .any(|e| e.file_name().as_bytes().ends_with(b".promisor"))
+            });
+        if promisor_pack {
+            return true;
+        }
+        let args = [
+            "config",
+            "--get-regexp",
+            r"^(extensions\.partialclone|remote\..*\.promisor)$",
+        ];
+        let Ok(out) =
+            git_command(&self.root).and_then(|mut c| Ok(c.args(args).output_bounded()?))
+        else {
+            return true;
+        };
+        match out.status.code() {
+            Some(1) => false,
+            Some(0) => stdout_string(&out).lines().any(|line| {
+                let (key, value) = line.split_once(' ').unwrap_or((line, ""));
+                key.starts_with("extensions.")
+                    || !matches!(
+                        value.to_ascii_lowercase().as_str(),
+                        "false" | "no" | "off" | "0"
+                    )
+            }),
+            _ => true,
+        }
+    }
 }
 
 /// [`read_closure_torn`], and with `torn` the closure's tips cut to the ones whose objects the
 /// store holds whole ([`GitRepo::split_whole_tips`]): a ref, a reflog entry or an index blob
-/// that names what a crash lost is left out of the pack, and the capture holds everything else.
-/// The refs themselves are kept as they are: a restore brings back the repository the disk
-/// holds, naming the same lost commit. The worktree tree and the raw tree are the files on
-/// disk, read again: one that is still not whole fails the read.
+/// that names what a crash lost is left out of the pack ([`Closure::lost`]), and the capture
+/// holds everything else. An index tree that is lost is not named (the workspace class carries
+/// the index's bytes). The worktree tree and the raw tree are the files on disk, read again:
+/// one that is still not whole fails the read.
 fn read_for_pack(
     repo: &GitRepo,
     scratch_dir: &Path,
@@ -3644,14 +3736,49 @@ fn read_for_pack(
             });
         }
     }
+    // A restore reads the index tree into the index: one the packs do not hold fails it.
+    let lost_index = closure.index_tree.take_if(|t| lost.contains(t));
+    // Whole or not at all: a tip packed with a hole (`pack-objects --missing=allow-any`, which
+    // still dies on a missing commit) would restore an object no walk of its history completes,
+    // and as a later pack's negative keep the missing object out should it come back. A tip the
+    // store holds itself (a commit whose blob or parent was torn) is said apart.
+    let readable = repo.existing(&lost)?;
     tracing::warn!(
         lost = lost.len(),
+        readable = readable.len(),
+        index_tree = ?lost_index,
         tips = %lost.join(" "),
-        "these tips (refs, reflog entries, index blobs) reach objects a crash lost; they are \
-         left out of the pack, and the capture holds the worktree and everything else"
+        "these tips (refs, reflog entries, the index) reach objects a crash lost; they are left \
+         out of the pack, and the capture holds the worktree and everything else"
     );
     closure.tips = whole;
+    closure.lost = lost;
     Ok(closure)
+}
+
+/// The closure as a capture names it, once the pack is built: no ref naming a tip the pack left
+/// out ([`Closure::lost`]). A restore of such a ref would name an object none of the capture's
+/// packs holds, a verifier walking the refs would find it missing, and a later pack would take
+/// it for one the store holds (a negative) and leave out the object should it come back.
+fn without_lost_refs(mut closure: Closure) -> Closure {
+    if closure.lost.is_empty() {
+        return closure;
+    }
+    let lost: BTreeSet<&String> = closure.lost.iter().collect();
+    let dropped: Vec<String> = closure
+        .refs
+        .iter()
+        .filter(|(_, sha)| lost.contains(sha))
+        .map(|(name, sha)| format!("{name} {sha}"))
+        .collect();
+    if !dropped.is_empty() {
+        tracing::warn!(
+            refs = %dropped.join(", "),
+            "these refs name commits a crash lost; the capture does not name them"
+        );
+        closure.refs.retain(|_, sha| !lost.contains(sha));
+    }
+    closure
 }
 
 /// Build the git class: read the closure, pack it against `previous_tips`, re-read refs and
@@ -3660,9 +3787,12 @@ fn read_for_pack(
 /// the worktree tree.
 ///
 /// Empty loose objects a crash left are removed first ([`sweep_torn`]), and again when a read
-/// or a pack fails. From then on the build is *torn*: index entries whose blobs are gone are
-/// read again from their files, and tips that reach lost objects are left out of the pack
-/// ([`read_for_pack`]), so a final flush after a hard kill still saves every file.
+/// or a pack fails. Once a crash is known to have torn objects of the repository
+/// ([`torn_allowed`]) the build is *torn*: index entries whose blobs are gone are read again
+/// from their files, tips that reach lost objects are left out of the pack ([`read_for_pack`])
+/// and refs naming them out of the capture ([`without_lost_refs`]), so a final flush after a
+/// hard kill still saves every file. Without that evidence a missing object fails the build as
+/// it always did.
 pub fn build_git_pack(
     repo: &GitRepo,
     out_dir: &Path,
@@ -3702,24 +3832,25 @@ pub fn build_git_pack_with(
     options: TreeOptions<'_>,
 ) -> Result<GitPackResult, GitError> {
     fs::create_dir_all(out_dir).map_err(at("mkdir -p", out_dir))?;
-    let mut torn = !sweep_torn(repo, false).is_empty();
+    sweep_torn(repo, false);
+    let mut torn = torn_allowed(repo);
     let mut negatives = repo.existing(previous_tips)?;
     let mut last: Option<(Option<FinishedGitPack>, Closure)> = None;
-    // Look again for torn objects; a negative it removed would fail every pack (`bad object`).
-    let go_torn = |negatives: &mut Vec<String>| -> Result<(), GitError> {
+    // Look again for torn objects (a negative removed would fail every pack: `bad object`), and
+    // whether the build may now leave out what a crash lost.
+    let look_again = |negatives: &mut Vec<String>| -> Result<bool, GitError> {
         if !sweep_torn(repo, true).is_empty() {
             *negatives = repo.existing(previous_tips)?;
         }
-        Ok(())
+        Ok(torn_allowed(repo))
     };
     for attempt in 1..=PACK_ATTEMPTS {
         let closure = match read_for_pack(repo, out_dir, excludes, options, torn, &negatives) {
             Ok(c) => c,
-            // Once, read again as torn: an index entry naming a blob a crash lost fails the
-            // worktree tree's `write-tree`. Anything else fails the same way twice.
-            Err(e) if !torn => {
-                tracing::warn!(attempt, error = %e, "reading the git closure failed; looking for objects a crash lost");
-                go_torn(&mut negatives)?;
+            // Read again as torn when a crash tore objects: an index entry naming a blob it
+            // lost fails the worktree tree's `write-tree`. Anything else fails as it did.
+            Err(e) if !torn && look_again(&mut negatives)? => {
+                tracing::warn!(attempt, error = %e, "reading the git closure failed over objects a crash lost; reading again");
                 torn = true;
                 continue;
             }
@@ -3730,8 +3861,7 @@ pub fn build_git_pack_with(
             Err(e) => {
                 tracing::warn!(attempt, error = %e, "pack-objects failed; re-reading refs");
                 if !torn {
-                    go_torn(&mut negatives)?;
-                    torn = true;
+                    torn = look_again(&mut negatives)?;
                 }
                 continue;
             }
@@ -3744,9 +3874,13 @@ pub fn build_git_pack_with(
             || head_after != closure.head;
         if !moved {
             let fsck = repo.fsck()?;
+            // Whole again: no later build leaves anything out for this crash.
+            if torn && closure.lost.is_empty() {
+                fs::remove_file(torn_mark(repo)).ok();
+            }
             return Ok(GitPackResult {
                 pack: packed,
-                closure,
+                closure: without_lost_refs(closure),
                 fsck,
                 attempts: attempt,
             });
@@ -3766,7 +3900,7 @@ pub fn build_git_pack_with(
     let packed = pack_once(repo, out_dir, &closure.tips, &negatives, PACK_ATTEMPTS + 1)?;
     Ok(GitPackResult {
         pack: packed,
-        closure,
+        closure: without_lost_refs(closure),
         fsck: FsckStatus::Unverified,
         attempts: PACK_ATTEMPTS + 1,
     })
@@ -4641,7 +4775,7 @@ mod tests {
     /// name objects that are gone and the index's stat data still matches the files (so `git
     /// add` would trust the lost blob). The capture still saves every file of the worktree,
     /// byte for byte, modified and untracked ones included; the lost commit is left out of the
-    /// pack and the ref comes back naming it, as the disk does.
+    /// pack, and no ref the capture names points at it.
     #[test]
     fn a_commit_torn_by_a_crash_still_leaves_every_file_saved() {
         let (dir, repo) = fixture();
@@ -4677,11 +4811,12 @@ mod tests {
                 || fs::metadata(loose_path(&repo, id)).unwrap().len() > 0),
             "no empty object is left"
         );
-        assert_eq!(
-            r.closure.refs.values().filter(|v| **v == lost).count(),
-            1,
-            "the ref still names the lost commit"
+        assert!(
+            r.closure.refs.values().all(|v| *v != lost),
+            "no ref the capture names points at the lost commit: {:?}",
+            r.closure.refs
         );
+        assert!(r.closure.lost.contains(&lost));
         assert!(
             !r.closure.tips.contains(&lost),
             "the lost commit is not packed"
@@ -4738,6 +4873,97 @@ mod tests {
         want_broken.sort();
         assert_eq!(whole, want_whole);
         assert_eq!(broken, want_broken);
+    }
+
+    /// No crash, objects missing all the same (an offline partial clone whose promisor remote
+    /// is gone): nothing is left out unsaid. The build fails as it always did, the readable
+    /// commit made there never dropped from a capture that says it succeeded, and that holds
+    /// even once a crash has torn an object of it: a partial clone's missing objects are the
+    /// promisor's, not a crash's.
+    #[test]
+    fn an_offline_partial_clone_without_a_crash_is_never_taken_for_a_torn_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        let source = GitRepo::init(&src).unwrap();
+        for (k, v) in [
+            ("user.email", "t@t"),
+            ("user.name", "t"),
+            ("uploadpack.allowFilter", "true"),
+        ] {
+            source.run(&["config", k, v]).unwrap();
+        }
+        fs::write(src.join("f"), "v1\n").unwrap();
+        fs::write(src.join("g"), "old\n").unwrap();
+        source.run(&["add", "-A"]).unwrap();
+        source.run(&["commit", "-q", "-m", "one"]).unwrap();
+        fs::write(src.join("f"), "v2\n").unwrap();
+        source.run(&["rm", "-q", "g"]).unwrap();
+        source.run(&["commit", "-q", "-m", "two"]).unwrap();
+        let url = format!("file://{}", src.display());
+        let clone_dir = dir.path().join("clone");
+        source
+            .run(&[
+                "clone",
+                "-q",
+                "--filter=blob:none",
+                &url,
+                clone_dir.to_str().unwrap(),
+            ])
+            .unwrap();
+        let clone = GitRepo::open(&clone_dir).unwrap();
+        clone.run(&["config", "user.email", "t@t"]).unwrap();
+        clone.run(&["config", "user.name", "t"]).unwrap();
+        fs::write(clone_dir.join("h"), "unpublished\n").unwrap();
+        clone.run(&["add", "h"]).unwrap();
+        clone.run(&["commit", "-q", "-m", "local"]).unwrap();
+        let local = stdout_string(&clone.run(&["rev-parse", "HEAD"]).unwrap());
+        fs::rename(&src, dir.path().join("gone")).unwrap();
+        assert!(clone.is_partial_clone());
+
+        let scratch = dir.path().join("scratch");
+        let packed = |label: &str| match build_git_pack(&clone, &scratch, &[], &[]) {
+            Err(_) => {}
+            Ok(r) => assert!(
+                r.closure.tips.contains(&local) && r.closure.lost.is_empty(),
+                "{label}: a capture that succeeded left the local commit out: {:?}",
+                r.closure.lost
+            ),
+        };
+        packed("no crash");
+        assert!(!torn_mark(&clone).exists(), "nothing was torn");
+        // A crash tears an object of it: the evidence is there, the partial clone still wins.
+        fs::write(clone_dir.join("h"), "edited\n").unwrap();
+        let blob = stdout_string(&clone.run(&["hash-object", "-w", "h"]).unwrap());
+        tear(&clone, &blob);
+        packed("a crash tore an object");
+        assert!(torn_mark(&clone).exists());
+    }
+
+    /// The evidence a torn build needs outlives the process that removed the objects (a
+    /// recovery asked again), and goes once a build finds the repository whole again.
+    #[test]
+    fn the_crash_evidence_is_kept_until_the_repository_is_whole_again() {
+        let (dir, repo) = fixture();
+        fs::write(repo.root.join("a"), "edited\n").unwrap();
+        let blob = stdout_string(&repo.run(&["hash-object", "-w", "a"]).unwrap());
+        tear(&repo, &blob);
+        assert!(!torn_allowed(&repo), "no evidence before a sweep");
+        let removed = remove_torn_objects(&repo.common_dir.join("objects"));
+        assert_eq!(removed, std::slice::from_ref(&blob));
+        // What a sweep records (`remove_torn_objects` alone records nothing).
+        tear(
+            &repo,
+            &stdout_string(&repo.run(&["hash-object", "-w", "a"]).unwrap()),
+        );
+        assert_eq!(sweep_torn(&repo, true), std::slice::from_ref(&blob));
+        assert!(torn_allowed(&repo));
+        let mark = fs::read_to_string(torn_mark(&repo)).unwrap();
+        assert!(mark.contains(&blob), "{mark}");
+        // The blob is written again from the file: the build is whole, and the mark goes.
+        let r = build_git_pack(&repo, &dir.path().join("scratch"), &[], &[]).unwrap();
+        assert!(r.closure.lost.is_empty());
+        assert!(!torn_mark(&repo).exists());
+        assert!(!torn_allowed(&repo));
     }
 
     /// A repository with no reflog (nothing ever updated a ref through git) has no tips, and

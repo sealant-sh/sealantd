@@ -226,3 +226,114 @@ fn a_recovery_final_flush_after_a_hard_kill_restores_every_file() {
         assert_eq!(fs::read(restored.join(path)).unwrap(), bytes, "{path}");
     }
 }
+
+/// R1 review of #242 (both reviewers): a commit the kill left whole whose blob it tore, the
+/// file edited again since. The index (its cache tree) still names the commit's tree, which
+/// reaches the lost blob: a capture that named it as its index tree made every restore fail
+/// (`git read-tree …: failed to unpack tree object`). The index tree is now left out with the
+/// tips that reach the lost blob, the final flush completes, and the head restores the latest
+/// edit byte for byte.
+#[test]
+fn a_lost_index_tree_is_not_named_and_the_head_restores() {
+    let fx = Fixture::new();
+    let running = fx.runner();
+    running.flush(CaptureKind::Checkpoint, None).unwrap();
+    running.stop();
+    drop(running);
+
+    fs::write(fx.root.join("src/edit.txt"), "committed\n").unwrap();
+    git(&fx.root, &["add", "src/edit.txt"]);
+    git(&fx.root, &["commit", "-q", "-m", "two"]);
+    let committed = git(&fx.root, &["rev-parse", "HEAD:src/edit.txt"]);
+    fs::write(
+        fx.root.join("src/edit.txt"),
+        "edited again after the commit\n",
+    )
+    .unwrap();
+    fx.index_after_the_files();
+    tear(&fx.root, &committed);
+
+    let recovery = fx.runner();
+    let flushed = recovery.flush_final(None);
+    assert!(flushed.complete(), "{flushed:?}");
+    let git_section = fx.registrar.head().unwrap().manifest.sections.git;
+    assert_eq!(
+        git_section.index_tree, None,
+        "the lost index tree is not named"
+    );
+    let restored = fx.restore("restored");
+    assert_eq!(files(&restored), files(&fx.root));
+    assert_eq!(
+        fs::read(restored.join("src/edit.txt")).unwrap(),
+        b"edited again after the commit\n"
+    );
+}
+
+/// R1 review of #242 (Astra #2): a tip a torn pack left out is no negative of a later one. The
+/// lost commit's objects come back (fetched again, written again); the next capture, in a
+/// process of its own, packs them, and its head restores the commit, detached `HEAD` and all.
+/// Taken for a negative (the capture names a detached `HEAD` whatever it is), the commit would
+/// stay out of every pack while the capture named it.
+#[test]
+fn a_lost_tip_that_comes_back_is_packed_not_taken_for_a_negative() {
+    let fx = Fixture::new();
+    let running = fx.runner();
+    running.flush(CaptureKind::Checkpoint, None).unwrap();
+    running.stop();
+    drop(running);
+
+    fs::write(fx.root.join("src/edit.txt"), "committed, lost, back\n").unwrap();
+    git(&fx.root, &["add", "src/edit.txt"]);
+    git(&fx.root, &["commit", "-q", "-m", "two"]);
+    git(&fx.root, &["checkout", "-q", "--detach"]);
+    let lost = git(&fx.root, &["rev-parse", "HEAD"]);
+    let ids = git(
+        &fx.root,
+        &["rev-list", "--objects", "--no-object-names", "HEAD^..HEAD"],
+    );
+    let saved: Vec<(PathBuf, Vec<u8>)> = ids
+        .lines()
+        .map(|id| {
+            let path = fx.root.join(".git/objects").join(&id[..2]).join(&id[2..]);
+            let bytes = fs::read(&path).unwrap();
+            (path, bytes)
+        })
+        .collect();
+    fx.index_after_the_files();
+    for id in ids.lines() {
+        tear(&fx.root, id);
+    }
+
+    let torn = fx.runner();
+    torn.flush(CaptureKind::Checkpoint, None).unwrap();
+    torn.stop();
+    drop(torn);
+    let head = fx.registrar.head().unwrap().manifest.sections.git;
+    assert!(
+        head.refs.values().all(|v| *v != lost),
+        "no ref names the lost commit: {:?}",
+        head.refs
+    );
+
+    // The objects come back.
+    for (path, bytes) in &saved {
+        let _ = fs::remove_file(path);
+        fs::write(path, bytes).unwrap();
+    }
+    let later = fx.runner();
+    later.flush(CaptureKind::Checkpoint, None).unwrap();
+    later.stop();
+    let head = fx.registrar.head().unwrap().manifest.sections.git;
+    assert_eq!(head.head, lost, "HEAD is detached at the commit");
+    assert!(head.refs.values().any(|v| *v == lost), "{:?}", head.refs);
+    let restored = fx.restore("restored");
+    assert_eq!(
+        git(&restored, &["cat-file", "-t", &lost]),
+        "commit",
+        "the commit came back with the capture"
+    );
+    assert_eq!(
+        fs::read(restored.join("src/edit.txt")).unwrap(),
+        b"committed, lost, back\n"
+    );
+}
