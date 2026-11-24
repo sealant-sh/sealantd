@@ -2185,22 +2185,128 @@ test("next publishes to npm only once every image is tagged, and prints each pin
     ["EGRESS_PROXY_DIGEST", "egress-proxy"],
   ])
     assert.equal(publish.env[variable], `\${{ needs.image-tag.outputs.${image}-digest }}`);
-  // The guard before the republish block: every digest, or nothing is published.
-  const guard = publish.run.slice(0, publish.run.indexOf("# --- republish ---"));
+  // The guard before the republish block: every digest, each read anonymously as image-tag wrote
+  // it, or nothing is published.
   const good = `sha256:${"a".repeat(64)}`;
-  const env = {
-    PATH: process.env.PATH,
-    SEALANTD_DIGEST: good,
-    VM_RUNNER_DIGEST: good,
-    EGRESS_PROXY_DIGEST: good,
+  const digests = {
+    sealantd: `sha256:${"a".repeat(64)}`,
+    "vm-runner": `sha256:${"b".repeat(64)}`,
+    "egress-proxy": `sha256:${"c".repeat(64)}`,
   };
-  assert.equal(bashStep(guard, { env }).status, 0);
+  const ref = (image) => `ghcr.io/sealant-sh/${image}-next:1.2.3-next.4`;
+  /**
+   * The whole publish step against a stand-in docker that answers each ref's anonymous read from
+   * `answers` (by default the digest image-tag reported) and refuses any read carrying a docker
+   * config with credentials in it, and a stand-in npm that records every call.
+   */
+  const publishWith = ({ env = {}, answers = {} } = {}) => {
+    const directory = scratch(t, "next-publish-");
+    const bin = path.join(directory, "bin");
+    mkdirSync(bin);
+    const calls = path.join(directory, "calls.jsonl");
+    writeFileSync(calls, "");
+    const served = Object.fromEntries(
+      IMAGES.map((image) => [
+        ref(image),
+        answers[image] ?? {
+          stdout: `${JSON.stringify({ mediaType: "application/vnd.oci.image.index.v1+json", digest: digests[image] })}\n`,
+        },
+      ]),
+    );
+    writeFileSync(path.join(directory, "served.json"), JSON.stringify(served));
+    writeFileSync(
+      path.join(bin, "docker"),
+      `#!${process.execPath}
+const fs = require("node:fs");
+const args = process.argv.slice(2);
+const config = process.env.DOCKER_CONFIG;
+fs.appendFileSync(${JSON.stringify(calls)}, JSON.stringify({ docker: args, anonymous: !!config && fs.existsSync(config) && fs.readdirSync(config).length === 0 }) + "\\n");
+if (!config || fs.readdirSync(config).length > 0) process.exit(97);
+if (args.slice(0, 3).join(" ") !== "buildx imagetools inspect" || args[4] !== "--format") process.exit(79);
+const answer = JSON.parse(fs.readFileSync(${JSON.stringify(path.join(directory, "served.json"))}, "utf8"))[args[3]];
+if (answer === undefined) { console.error("ERROR: " + args[3] + ": not found"); process.exit(1); }
+process.stdout.write(answer.stdout ?? "");
+process.stderr.write(answer.stderr ?? "");
+process.exit(answer.exit ?? 0);
+`,
+    );
+    writeFileSync(
+      path.join(bin, "npm"),
+      `#!${process.execPath}
+require("node:fs").appendFileSync(${JSON.stringify(calls)}, JSON.stringify({ npm: process.argv.slice(2) }) + "\\n");
+process.exit(98);
+`,
+    );
+    chmodSync(path.join(bin, "docker"), 0o755);
+    chmodSync(path.join(bin, "npm"), 0o755);
+    const result = bashStep(publish.run, {
+      env: {
+        PATH: `${bin}:${process.env.PATH}`,
+        VERSION: "1.2.3-next.4",
+        SHA: "f".repeat(40),
+        OWNER: "sealant-sh",
+        SEALANTD_DIGEST: digests.sealantd,
+        VM_RUNNER_DIGEST: digests["vm-runner"],
+        EGRESS_PROXY_DIGEST: digests["egress-proxy"],
+        GITHUB_WORKSPACE: directory,
+        GITHUB_STEP_SUMMARY: path.join(directory, "summary.md"),
+        ...env,
+      },
+    });
+    return { ...result, output: result.stdout + result.stderr, calls: readCalls(calls) };
+  };
+  // Every image reads anonymously as its digest: the guard passes, and the step goes on to the
+  // republish block, which stops at the artifact check (nothing was downloaded here).
+  const passes = publishWith();
+  assert.deepEqual(
+    passes.calls.filter((call) => call.docker).map(({ docker, anonymous }) => [docker[3], anonymous]),
+    IMAGES.map((image) => [ref(image), true]),
+  );
+  for (const image of IMAGES)
+    assert.match(passes.output, new RegExp(`${ref(image)} reads anonymously as ${digests[image]}`));
+  assert.match(passes.output, /missing from the artifact/);
   for (const variable of ["SEALANTD_DIGEST", "VM_RUNNER_DIGEST", "EGRESS_PROXY_DIGEST"])
     for (const value of ["", "latest", `sha256:${"a".repeat(63)}`]) {
-      const refused = bashStep(guard, { env: { ...env, [variable]: value } });
+      const refused = publishWith({ env: { [variable]: value } });
       assert.equal(refused.status, 1, `${variable}=${value}`);
       assert.match(refused.stdout, /not an index digest.*Nothing was published/);
+      assert.deepEqual(refused.calls, [], `${variable}=${value} reads and publishes nothing`);
     }
+  // A private (or missing) package, an index other than the one image-tag wrote, or an answer that
+  // is not one: the job stops naming the image, before npm runs at all.
+  for (const [label, image, answer, problem] of [
+    [
+      "a private vm-runner-next",
+      "vm-runner",
+      {
+        stderr:
+          "ERROR: failed to authorize: failed to fetch anonymous token: unexpected status from GET request to https://ghcr.io/token?scope=repository%3Asealant-sh%2Fvm-runner-next%3Apull&service=ghcr.io: 403 Forbidden\n",
+        exit: 1,
+      },
+      /vm-runner-next:1\.2\.3-next\.4 reads anonymously as 'nothing' \(exit 1\).*If the vm-runner-next package on GHCR is private, make it public/,
+    ],
+    [
+      "egress-proxy-next at another index",
+      "egress-proxy",
+      { stdout: `${JSON.stringify({ digest: FOREIGN })}\n` },
+      new RegExp(`egress-proxy-next:1\\.2\\.3-next\\.4 reads anonymously as '${FOREIGN}' \\(exit 0\\), not ${digests["egress-proxy"]}`),
+    ],
+    [
+      "sealantd-next answering without a digest",
+      "sealantd",
+      { stdout: "not json\n" },
+      /sealantd-next:1\.2\.3-next\.4 reads anonymously as 'nothing' \(exit 0\)/,
+    ],
+  ]) {
+    const refused = publishWith({ answers: { [image]: answer } });
+    assert.equal(refused.status, 1, `${label}: ${refused.output}`);
+    assert.match(refused.output, problem, label);
+    assert.match(refused.output, /Nothing was published/, label);
+    assert.ok(
+      refused.calls.every((call) => call.npm === undefined),
+      `${label}: npm never runs`,
+    );
+  }
   // Each image-tag leg records its own output and the ref sealant pins.
   const record = next["image-tag"].steps.find((step) => step.name === "Record the tagged index");
   assert.equal(record.env.DIGEST, "${{ steps.tag.outputs.digest }}");

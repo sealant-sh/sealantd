@@ -250,6 +250,12 @@ jobs:
           ref=$REPOSITORY:$VERSION
           sources=()
           for digest in *; do sources+=("$REPOSITORY@sha256:$digest"); done
+          # One build per arch, amd64 and arm64: a partial or stray artifact never tags an index.
+          hex='^[0-9a-f]{64}$'
+          if ((${#sources[@]} != 2)) || [[ ! ${sources[0]##*:} =~ $hex || ! ${sources[1]##*:} =~ $hex ]]; then
+            echo "::error::The digests artifacts hold '${sources[*]##*@sha256:}', not one image digest per arch; nothing was written."
+            exit 1
+          fi
           # This run's index digest, known before anything is written: --dry-run prints the exact
           # bytes create pushes, plus one newline, and the index digest is theirs.
           docker buildx imagetools create --dry-run --tag "$ref" "${sources[@]}" >"$RUNNER_TEMP/index.json"
@@ -436,6 +442,30 @@ jobs:
               echo "::error::image-tag reported '$digest', not an index digest, for one of the three images. Nothing was published."
               exit 1
             fi
+          done
+          # Each :<version> must resolve, read anonymously as sealant and every consumer read it,
+          # to the index image-tag wrote. image-tag wrote with this repository's token, so a package
+          # GHCR created private (a new package's first push) passes there and fails here, by name:
+          # make it public, then re-run this job. A read that fails, or a digest that differs,
+          # stops the job before npm is touched.
+          anonymous=$(mktemp -d)
+          inspect_err=$(mktemp)
+          for entry in "sealantd=$SEALANTD_DIGEST" "vm-runner=$VM_RUNNER_DIGEST" \
+            "egress-proxy=$EGRESS_PROXY_DIGEST"; do
+            image=${entry%%=*}
+            digest=${entry#*=}
+            ref=ghcr.io/$OWNER/$image-next:$VERSION
+            status=0
+            served=
+            out=$(DOCKER_CONFIG=$anonymous docker buildx imagetools inspect "$ref" \
+              --format '{{json .Manifest}}' 2>"$inspect_err") || status=$?
+            if ((status == 0)); then served=$(jq -r '.digest // ""' <<<"$out" 2>/dev/null) || served=; fi
+            if [[ $served != "$digest" ]]; then
+              cat "$inspect_err" >&2
+              echo "::error::$ref reads anonymously as '${served:-nothing}' (exit $status), not $digest, the index image-tag wrote. If the $image-next package on GHCR is private, make it public, then re-run this job. Nothing was published."
+              exit 1
+            fi
+            echo "$ref reads anonymously as $digest."
           done
           # --- republish ---
           # republish.test.mjs runs this block as written, against a stub registry. The callers check the
