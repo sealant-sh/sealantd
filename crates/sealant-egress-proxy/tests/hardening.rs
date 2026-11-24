@@ -520,3 +520,79 @@ async fn a_revoked_custom_port_host_is_refused_by_sni_on_15444() {
     let request = "GET / HTTP/1.1\r\nHost: other.test\r\n\r\n";
     assert_eq!(http_exchange(&mut tls, request).await.unwrap().0, 200);
 }
+
+/// Connect to `port` through the general TCP listener with SNI `sni`, trusting `roots`.
+async fn via_15444(
+    h: &Harness,
+    port: u16,
+    roots: rustls::RootCertStore,
+    sni: &str,
+) -> std::io::Result<tokio_rustls::client::TlsStream<TcpStream>> {
+    let mut s = TcpStream::connect(h.proxy.addrs.transparent_tcp.unwrap()).await?;
+    s.write_all(&proxy_v2(loopback(port))).await?;
+    tls_connect(s, roots, sni).await
+}
+
+async fn assert_revoked_sni_refused_on_15444(h: &Harness, public: &Ca, port: u16, seen: &Seen) {
+    assert!(
+        via_15444(h, port, public.roots(), "api.test")
+            .await
+            .is_err()
+    );
+    assert!(
+        !seen
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|head| head.contains("Host: api.test"))
+    );
+    let (_, events) = h.admin("GET", "/v1/events?follow=0", None).await;
+    let events = events.as_str().unwrap().to_string();
+    assert!(
+        events.lines().any(|l| l.contains("\"transparent_tcp\"")
+            && l.contains("\"api.test\"")
+            && l.contains("\"revoked\"")),
+        "{events}"
+    );
+    let mut tls = via_15444(h, port, public.roots(), "other.test")
+        .await
+        .unwrap();
+    let request = "GET / HTTP/1.1\r\nHost: other.test\r\n\r\n";
+    assert_eq!(http_exchange(&mut tls, request).await.unwrap().0, 200);
+}
+
+/// The secret is the only reason api.test is inspected; revoking both at once must still leave
+/// its port watched, also after a same-watermark retry.
+#[tokio::test]
+async fn revoking_a_host_and_its_only_secret_together_keeps_its_port_watched() {
+    let public = Ca::new("public");
+    let executor = Ca::new("executor");
+    let (port, seen) = https_echo(public.server_config(&["api.test", "other.test"])).await;
+    let h = Harness::start(records(&[("api.test", localhost())]), public.roots()).await;
+    assert_eq!(h.put_policy(&brokered(1, &executor, port)).await.0, 200);
+    let (status, _) = h
+        .admin(
+            "POST",
+            "/v1/revoke",
+            Some(&json!({ "revocationWatermark": 2, "revokeSecretIds": ["s1"], "revokeHosts": ["api.test"] })),
+        )
+        .await;
+    assert_eq!(status, 200);
+    assert_revoked_sni_refused_on_15444(&h, &public, port, &seen).await;
+    assert_eq!(h.put_policy(&brokered(2, &executor, port)).await.0, 200);
+    assert_revoked_sni_refused_on_15444(&h, &public, port, &seen).await;
+}
+
+/// A restarted proxy loaded with both tombstones for a host whose secret made it inspected.
+#[tokio::test]
+async fn policy_tombstones_for_a_host_and_its_only_secret_keep_its_port_watched() {
+    let public = Ca::new("public");
+    let executor = Ca::new("executor");
+    let (port, seen) = https_echo(public.server_config(&["api.test", "other.test"])).await;
+    let h = Harness::start(records(&[("api.test", localhost())]), public.roots()).await;
+    let mut policy = brokered(3, &executor, port);
+    policy["revokedSecretIds"] = json!(["s1"]);
+    policy["revokedHosts"] = json!(["api.test"]);
+    assert_eq!(h.put_policy(&policy).await.0, 200);
+    assert_revoked_sni_refused_on_15444(&h, &public, port, &seen).await;
+}

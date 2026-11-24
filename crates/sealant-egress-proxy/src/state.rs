@@ -225,11 +225,12 @@ impl Tombstones {
         if self.all {
             policy.revoke_all();
         }
-        for id in &self.secret_ids {
-            policy.revoke_secret(id);
-        }
+        // Hosts before secrets, so a host's inspection ports are recorded (see `Policy`).
         for host in &self.hosts {
             policy.revoke_host(host);
+        }
+        for id in &self.secret_ids {
+            policy.revoke_secret(id);
         }
         policy
             .revoked_inspection_ports
@@ -418,6 +419,17 @@ impl Shared {
             // A later watermark is Sealant's authoritative state, durable tombstones included
             // (`revokedHosts`, `revokedSecretIds`). The same watermark keeps what was revoked at it.
             inner.tombstones.advance_to(policy.revocation_watermark);
+            // A host the new policy revokes but no longer grants: the ports the active policy
+            // inspected it on still need ClientHello reads on the general TCP listener.
+            if let Some(current) = &inner.policy {
+                let inherited: Vec<u16> = policy
+                    .denied_hosts
+                    .iter()
+                    .filter(|host| current.inspects(host))
+                    .flat_map(|host| current.inspection_ports(host))
+                    .collect();
+                policy.revoked_inspection_ports.extend(inherited);
+            }
             // Tombstones a policy carries (`revokedHosts`, `revokedSecretIds`) join the ones held at
             // its watermark, so a retry at that watermark that omits them cannot undo them.
             if inner.tombstones.watermark == policy.revocation_watermark {
@@ -455,6 +467,7 @@ impl Shared {
                 });
             }
             let mut policy = (*current).clone();
+            let ports_before = policy.revoked_inspection_ports.clone();
             inner.tombstones.advance_to(request.revocation_watermark);
             inner.tombstones.all |= request.revoke_all;
             inner.tombstones.secret_ids.extend(
@@ -466,16 +479,24 @@ impl Shared {
             if request.revoke_all {
                 policy.revoke_all();
             }
-            for id in &request.revoke_secret_ids {
-                policy.revoke_secret(id.trim());
-            }
+            // Hosts before secrets, so a host's inspection ports are recorded (see `Policy`).
             for host in &request.revoke_hosts {
                 let host = normalize_host(host).unwrap_or_else(|| host.trim().to_ascii_lowercase());
                 policy.revoke_host(&host);
                 inner.tombstones.hosts.insert(host);
             }
+            for id in &request.revoke_secret_ids {
+                policy.revoke_secret(id.trim());
+            }
             policy.revocation_watermark = request.revocation_watermark;
-            inner.tombstones.absorb(&policy);
+            // Only what this revocation removed joins the tombstones; older ones were Sealant's
+            // to carry in any policy at a later watermark.
+            let new_ports: Vec<u16> = policy
+                .revoked_inspection_ports
+                .difference(&ports_before)
+                .copied()
+                .collect();
+            inner.tombstones.inspection_ports.extend(new_ports);
             inner.watermark = request.revocation_watermark;
             let closing = inner.take_matching(|tags| {
                 (request.revoke_all && tags.class != ConnClass::Public)

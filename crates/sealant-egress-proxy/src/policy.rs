@@ -441,13 +441,15 @@ impl Policy {
             ca,
             ca_source,
         };
-        for id in &doc.revoked_secret_ids {
-            policy.revoke_secret(id.trim());
-        }
+        // Hosts first: a host is revoked while its secrets still make it inspected, so the
+        // ports it was inspected on are recorded for the general TCP listener.
         for host in &doc.revoked_hosts {
             let host = normalize_host(host)
                 .ok_or_else(|| invalid(format!("revokedHosts: `{host}` is not a hostname")))?;
             policy.revoke_host(&host);
+        }
+        for id in &doc.revoked_secret_ids {
+            policy.revoke_secret(id.trim());
         }
         Ok(policy)
     }
@@ -502,7 +504,7 @@ impl Policy {
     }
 
     /// The ports TLS to an inspected `host` is terminated on: its `allowHosts` ports, else 443.
-    fn inspection_ports(&self, host: &str) -> Vec<u16> {
+    pub(crate) fn inspection_ports(&self, host: &str) -> Vec<u16> {
         let configured: Vec<u16> = self
             .allow_hosts
             .iter()
