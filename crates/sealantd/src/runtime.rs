@@ -249,6 +249,18 @@ pub struct Runtime {
     /// The workspace's own Docker daemon, whose containers the final capture stops
     /// ([`crate::docker`]). Set by boot; none by default.
     workspace_docker: Mutex<Option<crate::docker::DockerEndpoint>>,
+    /// The workspace Docker daemon this daemon runs itself (a microVM guest's `dockerd`):
+    /// spared by the final capture until its containers are stopped the second time, then
+    /// stopped. None by default.
+    docker_service: Mutex<Option<ServiceProcess>>,
+}
+
+/// A daemon sealantd started for the workspace and stops last ([`Runtime::start_docker_service`]).
+#[derive(Debug)]
+struct ServiceProcess {
+    pid: i32,
+    child: tokio::process::Child,
+    _gate: sealant_process::spawn::SpawnedPid,
 }
 
 impl Runtime {
@@ -346,6 +358,7 @@ impl Runtime {
             pidfd_supported,
             subreaper: AtomicBool::new(subreaper),
             workspace_docker: Mutex::new(None),
+            docker_service: Mutex::new(None),
         })
     }
 
@@ -630,6 +643,17 @@ impl Runtime {
             }
             last.clone()
         };
+        // The Docker service and its descendants are spared until its containers have been
+        // stopped the second time: the second check needs the daemon alive.
+        let service = self.docker_service_pid();
+        let exempt_sparing_service = || {
+            let mut spared = exempt();
+            if let Some(pid) = service {
+                spared.pids.insert(pid);
+                spared.trees.insert(pid);
+            }
+            spared
+        };
         let docker = self
             .workspace_docker
             .lock()
@@ -651,7 +675,12 @@ impl Runtime {
         let ((), (), (swept, sweep_left)) = tokio::join!(
             self.sessions.terminate_all(grace),
             self.processes.terminate_all(signal, grace),
-            sweeper.sweep(grace, self.shutdown.is_hard(), &admit, &exempt),
+            sweeper.sweep(
+                grace,
+                self.shutdown.is_hard(),
+                &admit,
+                &exempt_sparing_service
+            ),
         );
         // Then again: a container a process started on its way out (admission stays closed,
         // but sealantd does not admit what the daemon runs).
@@ -664,6 +693,20 @@ impl Runtime {
                 (_, again) => again,
             }),
             Err(error) => Err(error),
+        };
+        // Only now the Docker service itself, then whatever of its tree outlived it.
+        let service_left = match service {
+            None => 0,
+            Some(pid) => {
+                let stopped = self.stop_docker_service(grace).await;
+                let (_, tree_left) = sweeper
+                    .sweep(grace, self.shutdown.is_hard(), &admit, &exempt)
+                    .await;
+                if !stopped {
+                    tracing::error!(pid, "the workspace's Docker daemon outlived SIGKILL");
+                }
+                usize::from(!stopped) + tree_left
+            }
         };
         let managed_left = self.processes.registry.running().len() + self.sessions.registry.len();
         let (containers_stopped, containers_left) = match &containers {
@@ -680,7 +723,7 @@ impl Runtime {
                 (0, 1)
             }
         };
-        let remaining = managed_left + sweep_left + containers_left;
+        let remaining = managed_left + sweep_left + containers_left + service_left;
         let sweep_unavailable = self.sweep_unavailable() || exempt_unreadable;
         tracing::info!(
             processes = running.len(),
@@ -833,6 +876,69 @@ impl Runtime {
             .workspace_docker
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = endpoint;
+    }
+
+    /// Start the workspace's own Docker daemon (a microVM guest's `dockerd`) as a service of
+    /// this daemon, in a process group of its own. It is not a managed process: the final
+    /// capture stops every container through it (twice, the second time after every other
+    /// writer is gone), sparing it and its descendants (`containerd`) from the sweep until
+    /// then, and only after that stops it. Returns its pid.
+    ///
+    /// # Errors
+    /// The spawn failed.
+    pub fn start_docker_service(
+        &self,
+        command: &mut tokio::process::Command,
+    ) -> std::io::Result<i32> {
+        command.process_group(0).kill_on_drop(true);
+        let (child, gate) = sealant_process::spawn::spawn_tokio(command)?;
+        let pid = child.id().map_or(-1, |pid| pid as i32);
+        *self
+            .docker_service
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(ServiceProcess {
+            pid,
+            child,
+            _gate: gate,
+        });
+        Ok(pid)
+    }
+
+    fn docker_service_pid(&self) -> Option<i32> {
+        self.docker_service
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|service| service.pid)
+    }
+
+    /// Stop the Docker service: `SIGTERM`, `SIGKILL` after `grace` and its own shutdown time,
+    /// reaped. Whether it is gone (no service: `true`).
+    async fn stop_docker_service(&self, grace: Duration) -> bool {
+        use nix::sys::signal::{Signal, kill};
+        use nix::unistd::Pid;
+        let taken = self
+            .docker_service
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        let Some(mut service) = taken else {
+            return true;
+        };
+        let _ = kill(Pid::from_raw(service.pid), Signal::SIGTERM);
+        // dockerd stops containerd and its shims on its way out; give it its own time beyond
+        // the grace before the kill.
+        let patience = grace + Duration::from_secs(10);
+        if tokio::time::timeout(patience, service.child.wait())
+            .await
+            .is_ok()
+        {
+            return true;
+        }
+        let _ = kill(Pid::from_raw(service.pid), Signal::SIGKILL);
+        tokio::time::timeout(Duration::from_secs(5), service.child.wait())
+            .await
+            .is_ok()
     }
 
     /// Narrow the final flush's sweep to processes whose environment holds
@@ -1199,6 +1305,12 @@ impl Runtime {
             active_processes: processes,
             active_sessions: sessions,
         }
+    }
+
+    /// How many interactive sessions (PTYs) are open: what the idle reclaimer reads as a person
+    /// at work.
+    pub(crate) fn active_sessions(&self) -> usize {
+        self.sessions.registry.len()
     }
 
     pub(crate) async fn dispatch(&self, request: ControlRequest) -> ControlResponse {

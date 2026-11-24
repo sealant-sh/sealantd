@@ -9,7 +9,16 @@
 //! off, and no redirect is followed: a channel or a presigned URL that answers 3xx is refused like
 //! any other unexpected status, so an answer can never move a request to a host or scheme this
 //! policy did not check.
+//!
+//! Where the executor reaches the platform through a local socket instead of the network
+//! ([`Dial`]: a Unix socket on the `docker` runtime, `AF_VSOCK` to the host on `host-vm`), every
+//! request is written to that socket unchanged: the same request line, and the `Host` header the
+//! URL names (`Host: garage:3900`, `Host: mend:3106`), because a presigned URL's signature covers
+//! the host it was signed for and the relay behind the socket forwards it as it is. Plain HTTP is
+//! then dialled to any host: the bytes go no further than this machine's socket, to a relay the
+//! platform runs.
 use std::net::IpAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -48,12 +57,69 @@ pub enum TransportError {
     /// The CA bundle held no certificate, or could not be read.
     #[error("channel CA bundle: {0}")]
     CaBundle(String),
+    /// A [`Dial`] spelling that is not `tcp`, `unix:<path>` or `vsock:<cid>:<port>`.
+    #[error("capture dial {0:?} is not tcp, unix:<absolute path> or vsock:<cid>:<port>")]
+    Dial(String),
+}
+
+/// How a request reaches the host its URL names.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum Dial {
+    /// A TCP connection to the URL's host and port, resolved by DNS. The default.
+    #[default]
+    Tcp,
+    /// A Unix socket (`/run/sealant/capture.sock` on the `docker` runtime) whose relay forwards
+    /// each request, unchanged, to the host its `Host` header names.
+    Unix(PathBuf),
+    /// `AF_VSOCK` to `cid:port` (`2:1025`, the host's capture relay, on `host-vm`), likewise.
+    Vsock {
+        /// The peer's context id.
+        cid: u32,
+        /// The peer's port.
+        port: u32,
+    },
+}
+
+impl Dial {
+    /// Parse `tcp`, `unix:<absolute path>` or `vsock:<cid>:<port>` (`SEALANT_CAPTURE_DIAL`).
+    /// Empty is [`Dial::Tcp`].
+    ///
+    /// # Errors
+    /// [`TransportError::Dial`] for anything else.
+    pub fn parse(spec: &str) -> Result<Self, TransportError> {
+        let spec = spec.trim();
+        let refuse = || TransportError::Dial(spec.to_owned());
+        if spec.is_empty() || spec == "tcp" {
+            return Ok(Self::Tcp);
+        }
+        if let Some(path) = spec.strip_prefix("unix:") {
+            let path = PathBuf::from(path);
+            if !path.is_absolute() {
+                return Err(refuse());
+            }
+            return Ok(Self::Unix(path));
+        }
+        if let Some(rest) = spec.strip_prefix("vsock:") {
+            let (cid, port) = rest.split_once(':').ok_or_else(refuse)?;
+            let cid = cid.parse().map_err(|_| refuse())?;
+            let port = port.parse().map_err(|_| refuse())?;
+            return Ok(Self::Vsock { cid, port });
+        }
+        Err(refuse())
+    }
+
+    /// Whether requests go to a local socket rather than over the network.
+    #[must_use]
+    pub fn is_local(&self) -> bool {
+        !matches!(self, Self::Tcp)
+    }
 }
 
 /// How this session's outbound HTTP is dialled. Built once at boot from the environment.
 #[derive(Clone, Default)]
 pub struct ChannelTransport {
     allow_plaintext: bool,
+    dial: Dial,
     channel_roots: Option<Arc<Vec<Certificate<'static>>>>,
     object_roots: Option<Arc<Vec<Certificate<'static>>>>,
 }
@@ -62,6 +128,7 @@ impl std::fmt::Debug for ChannelTransport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ChannelTransport")
             .field("allow_plaintext", &self.allow_plaintext)
+            .field("dial", &self.dial)
             .field(
                 "channel_roots",
                 &self.channel_roots.as_ref().map(|roots| roots.len()),
@@ -115,10 +182,25 @@ impl ChannelTransport {
         Ok(self)
     }
 
-    /// Whether plain HTTP beyond loopback is dialled.
+    /// Send every request through `dial` instead of TCP: the request, its `Host` header and,
+    /// for HTTPS, its TLS server name stay those of the URL.
+    #[must_use]
+    pub fn dial_via(mut self, dial: Dial) -> Self {
+        self.dial = dial;
+        self
+    }
+
+    /// How requests are dialled.
+    #[must_use]
+    pub fn dial(&self) -> &Dial {
+        &self.dial
+    }
+
+    /// Whether plain HTTP beyond loopback is dialled: the explicit exception, or a local socket
+    /// ([`Dial::is_local`]).
     #[must_use]
     pub fn plaintext_allowed(&self) -> bool {
-        self.allow_plaintext
+        self.allow_plaintext || self.dial.is_local()
     }
 
     /// Refuse a URL this policy does not dial. `what` names its purpose for the error.
@@ -135,7 +217,7 @@ impl ChannelTransport {
             .ok_or(TransportError::Malformed { what })?;
         match uri.scheme_str() {
             Some("https") => Ok(()),
-            Some("http") if self.allow_plaintext || is_loopback(host) => Ok(()),
+            Some("http") if self.plaintext_allowed() || is_loopback(host) => Ok(()),
             Some("http") => Err(TransportError::Plaintext {
                 what,
                 host: host.to_owned(),
@@ -179,7 +261,211 @@ impl ChannelTransport {
             .proxy(None)
             .tls_config(tls)
             .build();
-        ureq::Agent::new_with_config(config)
+        match &self.dial {
+            Dial::Tcp => ureq::Agent::new_with_config(config),
+            local => {
+                use ureq::unversioned::transport::{Connector, RustlsConnector};
+                let connector =
+                    local::LocalConnector::new(local.clone()).chain(RustlsConnector::default());
+                ureq::Agent::with_parts(config, connector, local::NoResolve)
+            }
+        }
+    }
+}
+
+/// The ureq connector and resolver for a [`Dial`] that is not TCP.
+mod local {
+    use std::io::{self, Read, Write};
+    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+    use std::os::unix::net::UnixStream;
+    use std::time::Duration as StdDuration;
+
+    use ureq::Error;
+    use ureq::config::Config;
+    use ureq::http::Uri;
+    use ureq::unversioned::resolver::{ResolvedSocketAddrs, Resolver};
+    use ureq::unversioned::transport::{
+        Buffers, ConnectionDetails, Connector, LazyBuffers, NextTimeout, Transport,
+    };
+
+    use super::Dial;
+
+    /// Never resolves the URL's host: the socket is fixed, and the host only travels in the
+    /// request's `Host` header (and TLS server name). Answers one placeholder address because
+    /// ureq requires one.
+    #[derive(Debug)]
+    pub(super) struct NoResolve;
+
+    impl Resolver for NoResolve {
+        fn resolve(
+            &self,
+            _uri: &Uri,
+            _config: &Config,
+            _timeout: NextTimeout,
+        ) -> Result<ResolvedSocketAddrs, Error> {
+            let mut addrs = self.empty();
+            addrs.push(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)));
+            Ok(addrs)
+        }
+    }
+
+    /// Opens the [`Dial`]'s socket for every connection, whatever the URL names.
+    #[derive(Debug)]
+    pub(super) struct LocalConnector {
+        dial: Dial,
+    }
+
+    impl LocalConnector {
+        pub(super) fn new(dial: Dial) -> Self {
+            Self { dial }
+        }
+    }
+
+    impl<In: Transport> Connector<In> for LocalConnector {
+        type Out = LocalTransport;
+
+        fn connect(
+            &self,
+            details: &ConnectionDetails,
+            _chained: Option<In>,
+        ) -> Result<Option<Self::Out>, Error> {
+            let stream = match &self.dial {
+                Dial::Unix(path) => Stream::Unix(UnixStream::connect(path)?),
+                Dial::Vsock { cid, port } => Stream::Vsock(connect_vsock(*cid, *port)?),
+                Dial::Tcp => return Ok(None),
+            };
+            let buffers = LazyBuffers::new(
+                details.config.input_buffer_size(),
+                details.config.output_buffer_size(),
+            );
+            Ok(Some(LocalTransport {
+                stream,
+                buffers,
+                read_timeout: None,
+                write_timeout: None,
+            }))
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn connect_vsock(cid: u32, port: u32) -> io::Result<socket2::Socket> {
+        let socket = socket2::Socket::new(socket2::Domain::VSOCK, socket2::Type::STREAM, None)?;
+        socket.connect(&socket2::SockAddr::vsock(cid, port))?;
+        Ok(socket)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn connect_vsock(_cid: u32, _port: u32) -> io::Result<UnixStream> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "AF_VSOCK is Linux only",
+        ))
+    }
+
+    #[derive(Debug)]
+    enum Stream {
+        Unix(UnixStream),
+        #[cfg(target_os = "linux")]
+        Vsock(socket2::Socket),
+        #[cfg(not(target_os = "linux"))]
+        Vsock(UnixStream),
+    }
+
+    impl Stream {
+        fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
+            match self {
+                Self::Unix(stream) => (&*stream).read(buf),
+                Self::Vsock(socket) => (&*socket).read(buf),
+            }
+        }
+        fn write_all(&self, buf: &[u8]) -> io::Result<()> {
+            match self {
+                Self::Unix(stream) => (&*stream).write_all(buf),
+                Self::Vsock(socket) => (&*socket).write_all(buf),
+            }
+        }
+        fn set_read_timeout(&self, timeout: Option<StdDuration>) -> io::Result<()> {
+            match self {
+                Self::Unix(stream) => stream.set_read_timeout(timeout),
+                Self::Vsock(socket) => socket.set_read_timeout(timeout),
+            }
+        }
+        fn set_write_timeout(&self, timeout: Option<StdDuration>) -> io::Result<()> {
+            match self {
+                Self::Unix(stream) => stream.set_write_timeout(timeout),
+                Self::Vsock(socket) => socket.set_write_timeout(timeout),
+            }
+        }
+        fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
+            match self {
+                Self::Unix(stream) => stream.set_nonblocking(nonblocking),
+                Self::Vsock(socket) => socket.set_nonblocking(nonblocking),
+            }
+        }
+    }
+
+    /// One connection over the local socket.
+    #[derive(Debug)]
+    pub(super) struct LocalTransport {
+        stream: Stream,
+        buffers: LazyBuffers,
+        read_timeout: Option<StdDuration>,
+        write_timeout: Option<StdDuration>,
+    }
+
+    /// Map an I/O error, a timed-out read or write becoming ureq's timeout for `timeout`.
+    fn io_error(error: io::Error, timeout: NextTimeout) -> Error {
+        match error.kind() {
+            io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock => Error::Timeout(timeout.reason),
+            _ => Error::Io(error),
+        }
+    }
+
+    impl Transport for LocalTransport {
+        fn buffers(&mut self) -> &mut dyn Buffers {
+            &mut self.buffers
+        }
+
+        fn transmit_output(&mut self, amount: usize, timeout: NextTimeout) -> Result<(), Error> {
+            let wanted = timeout.not_zero().map(|t| *t);
+            if wanted != self.write_timeout {
+                self.stream.set_write_timeout(wanted)?;
+                self.write_timeout = wanted;
+            }
+            let output = &self.buffers.output()[..amount];
+            self.stream
+                .write_all(output)
+                .map_err(|error| io_error(error, timeout))
+        }
+
+        fn await_input(&mut self, timeout: NextTimeout) -> Result<bool, Error> {
+            let wanted = timeout.not_zero().map(|t| *t);
+            if wanted != self.read_timeout {
+                self.stream.set_read_timeout(wanted)?;
+                self.read_timeout = wanted;
+            }
+            let input = self.buffers.input_append_buf();
+            let read = self
+                .stream
+                .read(input)
+                .map_err(|error| io_error(error, timeout))?;
+            self.buffers.input_appended(read);
+            Ok(read > 0)
+        }
+
+        fn is_open(&mut self) -> bool {
+            // Pooled connections are reused only while nothing unasked-for is waiting and the
+            // peer has not closed: a read that would block.
+            if self.stream.set_nonblocking(true).is_err() {
+                return false;
+            }
+            let mut probe = [0u8; 1];
+            let open = matches!(
+                self.stream.read(&mut probe),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock
+            );
+            open && self.stream.set_nonblocking(false).is_ok()
+        }
     }
 }
 
@@ -321,6 +607,46 @@ mod tests {
             !text.contains("secret") && !text.contains("captures/w"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn a_dial_is_tcp_a_unix_path_or_a_vsock_address() {
+        assert_eq!(Dial::parse(""), Ok(Dial::Tcp));
+        assert_eq!(Dial::parse("tcp"), Ok(Dial::Tcp));
+        assert_eq!(
+            Dial::parse("unix:/run/sealant/capture.sock"),
+            Ok(Dial::Unix("/run/sealant/capture.sock".into()))
+        );
+        assert_eq!(
+            Dial::parse("vsock:2:1025"),
+            Ok(Dial::Vsock { cid: 2, port: 1025 })
+        );
+        for spec in [
+            "unix:relative.sock",
+            "unix:",
+            "vsock:2",
+            "vsock:host:1025",
+            "vsock:2:port",
+            "http://garage:3900",
+        ] {
+            assert!(
+                matches!(Dial::parse(spec), Err(TransportError::Dial(_))),
+                "{spec}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_local_dial_dials_plain_http_without_the_exception_but_no_other_scheme() {
+        let transport = ChannelTransport::verified().dial_via(Dial::Vsock { cid: 2, port: 1025 });
+        assert_eq!(
+            transport.check("an object URL", "http://garage:3900/captures/w/pack"),
+            Ok(())
+        );
+        assert!(matches!(
+            transport.check("an object URL", "ftp://garage:3900/pack"),
+            Err(TransportError::Scheme { .. })
+        ));
     }
 
     #[test]

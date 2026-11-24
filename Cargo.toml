@@ -67,6 +67,8 @@ walkdir = "2"
 nix = { version = "0.31", features = ["process", "signal", "term", "fs", "dir", "user", "poll", "ioctl", "socket", "resource"] }
 rustix = { version = "0.38", features = ["process", "fs", "termios", "pipe", "stdio"] }
 libc = "0.2"
+# AF_VSOCK sockets (the microVM guest's channels to its host) without unsafe code.
+socket2 = { version = "0.6", features = ["all"] }
 # protobuf wire format (ADR-0012)
 prost = "0.14"
 prost-build = "0.14"

@@ -61,6 +61,7 @@ fn source(recovery: bool) -> CaptureSourceConfig {
         recovery,
         launch_id: None,
         owners: None,
+        dial: sealant_capture::Dial::Tcp,
     }
 }
 

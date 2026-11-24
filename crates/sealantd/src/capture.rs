@@ -1768,6 +1768,7 @@ mod tests {
                 recovery: false,
                 launch_id: None,
                 owners: None,
+                dial: sealant_capture::Dial::Tcp,
             },
             &ws,
             tmp.path(),
@@ -1870,6 +1871,7 @@ mod tests {
                 recovery: false,
                 launch_id: None,
                 owners: None,
+                dial: sealant_capture::Dial::Tcp,
             },
             &ws,
             tmp,
@@ -2050,6 +2052,7 @@ mod tests {
                 recovery: false,
                 launch_id: None,
                 owners: None,
+                dial: sealant_capture::Dial::Tcp,
             },
             &ws,
             tmp.path(),
@@ -2125,6 +2128,7 @@ mod tests {
                 recovery: false,
                 launch_id: None,
                 owners: None,
+                dial: sealant_capture::Dial::Tcp,
             },
             &tmp.path().join("ws"),
             tmp.path(),
@@ -2195,6 +2199,7 @@ mod tests {
                     recovery: false,
                     launch_id: None,
                     owners,
+                    dial: sealant_capture::Dial::Tcp,
                 },
                 &ws,
                 tmp.path(),
@@ -2274,6 +2279,7 @@ mod tests {
                 recovery: false,
                 launch_id: None,
                 owners: None,
+                dial: sealant_capture::Dial::Tcp,
             },
             &ws,
             tmp.path(),
@@ -3154,6 +3160,198 @@ mod tests {
         assert_eq!(
             report.incomplete_reason.as_deref(),
             Some("processes-remain")
+        );
+    }
+
+    /// Whether `pid` is a live process (not gone, not a zombie).
+    fn alive(pid: i32) -> bool {
+        std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|line| crate::sweep::parse_stat(&line))
+            .is_some_and(|info| info.state != 'Z')
+    }
+
+    /// A Docker API on `socket` that answers only while `daemon` holds a live pid: no
+    /// container running. Gone, it closes each connection unanswered, as a dead `dockerd`'s
+    /// socket would leave the client.
+    fn docker_api_of(socket: &Path, daemon: Arc<std::sync::atomic::AtomicI32>) {
+        use std::sync::atomic::Ordering;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::UnixListener::bind(socket).unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut conn, _)) = listener.accept().await {
+                let pid = daemon.load(Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    let _ = conn.read(&mut buf).await;
+                    if pid > 0 && alive(pid) {
+                        let _ = conn
+                            .write_all(
+                                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n[]",
+                            )
+                            .await;
+                    }
+                });
+            }
+        });
+    }
+
+    /// A microVM guest's own `dockerd` is a service of the daemon, not a managed process: the
+    /// final flush stops its containers, terminates every writer while sparing the daemon and
+    /// its tree, asks it a second time, and only then stops it — complete. Run as a managed
+    /// process (as before), the daemon died with the writers, the second check found its
+    /// socket dead, counted that as a writer still running and called the flush incomplete.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_guest_owned_docker_daemon_lives_through_the_second_container_check() {
+        use std::sync::atomic::{AtomicI32, Ordering};
+        // The daemon stand-in: a parent with a child of its own, as dockerd with containerd.
+        const DAEMON: &str = "sleep 600 & wait";
+        let mark = format!("docker-service-{}", std::process::id());
+
+        // As a service: complete, and the daemon is gone after.
+        let tmp = tempfile::tempdir().unwrap();
+        let (runtime, capture, _registrar) = quiet_runtime(tmp.path());
+        runtime.set_sweep_mark(Some(mark.clone()));
+        capture.start_without_harness(runtime.clone());
+        let daemon = Arc::new(AtomicI32::new(0));
+        let socket = tmp.path().join("docker.sock");
+        docker_api_of(&socket, daemon.clone());
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command
+            .args(["-c", DAEMON])
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .env(crate::runtime::SWEEP_MARK_ENV, &mark);
+        let pid = runtime.start_docker_service(&mut command).unwrap();
+        daemon.store(pid, Ordering::SeqCst);
+        runtime.set_workspace_docker(Some(crate::docker::DockerEndpoint::Unix(socket)));
+        let report = runtime.final_flush(None, Some(1_000)).await.unwrap();
+        assert!(report.complete, "{report:?}");
+        assert!(
+            !alive(pid),
+            "the service is stopped once the containers are checked"
+        );
+
+        // As a managed process: the sweep kills it before the second check.
+        let tmp = tempfile::tempdir().unwrap();
+        let (runtime, capture, _registrar) = quiet_runtime(tmp.path());
+        runtime.set_sweep_mark(Some(mark.clone()));
+        capture.start_without_harness(runtime.clone());
+        let daemon = Arc::new(AtomicI32::new(0));
+        let socket = tmp.path().join("docker.sock");
+        docker_api_of(&socket, daemon.clone());
+        let mut args = sh(DAEMON, tmp.path());
+        args.env.push(sealant_protocol::EnvVar {
+            key: crate::runtime::SWEEP_MARK_ENV.to_owned(),
+            value: mark.clone(),
+        });
+        let managed = runtime.spawn_managed(args).unwrap();
+        daemon.store(managed.pid, Ordering::SeqCst);
+        runtime.set_workspace_docker(Some(crate::docker::DockerEndpoint::Unix(socket)));
+        let report = runtime.final_flush(None, Some(1_000)).await.unwrap();
+        assert!(!report.complete, "{report:?}");
+        assert_eq!(
+            report.incomplete_reason.as_deref(),
+            Some("processes-remain")
+        );
+    }
+
+    /// A microVM recovery boot (`sealantd --vm`, `sealantd.mode=recover`) starts no `dockerd`,
+    /// but the runner's boot env is the first boot's and names the guest daemon's socket. Left
+    /// in place, the final flush would wait on that socket as on an active writer — up to the
+    /// grace and the Docker client's 30 s slack, then call the flush incomplete. The recovery
+    /// clears the endpoint, so the flush stops no container, waits on nothing, and completes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_vm_recovery_clears_the_docker_endpoint_so_its_final_flush_never_waits_on_dockerd() {
+        use crate::boot::config::EnvSource as _;
+        use crate::vm::env::{Extras, VmEnv, assemble, clear_recovery_docker};
+        use crate::vm::protocol::{PROTOCOL_VERSION, VmBootConfig, VmMode};
+
+        let tmp = tempfile::tempdir().unwrap();
+        // A socket a hung daemon holds: it accepts and never answers.
+        let socket = tmp.path().join("docker.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((connection, _)) = listener.accept().await {
+                held.push(connection);
+            }
+        });
+        let docker_host = format!("unix://{}", socket.display());
+        let boot_env: std::collections::BTreeMap<String, String> = [
+            ("SEALANT_WORKSPACE_SOURCE", "capture"),
+            ("SEALANT_CAPTURE_ENDPOINT", "http://mend:3106/channel"),
+            ("SEALANT_HARNESS_LAUNCH_COMMAND", "claude"),
+            ("SEALANT_OS_FAMILY", "ubuntu"),
+            (
+                crate::docker::WORKSPACE_DOCKER_HOST_ENV,
+                docker_host.as_str(),
+            ),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .collect();
+
+        // The clearing itself: a recovery configuration whose environment still names the
+        // daemon comes out with none.
+        let mut raw = VmEnv(boot_env.clone());
+        raw.0.insert("SEALANT_RECOVERY".to_owned(), "1".to_owned());
+        let named = crate::boot::BootConfig::load(&raw).unwrap();
+        assert!(named.recovery && named.workspace_docker.is_some());
+        assert_eq!(
+            clear_recovery_docker(named, VmMode::Recover).workspace_docker,
+            None
+        );
+
+        // And the whole path from the runner's frame.
+        let boot = VmBootConfig {
+            version: PROTOCOL_VERSION,
+            mode: VmMode::Recover,
+            config: Default::default(),
+            boot_env,
+            secret_env: Default::default(),
+            dotfiles_archive: None,
+            executor_ca_pem: None,
+            network_config: None,
+            dockerd: true,
+        };
+        let env = assemble(&boot, &Extras::default());
+        assert_eq!(
+            env.get("SEALANT_CAPTURE_DIAL").as_deref(),
+            Some("vsock:2:1025")
+        );
+        let config = clear_recovery_docker(
+            crate::boot::BootConfig::load(&env).unwrap(),
+            VmMode::Recover,
+        );
+        assert!(config.recovery);
+        assert_eq!(config.workspace_docker, None);
+
+        let (runtime, capture, _registrar) = quiet_runtime(tmp.path());
+        capture.start_without_harness(runtime.clone());
+        runtime.set_workspace_docker(config.workspace_docker.clone());
+        let report = tokio::time::timeout(
+            Duration::from_secs(20),
+            runtime.final_flush(None, Some(1_000)),
+        )
+        .await
+        .expect("the final flush must not wait on a dockerd that is not running")
+        .unwrap();
+        assert!(report.complete, "{report:?}");
+
+        // The hazard the clearing removes: the same flush with the endpoint left in place is
+        // still waiting on the hung daemon well after the cleared one finished.
+        let other = tempfile::tempdir().unwrap();
+        let (runtime, capture, _registrar) = quiet_runtime(other.path());
+        capture.start_without_harness(runtime.clone());
+        runtime.set_workspace_docker(Some(crate::docker::DockerEndpoint::Unix(socket)));
+        assert!(
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                runtime.final_flush(None, Some(1_000))
+            )
+            .await
+            .is_err(),
+            "a final flush with the endpoint in place waits on the hung daemon"
         );
     }
 

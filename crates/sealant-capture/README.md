@@ -1580,6 +1580,16 @@ and a 307 to a plain-HTTP host is reported, not followed.
 A launcher that reaches the channel over plain HTTP on a private network (Docker and in-cluster
 Mend installs today) must now say so, or boot refuses.
 
+`Dial` (`SEALANT_CAPTURE_DIAL`) sends both paths through a local socket in place of TCP:
+`unix:/run/sealant/capture.sock` (the `docker` runtime's capture relay) or `vsock:2:1025` (the
+host's relay, for a `host-vm` guest). A ureq connector opens that socket for every connection and
+never resolves the URL's host, so the request line, the `Host` header and, for HTTPS, the TLS
+server name stay the URL's. A presigned `http://garage:3900/...` URL is signed over
+`Host: garage:3900`, and the relay forwards it as it is. Plain HTTP to the relay is dialled
+without the plaintext exception, because the bytes never leave the machine. `tests/local_dial.rs`
+runs the channel and a presigned upload against a real Unix-socket server, and the channel over
+vsock loopback, and checks the `Host` header and the path and query each one received.
+
 ## Deviations from ADR-0015 pending amendment
 
 - §"Capture format", Keys: "a new epoch never skips an upload because a prior epoch holds the

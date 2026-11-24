@@ -152,6 +152,15 @@ struct ServeArgs {
     /// Tracing log filter (e.g. `info`, `debug`).
     #[arg(long, default_value = "info")]
     log_level: String,
+    /// Run as PID 1 of a workspace microVM (the `host-vm` runtime): mount the two-disk layout,
+    /// take the boot config on vsock 1026, serve control on vsock 1024 and supervise as
+    /// `sealantd boot` does, then sync and power off. The mode comes from `--vm-mode` or the
+    /// kernel command line's `sealantd.mode=normal|recover` (default normal).
+    #[arg(long)]
+    vm: bool,
+    /// The `--vm` boot mode, over the kernel command line.
+    #[arg(long, requires = "vm", value_parser = ["normal", "recover"])]
+    vm_mode: Option<String>,
     /// Also serve the control protocol over mutual-TLS WebSocket on this address (ADR-0013).
     /// Off unless set; the Unix socket is still served.
     #[arg(long, requires_all = ["wss_cert", "wss_key", "wss_client_ca"])]
@@ -233,6 +242,13 @@ pub fn run() -> ExitCode {
     match cli.command {
         Some(Command::Boot(args)) => crate::boot::run_boot(&args.log_level, args.recovery),
         Some(Command::Capabilities(args)) => print_capabilities(&args),
+        None if cli.serve.vm => crate::vm::run(
+            cli.serve
+                .vm_mode
+                .as_deref()
+                .and_then(crate::vm::protocol::VmMode::parse),
+            &cli.serve.log_level,
+        ),
         None => run_serve(cli.serve),
     }
 }
@@ -397,7 +413,7 @@ async fn serve(cli: ServeArgs, wss: Option<WssConfig>, runtime: Arc<Runtime>) ->
             path: serve_runtime.socket_path(),
             allowed_peer_uids: serve_runtime.allowed_peer_uids(),
         };
-        spawn_control_frontends(serve_runtime, unix, wss_listener, serve_rx)
+        spawn_control_frontends(serve_runtime, unix, wss_listener, None, serve_rx)
     };
 
     let serve_finished = tokio::select! {

@@ -32,7 +32,10 @@ base64 = { workspace = true }
 thiserror = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
-nix = { workspace = true, features = ["dir"] }
+nix = { workspace = true, features = ["dir", "mount", "net", "reboot"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+socket2 = { workspace = true }
 
 [features]
 # The dotfiles copy's hold seam (`SEALANTD_DOTFILES_TEST_HOLD`): for the root tests only. Only

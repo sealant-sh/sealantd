@@ -16,6 +16,7 @@ pub mod runtime;
 pub mod shutdown;
 pub mod sweep;
 pub mod unclaimed;
+pub mod vm;
 
 /// What the root tests reach into the daemon with, in a build with the `test-support` feature
 /// only (`scripts/ci-test-support-gate.sh` keeps it out of every build of the daemon).

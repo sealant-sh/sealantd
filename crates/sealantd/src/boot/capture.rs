@@ -121,7 +121,12 @@ pub fn materialize(
     // Refused here, before the token leaves the process: plain HTTP beyond loopback without the
     // launcher's explicit exception, a scheme that is not http(s), or an unreadable CA bundle.
     let transport = transport_of(source)?;
-    if transport.plaintext_allowed() {
+    if transport.dial().is_local() {
+        tracing::info!(
+            dial = ?transport.dial(),
+            "the session channel and object URLs are reached through a local socket's relay"
+        );
+    } else if transport.plaintext_allowed() {
         tracing::warn!(
             "SEALANT_CAPTURE_ALLOW_PLAINTEXT is set: the session channel and object URLs may be \
              dialled over plain HTTP; the network between this executor and them must be private"
@@ -146,7 +151,9 @@ pub(crate) fn transport_of(source: &CaptureSourceConfig) -> Result<ChannelTransp
             .map_err(|error| BootError::config(format!("{name} {}: {error}", path.display()))),
         (None, None) => Ok(None),
     };
-    let mut transport = ChannelTransport::verified().allow_plaintext(source.allow_plaintext);
+    let mut transport = ChannelTransport::verified()
+        .allow_plaintext(source.allow_plaintext)
+        .dial_via(source.dial.clone());
     if let Some(pem) = bundle(&source.ca_pem, &source.ca_file, "SEALANT_CAPTURE_CA_FILE")? {
         transport = transport
             .with_channel_ca_pem(&pem)
@@ -904,6 +911,7 @@ mod tests {
             recovery: false,
             launch_id: None,
             owners: None,
+            dial: sealant_capture::Dial::Tcp,
         }
     }
 
@@ -2330,6 +2338,7 @@ mod tests {
         let named = |launch: &str| CaptureSourceConfig {
             launch_id: Some(launch.to_owned()),
             owners: None,
+            dial: sealant_capture::Dial::Tcp,
             ..source()
         };
         let ws = tmp.path().join("ws");

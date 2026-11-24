@@ -39,6 +39,26 @@
       "test": "sealant-capture::restore_measure_owners *",
       "gate": "#[ignore]",
       "reason": "A measurement over a real worktree as root, run by hand with --ignored"
+    },
+    {
+      "test": "sealant-control vsock::tests::a_real_vsock_loopback_peer_is_refused",
+      "gate": "SEALANTD_REQUIRE_VSOCK",
+      "reason": "Needs AF_VSOCK with the vsock loopback transport (vsock_loopback); a kernel without it has no vsock to test"
+    },
+    {
+      "test": "sealant-capture::local_dial the_session_channel_over_vsock_keeps_the_urls_host",
+      "gate": "SEALANTD_REQUIRE_VSOCK",
+      "reason": "Needs AF_VSOCK with the vsock loopback transport (vsock_loopback); a kernel without it has no vsock to test"
+    },
+    {
+      "test": "sealantd vm::net::tests::loopback_comes_up_in_a_fresh_namespace",
+      "gate": "#[ignore]",
+      "reason": "Changes lo: run by hand in a network namespace of its own (unshare -rn ... --ignored)"
+    },
+    {
+      "test": "sealantd vm::net::tests::the_guest_interface_comes_up_with_its_address_and_default_route",
+      "gate": "#[ignore]",
+      "reason": "Changes eth0 and the routes: run by hand in a network namespace of its own with a dummy eth0 (unshare -rn sh -c 'ip link add eth0 type dummy && ... --ignored')"
     }
   ]
 }
