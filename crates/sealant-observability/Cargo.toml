@@ -1,0 +1,27 @@
+[package]
+name = "sealant-observability"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Logs to stderr, traces over OTLP and errors to Sentry for sealantd, its VM runner and the egress proxy."
+
+[lints]
+workspace = true
+
+[dependencies]
+sealant-runtime-core = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["registry"] }
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+opentelemetry-otlp = { workspace = true }
+opentelemetry-http = { workspace = true }
+tracing-opentelemetry = { workspace = true }
+sentry = { workspace = true }
+async-trait = { workspace = true }
+http = { workspace = true }
+ureq = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

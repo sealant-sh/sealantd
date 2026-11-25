@@ -25,6 +25,7 @@ use sealant_pty::{SessionRegistry, SessionRuntime};
 use sealant_runtime_core::{Clock, IdGenerator, Redactor, RuntimeConfig, RuntimeStatus};
 use sealant_telemetry::{Correlation, EventBus};
 use tokio::sync::broadcast;
+use tracing::Instrument as _;
 
 use crate::shutdown::ShutdownSignal;
 
@@ -275,6 +276,8 @@ impl Runtime {
         let extra_env = Arc::new(Mutex::new(Vec::new()));
         // Redact the values of secret-looking env vars from captured I/O (plan §18).
         let redactor = Arc::new(Redactor::new(secret_env_values(&config)));
+        // What goes to Sentry is masked with the same secrets as recorded output.
+        sealant_observability::scrub::set_redactor(redactor.clone());
         let processes = ProcessRuntime {
             registry: Arc::new(ProcessRegistry::new()),
             bus: bus.clone(),
@@ -1713,6 +1716,10 @@ impl Runtime {
             // replaying the durable journal from a sequence first (reattach + scrollback).
             Command::AttachSession(args) => {
                 let channel_id = self.idgen.channel_id();
+                let subscribe = tracing::info_span!(
+                    "sealantd.session.subscribe",
+                    sealantd.replay = args.from_sequence.is_some(),
+                );
                 match self
                     .sessions
                     .attach(
@@ -1721,6 +1728,7 @@ impl Runtime {
                         conn.out_tx.clone(),
                         args.from_sequence,
                     )
+                    .instrument(subscribe)
                     .await
                 {
                     Ok(()) => {

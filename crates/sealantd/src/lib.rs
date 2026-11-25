@@ -15,6 +15,7 @@ pub(crate) mod dotfiles_verb;
 pub mod runtime;
 pub mod shutdown;
 pub mod sweep;
+pub mod telemetry;
 pub mod unclaimed;
 pub mod vm;
 

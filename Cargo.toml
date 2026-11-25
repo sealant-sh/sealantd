@@ -47,6 +47,17 @@ schemars = "0.8"
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+# Traces and errors to Sentry (SLNT-1351). OTLP over HTTP/protobuf through our own ureq client, so
+# the exporter adds no reqwest, hyper, tokio or aws-lc; Sentry's transport is ureq on rustls with
+# the ring provider ureq already brings. Both stay off unless the process is given a DSN.
+opentelemetry = { version = "0.33", default-features = false, features = ["trace"] }
+opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace"] }
+opentelemetry-otlp = { version = "0.33", default-features = false, features = ["http-proto", "trace"] }
+opentelemetry-http = { version = "0.33", default-features = false }
+tracing-opentelemetry = { version = "0.34", default-features = false }
+sentry = { version = "0.49", default-features = false, features = ["backtrace", "contexts", "panic", "tracing", "ureq", "rustls-no-provider"] }
+async-trait = "0.1"
+http = "1"
 # bytes / encoding / hashing
 bytes = "1"
 base64 = "0.22"
@@ -92,6 +103,7 @@ sealant-fs = { path = "crates/sealant-fs" }
 sealant-network = { path = "crates/sealant-network" }
 sealant-control = { path = "crates/sealant-control" }
 sealant-capture = { path = "crates/sealant-capture" }
+sealant-observability = { path = "crates/sealant-observability" }
 
 [profile.release]
 opt-level = 3

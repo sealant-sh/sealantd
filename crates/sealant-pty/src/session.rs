@@ -409,6 +409,11 @@ impl SessionRuntime {
 
         // Spawn the leader in the requested shape. Both shapes yield a child to wait on, an input
         // handle for `write_input`, and an output source for the single capture reader.
+        let spawn = tracing::info_span!(
+            "sealantd.session.spawn",
+            sealantd.session_mode = ?args.mode,
+        )
+        .entered();
         let (child, pid, spawned_pid, io, outputs, method) = match args.mode {
             SessionMode::Pty => {
                 let PtyChild {
@@ -477,8 +482,11 @@ impl SessionRuntime {
             .clone()
             .or_else(|| self.config.default_execution_id.clone());
 
+        drop(spawn);
+
         // The durable output journal is a product guarantee (reattach + scrollback); a session
         // that cannot journal must not open.
+        let journal_span = tracing::info_span!("sealantd.session.journal").entered();
         let journal_dir = self.config.session_journal_dir.clone().unwrap_or_else(|| {
             std::env::temp_dir().join(format!("sealantd-journals-{}", self.config.runtime_id))
         });
@@ -494,6 +502,7 @@ impl SessionRuntime {
                 journal_dir.display()
             ))
         })?;
+        drop(journal_span);
 
         // A PTY echoes a multi-line secret with CRLF line ends, and a terminal sends one typed or
         // pasted with CR. Output, pipe stderr and input each mask through their own state, with
