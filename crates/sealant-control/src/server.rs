@@ -119,9 +119,11 @@ fn record_outcome(
     if error.code == ControlErrorCode::InternalError && !forward && !conn.closed.is_cancelled() {
         span.record("otel.status_code", "ERROR");
         span.in_scope(|| {
+            // The message can quote the request (a path, a host): stderr only, never Sentry.
+            tracing::debug!(method, detail = %error.message, "internal error detail");
             tracing::error!(
                 method,
-                detail = %error.message,
+                code = ?error.code,
                 "control request {method} failed with an internal error"
             );
         });
