@@ -46,7 +46,7 @@ impl BootMode {
 
 /// The fields of the image's OCI config the guest applies (`docker export` strips them, so the
 /// worker saves them beside the disk).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImageConfig {
     #[serde(rename = "Env", default, skip_serializing_if = "Option::is_none")]
     pub env: Option<Vec<String>>,
@@ -66,6 +66,29 @@ pub struct ImageConfig {
     pub entrypoint: Option<Vec<String>>,
     #[serde(rename = "Cmd", default, skip_serializing_if = "Option::is_none")]
     pub cmd: Option<Vec<String>>,
+}
+
+/// Env names and argument counts only: an image can bake a credential into an `Env` value or its
+/// command line, and this config is logged at boot.
+impl fmt::Debug for ImageConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let names = self.env.as_ref().map(|env| {
+            env.iter()
+                .map(|entry| {
+                    entry
+                        .split_once('=')
+                        .map_or(entry.as_str(), |(name, _)| name)
+                })
+                .collect::<Vec<_>>()
+        });
+        f.debug_struct("ImageConfig")
+            .field("env", &names)
+            .field("user", &self.user)
+            .field("working_dir", &self.working_dir)
+            .field("entrypoint_args", &self.entrypoint.as_ref().map(Vec::len))
+            .field("cmd_args", &self.cmd.as_ref().map(Vec::len))
+            .finish()
+    }
 }
 
 /// How the guest configures `eth0`. Absent in recovery, where the guest gets no route out.
@@ -402,7 +425,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(
             tmp.path().join("sha256-abc.config.json"),
-            r#"{"Config":{"Env":["PATH=/usr/bin"],"User":"mend","WorkingDir":"/workspace","Entrypoint":null,"Cmd":["bash"],"Labels":{"a":"b"}}}"#,
+            r#"{"Config":{"Env":["PATH=/usr/bin","IMAGE_TOKEN=baked-in"],"User":"mend","WorkingDir":"/workspace","Entrypoint":null,"Cmd":["bash","--token=on-the-command-line"],"Labels":{"a":"b"}}}"#,
         )
         .unwrap();
         std::fs::write(
@@ -455,6 +478,12 @@ mod tests {
         );
         assert!(
             debug.contains("home.tar") && !debug.contains("c2VjcmV0LWZpbGU="),
+            "{debug}"
+        );
+        assert!(
+            debug.contains("IMAGE_TOKEN")
+                && !debug.contains("baked-in")
+                && !debug.contains("on-the-command-line"),
             "{debug}"
         );
     }

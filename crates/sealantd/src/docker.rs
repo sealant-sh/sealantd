@@ -124,10 +124,11 @@ pub async fn stop_all(endpoint: &DockerEndpoint, grace: Duration) -> Result<Stop
             Ok((id, Ok((204 | 304 | 404, _)))) => {
                 tracing::info!(container = %id, "final capture: container stopped");
             }
-            Ok((id, Ok((status, body)))) => tracing::warn!(
+            // The body is the Docker daemon's own text, which can quote container config: the
+            // status says enough.
+            Ok((id, Ok((status, _)))) => tracing::warn!(
                 container = %id,
                 status,
-                body = %String::from_utf8_lossy(&body),
                 "final capture: the daemon refused to stop a container"
             ),
             Ok((id, Err(error))) => {
