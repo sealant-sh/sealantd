@@ -39,7 +39,7 @@ pub mod session;
 use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use channel::BootChannel;
 use protocol::{GuestExitStatus, PROTOCOL_VERSION, VmBootConfig, VmMode};
@@ -79,13 +79,18 @@ impl Ended {
 
 /// Entry point for `sealantd --vm`. `cli_mode` (`--vm-mode`) wins over the kernel command line.
 pub fn run(cli_mode: Option<VmMode>, log_level: &str) -> ExitCode {
+    let started = SystemTime::now();
     crate::boot::init_tracing(log_level);
     let pid1 = std::process::id() == 1;
-    let (mode, ended, channel) = boot(cli_mode, pid1);
+    let (mode, ended, channel) = boot(cli_mode, pid1, started);
     finish(mode, ended, channel, pid1)
 }
 
-fn boot(cli_mode: Option<VmMode>, pid1: bool) -> (VmMode, Ended, Option<BootChannel>) {
+fn boot(
+    cli_mode: Option<VmMode>,
+    pid1: bool,
+    started: SystemTime,
+) -> (VmMode, Ended, Option<BootChannel>) {
     if pid1 && let Err(error) = apply_layout(&layout::early()) {
         // Without /proc there is no command line to read: say which boot failed as best known.
         let mode = cli_mode.unwrap_or_default();
@@ -99,7 +104,7 @@ fn boot(cli_mode: Option<VmMode>, pid1: bool) -> (VmMode, Ended, Option<BootChan
         })
         .unwrap_or_default();
     tracing::info!(?mode, pid1, "sealantd --vm starting");
-    let (ended, channel) = boot_mode(mode, pid1);
+    let (ended, channel) = boot_mode(mode, pid1, started);
     (mode, ended, channel)
 }
 
@@ -115,7 +120,7 @@ fn apply_layout(steps: &[layout::Step]) -> Result<(), String> {
     }
 }
 
-fn boot_mode(mode: VmMode, pid1: bool) -> (Ended, Option<BootChannel>) {
+fn boot_mode(mode: VmMode, pid1: bool, started: SystemTime) -> (Ended, Option<BootChannel>) {
     if pid1 {
         let steps = match mode {
             VmMode::Normal => layout::normal(),
@@ -131,11 +136,25 @@ fn boot_mode(mode: VmMode, pid1: bool) -> (Ended, Option<BootChannel>) {
         tracing::warn!("not PID 1: the filesystem layout is left as it is");
     }
 
+    let laid_out = SystemTime::now();
+
     // One connection, once: a version mismatch or a malformed frame fails the boot at once.
     let (mut channel, boot) = match BootChannel::open() {
         Ok(opened) => opened,
         Err(error) => return (Ended::failed(mode, format!("boot config: {error}")), None),
     };
+    // The trace begins now that it has a parent; the stages before it are recorded as they ran.
+    let telemetry = boot.telemetry.clone().unwrap_or_default();
+    crate::telemetry::begin_boot(
+        "sealantd.vm.boot",
+        started,
+        telemetry
+            .traceparent
+            .as_deref()
+            .map(|parent| (parent, telemetry.tracestate.as_deref().unwrap_or_default())),
+    );
+    crate::telemetry::boot_stage("disk_layout", started, laid_out);
+    crate::telemetry::boot_stage("boot_config", laid_out, SystemTime::now());
     let ended = boot_with_config(mode, pid1, &mut channel, boot);
     (ended, Some(channel))
 }

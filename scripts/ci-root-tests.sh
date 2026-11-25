@@ -32,5 +32,6 @@ run_as_root sealant-capture owner_map
 # One thread: a test sets the daemon's own environment (what a person's commands must not see).
 run_as_root sealantd run_as_user --test-threads 1
 run_as_root sealantd boot_privilege_posture
+run_as_root sealantd telemetry_boot
 # One thread: each test starts a runner in its own netns and plays its guest.
 run_as_root sealant-vm-runner jail --test-threads 1

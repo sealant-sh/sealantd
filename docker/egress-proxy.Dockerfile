@@ -24,6 +24,9 @@ COPY . .
 # Same cache layout and mtime stamping as docker/Dockerfile: dependencies come from the cache,
 # the workspace's own crates always rebuild.
 ARG TARGETPLATFORM
+# The release the binary reports to Sentry (`sealantd@<version>`) when its environment names none;
+# the next and release workflows pass it. Empty in a local build.
+ARG SENTRY_RELEASE
 RUN --mount=type=cache,id=sealantd-cargo-registry-${TARGETPLATFORM},target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=sealantd-cargo-git-${TARGETPLATFORM},target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=sealantd-target-${TARGETPLATFORM},target=/src/target,sharing=locked \

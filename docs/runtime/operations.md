@@ -113,6 +113,24 @@ The daemon reads these settings under a `SEALANT_` prefix, because a workspace i
   Sentry event is masked with the daemon's secrets and token shapes, and loses URL credentials
   and query strings. Events carry no breadcrumbs, host name or request data, and each one is
   linked to the trace of the span it happened in.
+- **Boots.** A boot is one trace. In a container, `sealantd.boot` starts with the process, as a
+  child of the launcher's span when `SEALANT_TRACEPARENT` (and `SEALANT_TRACESTATE`) name one.
+  Its children are the workspace's provisioning (`sealantd.boot.clone`, `.mount` or `.restore`),
+  then `sealantd.boot.healthy`, `.control_ready` and `.harness_started`, each measured from the
+  boot's start and carrying `sealant.boot.stage`. A recovery boot ends at `control_ready`. An
+  error while the boot is open is linked to its trace.
+- **host-vm.** The VM runner and the egress proxy read the contract's plain `SENTRY_DSN`,
+  `SENTRY_ENVIRONMENT`, `SENTRY_RELEASE`, `SENTRY_TRACES_SAMPLE_RATE` and `OTEL_EXPORTER_OTLP_*`,
+  because only sealant sets their environment. The staged `boot-env.json` (or
+  `recovery-env.json`) may carry
+  `"telemetry": {"traceparent", "tracestate", "sentryDsn", "environment", "release"}`. The runner
+  records `sealantd.vm.launch` under that traceparent, with `setup`, `boot_config` and
+  `vmm_started` stages. It passes the guest the staged settings, filled in from its own
+  environment, with the launch span as the guest's parent. The guest records `sealantd.vm.boot`
+  from PID 1's start, with `disk_layout` and `boot_config` recorded as they ran, then the stages
+  above. The runner starts its exporter only after it drops privileges, and the guest only after
+  it sets its environment. The proxy's policy, revoke and heartbeat requests are
+  `sealantd.proxy.admin.*` spans, under the controller's `traceparent` header when it sends one.
 - **Export.** One attempt, no retries. At most 2048 spans wait to be sent, and any past that are
   dropped. Shutdown sends what is queued within about two seconds.
 

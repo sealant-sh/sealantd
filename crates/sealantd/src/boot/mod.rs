@@ -49,9 +49,17 @@ const BOOT_OWNED_KEYS: &[&str] = &["HOME", "USER", "LOGNAME", "PATH"];
 /// Entry point for the `boot` subcommand. Performs synchronous prep, then enters Tokio to run the
 /// control server and supervise the harness. Returns the process exit code.
 pub fn run_boot(log_level: &str, recovery: bool) -> ExitCode {
+    let started = std::time::SystemTime::now();
     init_tracing(log_level);
     // A container may have threads from the start; a microVM guest starts these later.
     let _telemetry = crate::telemetry::start();
+    let parent = std::env::var(crate::telemetry::TRACEPARENT).ok();
+    let state = std::env::var(crate::telemetry::TRACESTATE).unwrap_or_default();
+    crate::telemetry::begin_boot(
+        "sealantd.boot",
+        started,
+        parent.as_deref().map(|parent| (parent, state.as_str())),
+    );
 
     let config = match BootConfig::from_env().and_then(|config| {
         if recovery {
@@ -294,6 +302,13 @@ fn prepare(
 
     // Steps 5–7: provision the working directory per source mode.
     let mut capture_boot = None;
+    let provisioned = std::time::SystemTime::now();
+    let stage = match &config.source {
+        WorkspaceSource::Clone(_) => Some("clone"),
+        WorkspaceSource::Mount(_) => Some("mount"),
+        WorkspaceSource::Standby(_) => None,
+        WorkspaceSource::Capture(_) => Some("restore"),
+    };
     match &config.source {
         // Clone with scoped credentials, then wipe them.
         WorkspaceSource::Clone(repo) => {
@@ -331,6 +346,9 @@ fn prepare(
                 &config.workspace.workspace_root,
             )?);
         }
+    }
+    if let Some(stage) = stage {
+        crate::telemetry::boot_stage(stage, provisioned, std::time::SystemTime::now());
     }
     // Every bindable root — the standby root and any extra bindable mount — must be a real,
     // writable mount, for the same reason a mounted source must: a bind onto a container-local
@@ -639,6 +657,7 @@ async fn boot_serve(
         tracing::info!(?network_mode, "network observation active");
     }
     runtime.mark_healthy();
+    crate::telemetry::boot_reached("healthy");
 
     // Step 11b: bind the working directory (and any other bindable mount) the orchestrator asked
     // for, plus whatever this container's record holds, BEFORE anything can look for the repo
@@ -737,7 +756,10 @@ async fn boot_serve(
         serve_rx,
     );
 
+    crate::telemetry::boot_reached("control_ready");
     if config.recovery {
+        // A recovery runs no harness: answering is all its boot does.
+        crate::telemetry::end_boot(true);
         return recover(runtime, capture_runtime, serve_tx, control_handle).await;
     }
 
@@ -782,6 +804,9 @@ async fn boot_serve(
             return shutdown_with(&runtime, &serve_tx, control_handle, code).await;
         }
     };
+
+    crate::telemetry::boot_reached("harness_started");
+    crate::telemetry::end_boot(true);
 
     // Step 15b: the fence pauses the harness from now on (the engine runs since step 11c).
     if let Some(capture) = &capture_runtime {

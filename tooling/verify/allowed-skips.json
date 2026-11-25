@@ -16,6 +16,11 @@
       "reason": "Needs root. CI runs it under sudo, where a skip fails (scripts/ci-root-tests.sh)"
     },
     {
+      "test": "sealantd::telemetry_boot *",
+      "gate": "SEALANTD_REQUIRE_ROOT_TESTS",
+      "reason": "Needs root (boot makes /run/sealant). CI runs it under sudo, where a skip fails (scripts/ci-root-tests.sh)"
+    },
+    {
       "test": "sealant-vm-runner::jail *",
       "gate": "SEALANTD_REQUIRE_ROOT_TESTS",
       "reason": "Needs root (a netns, tap0, nftables, setresuid). CI runs it under sudo, where a skip fails (scripts/ci-root-tests.sh)"

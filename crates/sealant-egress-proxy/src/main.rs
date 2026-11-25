@@ -55,15 +55,29 @@ fn resolv_conf_nameserver() -> Option<SocketAddr> {
     })
 }
 
+/// The release this build reports when `SENTRY_RELEASE` is unset (`sealantd@<version>`).
+const RELEASE: Option<&str> = option_env!("SENTRY_RELEASE");
+
+/// Sends the queued spans and errors when `main` returns, after its last log line.
+struct Flush;
+
+impl Drop for Flush {
+    fn drop(&mut self) {
+        sealant_observability::shutdown();
+    }
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .with_writer(std::io::stderr)
-        .init();
+    sealant_observability::install(
+        "sealant-egress-proxy",
+        tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+    );
+    sealant_observability::start(
+        &sealant_observability::Config::from_env().with_default_release(RELEASE),
+    );
+    let _flush = Flush;
     let args = Args::parse();
     let Some(upstream_dns) = args.upstream_dns.or_else(resolv_conf_nameserver) else {
         tracing::error!("no upstream DNS: pass --upstream-dns or provide /etc/resolv.conf");

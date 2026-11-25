@@ -19,6 +19,7 @@ getrandom = { workspace = true }
 libc = { workspace = true }
 # `net` adds SO_ORIGINAL_DST (`sockopt::OriginalDst`), which the TCP forwarders read.
 nix = { workspace = true, features = ["net"] }
+sealant-observability = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
