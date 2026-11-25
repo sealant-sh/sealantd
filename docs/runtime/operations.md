@@ -85,6 +85,37 @@ docker buildx build --platform linux/amd64,linux/arm64 -f docker/Dockerfile -t s
 The image is a single static binary on `scratch`. Mount the workspace and expose the socket via a
 shared volume; run as the same uid as the controlling process so peer validation passes.
 
+## Traces and errors
+
+Off unless the daemon is given a DSN. Then it sends its spans over OTLP and its `error!` events and
+panics to Sentry. Without one it builds no exporter, starts no thread and makes no network call.
+The daemon reads these settings under a `SEALANT_` prefix, because a workspace image's own
+`SENTRY_DSN` belongs to the user's code. Boot consumes them, so they never reach the harness.
+
+| Variable | Meaning |
+| --- | --- |
+| `SEALANT_SENTRY_DSN` | The Sentry project. Errors go to it, and spans go to its OTLP endpoint (`/api/<project>/integration/otlp/v1/traces`). |
+| `SEALANT_SENTRY_ENVIRONMENT` | Default `development`. |
+| `SEALANT_SENTRY_RELEASE` | Default: the `SENTRY_RELEASE` the binary was built with (`sealantd@<version>`). |
+| `SEALANT_SENTRY_TRACES_SAMPLE_RATE` | The share of new traces kept, default `1`. A caller's sampled flag always wins. |
+| `SEALANT_OTEL_EXPORTER_OTLP_ENDPOINT`, `SEALANT_OTEL_EXPORTER_OTLP_HEADERS` | Another collector for spans, in place of the DSN's. |
+
+`--log-level` filters stderr only, so `off` (the TypeScript client's default) still exports.
+
+- **Spans.** Each control request is a `sealantd.control.<method>` span. When the request carries
+  `trace` (a W3C `traceparent`), the span is a child of the caller's span. Exec, session open and
+  attach have child spans for their stages (`sealantd.process.identity`,
+  `sealantd.process.spawn`, `sealantd.session.spawn`, `sealantd.session.journal`,
+  `sealantd.session.subscribe`). Spans carry the method, the request id and the error code. They
+  never carry arguments, environment or output, and log lines never become span events.
+- **Errors.** A request that fails with an internal error is reported once, at the control server.
+  A forward's dial and a request whose connection has closed are not reported. Every string in a
+  Sentry event is masked with the daemon's secrets and token shapes, and loses URL credentials
+  and query strings. Events carry no breadcrumbs, host name or request data, and each one is
+  linked to the trace of the span it happened in.
+- **Export.** One attempt, no retries. At most 2048 spans wait to be sent, and any past that are
+  dropped. Shutdown sends what is queued within about two seconds.
+
 ## Shutdown
 
 `SIGTERM`/`SIGINT` (or the `runtime.gracefulShutdown` command) drains: managed processes and PTY
