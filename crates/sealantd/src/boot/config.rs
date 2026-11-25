@@ -65,6 +65,13 @@ pub fn people(source: &WorkspaceSource) -> People {
 /// All `SEALANT_*` keys this loader consumes. Used to compute the harness passthrough environment
 /// (every other env var) and to redact secrets from it.
 const CONSUMED_KEYS: &[&str] = &[
+    // The daemon's own telemetry (`crate::telemetry`): never the harness's.
+    "SEALANT_SENTRY_DSN",
+    "SEALANT_SENTRY_ENVIRONMENT",
+    "SEALANT_SENTRY_RELEASE",
+    "SEALANT_SENTRY_TRACES_SAMPLE_RATE",
+    "SEALANT_OTEL_EXPORTER_OTLP_ENDPOINT",
+    "SEALANT_OTEL_EXPORTER_OTLP_HEADERS",
     "SEALANT_WORKSPACE_ROOT",
     "SEALANT_WORKING_DIRECTORY",
     "SEALANT_WORKSPACE_SOURCE",
@@ -1860,6 +1867,36 @@ mod tests {
             }
             other => panic!("expected command foreground, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn the_daemons_telemetry_settings_never_reach_the_harness() {
+        for key in sealant_observability::VARIABLES {
+            let prefixed = format!("{}{key}", crate::telemetry::PREFIX);
+            assert!(CONSUMED_KEYS.contains(&prefixed.as_str()), "{prefixed}");
+        }
+        let cfg = load_with(&[
+            ("SEALANT_SENTRY_DSN", "https://k@sentry.example.com/10"),
+            (
+                "SEALANT_OTEL_EXPORTER_OTLP_HEADERS",
+                "x-sentry-auth=sentry sentry_key=k",
+            ),
+            // The image's own is the user's, and stays theirs.
+            ("SENTRY_DSN", "https://theirs@sentry.example.com/1"),
+        ])
+        .expect("valid");
+        let passed: Vec<&(String, String)> = cfg
+            .passthrough_env
+            .iter()
+            .filter(|(k, _)| k.contains("SENTRY") || k.contains("OTEL"))
+            .collect();
+        assert_eq!(
+            passed,
+            vec![&(
+                "SENTRY_DSN".to_owned(),
+                "https://theirs@sentry.example.com/1".to_owned()
+            )]
+        );
     }
 
     #[test]

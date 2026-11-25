@@ -50,6 +50,8 @@ const BOOT_OWNED_KEYS: &[&str] = &["HOME", "USER", "LOGNAME", "PATH"];
 /// control server and supervise the harness. Returns the process exit code.
 pub fn run_boot(log_level: &str, recovery: bool) -> ExitCode {
     init_tracing(log_level);
+    // A container may have threads from the start; a microVM guest starts these later.
+    let _telemetry = crate::telemetry::start();
 
     let config = match BootConfig::from_env().and_then(|config| {
         if recovery {
@@ -179,13 +181,10 @@ fn prepare_exit_code(error: &BootError, recovery: bool) -> u8 {
     }
 }
 
+/// Set the subscriber (stderr under `log_level`, spans and errors held for export). Starts no
+/// thread: a microVM guest calls it while it must still have only one.
 pub(crate) fn init_tracing(log_level: &str) {
-    let filter = tracing_subscriber::EnvFilter::try_new(log_level)
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    let _ = tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_env_filter(filter)
-        .try_init();
+    crate::telemetry::install(log_level);
 }
 
 /// Synchronous boot preparation (steps 2–7): all side effects that must complete, in order, before
@@ -598,6 +597,9 @@ fn run_supervised_inner(
     let shutdown = Arc::new(ShutdownSignal::new(runtime_config.shutdown_grace_ms));
     let runtime = Runtime::new(runtime_config, shutdown);
     prepare(&runtime);
+    // A microVM guest's first chance to start threads (its environment is set); a no-op where
+    // `run_boot` started them already. Held past the async runtime's shutdown.
+    let _telemetry = crate::telemetry::start();
 
     let tokio_runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()

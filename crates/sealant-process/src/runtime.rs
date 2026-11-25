@@ -178,6 +178,10 @@ impl ProcessRuntime {
         // A named user: resolved here and admitted only if the runtime's people include it,
         // its private directories made, its identity set in the child before exec
         // ([`crate::identity`]).
+        let identity = args
+            .user
+            .is_some()
+            .then(|| tracing::info_span!("sealantd.process.identity").entered());
         let run_as = args
             .user
             .as_deref()
@@ -192,6 +196,7 @@ impl ProcessRuntime {
                 ))
             })?;
         }
+        drop(identity);
 
         let mut command = tokio::process::Command::new(&args.executable);
         command.args(&args.args);
@@ -265,7 +270,8 @@ impl ProcessRuntime {
 
         // Spawn under the reap gate: the pid must be registered before the orphan reaper can peek
         // at it, or a fast-exiting child gets misread as an adopted orphan and its status stolen.
-        let (mut child, spawned_pid) = crate::spawn::spawn_tokio(&mut command)
+        let (mut child, spawned_pid) = tracing::info_span!("sealantd.process.spawn")
+            .in_scope(|| crate::spawn::spawn_tokio(&mut command))
             .map_err(|e| ControlError::process_start_failed(format!("{}: {e}", args.executable)))?;
 
         let pid = spawned_pid.pid();

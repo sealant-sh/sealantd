@@ -300,6 +300,9 @@ jobs:
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.version=${{ needs.stable-tag.outputs.version }}
+          # The release each binary reports to Sentry: the Sentry project, then the version.
+          build-args: |
+            SENTRY_RELEASE=sealantd@${{ needs.stable-tag.outputs.version }}
           outputs:
             type=image,name=ghcr.io/${{ github.repository_owner }}/${{ matrix.image.name }},push-by-digest=true,name-canonical=true,push=true
       - name: Export digest
@@ -363,6 +366,9 @@ jobs:
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.version=${{ needs.stable-tag.outputs.version }}
+          # The release each binary reports to Sentry: the Sentry project, then the version.
+          build-args: |
+            SENTRY_RELEASE=sealantd@${{ needs.stable-tag.outputs.version }}
           outputs: type=docker,dest=${{ runner.temp }}/archive/${{ matrix.image.name }}.tar
       # The digest is computed from the archive itself and must be the one BuildKit reports, so the
       # manifest records what the file holds.

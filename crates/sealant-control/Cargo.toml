@@ -11,6 +11,7 @@ workspace = true
 
 [dependencies]
 sealant-protocol = { workspace = true }
+sealant-observability = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true, features = ["io"] }
 futures = { workspace = true }

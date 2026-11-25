@@ -256,12 +256,8 @@ pub fn run() -> ExitCode {
 /// The bare control-server path: build the runtime from flags and serve. Unchanged behavior.
 fn run_serve(cli: ServeArgs) -> ExitCode {
     // Diagnostics go to stderr; stdout is reserved for the protocol in stdio mode.
-    let filter = tracing_subscriber::EnvFilter::try_new(&cli.log_level)
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    let _ = tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_env_filter(filter)
-        .try_init();
+    crate::telemetry::install(&cli.log_level);
+    let _telemetry = crate::telemetry::start();
 
     let config = build_config(&cli);
 

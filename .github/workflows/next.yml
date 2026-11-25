@@ -167,6 +167,9 @@ jobs:
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.revision=${{ needs.plan.outputs.sha }}
             org.opencontainers.image.version=${{ needs.plan.outputs.version }}
+          # The release each binary reports to Sentry: the Sentry project, then the version.
+          build-args: |
+            SENTRY_RELEASE=sealantd@${{ needs.plan.outputs.version }}
           outputs:
             type=image,name=ghcr.io/${{ github.repository_owner }}/${{ matrix.image.name }}-next,push-by-digest=true,name-canonical=true,push=true
       - name: Export digest
