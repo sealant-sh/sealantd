@@ -45,14 +45,16 @@ import {
   requestFrame,
   resultValue,
   streamFrame,
+  wireTrace,
   type CommandInit,
   type OpenForwardOptions,
   type StreamPayload,
+  type TraceInput,
 } from "./wire.js";
 
 export { Channel } from "./channel.js";
 export type { ChannelTransport, ChannelClose } from "./channel.js";
-export { SealantError, type OpenForwardOptions } from "./wire.js";
+export { SealantError, type OpenForwardOptions, type TraceInput } from "./wire.js";
 
 type Pending = {
   resolve: (response: ControlResponse) => void;
@@ -119,6 +121,24 @@ export interface ExecOptions {
   secretEnv?: Array<{ key: string; value: string }>;
 }
 
+/** Options every way of building a {@link SealantClient} takes. */
+export interface ClientOptions {
+  /**
+   * The caller's current trace context, read once as each request starts, so the daemon's span for
+   * it joins the caller's trace. Called synchronously from inside the method that sends the
+   * request, so a hook that reads ambient state (an Effect fiber's span, an OpenTelemetry context)
+   * sees the caller's. Return undefined outside a trace. A throw or a malformed value only leaves
+   * the request untraced. `@sealant/runtime-client/effect` has one for Effect callers.
+   */
+  traceContext?: () => TraceInput | undefined;
+}
+
+/** Options for {@link SealantClient.request}. */
+export interface RequestOptions {
+  /** This request's trace context, in place of the client's {@link ClientOptions.traceContext}. */
+  trace?: TraceInput;
+}
+
 /** The capability a daemon names when it honours `secretEnv` on exec and both session shapes. */
 export const SECRET_ENV_CAPABILITY = "process.secret-env.v1";
 
@@ -143,9 +163,11 @@ export class SealantClient {
   #pendingFrames: Map<string, StreamFrame[]> = new Map();
   #transport: ChannelTransport;
   #drain: Drain;
+  #traceContext: (() => TraceInput | undefined) | undefined;
 
-  constructor(stream: Duplex) {
+  constructor(stream: Duplex, options: ClientOptions = {}) {
     this.#stream = stream;
+    this.#traceContext = options.traceContext;
     this.#drain = new Drain(stream);
     // The transport every Channel uses to mux outbound frames back over this one connection.
     this.#transport = {
@@ -177,20 +199,20 @@ export class SealantClient {
    * daemon's Unix socket. The framing/protocol is transport-agnostic, so this drives the same
    * request/response/event machinery as {@link SealantClient.connect}.
    */
-  static fromStream(stream: Duplex): SealantClient {
-    return new SealantClient(stream);
+  static fromStream(stream: Duplex, options: ClientOptions = {}): SealantClient {
+    return new SealantClient(stream, options);
   }
 
   static async connect(
     socketPath: string,
-    options: { retries?: number; delayMs?: number } = {},
+    options: ClientOptions & { retries?: number; delayMs?: number } = {},
   ): Promise<SealantClient> {
     const retries = options.retries ?? 100;
     const delayMs = options.delayMs ?? 20;
     let lastError: unknown;
     for (let attempt = 0; attempt < retries; attempt++) {
       try {
-        return new SealantClient(await connectOnce(socketPath));
+        return new SealantClient(await connectOnce(socketPath), options);
       } catch (error) {
         lastError = error;
         await delay(delayMs);
@@ -199,7 +221,7 @@ export class SealantClient {
     throw lastError instanceof Error ? lastError : new Error("connection failed");
   }
 
-  static async spawn(options: {
+  static async spawn(options: ClientOptions & {
     binPath: string;
     socketPath: string;
     workspace?: string;
@@ -219,7 +241,12 @@ export class SealantClient {
     if (options.networkProxy) args.push("--network-proxy");
     const child = spawn(options.binPath, args, { stdio: ["ignore", "ignore", "inherit"] });
     try {
-      return { client: await SealantClient.connect(options.socketPath), child };
+      return {
+        client: await SealantClient.connect(options.socketPath, {
+          traceContext: options.traceContext,
+        }),
+        child,
+      };
     } catch (error) {
       child.kill("SIGKILL");
       throw error;
@@ -227,13 +254,15 @@ export class SealantClient {
   }
 
   /** Send a command oneof case and await its single (typed) response. */
-  request(command: CommandInit): Promise<ControlResponse> {
+  request(command: CommandInit, options: RequestOptions = {}): Promise<ControlResponse> {
     if (this.#closed) {
       return Promise.reject(new Error("client is closed"));
     }
     const requestId = `req_client_${++this.#counter}`;
+    // Read now, while the caller's context is the current one: a secret-env request sends later.
+    const trace = wireTrace(options.trace ?? this.#currentTrace());
     // Encoded now, so the command sent is the one asked for, whatever its options become.
-    const frame = requestFrame(requestId, command);
+    const frame = requestFrame(requestId, command, trace);
     const sent = create(CommandSchema, { command }).command;
     const secret =
       (sent.case === "exec" || sent.case === "openSession") && sent.value.secretEnv.length > 0;
@@ -246,6 +275,14 @@ export class SealantClient {
       if (this.#closed) throw new Error("client is closed");
       return this.#send(requestId, frame);
     });
+  }
+
+  #currentTrace(): TraceInput | undefined {
+    try {
+      return this.#traceContext?.();
+    } catch {
+      return undefined;
+    }
   }
 
   #send(requestId: string, frame: Uint8Array): Promise<ControlResponse> {

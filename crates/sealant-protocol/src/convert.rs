@@ -20,7 +20,7 @@ use crate::{
     ProcessList, ProcessStarted, ProcessState, ProcessSummary, ResponseOutcome, RuntimeHeartbeat,
     RuntimeMetrics, RuntimeState, RuntimeStateChanged, SecretEnvVar, ServerMessage, SessionList,
     SessionOpened, SessionSummary, SftpOpened, ShutdownAccepted, Signal, StreamAttached, StreamEnd,
-    StreamFrame, StreamKind, StreamPayload, TelemetryDropped, TransformMeta,
+    StreamFrame, StreamKind, StreamPayload, TelemetryDropped, TraceContext, TransformMeta,
 };
 use crate::{
     FileChange, FileChangeKind, FileDiffAvailable, FileEntry, FileSnapshotCompleted, FileType,
@@ -1758,6 +1758,10 @@ impl From<ControlRequest> for wire::ControlRequest {
             command: Some(wire::Command {
                 command: Some(r.command.into()),
             }),
+            trace: r.trace.map(|t| wire::TraceContext {
+                traceparent: t.traceparent,
+                tracestate: t.tracestate,
+            }),
         }
     }
 }
@@ -1772,6 +1776,14 @@ impl TryFrom<wire::ControlRequest> for ControlRequest {
             schema_version: r.schema_version,
             request_id: RequestId::new(r.request_id),
             command: command.try_into()?,
+            // An empty traceparent is no trace at all.
+            trace: r
+                .trace
+                .filter(|t| !t.traceparent.is_empty())
+                .map(|t| TraceContext {
+                    traceparent: t.traceparent,
+                    tracestate: t.tracestate,
+                }),
         })
     }
 }
@@ -2253,6 +2265,77 @@ mod tests {
     }
 
     #[test]
+    fn a_trace_context_round_trips_and_an_old_request_has_none() {
+        let traced = ClientMessage::Request(
+            ControlRequest::new(RequestId::new("req_t"), Command::RuntimeHealth).with_trace(
+                TraceContext {
+                    traceparent: "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+                        .to_owned(),
+                    tracestate: "congo=t61rcWkgMzE".to_owned(),
+                },
+            ),
+        );
+        let bytes = encode_client(&traced);
+        assert_eq!(decode_client(&bytes).expect("decode"), traced);
+
+        // A client from before the field sends no field 4.
+        let old = encode_client(&ClientMessage::Request(ControlRequest::new(
+            RequestId::new("req_o"),
+            Command::RuntimeHealth,
+        )));
+        let Ok(ClientMessage::Request(request)) = decode_client(&old) else {
+            panic!("decode");
+        };
+        assert_eq!(request.trace, None);
+
+        // An empty traceparent is no trace.
+        let empty = wire::ClientMessage {
+            message: Some(wire::client_message::Message::Request(
+                wire::ControlRequest {
+                    schema_version: crate::SCHEMA_VERSION,
+                    request_id: "req_e".to_owned(),
+                    command: Some(wire::Command {
+                        command: Some(wire::command::Command::RuntimeHealth(wire::Empty {})),
+                    }),
+                    trace: Some(wire::TraceContext::default()),
+                },
+            )),
+        }
+        .encode_to_vec();
+        let Ok(ClientMessage::Request(request)) = decode_client(&empty) else {
+            panic!("decode");
+        };
+        assert_eq!(request.trace, None);
+    }
+
+    /// A daemon from before the field skips it: the bytes decode as the same request without it.
+    #[test]
+    fn a_decoder_without_the_field_skips_it() {
+        #[derive(Clone, PartialEq, prost::Message)]
+        struct OldControlRequest {
+            #[prost(uint32, tag = "1")]
+            schema_version: u32,
+            #[prost(string, tag = "2")]
+            request_id: String,
+            #[prost(message, optional, tag = "3")]
+            command: Option<wire::Command>,
+        }
+        let traced = wire::ControlRequest::from(
+            ControlRequest::new(RequestId::new("req_t"), Command::RuntimeHealth).with_trace(
+                TraceContext {
+                    traceparent: "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+                        .to_owned(),
+                    tracestate: String::new(),
+                },
+            ),
+        )
+        .encode_to_vec();
+        let old = OldControlRequest::decode(traced.as_slice()).expect("old decode");
+        assert_eq!(old.request_id, "req_t");
+        assert!(old.command.is_some());
+    }
+
+    #[test]
     fn bind_mount_command_round_trips() {
         let msg = ClientMessage::Request(ControlRequest::new(
             RequestId::new("req_b"),
@@ -2280,6 +2363,7 @@ mod tests {
                             wire::CaptureFlushArgs::default(),
                         )),
                     }),
+                    trace: None,
                 },
             )),
         }

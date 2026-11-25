@@ -19,17 +19,42 @@ pub struct ControlRequest {
     pub request_id: RequestId,
     /// The command to execute.
     pub command: Command,
+    /// The caller's trace context, when the caller is in a trace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace: Option<TraceContext>,
 }
 
 impl ControlRequest {
-    /// Build a request at the current [`crate::SCHEMA_VERSION`].
+    /// Build a request at the current [`crate::SCHEMA_VERSION`], outside any trace.
     pub fn new(request_id: RequestId, command: Command) -> Self {
         Self {
             schema_version: crate::SCHEMA_VERSION,
             request_id,
             command,
+            trace: None,
         }
     }
+
+    /// The same request, carrying `trace`.
+    #[must_use]
+    pub fn with_trace(mut self, trace: TraceContext) -> Self {
+        self.trace = Some(trace);
+        self
+    }
+}
+
+/// A W3C trace context as the caller sent it (<https://www.w3.org/TR/trace-context/>).
+///
+/// Carried as given: the daemon parses and bounds it where it starts its span, and a malformed one
+/// only means the request's span starts a trace of its own.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct TraceContext {
+    /// `00-<trace id>-<parent span id>-<flags>`.
+    pub traceparent: String,
+    /// Vendor entries; empty when the caller has none.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub tracestate: String,
 }
 
 /// Outcome of a control request: exactly one ack or one typed error (plan §8.6).
