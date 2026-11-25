@@ -4,7 +4,10 @@
 //! reads its telemetry settings under [`PREFIX`]: `SEALANT_SENTRY_DSN` and the rest. Boot
 //! consumes them, so they never reach the harness. None set: nothing is exported.
 
-use sealant_observability::Config;
+use std::sync::OnceLock;
+use std::time::SystemTime;
+
+use sealant_observability::{BootTrace, Config};
 
 /// The prefix of every telemetry variable the daemon reads.
 pub const PREFIX: &str = "SEALANT_";
@@ -28,12 +31,56 @@ pub(crate) fn start() -> Guard {
     Guard(())
 }
 
-/// Sends what is queued when dropped: hold it for the life of the process's work.
+/// Sends what is queued when dropped: hold it for the life of the process's work. A boot still
+/// open then did not finish, and ends failed.
 #[derive(Debug)]
 pub(crate) struct Guard(());
 
 impl Drop for Guard {
     fn drop(&mut self) {
+        end_boot(false);
         sealant_observability::shutdown();
+    }
+}
+
+/// The launcher's trace context for a container boot: its span is the boot's parent.
+pub const TRACEPARENT: &str = "SEALANT_TRACEPARENT";
+/// The tracestate beside [`TRACEPARENT`].
+pub const TRACESTATE: &str = "SEALANT_TRACESTATE";
+
+static BOOT: OnceLock<BootTrace> = OnceLock::new();
+
+/// Begin this process's boot trace, `name` (`sealantd.boot`, `sealantd.vm.boot`), as started at
+/// `started`, under the launcher's `traceparent`. Only the first call counts.
+pub(crate) fn begin_boot(
+    name: &'static str,
+    started: SystemTime,
+    traceparent: Option<(&str, &str)>,
+) {
+    if BOOT.get().is_none()
+        && let Some(trace) = BootTrace::begin(name, started, traceparent)
+    {
+        let _ = BOOT.set(trace);
+    }
+}
+
+/// A boot stage that ran from `start` to `end`.
+pub(crate) fn boot_stage(stage: &'static str, start: SystemTime, end: SystemTime) {
+    if let Some(boot) = BOOT.get() {
+        boot.stage(stage, start, end);
+    }
+}
+
+/// The boot reached `stage`.
+pub(crate) fn boot_reached(stage: &'static str) {
+    if let Some(boot) = BOOT.get() {
+        boot.reached(stage);
+    }
+}
+
+/// End the boot: it finished (`ok`) or it never will.
+pub(crate) fn end_boot(ok: bool) {
+    if let Some(boot) = BOOT.get() {
+        boot.end(ok);
     }
 }

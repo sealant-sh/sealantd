@@ -157,6 +157,25 @@ pub struct DotfilesArchive {
     pub files: BTreeMap<String, String>,
 }
 
+/// Where the guest sends its traces and errors, and the trace its boot belongs to. Absent, or
+/// without a DSN, the guest exports nothing.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct Telemetry {
+    /// The runner's launch span, the guest boot's parent (W3C).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub traceparent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tracestate: Option<String>,
+    /// The Sentry project (`SEALANT_SENTRY_DSN` on the `docker` runtime).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sentry_dsn: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release: Option<String>,
+}
+
 /// What the runner sends at boot.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -186,6 +205,9 @@ pub struct VmBootConfig {
     /// Start the guest's own `dockerd` (normal mode only).
     #[serde(default)]
     pub dockerd: bool,
+    /// Traces and errors; absent from a runner that predates them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub telemetry: Option<Telemetry>,
 }
 
 impl std::fmt::Debug for VmBootConfig {
@@ -203,6 +225,7 @@ impl std::fmt::Debug for VmBootConfig {
             .field("executor_ca_pem", &self.executor_ca_pem.is_some())
             .field("network_config", &self.network_config)
             .field("dockerd", &self.dockerd)
+            .field("telemetry", &self.telemetry)
             .finish_non_exhaustive()
     }
 }
@@ -441,6 +464,13 @@ mod tests {
             executor_ca_pem: Some("-----BEGIN CERTIFICATE-----\n".to_owned()),
             network_config: Some(NetworkConfig::default()),
             dockerd: true,
+            telemetry: Some(Telemetry {
+                traceparent: Some(
+                    "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".to_owned(),
+                ),
+                sentry_dsn: Some("https://k@sentry.example.com/10".to_owned()),
+                ..Telemetry::default()
+            }),
         }
     }
 

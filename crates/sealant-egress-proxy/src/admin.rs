@@ -18,6 +18,7 @@ use serde::Serialize;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::broadcast::error::RecvError;
+use tracing::Instrument as _;
 
 use crate::http1::{HttpReader, parse_request};
 use crate::policy::{Policy, PolicyDocument};
@@ -153,22 +154,47 @@ async fn handle(shared: Arc<Shared>, stream: UnixStream) {
         .target
         .split_once('?')
         .unwrap_or((req.target.as_str(), ""));
-    match (req.method.as_str(), path) {
-        ("PUT", "/v1/policy") => put_policy(&shared, &mut stream, &body).await,
-        ("POST", "/v1/revoke") => revoke(&shared, &mut stream, &body).await,
-        ("POST", "/v1/heartbeat") => heartbeat(&shared, &mut stream, &body).await,
-        ("GET", "/v1/health") => send_json(&mut stream, 200, &shared.health()).await,
-        ("GET", "/v1/events") => {
-            let follow = !query
-                .split('&')
-                .any(|kv| kv == "follow=0" || kv == "follow=false");
-            events(&shared, stream, follow).await;
+    // The policy changes are spans, under the controller's `traceparent` when it sends one. The
+    // body (brokered secrets among it) is never recorded: only which change it was.
+    let change = match (req.method.as_str(), path) {
+        ("PUT", "/v1/policy") => Some("sealantd.proxy.admin.policy"),
+        ("POST", "/v1/revoke") => Some("sealantd.proxy.admin.revoke"),
+        ("POST", "/v1/heartbeat") => Some("sealantd.proxy.admin.heartbeat"),
+        _ => None,
+    };
+    let span = change.map_or_else(tracing::Span::none, |name| {
+        let span = tracing::info_span!(
+            "sealantd.proxy.admin",
+            otel.name = name,
+            otel.kind = "server"
+        );
+        let text = |name: &str| {
+            req.header(name)
+                .and_then(|value| std::str::from_utf8(value).ok())
+                .unwrap_or_default()
+        };
+        sealant_observability::set_remote_parent(&span, text("traceparent"), text("tracestate"));
+        span
+    });
+    let dispatch = async {
+        match (req.method.as_str(), path) {
+            ("PUT", "/v1/policy") => put_policy(&shared, &mut stream, &body).await,
+            ("POST", "/v1/revoke") => revoke(&shared, &mut stream, &body).await,
+            ("POST", "/v1/heartbeat") => heartbeat(&shared, &mut stream, &body).await,
+            ("GET", "/v1/health") => send_json(&mut stream, 200, &shared.health()).await,
+            ("GET", "/v1/events") => {
+                let follow = !query
+                    .split('&')
+                    .any(|kv| kv == "follow=0" || kv == "follow=false");
+                events(&shared, stream, follow).await;
+            }
+            (_, "/v1/policy" | "/v1/revoke" | "/v1/heartbeat" | "/v1/health" | "/v1/events") => {
+                send_error(&mut stream, 405, "method_not_allowed", "wrong method").await;
+            }
+            _ => send_error(&mut stream, 404, "not_found", "no such route").await,
         }
-        (_, "/v1/policy" | "/v1/revoke" | "/v1/heartbeat" | "/v1/health" | "/v1/events") => {
-            send_error(&mut stream, 405, "method_not_allowed", "wrong method").await;
-        }
-        _ => send_error(&mut stream, 404, "not_found", "no such route").await,
-    }
+    };
+    dispatch.instrument(span).await;
 }
 
 #[derive(Serialize)]

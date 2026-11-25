@@ -16,6 +16,7 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 #![forbid(unsafe_code)]
 
+mod boot;
 mod config;
 mod http;
 mod pipeline;
@@ -38,6 +39,7 @@ use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt as _;
 use tracing_subscriber::{Layer as _, Registry};
 
+pub use boot::{BootTrace, STAGE};
 pub use config::{
     Config, OTEL_EXPORTER_OTLP_ENDPOINT, OTEL_EXPORTER_OTLP_HEADERS, SENTRY_DSN,
     SENTRY_ENVIRONMENT, SENTRY_RELEASE, SENTRY_TRACES_SAMPLE_RATE, VARIABLES,
@@ -209,12 +211,24 @@ pub fn shutdown() {
     }
 }
 
-/// Link an event to the trace it happened in, when it happened inside a recorded span.
+/// The open boot's span ([`BootTrace`]): an error outside any span while the process boots
+/// belongs to the boot's trace.
+static BOOTING: std::sync::RwLock<Option<opentelemetry::trace::SpanContext>> =
+    std::sync::RwLock::new(None);
+
+/// Link an event to the trace it happened in: its span's, or the boot's while one is open.
 fn link_trace(mut event: sentry::protocol::Event<'static>) -> sentry::protocol::Event<'static> {
     let context = tracing::Span::current().context();
-    let span = context.span();
-    let span = span.span_context();
-    if span.is_valid() {
+    let current = context.span().span_context().clone();
+    let span = if current.is_valid() {
+        Some(current)
+    } else {
+        BOOTING
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    };
+    if let Some(span) = span.filter(opentelemetry::trace::SpanContext::is_valid) {
         event.contexts.insert(
             "trace".to_owned(),
             sentry::protocol::Context::Trace(Box::new(sentry::protocol::TraceContext {
@@ -254,12 +268,15 @@ pub fn set_remote_parent(span: &tracing::Span, traceparent: &str, tracestate: &s
 /// outside a recorded span.
 #[must_use]
 pub fn current_traceparent() -> Option<(String, String)> {
-    let context = tracing::Span::current().context();
+    traceparent_of(&tracing::Span::current().context())
+}
+
+fn traceparent_of(context: &Context) -> Option<(String, String)> {
     if !context.span().span_context().is_valid() {
         return None;
     }
     let mut carrier = HashMap::new();
-    TraceContextPropagator::new().inject_context(&context, &mut carrier);
+    TraceContextPropagator::new().inject_context(context, &mut carrier);
     let traceparent = carrier.remove("traceparent")?;
     Some((
         traceparent,

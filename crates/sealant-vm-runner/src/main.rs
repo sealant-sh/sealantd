@@ -6,9 +6,10 @@
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use clap::{Parser, ValueEnum};
+use sealant_observability::BootTrace;
 use tokio::net::{TcpListener, UdpSocket};
 
 use sealant_vm_runner::exit::{self, EXIT_SETUP_FAILED, ExitRecorder};
@@ -24,6 +25,18 @@ use sealant_vm_runner::vsock::{self, Mux};
 use sealant_vm_runner::{forward, jail, selftest};
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
+
+/// The release this build reports when `SENTRY_RELEASE` is unset (`sealantd@<version>`).
+const RELEASE: Option<&str> = option_env!("SENTRY_RELEASE");
+
+/// Sends the queued spans and errors when `main` returns, after its last log line.
+struct Flush;
+
+impl Drop for Flush {
+    fn drop(&mut self) {
+        sealant_observability::shutdown();
+    }
+}
 
 /// How long the boot channel may take to finish after the VMM exits.
 const BOOT_CHANNEL_DRAIN: Duration = Duration::from_secs(2);
@@ -98,13 +111,14 @@ struct Args {
 }
 
 fn main() -> ExitCode {
-    tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    let started = SystemTime::now();
+    // No thread yet: the privileged phase needs to be the only one. Spans are held until `run`.
+    sealant_observability::install(
+        "sealant-vm-runner",
+        tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+    );
+    let _flush = Flush;
     let args = Args::parse();
 
     if args.self_test {
@@ -128,7 +142,7 @@ fn main() -> ExitCode {
         };
     }
 
-    match setup(&args).and_then(|ready| run(&args, ready)) {
+    match setup(&args).and_then(|ready| run(&args, ready, started)) {
         Ok(code) => ExitCode::from(code),
         Err(e) => {
             tracing::error!("{e}");
@@ -145,10 +159,13 @@ struct Ready {
     policy: Policy,
     digest: String,
     upstreams: Option<Upstreams>,
+    /// When the privileged phase ran.
+    setup: (SystemTime, SystemTime),
 }
 
 /// The privileged phase, on the only thread: tap0, nftables, the drop, and its proof.
 fn setup(args: &Args) -> Result<Ready, Error> {
+    let setup_started = SystemTime::now();
     let digest = args
         .image_digest
         .clone()
@@ -204,6 +221,7 @@ fn setup(args: &Args) -> Result<Ready, Error> {
         policy,
         digest,
         upstreams,
+        setup: (setup_started, SystemTime::now()),
     })
 }
 
@@ -240,26 +258,55 @@ fn validate_digest(digest: &str) -> Result<(), Error> {
 
 /// The unprivileged phase: load the boot config, start the forwarders and vsock bridges, run the
 /// VMM, and answer the runner's exit code.
-fn run(args: &Args, ready: Ready) -> Result<u8, Error> {
+fn run(args: &Args, ready: Ready, started: SystemTime) -> Result<u8, Error> {
+    // Privileges are dropped: the exporter's and Sentry's threads may start.
+    sealant_observability::start(
+        &sealant_observability::Config::from_env().with_default_release(RELEASE),
+    );
     let files = StagedFiles::new(
         &args.sealant_run_dir,
         &args.images_dir,
         &ready.digest,
         args.mode,
     );
-    let boot = protocol::load_boot_config(
+    let loading = SystemTime::now();
+    let mut boot = protocol::load_boot_config(
         &files,
         args.mode,
         Some(GuestNetworkConfig::for_mac(&ready.mac)),
     )?;
+    // The launch, under the launcher's span; the guest's boot, under the launch.
+    let staged = boot.telemetry.take().unwrap_or_default();
+    let launch = BootTrace::begin(
+        "sealantd.vm.launch",
+        started,
+        staged
+            .traceparent
+            .as_deref()
+            .map(|parent| (parent, staged.tracestate.as_deref().unwrap_or_default())),
+    );
+    if let Some(launch) = &launch {
+        launch.stage("setup", ready.setup.0, ready.setup.1);
+        launch.stage("boot_config", loading, SystemTime::now());
+    }
+    boot.telemetry = Some(staged.for_guest(
+        launch.as_ref().and_then(BootTrace::traceparent),
+        |key| std::env::var(key).ok(),
+        RELEASE,
+    ));
     tracing::info!(?boot, "boot config loaded");
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    runtime.block_on(serve(args, ready, boot))
+    runtime.block_on(serve(args, ready, boot, launch))
 }
 
-async fn serve(args: &Args, ready: Ready, boot: VmBootConfig) -> Result<u8, Error> {
+async fn serve(
+    args: &Args,
+    ready: Ready,
+    boot: VmBootConfig,
+    launch: Option<BootTrace>,
+) -> Result<u8, Error> {
     if let Some(upstreams) = ready.upstreams {
         start_forwarders(&ready.policy, upstreams).await?;
     }
@@ -335,9 +382,17 @@ async fn serve(args: &Args, ready: Ready, boot: VmBootConfig) -> Result<u8, Erro
         if let Err(e) = jail::verify(Path::new(&format!("/proc/{pid}/status")), ready.kvm_gid) {
             child.start_kill()?;
             let _ = child.wait().await;
+            if let Some(launch) = &launch {
+                launch.end(false);
+            }
             return Err(format!("the VMM is not jailed: {e}").into());
         }
         tracing::info!(pid, "cloud-hypervisor started");
+    }
+    // Launched: the guest's boot carries on in its own trace span, under this one.
+    if let Some(launch) = &launch {
+        launch.reached("vmm_started");
+        launch.end(true);
     }
     let vmm_exit = vmm::supervise(
         &mut child,

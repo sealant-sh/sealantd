@@ -135,6 +135,54 @@ impl fmt::Debug for DotfilesArchive {
     }
 }
 
+/// Where the guest sends its traces and errors, and the trace its boot belongs to. Sealant
+/// stages it in the launch material; the runner fills what is missing from its own environment
+/// and makes its launch span the guest boot's parent.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Telemetry {
+    /// W3C: in the staged file the launcher's span, on the frame the runner's launch span.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub traceparent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tracestate: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sentry_dsn: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release: Option<String>,
+}
+
+impl Telemetry {
+    /// What the guest gets: what was staged, the runner's own `SENTRY_*` settings (`env`) where
+    /// the staged file names none, and the runner's launch span (`parent`) as the guest boot's
+    /// parent, or the launcher's when the launch is not recorded.
+    #[must_use]
+    pub fn for_guest(
+        self,
+        parent: Option<(String, String)>,
+        env: impl Fn(&str) -> Option<String>,
+        build_release: Option<&str>,
+    ) -> Self {
+        let env = |key: &str| env(key).filter(|value| !value.is_empty());
+        let (traceparent, tracestate) = match parent {
+            Some((parent, state)) => (Some(parent), Some(state).filter(|s| !s.is_empty())),
+            None => (self.traceparent, self.tracestate),
+        };
+        Self {
+            traceparent,
+            tracestate,
+            sentry_dsn: self.sentry_dsn.or_else(|| env("SENTRY_DSN")),
+            environment: self.environment.or_else(|| env("SENTRY_ENVIRONMENT")),
+            release: self
+                .release
+                .or_else(|| env("SENTRY_RELEASE"))
+                .or_else(|| build_release.filter(|r| !r.is_empty()).map(str::to_owned)),
+        }
+    }
+}
+
 /// Runner → guest, once, on the boot connection.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -155,6 +203,8 @@ pub struct VmBootConfig {
     pub executor_ca_pem: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network_config: Option<GuestNetworkConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub telemetry: Option<Telemetry>,
 }
 
 /// Names only: neither secret values, boot env values nor file contents reach a log line.
@@ -170,6 +220,7 @@ impl fmt::Debug for VmBootConfig {
             .field("dotfiles_archive", &self.dotfiles_archive)
             .field("executor_ca_pem", &self.executor_ca_pem.is_some())
             .field("network_config", &self.network_config)
+            .field("telemetry", &self.telemetry)
             .finish()
     }
 }
@@ -281,6 +332,8 @@ struct StagedLaunch {
     dockerd: bool,
     #[serde(default)]
     dotfiles_archive: Option<DotfilesArchive>,
+    #[serde(default)]
+    telemetry: Option<Telemetry>,
 }
 
 /// Where the staged files are.
@@ -388,6 +441,7 @@ pub fn load_boot_config(
             BootMode::Normal => network,
             BootMode::Recover => None,
         },
+        telemetry: launch.telemetry,
     })
 }
 
@@ -430,7 +484,7 @@ mod tests {
         .unwrap();
         std::fs::write(
             tmp.path().join("boot-env.json"),
-            r#"{"bootEnv":{"MEND_X":"1"},"secretEnv":{"TOKEN":"s3cret"},"dockerd":true,"dotfilesArchive":{"files":{"manifest.json":"e30=","home.tar":"c2VjcmV0LWZpbGU="}}}"#,
+            r#"{"bootEnv":{"MEND_X":"1"},"secretEnv":{"TOKEN":"s3cret"},"dockerd":true,"dotfilesArchive":{"files":{"manifest.json":"e30=","home.tar":"c2VjcmV0LWZpbGU="}},"telemetry":{"traceparent":"00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01","sentryDsn":"https://k@sentry.example.com/10"}}"#,
         )
         .unwrap();
         std::fs::write(
@@ -470,6 +524,14 @@ mod tests {
         assert_eq!(json["networkConfig"]["gateway"], "10.200.0.1");
         assert_eq!(json["networkConfig"]["dns"][0], "10.200.0.1");
         assert_eq!(json["networkConfig"]["mtu"], 1500);
+        assert_eq!(
+            json["telemetry"]["traceparent"],
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+        );
+        assert_eq!(
+            json["telemetry"]["sentryDsn"],
+            "https://k@sentry.example.com/10"
+        );
 
         let debug = format!("{config:?}");
         assert!(
@@ -486,6 +548,37 @@ mod tests {
                 && !debug.contains("on-the-command-line"),
             "{debug}"
         );
+    }
+
+    #[test]
+    fn the_guest_gets_the_launch_span_and_the_runners_settings_where_none_were_staged() {
+        let staged = Telemetry {
+            traceparent: Some("00-launcher-span".to_owned()),
+            environment: Some("preview".to_owned()),
+            ..Telemetry::default()
+        };
+        let env = |key: &str| match key {
+            "SENTRY_DSN" => Some("https://runner@sentry.example.com/10".to_owned()),
+            "SENTRY_ENVIRONMENT" => Some("production".to_owned()),
+            _ => None,
+        };
+        let guest = staged.clone().for_guest(
+            Some(("00-launch-span".to_owned(), String::new())),
+            env,
+            Some("sealantd@1.0.0"),
+        );
+        assert_eq!(guest.traceparent.as_deref(), Some("00-launch-span"));
+        assert_eq!(guest.tracestate, None);
+        assert_eq!(
+            guest.sentry_dsn.as_deref(),
+            Some("https://runner@sentry.example.com/10")
+        );
+        assert_eq!(guest.environment.as_deref(), Some("preview"));
+        assert_eq!(guest.release.as_deref(), Some("sealantd@1.0.0"));
+        // No launch span recorded: the launcher's span is the guest boot's parent.
+        let unrecorded = staged.for_guest(None, |_| None, None);
+        assert_eq!(unrecorded.traceparent.as_deref(), Some("00-launcher-span"));
+        assert_eq!(unrecorded.sentry_dsn, None);
     }
 
     #[test]

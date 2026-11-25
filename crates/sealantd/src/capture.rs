@@ -3362,6 +3362,7 @@ mod tests {
             executor_ca_pem: None,
             network_config: None,
             dockerd: true,
+            telemetry: None,
         };
         let env = assemble(&boot, &Extras::default());
         assert_eq!(

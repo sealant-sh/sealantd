@@ -67,6 +67,10 @@ const PROCESS_ENV_KEYS: &[&str] = &[
     "SEALANT_SFTP_SERVER_PATH",
     "SEALANT_DOTFILES_MAX_UNPACKED_BYTES",
     "SEALANT_DOTFILES_MAX_FILE_BYTES",
+    // The daemon's own telemetry, from the boot config's `telemetry` (`crate::telemetry`).
+    "SEALANT_SENTRY_DSN",
+    "SEALANT_SENTRY_ENVIRONMENT",
+    "SEALANT_SENTRY_RELEASE",
 ];
 
 /// The entries of `env` PID 1 sets in its own process environment ([`PROCESS_ENV_KEYS`], and
@@ -175,6 +179,19 @@ pub fn assemble(boot: &VmBootConfig, extras: &Extras) -> VmEnv {
     }
     env.entry("SEALANT_CAPTURE_DIAL".to_owned())
         .or_insert_with(|| CAPTURE_DIAL.to_owned());
+    // The runner's word on telemetry wins over anything the image or boot env says.
+    if let Some(telemetry) = &boot.telemetry {
+        for (key, value) in [
+            ("SEALANT_SENTRY_DSN", &telemetry.sentry_dsn),
+            ("SEALANT_SENTRY_ENVIRONMENT", &telemetry.environment),
+            ("SEALANT_SENTRY_RELEASE", &telemetry.release),
+        ] {
+            match value {
+                Some(value) => env.insert(key.to_owned(), value.clone()),
+                None => env.remove(key),
+            };
+        }
+    }
     // The launcher's secrets arrive in the frame and are handed to boot in memory, never as a
     // file a variable points at.
     env.remove("SEALANT_SECRET_ENV_FILE");
@@ -376,6 +393,7 @@ mod tests {
             executor_ca_pem: Some(CA.to_owned()),
             network_config: None,
             dockerd: true,
+            telemetry: None,
         }
     }
 
@@ -385,6 +403,44 @@ mod tests {
             session_endpoint: Some("http://127.0.0.1:41000".to_owned()),
             dotfiles_dir: Some(PathBuf::from(DOTFILES_ARCHIVE_DIR)),
         }
+    }
+
+    #[test]
+    fn the_runners_telemetry_reaches_the_daemons_own_environment() {
+        let mut boot = boot(VmMode::Normal);
+        // The image's own DSN is the user's; the runner's says where the daemon reports.
+        boot.config
+            .env
+            .push("SENTRY_DSN=https://theirs@sentry.example.com/1".to_owned());
+        boot.boot_env.insert(
+            "SEALANT_SENTRY_RELEASE".to_owned(),
+            "from-the-boot-env".to_owned(),
+        );
+        boot.telemetry = Some(crate::vm::protocol::Telemetry {
+            sentry_dsn: Some("https://ours@sentry.example.com/10".to_owned()),
+            environment: Some("preview".to_owned()),
+            ..Default::default()
+        });
+        let env = assemble(&boot, &extras());
+        let process = process_env(&env);
+        let get = |key: &str| {
+            process
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.as_str())
+        };
+        assert_eq!(
+            get("SEALANT_SENTRY_DSN"),
+            Some("https://ours@sentry.example.com/10")
+        );
+        assert_eq!(get("SEALANT_SENTRY_ENVIRONMENT"), Some("preview"));
+        assert_eq!(get("SEALANT_SENTRY_RELEASE"), None);
+        // Boot consumes the daemon's keys (`boot::config`), so the harness keeps the image's.
+        assert_eq!(get("SENTRY_DSN"), None);
+        assert_eq!(
+            env.get("SENTRY_DSN").as_deref(),
+            Some("https://theirs@sentry.example.com/1")
+        );
     }
 
     #[test]
