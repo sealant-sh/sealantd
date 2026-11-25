@@ -15,6 +15,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use collector::{Collector, Received, contains};
+use sealant_process::spawn::CommandGateExt as _;
 
 const TRACE_ID: &str = "5b8aa5a2d2c872e8321cf37308d69df2";
 const TRACEPARENT: &str = "00-5b8aa5a2d2c872e8321cf37308d69df2-051581bf3cb55c13-01";
@@ -47,11 +48,12 @@ fn boot(tmp: &Path, collector: &Collector, setup: &str) -> (std::process::ExitSt
     let git = Command::new("git")
         .args(["init", "-q"])
         .current_dir(&repo)
-        .status()
+        .output_gated()
         .expect("git init");
-    assert!(git.success());
+    assert!(git.status.success());
     let log = tmp.join("boot.log");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_sealantd"))
+    let mut boot = Command::new(env!("CARGO_BIN_EXE_sealantd"));
+    boot
         // `off`, as a launcher may set it: export must not depend on the log level. The log
         // file gets the boot's own errors, printed when it fails.
         .args(["boot", "--log-level", "off"])
@@ -73,9 +75,9 @@ fn boot(tmp: &Path, collector: &Collector, setup: &str) -> (std::process::ExitSt
         .env("SEALANT_TRACEPARENT", TRACEPARENT)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(std::fs::File::create(&log).expect("log file"))
-        .spawn()
-        .expect("spawn sealantd boot");
+        .stderr(std::fs::File::create(&log).expect("log file"));
+    let (mut child, _spawned) =
+        sealant_process::spawn::spawn_std(&mut boot).expect("spawn sealantd boot");
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         if let Some(status) = child.try_wait().expect("wait") {
