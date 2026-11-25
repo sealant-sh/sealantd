@@ -1777,13 +1777,12 @@ impl TryFrom<wire::ControlRequest> for ControlRequest {
             request_id: RequestId::new(r.request_id),
             command: command.try_into()?,
             // An empty traceparent is no trace at all.
-            trace: r
-                .trace
-                .filter(|t| !t.traceparent.is_empty())
-                .map(|t| TraceContext {
+            trace: r.trace.filter(|t| !t.traceparent.is_empty()).map(|t| {
+                Box::new(TraceContext {
                     traceparent: t.traceparent,
                     tracestate: t.tracestate,
-                }),
+                })
+            }),
         })
     }
 }
@@ -1899,7 +1898,7 @@ impl From<ClientMessage> for wire::ClientMessage {
     fn from(m: ClientMessage) -> Self {
         use wire::client_message::Message as W;
         let message = match m {
-            ClientMessage::Request(r) => W::Request(r.into()),
+            ClientMessage::Request(r) => W::Request(Box::new(r.into())),
             ClientMessage::Stream(f) => W::Stream(stream_frame_to_wire(f)),
         };
         Self {
@@ -1915,7 +1914,7 @@ impl TryFrom<wire::ClientMessage> for ClientMessage {
             .message
             .ok_or(WireError::MissingOneof("ClientMessage.message"))?
         {
-            W::Request(r) => Ok(ClientMessage::Request(r.try_into()?)),
+            W::Request(r) => Ok(ClientMessage::Request((*r).try_into()?)),
             W::Stream(f) => Ok(ClientMessage::Stream(stream_frame_from_wire(f)?)),
         }
     }
@@ -2290,7 +2289,7 @@ mod tests {
 
         // An empty traceparent is no trace.
         let empty = wire::ClientMessage {
-            message: Some(wire::client_message::Message::Request(
+            message: Some(wire::client_message::Message::Request(Box::new(
                 wire::ControlRequest {
                     schema_version: crate::SCHEMA_VERSION,
                     request_id: "req_e".to_owned(),
@@ -2299,7 +2298,7 @@ mod tests {
                     }),
                     trace: Some(wire::TraceContext::default()),
                 },
-            )),
+            ))),
         }
         .encode_to_vec();
         let Ok(ClientMessage::Request(request)) = decode_client(&empty) else {
@@ -2354,7 +2353,7 @@ mod tests {
     #[test]
     fn an_empty_capture_flush_is_a_suspend_flush() {
         let old = wire::ClientMessage {
-            message: Some(wire::client_message::Message::Request(
+            message: Some(wire::client_message::Message::Request(Box::new(
                 wire::ControlRequest {
                     schema_version: crate::SCHEMA_VERSION,
                     request_id: "req_old".to_owned(),
@@ -2365,7 +2364,7 @@ mod tests {
                     }),
                     trace: None,
                 },
-            )),
+            ))),
         }
         .encode_to_vec();
         let Ok(ClientMessage::Request(request)) = decode_client(&old) else {

@@ -19,9 +19,9 @@ pub struct ControlRequest {
     pub request_id: RequestId,
     /// The command to execute.
     pub command: Command,
-    /// The caller's trace context, when the caller is in a trace.
+    /// The caller's trace context, when the caller is in a trace. Boxed: most requests have none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub trace: Option<TraceContext>,
+    pub trace: Option<Box<TraceContext>>,
 }
 
 impl ControlRequest {
@@ -38,7 +38,7 @@ impl ControlRequest {
     /// The same request, carrying `trace`.
     #[must_use]
     pub fn with_trace(mut self, trace: TraceContext) -> Self {
-        self.trace = Some(trace);
+        self.trace = Some(Box::new(trace));
         self
     }
 }
