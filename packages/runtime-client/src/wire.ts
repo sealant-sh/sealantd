@@ -32,11 +32,43 @@ export class SealantError extends Error {
 /** The init shape of the `Command` oneof (what callers pass to `SealantClient.request`). */
 export type CommandInit = MessageInitShape<typeof CommandSchema>["command"];
 
-export function requestFrame(requestId: string, command: CommandInit): Uint8Array {
+/**
+ * A W3C trace context (https://www.w3.org/TR/trace-context/), or a bare `traceparent`
+ * (`00-<32 hex trace id>-<16 hex parent span id>-<2 hex flags>`). The daemon makes the span it
+ * starts for a request a child of it, so the request shows in the caller's trace.
+ */
+export type TraceInput = string | { traceparent: string; tracestate?: string };
+
+/** The wire field's shape. */
+type WireTrace = { traceparent: string; tracestate: string };
+
+const TRACEPARENT = /^[0-9a-f]{2}-(?!0{32})[0-9a-f]{32}-(?!0{16})[0-9a-f]{16}-[0-9a-f]{2}$/;
+// The W3C limit for tracestate (32 members of at most 256 bytes, kept well inside one frame).
+const MAX_TRACESTATE = 512;
+
+/**
+ * The trace context to put on the wire, or undefined when `input` is not a valid one. A bad trace
+ * is dropped, never thrown: tracing must not fail a request.
+ */
+export function wireTrace(input: TraceInput | undefined): WireTrace | undefined {
+  if (input === undefined) return undefined;
+  const { traceparent, tracestate } =
+    typeof input === "string" ? { traceparent: input, tracestate: undefined } : input;
+  if (typeof traceparent !== "string" || !TRACEPARENT.test(traceparent)) return undefined;
+  const state =
+    typeof tracestate === "string" && tracestate.length <= MAX_TRACESTATE ? tracestate : "";
+  return { traceparent, tracestate: state };
+}
+
+export function requestFrame(
+  requestId: string,
+  command: CommandInit,
+  trace?: WireTrace,
+): Uint8Array {
   const message = create(ClientMessageSchema, {
     message: {
       case: "request",
-      value: { schemaVersion: SCHEMA_VERSION, requestId, command: { command } },
+      value: { schemaVersion: SCHEMA_VERSION, requestId, command: { command }, trace },
     },
   });
   return encodeFrame(encodeClient(message));

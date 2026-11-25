@@ -13,6 +13,10 @@
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
+    },
+    "./effect": {
+      "types": "./dist/effect.d.ts",
+      "import": "./dist/effect.js"
     }
   },
   "files": [
@@ -32,7 +36,18 @@
     "prepublishOnly": "pnpm run build"
   },
   "dependencies": {
-    "@sealant/runtime-protocol": "workspace:*",
-    "@bufbuild/protobuf": "^2.12.0"
+    "@bufbuild/protobuf": "^2.12.0",
+    "@sealant/runtime-protocol": "workspace:*"
+  },
+  "peerDependencies": {
+    "effect": "^4.0.5"
+  },
+  "peerDependenciesMeta": {
+    "effect": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "effect": "^4.0.5"
   }
 }
