@@ -1,5 +1,6 @@
 packages:
   - packages/*
+# buf's install script only checks the binary its platform package already ships. pnpm 11 refuses
+# to install while a package's build is left unanswered.
 allowBuilds:
-  '@bufbuild/buf': set this to true or false
-  protobufjs: set this to true or false
+  '@bufbuild/buf': false
