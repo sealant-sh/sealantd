@@ -196,9 +196,12 @@ pub fn run(nft_bin: &str, args: &[&str], stdin: Option<&str>) -> Result<String, 
         .stderr(Stdio::piped())
         .spawn()
         .map_err(spawn_err)?;
-    if let (Some(text), Some(mut pipe)) = (stdin, child.stdin.take()) {
-        pipe.write_all(text.as_bytes()).map_err(spawn_err)?;
-    }
+    // An nft that refuses can exit before it reads its input, and the write then fails with a
+    // broken pipe: its exit status and stderr say why, so they are what is reported.
+    let written = match (stdin, child.stdin.take()) {
+        (Some(text), Some(mut pipe)) => pipe.write_all(text.as_bytes()),
+        _ => Ok(()),
+    };
     let output = child.wait_with_output().map_err(spawn_err)?;
     if !output.status.success() {
         return Err(NftError::Refused {
@@ -207,11 +210,38 @@ pub fn run(nft_bin: &str, args: &[&str], stdin: Option<&str>) -> Result<String, 
             stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
         });
     }
+    // It succeeded without reading what it was given: nothing says the ruleset was applied.
+    written.map_err(spawn_err)?;
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 #[cfg(test)]
 mod tests {
+    /// A refusal that exits before it reads its input is reported as a refusal, every time: the
+    /// write's broken pipe never hides it. The batch is larger than a pipe's buffer, so the write
+    /// always meets the closed pipe.
+    #[test]
+    fn a_refusal_before_the_input_is_read_is_still_a_refusal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let nft = tmp.path().join("nft");
+        std::fs::write(
+            &nft,
+            "#!/bin/sh\necho 'Operation not permitted' >&2\nexit 1\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&nft, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        let batch = "add table inet t\n".repeat(64 * 1024);
+        for _ in 0..20 {
+            match apply(nft.to_str().unwrap(), &batch) {
+                Err(NftError::Refused { stderr, .. }) => {
+                    assert!(stderr.contains("Operation not permitted"), "{stderr}");
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+    }
+
     use super::*;
 
     fn policy(mode: BootMode, egress: Egress) -> Policy {
