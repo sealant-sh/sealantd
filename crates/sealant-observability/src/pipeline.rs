@@ -4,7 +4,8 @@
 //! until it has dropped privileges, yet both make spans before then. [`Deferred`] is the
 //! provider's processor from the start: it holds up to [`PENDING`] finished spans until
 //! [`Deferred::run`] gives it the batch processor (whose thread starts then) or [`Deferred::off`]
-//! drops them. Its [`Sampler`] records nothing once the pipeline is off.
+//! drops them. Its [`Sampler`] records nothing once the pipeline is off, and begins a trace only
+//! for a span that may start one ([`conventions::starts_trace`]).
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -188,7 +189,9 @@ impl SpanProcessor for Deferred {
     }
 }
 
-/// Parent-based: a caller's sampled flag decides; a new trace is kept at the configured rate.
+/// Parent-based: a caller's sampled flag decides. A span with no parent begins a trace, kept at the
+/// configured rate, only when it is a boot or a request someone made ([`conventions::starts_trace`]);
+/// any other is dropped, and so are the spans under it.
 #[derive(Clone, Debug)]
 pub(crate) struct Sampler(pub(crate) Arc<Shared>);
 
@@ -202,19 +205,85 @@ impl ShouldSample for Sampler {
         attributes: &[KeyValue],
         links: &[Link],
     ) -> SamplingResult {
-        if self.0.is_off() {
+        use opentelemetry::trace::TraceContextExt as _;
+        let parented = parent_context
+            .is_some_and(|cx| cx.has_active_span() && cx.span().span_context().is_valid());
+        if self.0.is_off() || (!parented && !conventions::starts_trace(name)) {
             return SamplingResult {
                 decision: SamplingDecision::Drop,
                 attributes: Vec::new(),
                 trace_state: parent_context
-                    .map(|cx| {
-                        use opentelemetry::trace::TraceContextExt as _;
-                        cx.span().span_context().trace_state().clone()
-                    })
+                    .map(|cx| cx.span().span_context().trace_state().clone())
                     .unwrap_or_default(),
             };
         }
         SdkSampler::ParentBased(Box::new(SdkSampler::TraceIdRatioBased(self.0.rate())))
             .should_sample(parent_context, trace_id, name, span_kind, attributes, links)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use opentelemetry::trace::{SpanContext, SpanId, TraceContextExt as _, TraceFlags, TraceState};
+
+    fn decide(name: &str, parent: Option<&Context>) -> SamplingDecision {
+        Sampler(Shared::new())
+            .should_sample(
+                parent,
+                TraceId::from_bytes([7; 16]),
+                name,
+                &SpanKind::Server,
+                &[],
+                &[],
+            )
+            .decision
+    }
+
+    fn caller(flags: TraceFlags) -> Context {
+        Context::new().with_remote_span_context(SpanContext::new(
+            TraceId::from_bytes([1; 16]),
+            SpanId::from_bytes([2; 8]),
+            flags,
+            true,
+            TraceState::default(),
+        ))
+    }
+
+    #[test]
+    fn a_health_check_records_only_inside_a_callers_sampled_trace() {
+        let health = "sealantd.control.runtime.health";
+        assert_eq!(decide(health, None), SamplingDecision::Drop);
+        assert_eq!(
+            decide(health, Some(&Context::new())),
+            SamplingDecision::Drop
+        );
+        assert_eq!(
+            decide(health, Some(&caller(TraceFlags::SAMPLED))),
+            SamplingDecision::RecordAndSample
+        );
+        assert_eq!(
+            decide(health, Some(&caller(TraceFlags::default()))),
+            SamplingDecision::Drop
+        );
+    }
+
+    #[test]
+    fn a_spawn_with_no_parent_begins_no_trace_and_a_boot_or_request_does() {
+        assert_eq!(
+            decide("sealantd.process.spawn", None),
+            SamplingDecision::Drop
+        );
+        assert_eq!(
+            decide("sealantd.process.spawn", Some(&caller(TraceFlags::SAMPLED))),
+            SamplingDecision::RecordAndSample
+        );
+        for name in ["sealantd.boot", "sealantd.control.exec"] {
+            assert_eq!(
+                decide(name, None),
+                SamplingDecision::RecordAndSample,
+                "{name}"
+            );
+        }
     }
 }

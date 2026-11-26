@@ -1,6 +1,6 @@
 //! A container boot is one trace under the launcher's span (`SEALANT_TRACEPARENT`): a
-//! `sealantd.boot` span with a child per stage, and an error during the boot linked to it
-//! (SLNT-1351). `SEALANT_SENTRY_DSN` points the real `sealantd boot` at a loopback stand-in for
+//! `sealantd.boot` span with a child per stage and per process it spawns, and an error during the
+//! boot linked to it (SLNT-1351, SLNT-1386). `SEALANT_SENTRY_DSN` points the real `sealantd boot` at a loopback stand-in for
 //! Sentry, which keeps every byte it is sent.
 //!
 //! Root's work (boot makes `/run/sealant`): these run only with `SEALANTD_REQUIRE_ROOT_TESTS=1`,
@@ -116,7 +116,7 @@ fn a_boot_is_one_trace_with_a_span_per_stage() {
     }
     let collector = Collector::start();
     let tmp = tempfile::tempdir().expect("tempdir");
-    let (status, log) = boot(tmp.path(), &collector, "[]");
+    let (status, log) = boot(tmp.path(), &collector, r#"[{"run":"true"}]"#);
     assert!(status.success(), "{status}: {log}");
     let received = collected(&collector, b"sealantd.boot.harness_started");
     let spans = otlp(&received);
@@ -153,6 +153,24 @@ fn a_boot_is_one_trace_with_a_span_per_stage() {
         Some("runtime healthy")
     );
     assert_eq!(healthy.parent_span_id, root.span_id);
+    // One trace: the setup step's and the harness's spawns are the boot's, not traces of their
+    // own (SLNT-1386).
+    let spawns: Vec<_> = spans
+        .iter()
+        .filter(|s| s.name == "sealantd.process.spawn")
+        .collect();
+    assert_eq!(spawns.len(), 2, "the setup step and the harness: {spans:?}");
+    for spawn in spawns {
+        assert_eq!(spawn.parent_span_id, root.span_id);
+    }
+    for span in &spans {
+        assert_eq!(
+            span.trace_id,
+            hex(TRACE_ID),
+            "{} is in another trace",
+            span.name
+        );
+    }
 }
 
 #[test]

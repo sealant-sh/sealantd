@@ -18,6 +18,7 @@ pub(crate) struct Received {
 #[derive(Clone, Debug)]
 pub(crate) struct Exported {
     pub(crate) name: String,
+    pub(crate) trace_id: Vec<u8>,
     pub(crate) span_id: Vec<u8>,
     pub(crate) parent_span_id: Vec<u8>,
     pub(crate) attributes: Vec<(String, String)>,
@@ -51,6 +52,7 @@ pub(crate) fn exported_spans(received: &[Received]) -> Vec<Exported> {
         .flat_map(|scope| scope.spans)
         .map(|span| Exported {
             name: span.name,
+            trace_id: span.trace_id,
             span_id: span.span_id,
             parent_span_id: span.parent_span_id,
             // `STATUS_CODE_ERROR`.

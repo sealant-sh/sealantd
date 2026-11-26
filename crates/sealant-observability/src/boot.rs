@@ -5,7 +5,8 @@
 //! boot config that names its parent arrives), so a stage is recorded with the times it ran
 //! ([`BootTrace::stage`]). The others are measured from the boot's start ([`BootTrace::reached`]),
 //! or are ordinary spans made children of the boot ([`BootTrace::adopt`]). Every stage span
-//! carries `sealant.boot.stage`.
+//! carries `sealant.boot.stage`. Work the boot does itself, such as spawning its lifecycle steps
+//! and harness, runs in [`BootTrace::in_scope`] so its spans join the boot's trace.
 
 use std::borrow::Cow;
 use std::sync::Mutex;
@@ -87,6 +88,15 @@ impl BootTrace {
     /// Make `span` (not yet entered) a stage of this boot.
     pub fn adopt(&self, span: &tracing::Span) {
         let _ = span.set_parent(self.cx.clone());
+    }
+
+    /// Run `f` with the boot's span as the current context, while the boot is open: a span `f`
+    /// makes with no parent of its own (a process the boot spawns) is the boot's child, not a
+    /// trace of its own. Once the boot has ended, `f` runs as it is.
+    pub fn in_scope<R>(&self, f: impl FnOnce() -> R) -> R {
+        let open = !*self.ended.lock().unwrap_or_else(PoisonError::into_inner);
+        let _current = open.then(|| self.cx.clone().attach());
+        f()
     }
 
     /// The boot's span as a W3C `(traceparent, tracestate)`, for a process it starts; None when

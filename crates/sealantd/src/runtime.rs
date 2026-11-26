@@ -1061,7 +1061,8 @@ impl Runtime {
 
     /// Spawn a managed process through the process runtime so its stdout/stderr flow onto the event
     /// bus and its lifecycle is registered/reaped like any control-driven `exec`. Used by the boot
-    /// supervisor to run lifecycle steps and the harness with full telemetry.
+    /// supervisor to run lifecycle steps and the harness with full telemetry. While the boot is
+    /// open, the spawn's span is a child of the boot's, not a trace of its own.
     ///
     /// # Errors
     /// Returns a [`ControlError`] if arguments are invalid or the process cannot be spawned.
@@ -1073,7 +1074,7 @@ impl Runtime {
             return Err(Self::admission_closed_error());
         }
         let session = self.session_mark(&args);
-        self.processes.exec(args, None, session)
+        crate::telemetry::in_boot(|| self.processes.exec(args, None, session))
     }
 
     /// Subscribe to the telemetry event bus (used by the boot supervisor to await a managed
