@@ -78,6 +78,15 @@ pub(crate) fn boot_reached(stage: &'static str) {
     }
 }
 
+/// Run `f` under the boot's span while the boot is open: the spans it makes with no parent of
+/// their own (a lifecycle step's or the harness's spawn) are the boot's.
+pub(crate) fn in_boot<R>(f: impl FnOnce() -> R) -> R {
+    match BOOT.get() {
+        Some(boot) => boot.in_scope(f),
+        None => f(),
+    }
+}
+
 /// End the boot: it finished (`ok`) or it never will.
 pub(crate) fn end_boot(ok: bool) {
     if let Some(boot) = BOOT.get() {

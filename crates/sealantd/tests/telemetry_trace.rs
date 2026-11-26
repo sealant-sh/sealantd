@@ -36,18 +36,23 @@ fn traced(id: &str, command: Command) -> ControlRequest {
     })
 }
 
-#[tokio::test]
-async fn a_traced_request_is_exported_in_the_callers_trace_and_no_canary_with_it() {
-    let collector = Collector::start();
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let log = std::fs::File::create(tmp.path().join("daemon.log")).expect("log file");
+/// The real daemon over stdio, exporting to `collector`.
+fn daemon(
+    tmp: &std::path::Path,
+    collector: &Collector,
+) -> (
+    tokio::process::Child,
+    tokio::process::ChildStdin,
+    tokio::process::ChildStdout,
+) {
+    let log = std::fs::File::create(tmp.join("daemon.log")).expect("log file");
     let (mut child, _spawned) = sealant_process::spawn::spawn_tokio(
         tokio::process::Command::new(env!("CARGO_BIN_EXE_sealantd"))
             // `off`, as the TypeScript client spawns it: export must not depend on the log level.
             .args(["--stdio", "--log-level", "off", "--workspace"])
-            .arg(tmp.path())
+            .arg(tmp)
             .env_clear()
-            .env("TMPDIR", tmp.path())
+            .env("TMPDIR", tmp)
             .env("PATH", std::env::var("PATH").unwrap_or_default())
             .env("SEALANT_SENTRY_DSN", collector.dsn())
             .env("SEALANT_SENTRY_ENVIRONMENT", "test")
@@ -58,12 +63,41 @@ async fn a_traced_request_is_exported_in_the_callers_trace_and_no_canary_with_it
             .kill_on_drop(true),
     )
     .expect("spawn sealantd");
-    let mut stdin = child.stdin.take().expect("stdin");
-    let mut stdout = child.stdout.take().expect("stdout");
-    let send = async |stdin: &mut tokio::process::ChildStdin, request: ControlRequest| {
-        let body = sealant_protocol::encode_client(&ClientMessage::Request(request));
-        write_frame(stdin, &body, MAX).await.expect("write frame");
-    };
+    let stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    (child, stdin, stdout)
+}
+
+async fn send(stdin: &mut tokio::process::ChildStdin, request: ControlRequest) {
+    let body = sealant_protocol::encode_client(&ClientMessage::Request(request));
+    write_frame(stdin, &body, MAX).await.expect("write frame");
+}
+
+/// Wait for the response to each of `count` requests.
+async fn answers(stdout: &mut tokio::process::ChildStdout, count: usize) {
+    let mut answered = 0;
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while answered < count {
+            let body = read_frame(stdout, MAX)
+                .await
+                .expect("read frame")
+                .expect("frame present");
+            if let ServerMessage::Response(_) =
+                sealant_protocol::decode_server(&body).expect("decode")
+            {
+                answered += 1;
+            }
+        }
+    })
+    .await
+    .expect("every request answered");
+}
+
+#[tokio::test]
+async fn a_traced_request_is_exported_in_the_callers_trace_and_no_canary_with_it() {
+    let collector = Collector::start();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (mut child, mut stdin, mut stdout) = daemon(tmp.path(), &collector);
 
     send(
         &mut stdin,
@@ -213,4 +247,51 @@ async fn a_traced_request_is_exported_in_the_callers_trace_and_no_canary_with_it
             request.path
         );
     }
+}
+
+/// A health check, a capabilities probe or a stop with no caller trace sends no span (they
+/// flooded Sentry's trace list, SLNT-1386); a health check inside a caller's trace is a span of it.
+#[tokio::test]
+async fn housekeeping_sends_a_span_only_inside_a_callers_trace() {
+    let collector = Collector::start();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (mut child, mut stdin, mut stdout) = daemon(tmp.path(), &collector);
+    let plain = |id: &str, command| ControlRequest::new(RequestId::new(id), command);
+    send(&mut stdin, plain("h1", Command::RuntimeHealth)).await;
+    send(&mut stdin, plain("c1", Command::RuntimeGetCapabilities)).await;
+    send(&mut stdin, traced("h2", Command::RuntimeHealth)).await;
+    answers(&mut stdout, 3).await;
+    send(
+        &mut stdin,
+        plain(
+            "s1",
+            Command::RuntimeGracefulShutdown {
+                grace_millis: Some(5_000),
+            },
+        ),
+    )
+    .await;
+    let status = tokio::time::timeout(Duration::from_secs(20), child.wait())
+        .await
+        .expect("the daemon exits")
+        .expect("wait");
+    drop(stdin);
+    assert!(status.code().is_some(), "{status}");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let received = loop {
+        let received = collector.received();
+        if !exported_spans(&received).is_empty() || Instant::now() > deadline {
+            break received;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    let spans = exported_spans(&received);
+    let names: Vec<&str> = spans.iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(names, ["sealantd.control.runtime.health"], "{spans:?}");
+    let health = &spans[0];
+    assert_eq!(health.attribute("sealantd.request_id"), Some("h2"));
+    assert_eq!(health.trace_id, hex(TRACE_ID));
+    assert_eq!(health.parent_span_id, hex(&TRACEPARENT[36..52]));
+    assert_sentry_shows(&spans);
 }

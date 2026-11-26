@@ -132,6 +132,35 @@ pub(crate) fn describe(name: &str, attributes: &[KeyValue]) -> (Cow<'static, str
     (op.into(), name.to_owned())
 }
 
+/// Control methods a launcher or gateway calls to watch the daemon or to stop it: readiness polls,
+/// capability probes, metrics and capture status, the lease check and the stop. Each is a span in
+/// a caller's trace. Without one it starts none, or Sentry's trace list fills with them.
+const HOUSEKEEPING: &[&str] = &[
+    "runtime.health",
+    "runtime.getCapabilities",
+    "runtime.gracefulShutdown",
+    "getRuntimeMetrics",
+    "capture.status",
+    "lease.epoch",
+];
+
+/// Whether a span named `name` may begin a trace of its own when nothing it ran under (a
+/// caller's trace, a boot) is recorded. A boot may, and so may a request someone made of the
+/// daemon or the egress proxy, except housekeeping ([`HOUSEKEEPING`] and the proxy's heartbeat).
+/// Anything else with no parent (a spawn, a capture, work no caller started) sends nothing.
+pub(crate) fn starts_trace(name: &str) -> bool {
+    if let Some(method) = name.strip_prefix("sealantd.control.") {
+        return !HOUSEKEEPING.contains(&method);
+    }
+    if let Some(route) = name.strip_prefix("sealantd.proxy.admin.") {
+        return route != "heartbeat";
+    }
+    matches!(
+        name,
+        "sealantd.boot" | "sealantd.vm.boot" | "sealantd.vm.launch"
+    )
+}
+
 /// What a boot stage did, in words.
 fn stage_description(name: &str, stage: &str) -> String {
     let launch = name.starts_with("sealantd.vm.launch.");
@@ -252,6 +281,37 @@ mod tests {
                 (got_op.as_ref(), got_description.as_str()),
                 (*op, *description)
             );
+        }
+    }
+
+    #[test]
+    fn only_a_boot_or_a_request_someone_made_begins_a_trace() {
+        for name in [
+            "sealantd.boot",
+            "sealantd.vm.boot",
+            "sealantd.vm.launch",
+            "sealantd.control.exec",
+            "sealantd.control.openSession",
+            "sealantd.control.runtime.kill",
+            "sealantd.proxy.admin.policy",
+        ] {
+            assert!(starts_trace(name), "{name}");
+        }
+        for name in [
+            "sealantd.control.runtime.health",
+            "sealantd.control.runtime.getCapabilities",
+            "sealantd.control.runtime.gracefulShutdown",
+            "sealantd.control.getRuntimeMetrics",
+            "sealantd.control.capture.status",
+            "sealantd.control.lease.epoch",
+            "sealantd.proxy.admin.heartbeat",
+            "sealantd.process.spawn",
+            "sealantd.session.spawn",
+            "sealantd.boot.harness_started",
+            "sealantd.capture.seal",
+            "sealantd.control",
+        ] {
+            assert!(!starts_trace(name), "{name}");
         }
     }
 

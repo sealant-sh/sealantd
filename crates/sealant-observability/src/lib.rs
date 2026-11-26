@@ -238,7 +238,8 @@ fn link_trace(mut event: sentry::protocol::Event<'static>) -> sentry::protocol::
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
     };
-    if let Some(span) = span.filter(opentelemetry::trace::SpanContext::is_valid) {
+    // A span the sampler dropped has a valid context but no trace in Sentry to link to.
+    if let Some(span) = span.filter(|span| span.is_valid() && span.is_sampled()) {
         event.contexts.insert(
             "trace".to_owned(),
             sentry::protocol::Context::Trace(Box::new(sentry::protocol::TraceContext {
