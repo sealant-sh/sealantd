@@ -4,9 +4,9 @@
 //! semantic ones (`http.request.method`, `db.system.name`, `rpc.service`, `messaging.system`),
 //! and a description only from `sentry.description`. Without them every span reads `default`
 //! with a blank description, and its release is unset unless it carries `sentry.release`. So
-//! every span leaving the process passes through [`finish`], which adds the three (and the
-//! environment) from the span's name, its attributes and [`Common`]. A span that sets its own
-//! `sentry.op` or `sentry.description` keeps it.
+//! every span leaving the process passes through [`finish`], which adds the op and description
+//! from the span's name and attributes, then the release, environment and [`crate::tag`]s. A
+//! span that sets its own `sentry.op` or `sentry.description` keeps it.
 //!
 //! The operation's first segment is Sentry's span category where one fits (`rpc`, `http`,
 //! `subprocess`, `file`); the daemon's own work (a boot, a microVM launch) gets a `sealantd.*`
@@ -136,7 +136,7 @@ pub(crate) fn describe(name: &str, attributes: &[KeyValue]) -> (Cow<'static, str
 fn stage_description(name: &str, stage: &str) -> String {
     let launch = name.starts_with("sealantd.vm.launch.");
     match (launch, stage) {
-        (true, "setup") => "set up jail and network",
+        (true, "setup") => "set up network and jail",
         (true, "boot_config") => "load boot config",
         (true, "vmm_started") => "start VMM",
         (false, "disk_layout") => "lay out disks",
