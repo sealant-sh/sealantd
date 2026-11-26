@@ -117,6 +117,7 @@ fn a_canary_never_reaches_the_exporters_and_the_trace_still_does() {
     );
     assert_eq!(request.attribute("sentry.environment"), Some("development"));
     assert!(!request.failed, "the request was answered");
+    assert_eq!(request.trace_id, hex(TRACE_ID));
     let spawn = spans
         .iter()
         .find(|s| s.name == "sealantd.process.spawn")
