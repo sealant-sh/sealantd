@@ -270,9 +270,17 @@ impl ProcessRuntime {
 
         // Spawn under the reap gate: the pid must be registered before the orphan reaper can peek
         // at it, or a fast-exiting child gets misread as an adopted orphan and its status stolen.
-        let (mut child, spawned_pid) = tracing::info_span!("sealantd.process.spawn")
+        let spawn = tracing::info_span!(
+            "sealantd.process.spawn",
+            otel.status_code = tracing::field::Empty,
+        );
+        let (mut child, spawned_pid) = spawn
             .in_scope(|| crate::spawn::spawn_tokio(&mut command))
-            .map_err(|e| ControlError::process_start_failed(format!("{}: {e}", args.executable)))?;
+            .map_err(|e| {
+            spawn.record("otel.status_code", "ERROR");
+            ControlError::process_start_failed(format!("{}: {e}", args.executable))
+        })?;
+        drop(spawn);
 
         let pid = spawned_pid.pid();
         // process_group(0) makes the child a group leader, so pgid == pid.

@@ -46,6 +46,8 @@ test-support = []
 
 [dev-dependencies]
 sealantd = { path = ".", features = ["test-support"] }
+opentelemetry-proto = { workspace = true }
+prost = { workspace = true }
 libc = { workspace = true }
 # The manual clock (`ManualClock`, `CaptureConfig::clock`) for the capture tests: test builds only
 # (`scripts/ci-test-support-gate.sh`).

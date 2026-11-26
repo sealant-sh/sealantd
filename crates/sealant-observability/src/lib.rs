@@ -18,6 +18,7 @@
 
 mod boot;
 mod config;
+mod conventions;
 mod http;
 mod pipeline;
 pub mod scrub;
@@ -141,7 +142,8 @@ pub fn start(config: &Config) {
                 if let Some(release) = &config.release {
                     extra.push(KeyValue::new("service.version", release.clone()));
                 }
-                state.shared.run(batch, extra, config.sample_rate);
+                let common = conventions::release(&config.environment, config.release.as_deref());
+                state.shared.run(batch, extra, common, config.sample_rate);
             }
             Err(error) => {
                 tracing::warn!(%error, "the trace exporter could not be built: no traces are sent");
@@ -194,6 +196,14 @@ fn exporter(
         .with_timeout(Duration::from_secs(5))
         .with_retry_policy(opentelemetry_otlp::RetryPolicy::disabled())
         .build()
+}
+
+/// Set `key` on every span this process exports from now on: an ID that holds for the process's
+/// life, such as `sealant.runtime_id`. A no-op without [`install`].
+pub fn tag(key: &'static str, value: impl Into<String>) {
+    if let Some(state) = STATE.get() {
+        state.shared.tag(KeyValue::new(key, value.into()));
+    }
 }
 
 /// Send what is queued (spans, then Sentry events) and stop, in about two seconds at most.

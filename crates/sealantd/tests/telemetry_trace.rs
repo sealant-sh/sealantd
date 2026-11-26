@@ -10,7 +10,7 @@ mod collector;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
-use collector::{Collector, contains};
+use collector::{Collector, assert_sentry_shows, contains, exported_spans};
 use sealant_control::{read_frame, write_frame};
 use sealant_protocol::{
     ClientMessage, Command, ControlRequest, EnvVar, EventPayload, ExecArgs, ProcessId, RequestId,
@@ -162,10 +162,46 @@ async fn a_traced_request_is_exported_in_the_callers_trace_and_no_canary_with_it
         "sealantd.control.exec",
         "sealantd.process.spawn",
         "sealantd.control.signalProcess",
-        "ProcessNotFound",
     ] {
         assert!(contains(&otlp, name.as_bytes()), "{name} was not exported");
     }
+    // Each span reads in Sentry as what it is, in the daemon's environment and runtime.
+    let spans = exported_spans(&received);
+    assert_sentry_shows(&spans);
+    for span in &spans {
+        assert_eq!(
+            span.attribute("sentry.environment"),
+            Some("test"),
+            "{}",
+            span.name
+        );
+        assert!(
+            span.attribute("sealant.runtime_id")
+                .is_some_and(|id| id.starts_with("rt_")),
+            "{} names no runtime",
+            span.name
+        );
+    }
+    let span = |name: &str| {
+        spans
+            .iter()
+            .find(|s| s.name == name)
+            .unwrap_or_else(|| panic!("no {name} span"))
+    };
+    let exec = span("sealantd.control.exec");
+    assert_eq!(exec.attribute("sentry.op"), Some("rpc.server"));
+    assert_eq!(
+        exec.attribute("sentry.description"),
+        Some("sealantd.control/exec")
+    );
+    assert_eq!(exec.attribute("sealantd.request_id"), Some("r1"));
+    assert_eq!(span("sealantd.process.spawn").parent_span_id, exec.span_id);
+    // A refusal is coded on its span in the wire form the client reads.
+    let refused = span("sealantd.control.signalProcess");
+    assert_eq!(
+        refused.attribute("rpc.response.status_code"),
+        Some("process-not-found")
+    );
     assert!(
         contains(&otlp, &hex(TRACE_ID)),
         "the spans are not in the caller's trace"

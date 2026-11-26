@@ -268,6 +268,11 @@ impl Runtime {
     /// Build the runtime from validated configuration.
     #[must_use]
     pub fn new(config: RuntimeConfig, shutdown: Arc<ShutdownSignal>) -> Arc<Self> {
+        // Every span this daemon exports names the runtime (and the workspace, when known).
+        sealant_observability::tag("sealant.runtime_id", config.runtime_id.as_str());
+        if let Some(workspace_id) = &config.workspace_id {
+            sealant_observability::tag("sealant.workspace_id", workspace_id.clone());
+        }
         let config = Arc::new(config);
         let clock = Arc::new(Clock::new());
         let idgen = Arc::new(IdGenerator::new(&config.runtime_id));

@@ -14,6 +14,80 @@ pub(crate) struct Received {
     pub(crate) body: Vec<u8>,
 }
 
+/// One span from an OTLP export, its attribute values as text.
+#[derive(Clone, Debug)]
+pub(crate) struct Exported {
+    pub(crate) name: String,
+    pub(crate) span_id: Vec<u8>,
+    pub(crate) parent_span_id: Vec<u8>,
+    pub(crate) attributes: Vec<(String, String)>,
+    /// Whether OpenTelemetry's status says the span failed.
+    pub(crate) failed: bool,
+}
+
+impl Exported {
+    pub(crate) fn attribute(&self, key: &str) -> Option<&str> {
+        self.attributes
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+    }
+}
+
+/// Every span in the OTLP trace exports among `received`.
+pub(crate) fn exported_spans(received: &[Received]) -> Vec<Exported> {
+    use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
+    use opentelemetry_proto::tonic::common::v1::any_value::Value;
+    use prost::Message as _;
+    received
+        .iter()
+        .filter(|r| r.path.ends_with("/otlp/v1/traces"))
+        .flat_map(|r| {
+            ExportTraceServiceRequest::decode(r.body.as_slice())
+                .expect("an OTLP protobuf export")
+                .resource_spans
+        })
+        .flat_map(|resource| resource.scope_spans)
+        .flat_map(|scope| scope.spans)
+        .map(|span| Exported {
+            name: span.name,
+            span_id: span.span_id,
+            parent_span_id: span.parent_span_id,
+            // `STATUS_CODE_ERROR`.
+            failed: span.status.is_some_and(|status| status.code == 2),
+            attributes: span
+                .attributes
+                .into_iter()
+                .map(|kv| {
+                    let value = match kv.value.and_then(|v| v.value) {
+                        Some(Value::StringValue(s)) => s,
+                        Some(Value::BoolValue(b)) => b.to_string(),
+                        Some(Value::IntValue(i)) => i.to_string(),
+                        Some(Value::DoubleValue(d)) => d.to_string(),
+                        other => format!("{other:?}"),
+                    };
+                    (kv.key, value)
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+/// Fail unless every span reads in Sentry as what it is: an op other than `default` and a
+/// description that is not blank.
+pub(crate) fn assert_sentry_shows(spans: &[Exported]) {
+    assert!(!spans.is_empty(), "no spans");
+    for span in spans {
+        let op = span.attribute("sentry.op").unwrap_or_default();
+        let description = span.attribute("sentry.description").unwrap_or_default();
+        assert!(
+            !op.is_empty() && op != "default" && !description.trim().is_empty(),
+            "{} would show in Sentry as op {op:?}, description {description:?}",
+            span.name
+        );
+    }
+}
+
 impl Received {
     pub(crate) fn header(&self, name: &str) -> Option<&str> {
         self.headers

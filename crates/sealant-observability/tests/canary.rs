@@ -13,7 +13,7 @@ mod collector;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use collector::{Collector, contains};
+use collector::{Collector, assert_sentry_shows, contains, exported_spans};
 use sealant_runtime_core::redact::Redactor;
 
 /// A launch secret the daemon knows: masked wherever it is quoted.
@@ -103,6 +103,26 @@ fn a_canary_never_reaches_the_exporters_and_the_trace_still_does() {
         contains(&otlp, &hex(TRACE_ID)),
         "the span is not in the caller's trace"
     );
+    // Sentry shows each span as what it is, the spawn under the request.
+    let spans = exported_spans(&received);
+    assert_sentry_shows(&spans);
+    let request = spans
+        .iter()
+        .find(|s| s.name == "sealantd.control.exec")
+        .expect("the request's span");
+    assert_eq!(request.attribute("sentry.op"), Some("rpc.server"));
+    assert_eq!(
+        request.attribute("sentry.description"),
+        Some("sealantd.control/exec")
+    );
+    assert_eq!(request.attribute("sentry.environment"), Some("development"));
+    assert!(!request.failed, "the request was answered");
+    let spawn = spans
+        .iter()
+        .find(|s| s.name == "sealantd.process.spawn")
+        .expect("the spawn's span");
+    assert_eq!(spawn.attribute("sentry.op"), Some("subprocess.spawn"));
+    assert_eq!(spawn.parent_span_id, request.span_id);
     for export in &traces {
         assert_eq!(
             export.header("x-sentry-auth"),

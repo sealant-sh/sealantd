@@ -14,6 +14,8 @@ use std::time::Duration;
 use opentelemetry::trace::{Link, SpanKind, TraceId};
 use opentelemetry::{Context, KeyValue};
 use opentelemetry_sdk::Resource;
+
+use crate::conventions;
 use opentelemetry_sdk::error::OTelSdkResult;
 use opentelemetry_sdk::trace::{
     BatchSpanProcessor, Sampler as SdkSampler, SamplingDecision, SamplingResult, ShouldSample,
@@ -36,6 +38,8 @@ pub(crate) struct Shared {
     /// The sample rate's bits (an f64).
     rate: AtomicU64,
     resource: Mutex<Option<Resource>>,
+    /// What every exported span carries ([`conventions::finish`]).
+    common: RwLock<Vec<KeyValue>>,
 }
 
 impl Shared {
@@ -44,6 +48,7 @@ impl Shared {
             stage: RwLock::new(Stage::Pending(VecDeque::new())),
             rate: AtomicU64::new(1.0_f64.to_bits()),
             resource: Mutex::new(None),
+            common: RwLock::new(Vec::new()),
         })
     }
 
@@ -58,9 +63,34 @@ impl Shared {
         )
     }
 
+    /// Set `key` on every span exported from now on, replacing an earlier value.
+    pub(crate) fn tag(&self, attribute: KeyValue) {
+        let mut common = self.common.write().unwrap_or_else(PoisonError::into_inner);
+        common.retain(|kv| kv.key != attribute.key);
+        common.push(attribute);
+    }
+
+    /// Hand `span` to `processor` with what Sentry needs to show it.
+    fn export(&self, processor: &BatchSpanProcessor, mut span: SpanData) {
+        conventions::finish(
+            &mut span,
+            &self.common.read().unwrap_or_else(PoisonError::into_inner),
+        );
+        processor.on_end(span);
+    }
+
     /// Start exporting through `processor`, held spans first. Extra resource attributes (the
-    /// environment and release, known only now) join the provider's.
-    pub(crate) fn run(&self, mut processor: BatchSpanProcessor, extra: Vec<KeyValue>, rate: f64) {
+    /// environment and release, known only now) join the provider's; `common` joins every span's.
+    pub(crate) fn run(
+        &self,
+        mut processor: BatchSpanProcessor,
+        extra: Vec<KeyValue>,
+        common: Vec<KeyValue>,
+        rate: f64,
+    ) {
+        for attribute in common {
+            self.tag(attribute);
+        }
         self.rate.store(rate.to_bits(), Ordering::Relaxed);
         let base = self
             .resource
@@ -87,7 +117,7 @@ impl Shared {
             Stage::Off => VecDeque::new(),
         };
         for span in held {
-            processor.on_end(span);
+            self.export(&processor, span);
         }
         *stage = Stage::Running(processor);
     }
@@ -120,7 +150,7 @@ impl SpanProcessor for Deferred {
         {
             let stage = self.0.stage.read().unwrap_or_else(PoisonError::into_inner);
             match &*stage {
-                Stage::Running(processor) => return processor.on_end(span),
+                Stage::Running(processor) => return self.0.export(processor, span),
                 Stage::Off => return,
                 Stage::Pending(_) => {}
             }
@@ -133,7 +163,7 @@ impl SpanProcessor for Deferred {
                 }
                 held.push_back(span);
             }
-            Stage::Running(processor) => processor.on_end(span),
+            Stage::Running(processor) => self.0.export(processor, span),
             Stage::Off => {}
         }
     }

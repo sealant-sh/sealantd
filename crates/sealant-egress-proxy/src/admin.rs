@@ -64,6 +64,12 @@ struct ErrorBody<'a> {
 }
 
 async fn send_json<W: AsyncWrite + Unpin>(w: &mut W, status: u16, body: &impl Serialize) {
+    // On a policy change's span, when this answers one: a 5xx is the proxy's failure.
+    let span = tracing::Span::current();
+    span.record("http.response.status_code", status);
+    if status >= 500 {
+        span.record("otel.status_code", "ERROR");
+    }
     let body = serde_json::to_vec(body).unwrap_or_else(|_| b"{}".to_vec());
     let reason = match status {
         200 => "OK",
@@ -156,17 +162,24 @@ async fn handle(shared: Arc<Shared>, stream: UnixStream) {
         .unwrap_or((req.target.as_str(), ""));
     // The policy changes are spans, under the controller's `traceparent` when it sends one. The
     // body (brokered secrets among it) is never recorded: only which change it was.
+    // Sentry shows each as an HTTP server span, `PUT /v1/policy`.
     let change = match (req.method.as_str(), path) {
-        ("PUT", "/v1/policy") => Some("sealantd.proxy.admin.policy"),
-        ("POST", "/v1/revoke") => Some("sealantd.proxy.admin.revoke"),
-        ("POST", "/v1/heartbeat") => Some("sealantd.proxy.admin.heartbeat"),
+        ("PUT", "/v1/policy") => Some(("sealantd.proxy.admin.policy", "PUT", "/v1/policy")),
+        ("POST", "/v1/revoke") => Some(("sealantd.proxy.admin.revoke", "POST", "/v1/revoke")),
+        ("POST", "/v1/heartbeat") => {
+            Some(("sealantd.proxy.admin.heartbeat", "POST", "/v1/heartbeat"))
+        }
         _ => None,
     };
-    let span = change.map_or_else(tracing::Span::none, |name| {
+    let span = change.map_or_else(tracing::Span::none, |(name, method, route)| {
         let span = tracing::info_span!(
             "sealantd.proxy.admin",
             otel.name = name,
-            otel.kind = "server"
+            otel.kind = "server",
+            otel.status_code = tracing::field::Empty,
+            http.request.method = method,
+            http.route = route,
+            http.response.status_code = tracing::field::Empty,
         );
         let text = |name: &str| {
             req.header(name)

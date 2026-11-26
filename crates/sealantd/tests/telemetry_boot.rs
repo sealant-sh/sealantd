@@ -14,7 +14,7 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use collector::{Collector, Received, contains};
+use collector::{Collector, Received, assert_sentry_shows, contains, exported_spans};
 use sealant_process::spawn::CommandGateExt as _;
 
 const TRACE_ID: &str = "5b8aa5a2d2c872e8321cf37308d69df2";
@@ -134,6 +134,25 @@ fn a_boot_is_one_trace_with_a_span_per_stage() {
         contains(&spans, &hex(TRACE_ID)),
         "the boot is not in the launcher's trace"
     );
+    // Sentry shows the boot and each stage under it as what they are.
+    let spans = exported_spans(&received);
+    assert_sentry_shows(&spans);
+    let root = spans
+        .iter()
+        .find(|s| s.name == "sealantd.boot")
+        .expect("the boot's span");
+    assert_eq!(root.attribute("sentry.op"), Some("sealantd.boot"));
+    assert!(!root.failed);
+    let healthy = spans
+        .iter()
+        .find(|s| s.name == "sealantd.boot.healthy")
+        .expect("the healthy stage");
+    assert_eq!(healthy.attribute("sentry.op"), Some("sealantd.boot.stage"));
+    assert_eq!(
+        healthy.attribute("sentry.description"),
+        Some("runtime healthy")
+    );
+    assert_eq!(healthy.parent_span_id, root.span_id);
 }
 
 #[test]
@@ -165,5 +184,11 @@ fn an_error_during_the_boot_is_linked_to_its_trace() {
     assert!(
         !contains(&spans, b"sealantd.boot.harness_started"),
         "no harness started"
+    );
+    let spans = exported_spans(&received);
+    assert_sentry_shows(&spans);
+    assert!(
+        spans.iter().any(|s| s.name == "sealantd.boot" && s.failed),
+        "the boot's span is not marked failed"
     );
 }
