@@ -25,3 +25,5 @@ ureq = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+opentelemetry-proto = { workspace = true }
+prost = { workspace = true }

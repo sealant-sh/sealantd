@@ -411,6 +411,7 @@ impl SessionRuntime {
         // handle for `write_input`, and an output source for the single capture reader.
         let spawn = tracing::info_span!(
             "sealantd.session.spawn",
+            otel.status_code = tracing::field::Empty,
             sealantd.session_mode = ?args.mode,
         )
         .entered();
@@ -431,6 +432,7 @@ impl SessionRuntime {
                     run_as.as_ref(),
                 )
                 .map_err(|e| {
+                    spawn.record("otel.status_code", "ERROR");
                     ControlError::new(
                         sealant_protocol::ControlErrorCode::PtyAllocationFailed,
                         format!("{shell}: {e}"),
@@ -457,6 +459,7 @@ impl SessionRuntime {
                     pid,
                     spawned,
                 } = pipe::spawn(&shell, &args.args, &cwd, &env, run_as.as_ref()).map_err(|e| {
+                    spawn.record("otel.status_code", "ERROR");
                     ControlError::new(
                         sealant_protocol::ControlErrorCode::ProcessStartFailed,
                         format!("{shell}: {e}"),

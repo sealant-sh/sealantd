@@ -81,7 +81,8 @@ fn decode_inbound(body: &[u8]) -> Inbound {
 const MAX_RECORDED_REQUEST_ID: usize = 64;
 
 /// The span of one request, `sealantd.control.<method>`, a child of the caller's trace when the
-/// request carries one. It names the method and request id only: never an argument.
+/// request carries one. It names the method and request id only: never an argument. Sentry
+/// shows it as an RPC server call, `sealantd.control/<method>` (OpenTelemetry's `rpc.*`).
 fn request_span(request: &ControlRequest) -> tracing::Span {
     let method = request.command.name();
     let request_id = request.request_id.as_str();
@@ -90,6 +91,9 @@ fn request_span(request: &ControlRequest) -> tracing::Span {
         otel.name = format!("sealantd.control.{method}"),
         otel.kind = "server",
         otel.status_code = tracing::field::Empty,
+        rpc.system.name = "sealantd",
+        rpc.method = format!("sealantd.control/{method}"),
+        rpc.response.status_code = tracing::field::Empty,
         sealantd.method = method,
         sealantd.request_id = (request_id.len() <= MAX_RECORDED_REQUEST_ID).then_some(request_id),
         sealantd.error_code = tracing::field::Empty,
@@ -115,7 +119,9 @@ fn record_outcome(
     let ResponseOutcome::Error { error } = &response.outcome else {
         return;
     };
-    span.record("sealantd.error_code", tracing::field::debug(error.code));
+    let code = error.code.as_wire();
+    span.record("sealantd.error_code", code);
+    span.record("rpc.response.status_code", code);
     if error.code == ControlErrorCode::InternalError && !forward && !conn.closed.is_cancelled() {
         span.record("otel.status_code", "ERROR");
         span.in_scope(|| {

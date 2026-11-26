@@ -55,6 +55,8 @@ opentelemetry_sdk = { version = "0.33", default-features = false, features = ["t
 opentelemetry-otlp = { version = "0.33", default-features = false, features = ["http-proto", "trace"] }
 opentelemetry-http = { version = "0.33", default-features = false }
 tracing-opentelemetry = { version = "0.34", default-features = false }
+# Tests decode what the OTLP exporter sends (already built by `opentelemetry-otlp`).
+opentelemetry-proto = { version = "0.33", default-features = false, features = ["gen-tonic-messages", "trace"] }
 sentry = { version = "0.49", default-features = false, features = ["backtrace", "contexts", "panic", "tracing", "ureq", "rustls-no-provider"] }
 async-trait = "0.1"
 http = "1"
