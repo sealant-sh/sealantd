@@ -9,6 +9,7 @@ pub mod app;
 pub mod binds;
 pub mod boot;
 pub mod capture;
+pub(crate) mod clock;
 pub(crate) mod control_frontends;
 pub mod docker;
 pub(crate) mod dotfiles_verb;
