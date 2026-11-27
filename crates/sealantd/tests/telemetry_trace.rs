@@ -182,7 +182,7 @@ async fn a_traced_request_is_exported_in_the_callers_trace_and_no_canary_with_it
     let received = loop {
         let received = collector.received();
         let otlp: Vec<u8> = received.iter().flat_map(|r| r.body.clone()).collect();
-        if contains(&otlp, b"sealantd.control.signalProcess") || Instant::now() > deadline {
+        if contains(&otlp, b"sealantd.control.signal_process") || Instant::now() > deadline {
             break received;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -195,7 +195,7 @@ async fn a_traced_request_is_exported_in_the_callers_trace_and_no_canary_with_it
     for name in [
         "sealantd.control.exec",
         "sealantd.process.spawn",
-        "sealantd.control.signalProcess",
+        "sealantd.control.signal_process",
     ] {
         assert!(contains(&otlp, name.as_bytes()), "{name} was not exported");
     }
@@ -223,15 +223,19 @@ async fn a_traced_request_is_exported_in_the_callers_trace_and_no_canary_with_it
             .unwrap_or_else(|| panic!("no {name} span"))
     };
     let exec = span("sealantd.control.exec");
-    assert_eq!(exec.attribute("sentry.op"), Some("rpc.server"));
-    assert_eq!(
-        exec.attribute("sentry.description"),
-        Some("sealantd.control/exec")
-    );
+    assert_eq!(exec.attribute("sentry.op"), Some("sealantd.control"));
+    assert_eq!(exec.attribute("sentry.description"), Some("start process"));
+    // The wire name stays in `rpc.method`.
+    assert_eq!(exec.attribute("rpc.method"), Some("exec"));
     assert_eq!(exec.attribute("sealantd.request_id"), Some("r1"));
     assert_eq!(span("sealantd.process.spawn").parent_span_id, exec.span_id);
     // A refusal is coded on its span in the wire form the client reads.
-    let refused = span("sealantd.control.signalProcess");
+    let refused = span("sealantd.control.signal_process");
+    assert_eq!(refused.attribute("rpc.method"), Some("signalProcess"));
+    assert_eq!(
+        refused.attribute("sentry.description"),
+        Some("signal process")
+    );
     assert_eq!(
         refused.attribute("rpc.response.status_code"),
         Some("process-not-found")
@@ -288,7 +292,7 @@ async fn housekeeping_sends_a_span_only_inside_a_callers_trace() {
     };
     let spans = exported_spans(&received);
     let names: Vec<&str> = spans.iter().map(|s| s.name.as_str()).collect();
-    assert_eq!(names, ["sealantd.control.runtime.health"], "{spans:?}");
+    assert_eq!(names, ["sealantd.control.runtime_health"], "{spans:?}");
     let health = &spans[0];
     assert_eq!(health.attribute("sealantd.request_id"), Some("h2"));
     assert_eq!(health.trace_id, hex(TRACE_ID));

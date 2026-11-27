@@ -42,9 +42,10 @@ use tracing_subscriber::{Layer as _, Registry};
 
 pub use boot::{BootTrace, STAGE};
 pub use config::{
-    Config, OTEL_EXPORTER_OTLP_ENDPOINT, OTEL_EXPORTER_OTLP_HEADERS, SENTRY_DSN,
+    Config, DEV_RELEASE, OTEL_EXPORTER_OTLP_ENDPOINT, OTEL_EXPORTER_OTLP_HEADERS, SENTRY_DSN,
     SENTRY_ENVIRONMENT, SENTRY_RELEASE, SENTRY_TRACES_SAMPLE_RATE, VARIABLES,
 };
+pub use conventions::{CONTAINER_BOOT, GUEST_BOOT, VM_LAUNCH};
 
 /// How long [`shutdown`] gives queued spans, then queued Sentry events.
 const FLUSH_SPANS: Duration = Duration::from_millis(1500);
@@ -124,6 +125,8 @@ pub fn start(config: &Config) {
     {
         return;
     }
+    // Every span and event names a release: the configured one, or a development build's.
+    let release = config.release.as_deref().unwrap_or(DEV_RELEASE);
     match &config.traces {
         Some(target) => match exporter(target) {
             Ok(exporter) => {
@@ -135,14 +138,11 @@ pub fn start(config: &Config) {
                             .build(),
                     )
                     .build();
-                let mut extra = vec![KeyValue::new(
-                    "deployment.environment.name",
-                    config.environment.clone(),
-                )];
-                if let Some(release) = &config.release {
-                    extra.push(KeyValue::new("service.version", release.clone()));
-                }
-                let common = conventions::release(&config.environment, config.release.as_deref());
+                let extra = vec![
+                    KeyValue::new("deployment.environment.name", config.environment.clone()),
+                    KeyValue::new("service.version", release.to_owned()),
+                ];
+                let common = conventions::release(&config.environment, release);
                 state.shared.run(batch, extra, common, config.sample_rate);
             }
             Err(error) => {
@@ -156,13 +156,7 @@ pub fn start(config: &Config) {
         let mut options = sentry::ClientOptions::default();
         options.dsn = Some(dsn.clone());
         // Always set: left unset, the SDK would take the image's `SENTRY_RELEASE`.
-        options.release = Some(
-            config
-                .release
-                .clone()
-                .unwrap_or_else(|| "unknown".to_owned())
-                .into(),
-        );
+        options.release = Some(release.to_owned().into());
         options.environment = Some(config.environment.clone().into());
         options.send_default_pii = false;
         options.max_breadcrumbs = 0;

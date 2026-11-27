@@ -181,7 +181,7 @@ impl ProcessRuntime {
         let identity = args
             .user
             .is_some()
-            .then(|| tracing::info_span!("sealantd.process.identity").entered());
+            .then(|| tracing::info_span!("sealantd.process.resolve_user").entered());
         let run_as = args
             .user
             .as_deref()

@@ -146,7 +146,7 @@ fn boot_mode(mode: VmMode, pid1: bool, started: SystemTime) -> (Ended, Option<Bo
     // The trace begins now that it has a parent; the stages before it are recorded as they ran.
     let telemetry = boot.telemetry.clone().unwrap_or_default();
     crate::telemetry::begin_boot(
-        "sealantd.vm.boot",
+        sealant_observability::GUEST_BOOT,
         started,
         telemetry
             .traceparent

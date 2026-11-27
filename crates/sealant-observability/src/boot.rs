@@ -8,7 +8,6 @@
 //! carries `sealant.boot.stage`. Work the boot does itself, such as spawning its lifecycle steps
 //! and harness, runs in [`BootTrace::in_scope`] so its spans join the boot's trace.
 
-use std::borrow::Cow;
 use std::sync::Mutex;
 use std::sync::PoisonError;
 use std::time::SystemTime;
@@ -35,7 +34,7 @@ pub struct BootTrace {
 }
 
 impl BootTrace {
-    /// Begin `name` (`sealantd.vm.boot`), as started at `started`, as a child of the launcher's
+    /// Begin `name` ([`crate::CONTAINER_BOOT`], [`crate::GUEST_BOOT`], [`crate::VM_LAUNCH`]), as started at `started`, as a child of the launcher's
     /// `traceparent` when it names a span. None before [`crate::install`].
     #[must_use]
     pub fn begin(
@@ -68,7 +67,7 @@ impl BootTrace {
 
     fn stage_span(&self, stage: &'static str, start: SystemTime) -> opentelemetry_sdk::trace::Span {
         self.tracer
-            .span_builder(Cow::Owned(format!("{}.{stage}", self.name)))
+            .span_builder(crate::conventions::stage_name(self.name, stage))
             .with_kind(SpanKind::Internal)
             .with_start_time(start)
             .with_attributes([KeyValue::new(STAGE, stage)])

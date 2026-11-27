@@ -87,6 +87,34 @@ pub(crate) fn assert_sentry_shows(spans: &[Exported]) {
             "{} would show in Sentry as op {op:?}, description {description:?}",
             span.name
         );
+        assert!(
+            span.attribute("sentry.release")
+                .is_some_and(|release| !release.is_empty()),
+            "{} names no release",
+            span.name
+        );
+        // The naming contract: `sealantd.<area>.<operation>` in lower snake case under the op
+        // `sealantd.<area>`, or an HTTP server's `<METHOD> <route>`.
+        if op == "http.server" {
+            assert!(span.name.contains(" /"), "{}", span.name);
+            continue;
+        }
+        let parts: Vec<&str> = span.name.split('.').collect();
+        assert!(
+            parts.len() == 3
+                && parts[0] == "sealantd"
+                && parts
+                    .iter()
+                    .all(|part| part.chars().all(|c| c.is_ascii_lowercase() || c == '_')),
+            "{} breaks the naming contract",
+            span.name
+        );
+        assert_eq!(op, format!("sealantd.{}", parts[1]), "{}", span.name);
+        assert_ne!(
+            description, span.name,
+            "{} is described by its name",
+            span.name
+        );
     }
 }
 
