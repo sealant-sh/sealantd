@@ -10,7 +10,7 @@ import { parse } from "yaml";
 // writes to the repository or its packages, runs every job on a GitHub-hosted runner: a fresh VM.
 // Labels are allowed, not denied: a selector such as [linux, x64] reaches the box without naming it.
 const PUBLISHING = ["next.yml", "release.yml", "version.yml"];
-const HOSTED = /^ubuntu-(latest|[0-9.]+(-arm)?)$/;
+const HOSTED = /^(?:ubuntu-(?:latest|[0-9.]+(?:-arm)?)|macos-[0-9]+)$/;
 const MATRIX = /^\$\{\{ matrix\.[a-z.]+ \}\}$/;
 
 /** Every runner a workflow names: runs-on values and matrix `runner:` entries, in flow or block form. */

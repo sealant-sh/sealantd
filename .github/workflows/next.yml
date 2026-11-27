@@ -184,6 +184,25 @@ jobs:
           path: /tmp/digests/*
           if-no-files-found: error
           retention-days: 1
+      # Export the exact arm64 guest kernel shipped inside vm-runner for the macOS sealant-vmd bundle.
+      - name: Export arm64 guest kernel
+        if: matrix.image.name == 'vm-runner' && matrix.platform.arch == 'arm64'
+        env:
+          REF: ghcr.io/${{ github.repository_owner }}/${{ matrix.image.name }}-next@${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/kernel-arm64
+          docker pull "$REF"
+          cid=$(docker create "$REF")
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          docker cp "$cid:/usr/share/sealant/vm/kernel" /tmp/kernel-arm64/Image
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: matrix.image.name == 'vm-runner' && matrix.platform.arch == 'arm64'
+        with:
+          name: next-kernel-arm64
+          path: /tmp/kernel-arm64/Image
+          if-no-files-found: error
+          retention-days: 1
       # Telemetry only: it never turns the job's result red, and says so when it has nothing.
       - name: Report peak disk use
         if: always()
@@ -405,6 +424,56 @@ jobs:
           path: ${{ runner.temp }}/tarballs/*.tgz
           if-no-files-found: error
           retention-days: 1
+
+  # Builds, signs (Developer ID + notarization when Apple secrets are configured, else ad-hoc),
+  # verifies, and packages the Apple Silicon macOS helper bundle alongside the pinned arm64 kernel.
+  macos-vmd:
+    name: Build macOS sealant-vmd bundle (arm64)
+    needs: [plan, image]
+    if: needs.plan.outputs.publish == 'true'
+    runs-on: macos-15
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.plan.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: next-kernel-arm64
+          path: ${{ runner.temp }}/kernel
+      - run: rustup toolchain install
+      - name: Build, sign, verify and package sealant-vmd-darwin-arm64.tar.gz
+        env:
+          APPLE_DEVELOPER_IDENTITY: ${{ secrets.APPLE_DEVELOPER_IDENTITY }}
+          APPLE_DEVELOPER_CERT_P12: ${{ secrets.APPLE_DEVELOPER_CERT_P12 }}
+          APPLE_DEVELOPER_CERT_PASSWORD: ${{ secrets.APPLE_DEVELOPER_CERT_PASSWORD }}
+          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+          APPLE_NOTARY_PRIVATE_KEY: ${{ secrets.APPLE_NOTARY_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          bash scripts/build-macos-vmd.sh \
+            --out "$RUNNER_TEMP/macos-vmd" \
+            --kernel "$RUNNER_TEMP/kernel/Image" \
+            --version "${{ needs.plan.outputs.version }}"
+          {
+            echo "## macOS sealant-vmd ${{ needs.plan.outputs.version }}"
+            echo
+            echo "\`\`\`"
+            cat "$RUNNER_TEMP/macos-vmd/sealant-vmd-darwin-arm64.tar.gz.sha256"
+            echo "\`\`\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: macos-vmd-darwin-arm64
+          path: |
+            ${{ runner.temp }}/macos-vmd/sealant-vmd-darwin-arm64.tar.gz
+            ${{ runner.temp }}/macos-vmd/sealant-vmd-darwin-arm64.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 90
 
   # Holds the npm credential and runs nothing from the repository: no checkout. It checks each
   # tarball is ours, this version and this commit, that `next` would move forward, and publishes.
