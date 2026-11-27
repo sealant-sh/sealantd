@@ -82,7 +82,7 @@ func resolveRealpath(_ path: String) -> String? {
     return String(cString: resolved)
 }
 
-func verifyAndOpenDisk(path: String, underRoot canonRoot: String, writable: Bool, acquireLock: Bool) -> Int32? {
+func verifyAndOpenDisk(path: String, underRoot canonRoot: String, writable: Bool) -> Int32? {
     let parent = (path as NSString).deletingLastPathComponent
     guard let canonParent = resolveRealpath(parent) else {
         fputs("[vz-worker] cannot resolve parent of \(path)\n", stderr)
@@ -110,12 +110,39 @@ func verifyAndOpenDisk(path: String, underRoot canonRoot: String, writable: Bool
         Darwin.close(fd)
         return nil
     }
-    if acquireLock {
-        if flock(fd, LOCK_EX | LOCK_NB) != 0 {
-            fputs("[vz-worker] data disk \(path) is already locked by another worker (errno=\(errno))\n", stderr)
-            Darwin.close(fd)
-            return nil
-        }
+    return fd
+}
+
+/// Acquires an exclusive non-blocking `flock` on a sibling `.lock` sidecar file instead of
+/// `data.img` itself: Apple's `VZDiskImageStorageDeviceAttachment(readOnly: false)` acquires its
+/// own internal lock on `data.img` inside the Virtualization XPC helper and fails VM start if
+/// another FD already holds `flock(LOCK_EX)` on `data.img`.
+func acquireSidecarLock(forDiskPath diskPath: String, underRoot canonRoot: String) -> Int32? {
+    let parent = (diskPath as NSString).deletingLastPathComponent
+    guard let canonParent = resolveRealpath(parent) else {
+        fputs("[vz-worker] cannot resolve parent of \(diskPath)\n", stderr)
+        return nil
+    }
+    if canonParent != canonRoot && !canonParent.hasPrefix(canonRoot + "/") {
+        fputs("[vz-worker] lock path for \(diskPath) escapes vmRoot \(canonRoot)\n", stderr)
+        return nil
+    }
+    let lockPath = diskPath + ".lock"
+    let fd = Darwin.open(lockPath, O_CREAT | O_RDWR | O_NOFOLLOW | O_CLOEXEC, 0o600)
+    if fd < 0 {
+        fputs("[vz-worker] open(\(lockPath)) failed: errno=\(errno)\n", stderr)
+        return nil
+    }
+    var st = stat()
+    if fstat(fd, &st) != 0 || (st.st_mode & S_IFMT) != S_IFREG || st.st_nlink != 1 || st.st_uid != geteuid() {
+        fputs("[vz-worker] sidecar lock \(lockPath) failed safety check\n", stderr)
+        Darwin.close(fd)
+        return nil
+    }
+    if flock(fd, LOCK_EX | LOCK_NB) != 0 {
+        fputs("[vz-worker] data disk \(diskPath) is already locked by another worker (errno=\(errno))\n", stderr)
+        Darwin.close(fd)
+        return nil
     }
     return fd
 }
@@ -547,18 +574,24 @@ guard let canonRoot = resolveRealpath(spec.vmRoot) else {
     exit(2)
 }
 
-// Validate both disks (symlink-safe + regular + nlink == 1 + owned by UID) and hold exclusive
-// flock on data.img for the worker's entire lifetime!
-guard let baseCheckFd = verifyAndOpenDisk(path: spec.baseImagePath, underRoot: canonRoot, writable: false, acquireLock: false) else {
+// Validate both disks (symlink-safe + regular + nlink == 1 + owned by UID) and hold an exclusive
+// sidecar flock beside data.img for the worker's entire lifetime (so VZ can hold its own lock on
+// data.img itself).
+guard let baseCheckFd = verifyAndOpenDisk(path: spec.baseImagePath, underRoot: canonRoot, writable: false) else {
     exit(3)
 }
 Darwin.close(baseCheckFd)
 
-guard let lockedDataFd = verifyAndOpenDisk(path: spec.dataImagePath, underRoot: canonRoot, writable: true, acquireLock: true) else {
+guard let dataCheckFd = verifyAndOpenDisk(path: spec.dataImagePath, underRoot: canonRoot, writable: true) else {
+    exit(4)
+}
+Darwin.close(dataCheckFd)
+
+guard let sidecarLockFd = acquireSidecarLock(forDiskPath: spec.dataImagePath, underRoot: canonRoot) else {
     exit(4)
 }
 // Intentionally kept open (and locked!) for the lifetime of sealant-vz-worker.
-_ = lockedDataFd
+_ = sidecarLockFd
 
 configureTcpKeepalive(spec.transportFd)
 let writer = FrameWriter(fd: spec.transportFd)
