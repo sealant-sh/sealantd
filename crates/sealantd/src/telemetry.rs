@@ -50,8 +50,8 @@ pub const TRACESTATE: &str = "SEALANT_TRACESTATE";
 
 static BOOT: OnceLock<BootTrace> = OnceLock::new();
 
-/// Begin this process's boot trace, `name` (`sealantd.workspace.boot`, `sealantd.vm.boot`), as started at
-/// `started`, under the launcher's `traceparent`. Only the first call counts.
+/// Begin this process's boot trace, `name` (`sealantd.workspace.boot`, `sealantd.vm.boot`), as
+/// started at `started`, under the launcher's `traceparent`. Only the first call counts.
 pub(crate) fn begin_boot(
     name: &'static str,
     started: SystemTime,

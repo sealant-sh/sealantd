@@ -158,6 +158,28 @@ fn a_boot_is_one_trace_with_a_span_per_stage() {
     );
     assert_eq!(healthy.attribute("sealant.boot.stage"), Some("healthy"));
     assert_eq!(healthy.parent_span_id, root.span_id);
+    // The stages are one step after another: each starts where the one before it ended.
+    let stage = |name: &str| {
+        spans
+            .iter()
+            .find(|s| s.name == name)
+            .unwrap_or_else(|| panic!("no {name}"))
+    };
+    let order = [
+        "sealantd.boot.clone_repository",
+        "sealantd.boot.start_runtime",
+        "sealantd.boot.start_control_server",
+        "sealantd.boot.start_harness",
+    ];
+    for pair in order.windows(2) {
+        let (before, after) = (stage(pair[0]), stage(pair[1]));
+        assert!(
+            after.start >= before.end,
+            "{} starts before {} ends",
+            pair[1],
+            pair[0]
+        );
+    }
     // One trace: the setup step's and the harness's spawns are the boot's, not traces of their
     // own (SLNT-1386).
     let spawns: Vec<_> = spans

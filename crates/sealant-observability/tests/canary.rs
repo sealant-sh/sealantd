@@ -7,6 +7,7 @@
 //! inside a traced span (log lines never become span events). The traced request and the error
 //! must still arrive, linked to the caller's trace, so the test cannot pass by sending nothing.
 
+#[allow(dead_code)]
 #[path = "support/collector.rs"]
 mod collector;
 

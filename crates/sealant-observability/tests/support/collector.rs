@@ -22,6 +22,9 @@ pub(crate) struct Exported {
     pub(crate) span_id: Vec<u8>,
     pub(crate) parent_span_id: Vec<u8>,
     pub(crate) attributes: Vec<(String, String)>,
+    /// Start and end, nanoseconds since the Unix epoch.
+    pub(crate) start: u64,
+    pub(crate) end: u64,
     /// Whether OpenTelemetry's status says the span failed.
     pub(crate) failed: bool,
 }
@@ -55,6 +58,8 @@ pub(crate) fn exported_spans(received: &[Received]) -> Vec<Exported> {
             trace_id: span.trace_id,
             span_id: span.span_id,
             parent_span_id: span.parent_span_id,
+            start: span.start_time_unix_nano,
+            end: span.end_time_unix_nano,
             // `STATUS_CODE_ERROR`.
             failed: span.status.is_some_and(|status| status.code == 2),
             attributes: span
