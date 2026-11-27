@@ -460,6 +460,16 @@ pub struct DotfilesApplied {
     pub bootstrap: Option<ExecAccepted>,
 }
 
+/// Result of `runtime.syncClock`: whether the guest wall clock was stepped and the observed drift.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ClockSynced {
+    /// True when `|drift|` exceeded the step threshold and `CLOCK_REALTIME` was stepped.
+    pub stepped: bool,
+    /// `target - guest_before` in milliseconds (positive means the guest clock was behind).
+    pub drift_ms: i64,
+}
+
 /// The set of control commands. Adjacently tagged: `{ "cmd": ..., "args": ... }`.
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "cmd", content = "args", rename_all = "camelCase")]
@@ -643,6 +653,13 @@ pub enum Command {
     /// a managed process of that user.
     #[serde(rename = "dotfiles.apply")]
     DotfilesApply(Box<DotfilesApplyArgs>),
+    /// Step guest `CLOCK_REALTIME` toward the host UTC timestamp when drift exceeds 500 ms.
+    #[serde(rename = "runtime.syncClock")]
+    RuntimeSyncClock {
+        /// Target wall-clock timestamp in nanoseconds since the Unix epoch.
+        #[serde(rename = "unixEpochNs")]
+        unix_epoch_ns: u64,
+    },
 }
 
 /// What a `capture.flush` waits for.
@@ -712,6 +729,7 @@ impl Command {
             Self::LeaseEpoch => "lease.epoch",
             Self::CaptureReplan => "capture.replan",
             Self::DotfilesApply(_) => "dotfiles.apply",
+            Self::RuntimeSyncClock { .. } => "runtime.syncClock",
         }
     }
 }
@@ -1355,6 +1373,8 @@ pub enum CommandResult {
     CaptureReplanned(CaptureReplanned),
     /// A person's dotfiles were applied.
     DotfilesApplied(DotfilesApplied),
+    /// Guest wall-clock synchronization outcome.
+    ClockSynced(ClockSynced),
     /// Generic acknowledgement with no data.
     Accepted,
 }

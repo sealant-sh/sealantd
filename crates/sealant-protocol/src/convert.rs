@@ -11,16 +11,17 @@ use crate::wire;
 use crate::{
     ArtifactRef, AttachMode, AttachSessionArgs, Base64Bytes, Capabilities, CaptureClass,
     CaptureClassSnaps, CaptureFlushKind, CaptureKind, CaptureMethod, CaptureMode, CaptureOverdue,
-    CapturePolicy, CaptureReplanned, CaptureStaged, CaptureStatusReport, ClientMessage, Command,
-    CommandResult, Confidence, ControlError, ControlErrorCode, ControlRequest, ControlResponse,
-    DotfilesApplied, DotfilesApplyArgs, DotfilesRepository, Encoding, EnvVar, EventEnvelope,
-    EventPayload, ExecAccepted, ExecArgs, ExecutionStartArgs, ExitReason, Feature, FeatureMatrix,
-    FeatureState, ForwardOpened, ForwardProtocol, HealthReport, IoChunk, LeaseEpochReport, Limits,
-    NetworkMode, OpenForwardArgs, OpenSessionArgs, OpenSftpArgs, ProcessAttached, ProcessExited,
-    ProcessList, ProcessStarted, ProcessState, ProcessSummary, ResponseOutcome, RuntimeHeartbeat,
-    RuntimeMetrics, RuntimeState, RuntimeStateChanged, SecretEnvVar, ServerMessage, SessionList,
-    SessionOpened, SessionSummary, SftpOpened, ShutdownAccepted, Signal, StreamAttached, StreamEnd,
-    StreamFrame, StreamKind, StreamPayload, TelemetryDropped, TraceContext, TransformMeta,
+    CapturePolicy, CaptureReplanned, CaptureStaged, CaptureStatusReport, ClientMessage,
+    ClockSynced, Command, CommandResult, Confidence, ControlError, ControlErrorCode,
+    ControlRequest, ControlResponse, DotfilesApplied, DotfilesApplyArgs, DotfilesRepository,
+    Encoding, EnvVar, EventEnvelope, EventPayload, ExecAccepted, ExecArgs, ExecutionStartArgs,
+    ExitReason, Feature, FeatureMatrix, FeatureState, ForwardOpened, ForwardProtocol, HealthReport,
+    IoChunk, LeaseEpochReport, Limits, NetworkMode, OpenForwardArgs, OpenSessionArgs, OpenSftpArgs,
+    ProcessAttached, ProcessExited, ProcessList, ProcessStarted, ProcessState, ProcessSummary,
+    ResponseOutcome, RuntimeHeartbeat, RuntimeMetrics, RuntimeState, RuntimeStateChanged,
+    SecretEnvVar, ServerMessage, SessionList, SessionOpened, SessionSummary, SftpOpened,
+    ShutdownAccepted, Signal, StreamAttached, StreamEnd, StreamFrame, StreamKind, StreamPayload,
+    TelemetryDropped, TraceContext, TransformMeta,
 };
 use crate::{
     FileChange, FileChangeKind, FileDiffAvailable, FileEntry, FileSnapshotCompleted, FileType,
@@ -1092,6 +1093,9 @@ impl From<Command> for wire::command::Command {
                 archive_dir: a.archive_dir,
                 execution_id: opt_id(a.execution_id),
             })),
+            Command::RuntimeSyncClock { unix_epoch_ns } => {
+                W::RuntimeSyncClock(wire::SyncClockArgs { unix_epoch_ns })
+            }
             Command::AttachSession(a) => W::AttachSession(a.into()),
             Command::DetachSession { channel_id } => W::DetachSession(wire::DetachSessionArgs {
                 channel_id: channel_id.into_inner(),
@@ -1195,6 +1199,9 @@ impl TryFrom<wire::command::Command> for Command {
                 archive_dir: a.archive_dir,
                 execution_id: a.execution_id.map(ExecutionId::new),
             })),
+            W::RuntimeSyncClock(a) => Command::RuntimeSyncClock {
+                unix_epoch_ns: a.unix_epoch_ns,
+            },
             W::AttachSession(a) => Command::AttachSession(a.try_into()?),
             W::DetachSession(a) => Command::DetachSession {
                 channel_id: ChannelId::new(a.channel_id),
@@ -1568,6 +1575,10 @@ impl From<CommandResult> for wire::command_result::Result {
                     pidfd: a.pidfd,
                 }),
             }),
+            CommandResult::ClockSynced(c) => W::ClockSynced(wire::ClockSynced {
+                stepped: c.stepped,
+                drift_ms: c.drift_ms,
+            }),
             CommandResult::Accepted => W::Accepted(wire::Empty {}),
         }
     }
@@ -1720,6 +1731,10 @@ impl TryFrom<wire::command_result::Result> for CommandResult {
                     pgid: a.pgid,
                     pidfd: a.pidfd,
                 }),
+            }),
+            W::ClockSynced(c) => CommandResult::ClockSynced(ClockSynced {
+                stepped: c.stepped,
+                drift_ms: c.drift_ms,
             }),
             W::Accepted(_) => CommandResult::Accepted,
         })

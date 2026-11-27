@@ -1596,6 +1596,12 @@ impl Runtime {
                     Err(error) => ControlResponse::error(rid, error),
                 }
             }
+            Command::RuntimeSyncClock { unix_epoch_ns } => {
+                match crate::clock::sync_clock(unix_epoch_ns) {
+                    Ok(synced) => ControlResponse::ok_with(rid, CommandResult::ClockSynced(synced)),
+                    Err(error) => ControlResponse::error(rid, error),
+                }
+            }
             // Streaming commands are routed through dispatch_streaming (they need the ConnHandle).
             Command::AttachSession(_)
             | Command::DetachSession { .. }

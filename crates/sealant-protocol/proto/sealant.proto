@@ -519,6 +519,7 @@ message Command {
     Empty lease_epoch = 31;
     Empty capture_replan = 32;
     DotfilesApplyArgs dotfiles_apply = 33;
+    SyncClockArgs runtime_sync_clock = 34;
   }
 }
 
@@ -592,6 +593,15 @@ message DotfilesApplied {
   string user = 1;
   string home = 2;
   optional ExecAccepted bootstrap = 3;
+}
+// `runtime.syncClock`: step guest CLOCK_REALTIME to host UTC when drift exceeds 500 ms
+// (used after host sleep/wake under Apple Virtualization.framework where NTP is blocked).
+message SyncClockArgs {
+  uint64 unix_epoch_ns = 1;
+}
+message ClockSynced {
+  bool stepped = 1;
+  int64 drift_ms = 2;
 }
 message SessionOpened { string session_id = 1; string process_id = 2; int32 pid = 3; }
 
@@ -823,6 +833,7 @@ message CommandResult {
     LeaseEpochReport lease_epoch = 17;
     CaptureReplanned capture_replanned = 18;
     DotfilesApplied dotfiles_applied = 19;
+    ClockSynced clock_synced = 20;
   }
 }
 
