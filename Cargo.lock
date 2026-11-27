@@ -2176,6 +2176,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "sealant-vmd"
+version = "0.0.0"
+dependencies = [
+ "clap",
+ "getrandom 0.2.17",
+ "hex",
+ "httparse",
+ "libc",
+ "sealant-vmm-proto",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "sealant-vmm-proto"
+version = "0.0.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "sealantctl"
 version = "0.0.0"
 dependencies = [

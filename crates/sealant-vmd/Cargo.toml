@@ -1,0 +1,28 @@
+[package]
+name = "sealant-vmd"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Stateless macOS host launcher for Sealant Apple Virtualization.framework microVMs."
+
+[lints]
+workspace = true
+
+[dependencies]
+clap = { workspace = true }
+getrandom = { workspace = true }
+hex = { workspace = true }
+httparse = { workspace = true }
+libc = { workspace = true }
+sealant-vmm-proto = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

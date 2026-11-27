@@ -106,6 +106,7 @@ sealant-network = { path = "crates/sealant-network" }
 sealant-control = { path = "crates/sealant-control" }
 sealant-capture = { path = "crates/sealant-capture" }
 sealant-observability = { path = "crates/sealant-observability" }
+sealant-vmm-proto = { path = "crates/sealant-vmm-proto" }
 
 [profile.release]
 opt-level = 3
