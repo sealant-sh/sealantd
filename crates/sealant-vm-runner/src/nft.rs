@@ -12,6 +12,7 @@
 //!   port directly, or spoofing another source, is refused.
 
 use std::io::Write;
+use std::net::IpAddr;
 use std::process::{Command, Stdio};
 
 use crate::net::{
@@ -34,11 +35,22 @@ pub enum Egress {
     Restricted { extra_tcp_ports: Vec<u16> },
 }
 
+/// Output-chain restriction for the macOS `mend-vmd-link` interface: allows ONLY TCP to the
+/// resolved `sealant-vmd` host address and port (plus established replies) and drops all other
+/// traffic leaving that interface.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VmdOutputLock {
+    pub interface: String,
+    pub host_ip: IpAddr,
+    pub port: u16,
+}
+
 /// What the ruleset is built from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Policy {
     pub mode: BootMode,
     pub egress: Egress,
+    pub vmd_output: Option<VmdOutputLock>,
 }
 
 impl Policy {
@@ -137,6 +149,25 @@ pub fn ruleset(policy: &Policy) -> String {
     }
     out.push_str("\t}\n");
     out.push_str("\tchain forward {\n\t\ttype filter hook forward priority 0; policy drop;\n\t}\n");
+    if let Some(lock) = &policy.vmd_output {
+        let iface = &lock.interface;
+        let daddr = match lock.host_ip {
+            IpAddr::V4(v4) => format!("ip daddr {v4}"),
+            IpAddr::V6(v6) => format!("ip6 daddr {v6}"),
+        };
+        out.push_str(
+            "\tchain output {\n\t\ttype filter hook output priority filter; policy accept;\n",
+        );
+        out.push_str(&format!(
+            "\t\toifname \"{iface}\" ct state established,related accept\n"
+        ));
+        out.push_str(&format!(
+            "\t\toifname \"{iface}\" {daddr} tcp dport {} accept\n",
+            lock.port
+        ));
+        out.push_str(&format!("\t\toifname \"{iface}\" drop\n"));
+        out.push_str("\t}\n");
+    }
     out.push_str("}\n");
     out
 }
@@ -245,7 +276,31 @@ mod tests {
     use super::*;
 
     fn policy(mode: BootMode, egress: Egress) -> Policy {
-        Policy { mode, egress }
+        Policy {
+            mode,
+            egress,
+            vmd_output: None,
+        }
+    }
+
+    #[test]
+    fn vmd_output_lock_restricts_only_the_vmd_interface_to_host_ip_and_port() {
+        let p = Policy {
+            mode: BootMode::Normal,
+            egress: Egress::Standard,
+            vmd_output: Some(VmdOutputLock {
+                interface: "eth1".to_owned(),
+                host_ip: IpAddr::V4(std::net::Ipv4Addr::new(0, 250, 250, 254)),
+                port: 49152,
+            }),
+        };
+        let rules = ruleset(&p);
+        assert!(rules.contains("chain output {"), "{rules}");
+        assert!(
+            rules.contains("oifname \"eth1\" ip daddr 0.250.250.254 tcp dport 49152 accept"),
+            "{rules}"
+        );
+        assert!(rules.contains("oifname \"eth1\" drop"), "{rules}");
     }
 
     /// The rules of one chain, trimmed, without its `type ... hook` header line.

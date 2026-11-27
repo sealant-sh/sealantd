@@ -19,6 +19,7 @@
 pub mod exit;
 pub mod forward;
 pub mod jail;
+pub mod mac_vmd;
 pub mod net;
 pub mod nft;
 pub mod protocol;

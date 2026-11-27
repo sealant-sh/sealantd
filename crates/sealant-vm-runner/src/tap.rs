@@ -25,6 +25,10 @@ impl Tap {
     pub fn raw_fd(&self) -> RawFd {
         self.fd.as_raw_fd()
     }
+
+    pub fn into_owned_fd(self) -> OwnedFd {
+        self.fd
+    }
 }
 
 /// Creates `name` on `tun_path` (`IFF_TAP | IFF_NO_PI | IFF_VNET_HDR`), gives it `addr/prefix_len`
@@ -40,17 +44,51 @@ pub fn create(
     prefix_len: u8,
     mtu: u32,
 ) -> std::io::Result<Tap> {
+    create_with_flags(
+        tun_path,
+        name,
+        addr,
+        prefix_len,
+        mtu,
+        sys::IFF_TAP | sys::IFF_NO_PI | sys::IFF_VNET_HDR,
+    )
+}
+
+/// Creates `name` on `tun_path` with raw Ethernet frames (`IFF_TAP | IFF_NO_PI`, no
+/// `IFF_VNET_HDR`), as required by Apple `Virtualization.framework`'s
+/// `VZFileHandleNetworkDeviceAttachment`.
+pub fn create_raw(
+    tun_path: &Path,
+    name: &str,
+    addr: Ipv4Addr,
+    prefix_len: u8,
+    mtu: u32,
+) -> std::io::Result<Tap> {
+    create_with_flags(
+        tun_path,
+        name,
+        addr,
+        prefix_len,
+        mtu,
+        sys::IFF_TAP | sys::IFF_NO_PI,
+    )
+}
+
+fn create_with_flags(
+    tun_path: &Path,
+    name: &str,
+    addr: Ipv4Addr,
+    prefix_len: u8,
+    mtu: u32,
+    flags: libc::c_short,
+) -> std::io::Result<Tap> {
     let file = OpenOptions::new()
         .read(true)
         .write(true)
         .custom_flags(libc::O_CLOEXEC | libc::O_NONBLOCK)
         .open(tun_path)?;
     let fd = OwnedFd::from(file);
-    sys::tun_set_iff(
-        fd.as_fd(),
-        name,
-        sys::IFF_TAP | sys::IFF_NO_PI | sys::IFF_VNET_HDR,
-    )?;
+    sys::tun_set_iff(fd.as_fd(), name, flags)?;
     sys::configure_interface(name, addr, prefix_len, mtu)?;
     Ok(Tap {
         fd,

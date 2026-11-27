@@ -3,7 +3,7 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 #![forbid(unsafe_code)]
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, SystemTime};
@@ -13,11 +13,12 @@ use sealant_observability::BootTrace;
 use tokio::net::{TcpListener, UdpSocket};
 
 use sealant_vm_runner::exit::{self, EXIT_SETUP_FAILED, ExitRecorder};
+use sealant_vm_runner::mac_vmd::{self, DEFAULT_MAC_MTU, MacVmdConfig};
 use sealant_vm_runner::net::{
     DNS_PORT, HOST_IP, HTTP_PORT, HTTPS_PORT, MTU, PREFIX_LEN, RESOURCE_PORT, TAP_NAME, TCP_PORT,
     Upstreams,
 };
-use sealant_vm_runner::nft::{self, Egress, Policy};
+use sealant_vm_runner::nft::{self, Egress, Policy, VmdOutputLock};
 use sealant_vm_runner::protocol::{self, BootMode, GuestNetworkConfig, StagedFiles, VmBootConfig};
 use sealant_vm_runner::tap::{self, Tap};
 use sealant_vm_runner::vmm::{self, Access, Arch, LandlockRule, NetFd, VmmSpec};
@@ -49,6 +50,14 @@ enum EgressMode {
     Restricted,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum VmmBackend {
+    /// Local Linux KVM Cloud Hypervisor (default).
+    CloudHypervisor,
+    /// Remote macOS `sealant-vmd` -> `sealant-vz-worker` over authenticated TCP Upgrade.
+    MacVmd,
+}
+
 /// Runs one workspace microVM inside its host-vm container.
 #[derive(Debug, Parser)]
 #[command(name = "sealant-vm-runner", version)]
@@ -56,6 +65,29 @@ struct Args {
     /// Check KVM, TUN, nftables, Landlock and Cloud Hypervisor, print a JSON report, and exit.
     #[arg(long)]
     self_test: bool,
+
+    /// Which VMM backend runs the microVM (`cloud-hypervisor` on Linux KVM, `mac-vmd` on macOS).
+    #[arg(long, value_enum, default_value = "cloud-hypervisor")]
+    vmm_backend: VmmBackend,
+
+    /// `sealant-vmd` hostname (mac-vmd backend only).
+    #[arg(long, default_value = "host.docker.internal")]
+    vmd_host: String,
+    /// `sealant-vmd` loopback port (required for `--vmm-backend mac-vmd`).
+    #[arg(long)]
+    vmd_port: Option<u16>,
+    /// Path to the read-only `vmd-token` bearer secret (read before privilege drop).
+    #[arg(long)]
+    vmd_token_file: Option<PathBuf>,
+    /// Container interface attached to `mend-vmd-link` locked in nftables `chain output`.
+    #[arg(long)]
+    vmd_interface: Option<String>,
+    /// Workspace VM name under `vm/<installId>/data/<vm-name>/data.img` (mac-vmd backend).
+    #[arg(long)]
+    vm_name: Option<String>,
+    /// Guest `eth0` / `tap0` MTU (defaults to 1500 for cloud-hypervisor, 65520 for mac-vmd).
+    #[arg(long)]
+    mtu: Option<u32>,
 
     /// `normal`, or `recover` (clean base, flush and status only, no session channel, no egress).
     #[arg(long, value_enum, default_value = "normal")]
@@ -122,12 +154,16 @@ fn main() -> ExitCode {
     let args = Args::parse();
 
     if args.self_test {
-        let report = selftest::run(&selftest::Probes {
+        let probes = selftest::Probes {
             kvm: args.kvm.clone(),
             tun: args.tun.clone(),
             nft: args.nft.clone(),
             cloud_hypervisor: args.cloud_hypervisor.clone(),
-        });
+        };
+        let report = match args.vmm_backend {
+            VmmBackend::CloudHypervisor => selftest::run(&probes),
+            VmmBackend::MacVmd => selftest::run_mac_vmd(&probes),
+        };
         match serde_json::to_string(&report) {
             Ok(json) => println!("{json}"),
             Err(e) => {
@@ -153,12 +189,14 @@ fn main() -> ExitCode {
 
 /// What the privileged phase hands the unprivileged one.
 struct Ready {
-    tap: Tap,
+    tap: Option<Tap>,
     mac: String,
-    kvm_gid: u32,
+    mtu: u32,
+    kvm_gid: Option<u32>,
     policy: Policy,
     digest: String,
     upstreams: Option<Upstreams>,
+    mac_vmd: Option<MacVmdConfig>,
     /// When the privileged phase ran.
     setup: (SystemTime, SystemTime),
 }
@@ -176,6 +214,75 @@ fn setup(args: &Args) -> Result<Ready, Error> {
         (BootMode::Normal, None) => return Err("--proxy-ip is required in normal mode".into()),
         (BootMode::Recover, _) => None,
     };
+    let mtu = args.mtu.unwrap_or(match args.vmm_backend {
+        VmmBackend::CloudHypervisor => MTU,
+        VmmBackend::MacVmd => DEFAULT_MAC_MTU,
+    });
+    let mac = match &args.mac {
+        Some(mac) => mac.clone(),
+        None => sealant_vm_runner::net::random_guest_mac()?,
+    };
+
+    let (kvm_gid, vmd_output, mac_vmd) = match args.vmm_backend {
+        VmmBackend::CloudHypervisor => {
+            let gid = match args.kvm_gid {
+                Some(gid) => jail::validate_kvm_gid(gid)?,
+                None => jail::kvm_gid(&args.kvm)?,
+            };
+            (Some(gid), None, None)
+        }
+        VmmBackend::MacVmd => {
+            let port = args
+                .vmd_port
+                .ok_or("--vmd-port is required for --vmm-backend mac-vmd")?;
+            let token_file = args
+                .vmd_token_file
+                .as_ref()
+                .ok_or("--vmd-token-file is required for --vmm-backend mac-vmd")?;
+            let vm_name = args
+                .vm_name
+                .clone()
+                .ok_or("--vm-name is required for --vmm-backend mac-vmd")?;
+            // Read bearer token into memory BEFORE privilege drop so the bind mount can stay 0400.
+            let bearer_token = std::fs::read_to_string(token_file)
+                .map_err(|e| format!("reading {}: {e}", token_file.display()))?
+                .trim()
+                .to_owned();
+            if bearer_token.is_empty() {
+                return Err("vmd-token file is empty".into());
+            }
+            let host_ip = resolve_vmd_host(&args.vmd_host, port)?;
+            let vmd_iface = args.vmd_interface.clone().unwrap_or_else(|| {
+                if args.mode == BootMode::Normal {
+                    "eth1".to_owned()
+                } else {
+                    "eth0".to_owned()
+                }
+            });
+            let lock = VmdOutputLock {
+                interface: vmd_iface,
+                host_ip,
+                port,
+            };
+            let cfg = MacVmdConfig {
+                host: args.vmd_host.clone(),
+                host_ip,
+                port,
+                bearer_token,
+                vm_name,
+                mode: args.mode,
+                base_image_key: digest.clone(),
+                vcpus: args.vcpus,
+                memory_bytes: args.memory_mib.saturating_mul(1024 * 1024),
+                mac: (args.mode == BootMode::Normal).then(|| mac.clone()),
+                mtu,
+                sealant_run_dir: args.sealant_run_dir.clone(),
+                shutdown_grace: Duration::from_secs(args.shutdown_grace_secs),
+            };
+            (None, Some(lock), Some(cfg))
+        }
+    };
+
     let policy = Policy {
         mode: args.mode,
         egress: match args.egress {
@@ -184,30 +291,36 @@ fn setup(args: &Args) -> Result<Ready, Error> {
                 extra_tcp_ports: args.allow_tcp_ports.clone(),
             },
         },
-    };
-    let kvm_gid = match args.kvm_gid {
-        Some(gid) => jail::validate_kvm_gid(gid)?,
-        None => jail::kvm_gid(&args.kvm)?,
-    };
-    let mac = match &args.mac {
-        Some(mac) => mac.clone(),
-        None => sealant_vm_runner::net::random_guest_mac()?,
+        vmd_output,
     };
 
-    let tap = tap::create(&args.tun, TAP_NAME, HOST_IP, PREFIX_LEN, MTU)
-        .map_err(|e| format!("creating {TAP_NAME}: {e}"))?;
+    let tap = match (args.vmm_backend, args.mode) {
+        (VmmBackend::CloudHypervisor, _) => Some(
+            tap::create(&args.tun, TAP_NAME, HOST_IP, PREFIX_LEN, mtu)
+                .map_err(|e| format!("creating {TAP_NAME}: {e}"))?,
+        ),
+        (VmmBackend::MacVmd, BootMode::Normal) => Some(
+            tap::create_raw(&args.tun, TAP_NAME, HOST_IP, PREFIX_LEN, mtu)
+                .map_err(|e| format!("creating {TAP_NAME}: {e}"))?,
+        ),
+        // Recovery on mac-vmd has zero network devices (no tap0 needed).
+        (VmmBackend::MacVmd, BootMode::Recover) => None,
+    };
     nft::apply(&args.nft, &nft::script(&policy))
         .map_err(|e| format!("installing the nftables ruleset: {e}"))?;
     tracing::info!(
         mode = args.mode.as_str(),
+        backend = ?args.vmm_backend,
         egress = ?policy.egress,
+        mtu,
         "{TAP_NAME} up at {HOST_IP}/{PREFIX_LEN}, nftables table {} installed",
         nft::TABLE
     );
 
     raise_nofile();
-    jail::drop_privileges(kvm_gid)?;
-    let status = jail::verify(Path::new("/proc/self/status"), kvm_gid)?;
+    let expected_groups: Vec<u32> = kvm_gid.into_iter().collect();
+    jail::drop_privileges_with_groups(&expected_groups)?;
+    let status = jail::verify_with_groups(Path::new("/proc/self/status"), &expected_groups)?;
     tracing::info!(
         uid = status.uid[0],
         gid = status.gid[0],
@@ -217,12 +330,32 @@ fn setup(args: &Args) -> Result<Ready, Error> {
     Ok(Ready {
         tap,
         mac,
+        mtu,
         kvm_gid,
         policy,
         digest,
         upstreams,
+        mac_vmd,
         setup: (setup_started, SystemTime::now()),
     })
+}
+
+fn resolve_vmd_host(host: &str, port: u16) -> Result<IpAddr, Error> {
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return Ok(ip);
+    }
+    let mut addrs = (host, port)
+        .to_socket_addrs()
+        .map_err(|e| format!("resolving --vmd-host {host:?}: {e}"))?;
+    // Prefer IPv4 when both v4 and v6 are returned (OrbStack/Docker Desktop both resolve v4).
+    let mut first = None;
+    for addr in &mut addrs {
+        if addr.ip().is_ipv4() {
+            return Ok(addr.ip());
+        }
+        first.get_or_insert(addr.ip());
+    }
+    first.ok_or_else(|| format!("--vmd-host {host:?} resolved to no addresses").into())
 }
 
 /// Raises the soft `RLIMIT_NOFILE` to the hard limit, up to [`NOFILE_TARGET`]. Best effort: the
@@ -273,7 +406,7 @@ fn run(args: &Args, ready: Ready, started: SystemTime) -> Result<u8, Error> {
     let mut boot = protocol::load_boot_config(
         &files,
         args.mode,
-        Some(GuestNetworkConfig::for_mac(&ready.mac)),
+        Some(GuestNetworkConfig::for_mac_with_mtu(&ready.mac, ready.mtu)),
     )?;
     // The launch, under the launcher's span; the guest's boot, under the launch.
     let staged = boot.telemetry.take().unwrap_or_default();
@@ -310,6 +443,25 @@ async fn serve(
     if let Some(upstreams) = ready.upstreams {
         start_forwarders(&ready.policy, upstreams).await?;
     }
+
+    if let Some(mac_cfg) = ready.mac_vmd {
+        let exits = ExitRecorder::default();
+        if let Some(launch) = &launch {
+            launch.reached("vmm_started");
+            launch.end(true);
+        }
+        let vmm_exit =
+            mac_vmd::run_vm(&mac_cfg, ready.tap, boot.to_frame()?, exits.clone()).await?;
+        let guest = exits.latest();
+        let code = exit::runner_exit_code(vmm_exit, guest.as_ref());
+        tracing::info!(?vmm_exit, ?guest, code, "mac-vmd VM ended");
+        return Ok(code);
+    }
+
+    let tap = ready.tap.ok_or("missing tap0 for cloud-hypervisor")?;
+    let kvm_gid = ready
+        .kvm_gid
+        .ok_or("missing kvm_gid for cloud-hypervisor")?;
 
     let mux = Mux::new(args.vm_run_dir.join("vsock.sock"));
     let api_socket = args.vm_run_dir.join("ch-api.sock");
@@ -360,7 +512,7 @@ async fn serve(
         vcpus: args.vcpus,
         memory_mib: args.memory_mib,
         net: Some(NetFd {
-            fd: ready.tap.raw_fd(),
+            fd: tap.raw_fd(),
             mac: ready.mac.clone(),
         }),
         vsock_socket: mux.socket().to_owned(),
@@ -375,11 +527,11 @@ async fn serve(
             rule(&args.kvm, Access::ReadWrite),
         ],
     };
-    let mut child = vmm::spawn(&spec, Some(&ready.tap))?;
+    let mut child = vmm::spawn(&spec, Some(&tap))?;
     // The tap descriptor now lives in the VMM; the runner's copy is no longer needed.
-    drop(ready.tap);
+    drop(tap);
     if let Some(pid) = child.id() {
-        if let Err(e) = jail::verify(Path::new(&format!("/proc/{pid}/status")), ready.kvm_gid) {
+        if let Err(e) = jail::verify(Path::new(&format!("/proc/{pid}/status")), kvm_gid) {
             child.start_kill()?;
             let _ = child.wait().await;
             if let Some(launch) = &launch {

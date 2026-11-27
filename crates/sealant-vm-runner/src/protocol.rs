@@ -107,12 +107,16 @@ pub struct GuestNetworkConfig {
 
 impl GuestNetworkConfig {
     pub fn for_mac(mac: &str) -> Self {
+        Self::for_mac_with_mtu(mac, MTU)
+    }
+
+    pub fn for_mac_with_mtu(mac: &str, mtu: u32) -> Self {
         Self {
             interface: "eth0".to_owned(),
             address: format!("{GUEST_IP}/{PREFIX_LEN}"),
             gateway: HOST_IP.to_string(),
             dns: vec![HOST_IP.to_string()],
-            mtu: MTU,
+            mtu,
             mac: mac.to_owned(),
         }
     }
