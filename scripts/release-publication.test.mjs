@@ -2536,6 +2536,7 @@ const SKIPPED_TOGETHER = new Map([
   // rest only when it decides not to publish.
   ["next.yml image", "plan skips only on a fork or a failed ci; publish is plan's decision"],
   ["next.yml image-tag", "skipped exactly when plan decided not to publish"],
+  ["next.yml macos-vmd", "skipped exactly when plan decided not to publish"],
   ["next.yml pack", "skipped exactly when plan decided not to publish"],
   ["next.yml publish", "skipped exactly when plan decided not to publish"],
   [
