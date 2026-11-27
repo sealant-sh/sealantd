@@ -76,6 +76,17 @@ pub fn run(probes: &Probes) -> Report {
     }
 }
 
+/// Self-test for `--vmm-backend mac-vmd` inside Docker Desktop / OrbStack, where `/dev/kvm`,
+/// Landlock, and Cloud Hypervisor are absent and only `/dev/net/tun` + `nftables` are required.
+pub fn run_mac_vmd(probes: &Probes) -> Report {
+    let checks = vec![check_tun(&probes.tun), check_nft(&probes.nft)];
+    Report {
+        version: 1,
+        ok: checks.iter().all(|c| c.ok),
+        checks,
+    }
+}
+
 fn check_kvm(path: &Path) -> Check {
     let shown = path.display().to_string();
     let meta = match std::fs::metadata(path) {

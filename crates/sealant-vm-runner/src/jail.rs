@@ -76,8 +76,15 @@ fn step(step: &'static str) -> impl FnOnce(std::io::Error) -> JailError {
     move |source| JailError::Step { step, source }
 }
 
-/// Runs the whole drop, in order. Irreversible: on error the process must exit.
+/// Runs the whole drop, in order, keeping only `[kvm_gid]`. Irreversible: on error the process
+/// must exit.
 pub fn drop_privileges(kvm_gid: u32) -> Result<(), JailError> {
+    drop_privileges_with_groups(&[kvm_gid])
+}
+
+/// Runs the whole drop, in order, keeping only `supplementary_groups` (empty for remote `mac-vmd`,
+/// where no `/dev/kvm` exists). Irreversible: on error the process must exit.
+pub fn drop_privileges_with_groups(supplementary_groups: &[u32]) -> Result<(), JailError> {
     let last_cap = std::fs::read_to_string("/proc/sys/kernel/cap_last_cap")
         .map_err(step("reading cap_last_cap"))?
         .trim()
@@ -91,7 +98,12 @@ pub fn drop_privileges(kvm_gid: u32) -> Result<(), JailError> {
     }
     sys::ambient_clear_all().map_err(step("PR_CAP_AMBIENT_CLEAR_ALL"))?;
     sys::clear_inheritable().map_err(step("capset(inheritable = 0)"))?;
-    nix::unistd::setgroups(&[Gid::from_raw(kvm_gid)]).map_err(|e| step("setgroups")(e.into()))?;
+    let gids: Vec<Gid> = supplementary_groups
+        .iter()
+        .copied()
+        .map(Gid::from_raw)
+        .collect();
+    nix::unistd::setgroups(&gids).map_err(|e| step("setgroups")(e.into()))?;
     let gid = Gid::from_raw(JAIL_GID);
     nix::unistd::setresgid(gid, gid, gid).map_err(|e| step("setresgid")(e.into()))?;
     nix::sys::prctl::set_keepcaps(false).map_err(|e| step("PR_SET_KEEPCAPS")(e.into()))?;
@@ -181,6 +193,11 @@ impl fmt::Display for Violation {
 /// Every difference between `status` and the jail: UID and GID `65532` in all four slots, groups
 /// exactly `[kvm_gid]`, no-new-privileges set, and all five capability masks zero.
 pub fn violations(status: &ProcStatus, kvm_gid: u32) -> Vec<Violation> {
+    violations_with_groups(status, &[kvm_gid])
+}
+
+/// Same as [`violations`], parameterized by the exact expected supplementary group set.
+pub fn violations_with_groups(status: &ProcStatus, expected_groups: &[u32]) -> Vec<Violation> {
     let mut out = Vec::new();
     if status.uid != [JAIL_UID; 4] {
         out.push(Violation::Uid(status.uid));
@@ -188,7 +205,7 @@ pub fn violations(status: &ProcStatus, kvm_gid: u32) -> Vec<Violation> {
     if status.gid != [JAIL_GID; 4] {
         out.push(Violation::Gid(status.gid));
     }
-    if status.groups != [kvm_gid] {
+    if status.groups != expected_groups {
         out.push(Violation::Groups(status.groups.clone()));
     }
     if status.no_new_privs != 1 {
@@ -210,6 +227,11 @@ pub fn violations(status: &ProcStatus, kvm_gid: u32) -> Vec<Violation> {
 
 /// Reads `path` (`/proc/self/status`, or a child's) and fails unless the jail holds.
 pub fn verify(path: &Path, kvm_gid: u32) -> Result<ProcStatus, JailError> {
+    verify_with_groups(path, &[kvm_gid])
+}
+
+/// Reads `path` and fails unless the jail holds with `expected_groups`.
+pub fn verify_with_groups(path: &Path, expected_groups: &[u32]) -> Result<ProcStatus, JailError> {
     let text = std::fs::read_to_string(path).map_err(|source| JailError::Status {
         path: path.display().to_string(),
         source,
@@ -218,7 +240,7 @@ pub fn verify(path: &Path, kvm_gid: u32) -> Result<ProcStatus, JailError> {
         path: path.display().to_string(),
         reason,
     })?;
-    let found = violations(&status, kvm_gid);
+    let found = violations_with_groups(&status, expected_groups);
     if !found.is_empty() {
         return Err(JailError::Violations(found));
     }

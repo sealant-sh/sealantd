@@ -20,6 +20,8 @@ libc = { workspace = true }
 # `net` adds SO_ORIGINAL_DST (`sockopt::OriginalDst`), which the TCP forwarders read.
 nix = { workspace = true, features = ["net"] }
 sealant-observability = { workspace = true }
+sealant-protocol = { workspace = true }
+sealant-vmm-proto = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -29,5 +31,6 @@ tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
 nix = { workspace = true }
+sealant-vmd = { path = "../sealant-vmd" }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
