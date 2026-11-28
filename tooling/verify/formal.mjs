@@ -49,13 +49,48 @@ const syncAt = (root, dir, ref) => {
   }
 };
 
-/** The guard for one model over a diff's files; `base` is where the diff starts. */
-export const guard = (root, coverage, { files, base }) => {
+const gitOk = (root, args) => {
+  try {
+    gitOut(root, args);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+// Why a sync commit can be missing. CI's checkout holds branches and tags, no pull request ref, and
+// a squash merge puts none of a pull request's own commits on main.
+const WHY_SYNC_VANISHES =
+  "A squash merge puts none of a pull request's own commits on main. Once its branch is deleted, only GitHub's pull request ref holds its last pushed head and the commits under it, and verify formal fetches those by SHA. A commit that a rebase or force-push replaced before the merge, or one never pushed, is held by nothing";
+
+/** Whether this clone has `sha`, fetching it from origin by SHA when it does not. */
+export const fetchCommit = (root, sha) => {
+  if (gitOk(root, ["cat-file", "-e", `${sha}^{commit}`])) return true;
+  try {
+    execFileSync("git", ["fetch", "--quiet", "--no-tags", "origin", sha], { cwd: root, stdio: "ignore", timeout: 120_000 });
+  } catch {
+    return false;
+  }
+  return gitOk(root, ["cat-file", "-e", `${sha}^{commit}`]);
+};
+
+/**
+ * The guard for one model over a diff's files; `base` is where the diff starts and `head` where it
+ * ends. A sync commit the diff moves must be one `head` reaches, so that main or the pull request's
+ * last pushed head still holds it after the squash merge.
+ */
+export const guard = (root, coverage, { files, base, head = "HEAD" }) => {
+  const before = base ? syncAt(root, coverage.dir, base) : null;
+  if (before !== null && before !== coverage.sync && !gitOk(root, ["merge-base", "--is-ancestor", coverage.sync, head])) {
+    return {
+      status: "failed",
+      detail: `${coverage.dir}/COVERAGE moves sync to ${coverage.sync.slice(0, 10)}, which this branch does not reach: a commit that a rebase or force-push replaced, one from another branch, or one never pushed. After the squash merge GitHub keeps only main and this pull request's last pushed head, so the commit would vanish. Name a commit on main, or this branch's commit that holds the code you checked, as pushed, and re-point it after every rebase`,
+    };
+  }
   const code = files.filter((f) => coverage.paths.includes(f));
   if (code.length === 0) return { status: "passed", detail: "no covered code changed" };
   const model = files.filter((f) => coverage.model.includes(f));
   if (model.length > 0) return { status: "passed", detail: `covered code and the model changed (${model.join(", ")})` };
-  const before = base ? syncAt(root, coverage.dir, base) : null;
   if (before !== null && before !== coverage.sync) {
     return { status: "passed", detail: `covered code changed and the sync commit moved to ${coverage.sync.slice(0, 10)}` };
   }
@@ -66,19 +101,18 @@ export const guard = (root, coverage, { files, base }) => {
   };
 };
 
-/** Covered files that changed since the sync commit, at `head`. */
-export const drift = (root, coverage, head) => {
-  try {
-    gitOut(root, ["cat-file", "-e", `${coverage.sync}^{commit}`]);
-  } catch {
-    return { known: false, files: [] };
-  }
+/**
+ * Covered files that changed since the sync commit, at `head`. A sync commit this clone lacks is
+ * fetched from origin; `known` is false when origin does not serve it either.
+ */
+export const drift = (root, coverage, head, fetch = fetchCommit) => {
+  if (!fetch(root, coverage.sync)) return { known: false, files: [] };
   const files = gitOut(root, ["diff", "--name-only", coverage.sync, head, "--", ...coverage.paths]).split("\n").filter(Boolean);
   return { known: true, files };
 };
 
 const driftDetail = (coverage, moved) =>
-  `drift since ${coverage.sync.slice(0, 10)}: ${moved.known ? (moved.files.length ? moved.files.join(", ") : "none") : "the sync commit is not in this clone"}`;
+  `drift since ${coverage.sync.slice(0, 10)}: ${moved.known ? (moved.files.length ? moved.files.join(", ") : "none") : "unknown, the sync commit cannot be read"}`;
 
 /** The guard and the check for each owed model. `run(argv, log)` resolves to { code }. */
 export const modelSteps = async (root, models, { files, base, head, full = false, run }) => {
@@ -93,12 +127,22 @@ export const modelSteps = async (root, models, { files, base, head, full = false
       steps.push({ id: `${o.id}-guard`, title: o.model, status: "failed", detail: error.message });
       continue;
     }
-    const verdict = base ? guard(root, coverage, { files, base }) : { status: "passed", detail: "no base: the guard needs a diff" };
+    const verdict = base ? guard(root, coverage, { files, base, head }) : { status: "passed", detail: "no base: the guard needs a diff" };
+    const moved = drift(root, coverage, head);
+    if (!moved.known) {
+      const area = path.posix.basename(coverage.dir);
+      steps.push({
+        id: `${o.id}-sync`,
+        title: `${o.model}: the sync commit in COVERAGE can be read`,
+        status: "failed",
+        detail: `${area}'s sync commit ${coverage.sync} is not in this clone, and origin does not serve it. ${WHY_SYNC_VANISHES}. Point the sync line in ${coverage.dir}/COVERAGE at the commit on main that holds the code the model was last checked against (usually the squash commit of the pull request that set it: git log origin/main --format=%H -- ${coverage.dir}/COVERAGE), and account for any covered hunk between the two as .agents/skills/${area} says`,
+      });
+    }
     steps.push({
       id: `${o.id}-guard`,
       title: `${o.model}: covered code changes move the model or its sync commit`,
       status: verdict.status,
-      detail: `${verdict.detail}. ${driftDetail(coverage, drift(root, coverage, head))}`,
+      detail: `${verdict.detail}. ${driftDetail(coverage, moved)}`,
     });
     // check.sh runs tlx, which docs/formal/tlx.sh builds from its pinned commit the first time.
     const argv = ["bash", path.join(o.dir, "check.sh"), ...(full ? [] : ["--quick"])];
