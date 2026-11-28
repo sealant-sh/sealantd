@@ -36,11 +36,11 @@
     "prepublishOnly": "pnpm run build"
   },
   "dependencies": {
-    "@bufbuild/protobuf": "^2.12.0",
+    "@bufbuild/protobuf": "^2.17.0",
     "@sealant/runtime-protocol": "workspace:*"
   },
   "peerDependencies": {
-    "effect": "^4.0.5"
+    "effect": "^4.1.5"
   },
   "peerDependenciesMeta": {
     "effect": {
@@ -48,6 +48,6 @@
     }
   },
   "devDependencies": {
-    "effect": "^4.0.5"
+    "effect": "^4.1.5"
   }
 }
