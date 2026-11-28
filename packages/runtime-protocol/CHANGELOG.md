@@ -1,5 +1,243 @@
 # @sealant/runtime-protocol
 
+## 0.21.0
+
+### Minor Changes
+
+- cf8ca02: A workspace boot is now one trace. A container boot records `sealantd.boot` from the process's start, as a child of `SEALANT_TRACEPARENT` when set. A host-vm boot records the runner's `sealantd.vm.launch` and the guest's `sealantd.vm.boot`, under the `telemetry.traceparent` staged in `boot-env.json`. Each stage is a child span carrying `sealant.boot.stage`: provisioning (`clone`, `mount` or `restore`), `healthy`, `control_ready` and `harness_started`, plus the guest's `disk_layout` and `boot_config`. An error during the boot is linked to its trace. The VM runner and the egress proxy export too, under the plain `SENTRY_*` variables. The runner passes the guest its DSN, environment and release, from the staged `telemetry` or its own environment.
+- 32e8654: A control request can now carry the caller's W3C trace context, so the daemon's work on it shows up in the caller's trace. `ControlRequest` has an optional `trace` field (`TraceContext { traceparent, tracestate }`, field 4). A daemon from before this ignores the field, and a request without it works as before.
+
+  `SealantClient.connect`, `fromStream` and `spawn` take a `traceContext` hook. The client calls it as each request starts and sends what it returns. `request(command, { trace })` sets the context for one request, as a `traceparent` string or `{ traceparent, tracestate }`. A malformed context, or a hook that throws, leaves the request untraced and still sends it. Effect callers can pass `effectTraceContext` from the new `@sealant/runtime-client/effect` entry point. It reads the calling fiber's current span, so `Effect.tryPromise(() => client.exec(...))` inside `Effect.withSpan` sends that span as the parent. `effect` is an optional peer dependency, needed only for that entry point.
+
+- b1ac03c: sealantd can send its traces and errors to Sentry. Set `SEALANT_SENTRY_DSN` on the daemon, and optionally `SEALANT_SENTRY_ENVIRONMENT`, `SEALANT_SENTRY_RELEASE` and `SEALANT_SENTRY_TRACES_SAMPLE_RATE`. `SEALANT_OTEL_EXPORTER_OTLP_ENDPOINT` and `SEALANT_OTEL_EXPORTER_OTLP_HEADERS` send spans to another collector. Without them nothing is exported and no network call is made. The names carry a `SEALANT_` prefix so that a workspace image's own `SENTRY_DSN` stays the user's, and boot keeps them out of the harness's environment.
+
+  Each control request becomes a `sealantd.control.<method>` span, a child of the caller's trace when the request carries `trace`, and exec, session open and attach get child spans for their stages. Spans name the method, request id and error code, never arguments, environment or output. A request that fails with an internal error is reported to Sentry once. Every string in a report is masked with the daemon's secrets and loses URL credentials and query strings. `--log-level` now filters stderr only, so `off` still exports.
+
+- 1c767a3: A forward can hold back what it reads instead of buffering it without bound.
+  `openForwardConnection(stream, { host, port, protocol, executionId?, highWaterMarkBytes })` opens
+  one forward on a connection that carries nothing else, and owns that connection from then on:
+
+  - It pauses reading the connection while the forward holds more than `highWaterMarkBytes` unread
+    bytes, and resumes once the consumer reads them back under. sealantd then stops reading the
+    forward's target, so a slow consumer holds back a fast producer. Each payload it holds is its own
+    copy, so the bytes held are the bytes counted.
+  - `channel.destroy()` closes the connection, also while it is paused, and sealantd reaps the
+    forward when the connection closes. The target's `End` ends the connection once queued writes
+    have flushed.
+  - It rejects when the forward does not open, when the connection closes first, or when more than
+    the mark arrives before sealantd confirms the forward. It never resolves with a channel that
+    lost bytes.
+  - The mark must be a positive integer; anything else is a `RangeError` before the connection is
+    touched.
+
+  `OpenForwardArgs.dedicated` (field 5) tells sealantd that the connection carries only this forward,
+  so it sends that connection no events. `openForwardConnection` sets it. A daemon that predates the
+  field keeps sending events, which the connection drops.
+
+  `Channel.write()` returns the connection's `write()` result (`false` once its outbound buffer is
+  full), and `Channel.drained()` resolves when that buffer drains. `drained()` rejects once the
+  connection can take no more writes: after a write error, a close, or `close()`. `Channel.destroy()`
+  also drops inbound bytes still queued on a channel the daemon already closed. The multiplexed
+  `SealantClient` keeps reading as before.
+
+  Breaking: `SealantClient.openForward` takes one object, `{ host, port, protocol, executionId? }`,
+  in place of positional arguments. `ChannelTransport` gains `drained` and `inboundQueued`, and its
+  `sendData` returns the `write()` result.
+
+- 0a46de1: A forward can be bound to a session. `openForward` and `openForwardConnection` take
+  `ownerSessionId` (`OpenForwardArgs.owner_session_id`, field 6): the forward opens only once the
+  session's processes, and no other process, hold the far end of the connection sealantd made, and
+  its result echoes the session in `boundSessionId` (`ForwardOpened.bound_session_id`, field 2).
+
+  A holder belongs to the session when it shares the leader's Linux session id, or when it runs as
+  the leader's user and group and the first `SEALANT_SESSION_MARKER` entry of its environment is the
+  session's marker. The marker is a secret sealantd mints per session, never the session id. Every
+  session leader carries it, and so does an `exec` that names a running session and runs as that
+  session's user and group; any other `exec` has the variable removed. A server that called
+  `setsid` or double-forked still counts this way. sealantd reads each process through one handle on
+  its `/proc/<pid>` directory, so a reused pid reads as gone, and reads another user's fds and
+  environment with that user's filesystem ids, so it needs no `CAP_SYS_PTRACE`. The whole check,
+  scans included, runs off the async runtime within the dial's 5 s deadline. No byte crosses before
+  the check passes. A bound forward ends when the session's leader exits, as soon as the leader is
+  reaped, with one `End` whose error is `owner-exited`.
+
+  A refusal carries `detail.reason`, which the package exports as `FORWARD_BINDING_REFUSALS`:
+  `owner-exited` (`session-not-found`: the session is not running), `peer-mismatch`
+  (`policy-denied`: a process outside the session holds the connection), or `binding-unverifiable`
+  (`policy-denied`: no holder could be found and checked in time, such as a server that never
+  accepts, or a holder whose membership could not be read). A bound forward is TCP to a loopback
+  address only (`invalid-argument` otherwise, checked before the session is looked up). `supports`
+  names `forward.owner`; a daemon without it ignores the field and opens the forward unbound, so a
+  caller checks the echo.
+
+  What the binding does not prove: a process of the session's own user can copy the marker into its
+  environment, a long-lived server the session started (a `tmux` server) passes the marker to what
+  it starts later from any session, and a holder of another uid than the listener's is not looked
+  for. A process whose fds cannot be read, such as a non-dumpable `ssh-agent`, does not stop a
+  member's holding from proving the binding. A cgroup per session would prove membership without
+  the marker; that is a follow-up.
+
+- 54c6e6c: A TCP forward that cannot connect says why. Its `internal-error` keeps its code and message and
+  gains `detail.reason`: `connection-refused` (nothing listens on that address and port),
+  `name-unresolved` (the host did not resolve, or not in time), `network-unreachable`, or
+  `dial-timeout`. A failure outside those kinds carries no reason. The reason comes from where and
+  how the connect failed, never from the error's text, and across a host's addresses it is the most
+  telling one: a refusal, then a timeout, then unreachable. The package exports the reasons as
+  `FORWARD_CONNECT_REASONS` and the `ForwardConnectReason` type, so a caller imports them rather than
+  retyping them.
+
+  A connect, name resolution included, gives up after 5 seconds instead of the kernel's own timeout.
+  A host's addresses are tried in turn, each starting 250 ms after the one before or as soon as it
+  fails, so one that does not answer leaves time for the others. sealantd runs a forward's open
+  beside the connection's reader, so a slow dial no longer holds up the connection's other requests
+  and channels, and closing the connection drops the dial and its socket at once.
+
+- 4dfe04f: `exec` and `openSession` take a secret env: variables for the process they start and no other.
+  The wire field is `ExecArgs.secret_env` (field 14) and `OpenSessionArgs.secret_env` (field 11), a
+  list of `SecretEnvVar { key, value }`. The client's `exec`, `execAttached` and `openSession` take
+  it as `secretEnv`.
+
+  The process gets each value exactly as sent, set over its `env`. sealantd masks the value in
+  everything it records of that process: stdout and stderr, a session's journal and input, the
+  events and the spool. The patterns are the process's own, so another process that prints the
+  same value is recorded as it wrote it. The exec-attach channel is a live forward that is never
+  recorded, and it carries the value as the process wrote it.
+
+  sealantd refuses a secret env with `invalid-argument`, and starts nothing, when an entry breaks a
+  rule. The error names the entry's index and the rule, never its name or value. Names follow
+  `[A-Za-z_][A-Za-z0-9_]*` and are at most 128 bytes. Values are 6 to 4096 bytes and hold no NUL. A
+  value that is part of `***REDACTED***`, starts with the marker's end or ends with its start is
+  refused, since a masked span beside it could complete it. A map holds at most 128 entries and
+  32 KiB. A duplicate name, a name also in `env`, a `SEALANT_` name, an identity name (`HOME`,
+  `USER`, `LOGNAME`, `SHELL`, `TMPDIR`, `XDG_RUNTIME_DIR`, `PATH`, `TERM`), or a proxy variable
+  sealantd sets (`HTTP_PROXY`, `HTTPS_PROXY`, in any case) is refused rather than replaced.
+
+  `supports` names `process.secret-env.v1`. A daemon without it ignores the field, so the client
+  asks the daemon on the same connection first and throws, sending nothing, when the daemon does not
+  name it. `request()` applies the same check to any `exec` or `openSession` that carries
+  `secretEnv`, and sends the command as it was when called. A call without `secretEnv` is sent at
+  once, as before. The package exports the name as `SECRET_ENV_CAPABILITY`.
+
+- f2c8f66: `sealantd --vm` runs the daemon as PID 1 of a workspace microVM (the `host-vm` runtime). It
+  mounts the guest's two disks: an overlay root over the read-only base disk, with the workspace,
+  `/home` and `/var/lib/docker` on the data disk directly, and adds `/dev/shm` and the
+  `/dev/fd`, `/dev/stdin`, `/dev/stdout` and `/dev/stderr` links. It opens one connection to the
+  runner on vsock port 1026 and keeps it for as long as it runs. The boot configuration comes in
+  on it, and a `{"version":1,"type":"shutdown"}` frame on it (or the power button) starts the
+  same graceful shutdown as `SIGTERM`. It serves the control protocol on vsock port 1024 to the
+  host (CID 2) only. On its way out it syncs the data disk, then on the same connection sends
+  `{"version":1,"type":"exit","exitCode":…,"synced":…}`. It waits for
+  `{"version":1,"type":"exitAck","accepted":true}` before it powers off. `synced` is true only when
+  the data disk's `syncfs` completed. The mode comes from `sealantd.mode=normal|recover` on the
+  kernel command line, or `--vm-mode`. A normal boot also configures `lo` and `eth0`, writes a
+  combined CA bundle (`/etc/ssl/certs/sealant-ca-bundle.pem`, exported as `SSL_CERT_FILE`,
+  `REQUESTS_CA_BUNDLE` and `NODE_EXTRA_CA_CERTS`) and fills a missing or empty `/etc/hosts`. It
+  also forwards `MEND_SESSION_ENDPOINT` on loopback to vsock port 1027 and starts the guest
+  `dockerd` when asked, plus `nix-daemon` on a Nix image. The final flush stops the guest
+  `dockerd`'s containers twice and stops `dockerd` only after the second time, so a workspace
+  running Docker still ends with a complete flush. The image's `PATH` is set on the daemon itself,
+  so the capture's `git` and the dotfiles' `chezmoi` are found. When the guest is idle, it drops
+  clean page cache and trims the data disk. A recovery boot runs on the clean, read-only base disk
+  with only the workspace and `/home`. It writes nothing to the base disk (session journals go to
+  `/run/sealant/session-journals`) and starts no `dockerd`, dotfiles, harness or session forwarder.
+
+  A recovery boot (`sealantd boot --recovery` as well as `--vm` in recover mode) now answers only
+  `runtime.health`, `runtime.getCapabilities`, `getRuntimeMetrics`, `listProcesses`,
+  `capture.status`, `lease.epoch`, `capture.flush` of kind `final` and `runtime.gracefulShutdown`.
+  Every other command, including a suspend flush, `runtime.kill` and `signalProcess`, is refused
+  with `policy-denied`.
+
+  `SEALANT_CAPTURE_DIAL` sends capture traffic through a local relay instead of TCP:
+  `unix:/run/sealant/capture.sock` on the `docker` runtime, or `vsock:2:1025` (the default
+  under `--vm`). Each request keeps its URL's path, query and `Host` header (`Host: garage:3900`),
+  so presigned object URLs still verify. Plain HTTP to the relay needs no
+  `SEALANT_CAPTURE_ALLOW_PLAINTEXT`. Unset, or `tcp`, capture traffic is dialled as before.
+
+### Patch Changes
+
+- 08a9aaf: Capture and restore now exclude Antigravity (`agy`) credentials (`.gemini/antigravity-cli/antigravity-oauth-token`, `.gemini/antigravity-acp/antigravity-oauth-token`, `.gemini/config/mcp_config.json`, logs and crash dumps) and machine-local state (`builtin/`, `updater/`, `presence/`, `installation_id`, `last_check.timestamp`, `cli.log`, `.cache/antigravity/`, and SQLite `*-shm` files), while preserving conversation databases, WALs, brain artifacts and settings across stop and resume.
+- 4b1a5b8: Two log lines no longer print values that can hold a credential. The VM runner's `boot config loaded` line names the image's `Env` variables without their values and gives the image entrypoint and command as argument counts, and a refused container stop during final capture logs the Docker daemon's status without its response body.
+- 9289888: A capture-store boot no longer fails when one `plan.get` hangs and then drops. Each boot
+  `plan.get` now has its own time limit (10 s, then 15 s, then 20 s for every later attempt) instead
+  of the channel's 60 s, and the boot always makes at least three attempts before its 20 s budget
+  can end the retries. When every call hangs, the boot gives up 45.75 s after the first attempt
+  began, with `capture plan.get failed after 3 attempts over 45.8 s: <last error>`. Before, one call
+  that hung for 30 s spent the whole budget and the session failed to start.
+
+  The boot's reads from the object store (the head manifest, packs, dir packs and plan sources) are
+  now asked again after a dropped connection, a reset, a timeout or a 5xx: four attempts at most,
+  0.25 s, 0.5 s and 1 s apart, each reading the whole object again from its first byte. A 403 or a
+  404 still fails at once. When every attempt fails, the error reads
+  `gave up after 4 attempts over <time> s: <last error>`.
+
+- cc763c2: A secret sealantd masks in recorded output stays masked however the process's writes split it.
+  Before, sealantd masked each read on its own, so a workspace secret written in two parts reached
+  the session journal, the event spool and `io.chunk` events as two raw halves. Each recorded stream
+  (exec stdout and stderr, a session's output, pipe stderr and input) now holds back a short suffix
+  that could still begin a configured secret until a later read, or the stream's end, decides it.
+  Overlapping matches are masked as one span. A PTY session also masks a multi-line secret its
+  output writes with CRLF line ends, and one its input sends with CR.
+
+  The token shapes (`ghp_…`, `sk-…`, `AKIA…`) hold nothing until a token's whole prefix has been
+  seen, so a live terminal shows every keystroke and frame at once; a token's bytes after its
+  prefix wait until it is long enough to mask or ends. The prefix stays in the record:
+  `ghp_***REDACTED***` where it was `***REDACTED***`.
+
+  An `io.chunk`'s `streamOffset` is now the raw position of the bytes it stands for, and its
+  `transform.originalByteCount` the number of those raw bytes; `byteCount` stays the recorded
+  length. A chunk can stand for raw bytes and record none, when a masked span from the chunk before
+  covers them all. Session input chunks carry offsets too, where they were all 0. Every stream's
+  held suffix is recorded before the `process.exited` that ends it, pipe-session stderr included:
+  stderr now drains after the leader's exit within the same bounds as stdout. When reading stops
+  before the writer closed (a drain cut short after the leader exits), or input is cut off (the
+  leader exits, or a write fails part way), a held suffix that could begin a secret is masked.
+  Input is recorded part by part as the leader takes it. A session refuses input once its leader
+  has exited, and a write the exit leaves blocked fails instead of waiting.
+
+- 87272fd: When `nft` refuses the VM runner's ruleset (in setup or `--self-test`) and exits before reading all of it, the runner now reports nft's own reason, such as `Operation not permitted`, not a `Broken pipe` from writing the ruleset.
+- f2cdf4e: A session that claims a standby workspace no longer fails to save. When the standby had staged a
+  capture of its own before the claim (it holds no lease, so the capture waited to be sent again) and
+  the claim's re-plan landed while that capture was being sent, the session's first capture was
+  merged into it: it named the standby's capture as its parent and carried packs under the standby's
+  key prefix, so the registrar refused it and the final flush never finished (`not saved · workspace
+kept`). A capture staged under another identity is now never merged into the session's, and it is
+  dropped once the shipper lets go of it. Removing a capture from the queue now checks that it is the
+  capture the shipper sent, so the session's capture, which takes the same chain position, is never
+  removed in its place. The log says `a capture staged under another identity is not coalesced with`
+  and `a capture staged under another identity was dropped once the shipper let go of it`.
+- f6f4612: A capture-store boot asks `plan.get` again when the request may never have reached the registrar:
+  a connection closed, reset or refused, a name that did not resolve, a timeout, a 5xx. It waits
+  0.25 s, 0.5 s, 1 s, 2 s and then 4 s between attempts, and gives up when the next wait would take
+  it past 20 s from the first failed attempt; the error then names the attempts, the time spent and
+  the last error. Before, one dropped connection failed the session's start with
+  `capture plan.get failed: transport: io: unexpected end of file`. A refusal from the registrar
+  still fails the boot at once, and a `worktree-leased` answer waits as before.
+- b66d78a: Every release now publishes two more images beside `ghcr.io/sealant-sh/sealantd`, each for amd64 and arm64 at the same version: `ghcr.io/sealant-sh/vm-runner` (the `host-vm` runner, with Cloud Hypervisor and the guest kernel) and `ghcr.io/sealant-sh/egress-proxy` (the per-workspace egress proxy). Each `-next` build publishes them as `vm-runner-next` and `egress-proxy-next`. The npm packages publish only once all three images are tagged, and the run summary lists each image as `tag@sha256:…` to pin.
+- c985dbf: sealantd no longer sends a trace of its own for a health check, capabilities probe, metrics or capture status read, lease check or shutdown that arrives without a caller's trace, or for the egress proxy's heartbeat. With a caller's trace, each is still a span in it. A boot's setup steps and harness spawn now show inside the boot's trace instead of as separate `sealantd.process.spawn` traces, and other background work no caller or boot started sends no trace.
+- e801076: A worktree no longer stops saving after a daemon restart that came right after a capture was
+  registered. When the daemon died after the registrar accepted a capture and before it removed that
+  capture from its staging queue, the first snap after the restart could replace that capture in the
+  queue. Every later register was then refused with a wrong-parent conflict, so nothing on that
+  worktree saved again, and a second restart laid the registered head over the disk, losing the edits
+  staged since. The restart now removes from the queue a capture the registrar already holds, before
+  it snaps. The log says `a capture registered before the daemon stopped was still queued; acked`
+  when it does.
+- cc225dc: Add `runtime.syncClock` control command so `sealant-vm-runner` can step a microVM guest's wall clock back to host UTC after host sleep/wake.
+- 71b8202: The daemon's spans now read in Sentry as what they are, instead of every one showing as `default` with a blank description. Control requests are RPC server calls (`rpc.server`, `sealantd.control/<method>`); process and session spawns, journals and attaches are `subprocess.*` and `file.create` spans; egress proxy policy changes are HTTP server routes (`PUT /v1/policy`); boots are `sealantd.boot` with a `sealantd.boot.stage` per stage, and a microVM launch is `sealantd.vm`. Each span also carries the release and environment the daemon reports, and `sealant.runtime_id` (plus `sealant.workspace_id` when the launcher names one), so Sentry can filter by them. A failed process or session spawn marks its span failed. A refused request's code is recorded in its wire form (`process-not-found`) as `sealantd.error_code` and `rpc.response.status_code`.
+- 1f23548: The daemon's spans follow the naming contract sealant and Mend share: `sealantd.<area>.<operation>` in lower snake case, op `sealantd.<area>`, and a short description of its own. Control requests are `sealantd.control.<method in snake case>` (`sealantd.control.write_stdin`, `sealantd.control.runtime_health`), described as what the method does ("write to stdin", "check runtime health"), with the wire name kept in `rpc.method` (`writeStdin`). A container boot is `sealantd.workspace.boot`, and each boot stage is named for what it does (`sealantd.boot.clone_repository`, `sealantd.boot.start_harness`, the runner's `sealantd.vm.start_vmm`), still carrying `sealant.boot.stage`. A process's user lookup is `sealantd.process.resolve_user`, a session's journal `sealantd.session.create_journal`, and attaching to its output `sealantd.session.stream_output`. The egress proxy's admin spans are named by route (`PUT /v1/policy`). Each boot stage now runs from where the stage before it ended, so a boot's stages read as one step after another instead of each starting at the boot's start. Every exported span and error now names a release: a build with no `SENTRY_RELEASE` (a local one) reports a `-dev` release (`sealantd@0.0.0-dev`). A batch of spans the collector didn't take (no answer, 429, 502, 503 or 504) is now sent again with backoff for up to a minute instead of dropped, so a network that stalls new connections for a while no longer loses a session's daemon spans; only the exporter's own thread waits, and shutdown keeps its two-second budget.
+- c8f976a: A `host-vm` workspace that was hard-killed seconds after an edit, a `git commit` or a capture now recovers its saved work. A kill before Linux wrote the newest git objects back to disk leaves them as empty files, even though the edited files themselves were synced. The recovery boot's final flush then failed in `git pack-objects` (`object file … is empty`): `FINAL CAPTURE INCOMPLETE reason=snapshot-failed`, exit 75, and the edit was never recovered. The capture now removes empty loose objects before it packs a repository, and again whenever a pack fails, and records that a crash tore objects there. A file whose blob was lost is read from disk again. In a repository a crash tore, a branch or reflog entry that names what the crash lost is left out of the capture (the log names each ref), and it is packed again if its objects come back. An index naming a lost object comes back rebuilt from the files, so the restored workspace captures new work at once. A `HEAD` detached at a lost commit still fails the final flush, since nothing can stand in for it. A partial clone, or a repository with no sign of a crash, still fails on a missing object as before, rather than leave anything out. The final flush completes and restores every file of the worktree byte for byte. The git commands the capture runs now flush the loose objects, index and refs they write to disk before they return (`core.fsync`, with `core.fsyncMethod=batch`), so a capture no longer leaves empty objects in the repository. The capture's own staged packs are not fsynced yet. The log says `removed an empty loose object, which a crash left before its bytes reached the disk`.
+
+  `sealantd --vm` now names the guest `workspace` at boot and makes `/etc/hosts` resolve it, so `sudo` in a `host-vm` workspace no longer prints `sudo: unable to resolve host (none)`. An `/etc/hosts` the image or the user wrote keeps every line and gains `127.0.1.1 workspace` only when no line names the host already.
+
+  Before powering off, `sealantd --vm` now remounts the data disk read-only after syncing it, so `e2fsck -fn data.img` finds the filesystem clean with no journal to replay. A disk still in use (`EBUSY`) is logged as `still in use, left read-write for the power-off`, and the power-off goes ahead.
+
+- c56c6e8: `sudo` now works inside a `host-vm` workspace. A normal `sealantd --vm` boot leaves no-new-privileges unset, whatever the workspace source (clone, SDK capture or a per-person capture), because the guest kernel is the isolation boundary. Before, a workspace with no per-person owner map inherited the container posture, and `sudo` failed with `effective uid is not 0, is /usr/bin/sudo on a file system with the 'nosuid' option set`. A recovery boot still sets no-new-privileges, owner map or not, and container boots (`sealantd boot`) keep the posture they had. The boot log names a microVM's posture as `privilege posture: microVM normal boot: …`.
+- fca1486: Live `file.changed` events no longer miss files inside a directory created within a new directory.
+  When a tool ran `mkdir -p a/b` and the second directory appeared while the daemon was still adding
+  watches for the first, `a/b` was reported once but never watched, so later writes inside it raised
+  no event until the shutdown diff. The daemon now lists a new directory again after adding its
+  watches, until no new directory turns up.
+
 ## 0.20.0
 
 ### Minor Changes
@@ -321,11 +559,11 @@ rev-list --stdin` got their whole input before their answer was read: once the a
 standby no session claimed (…)` on stderr, which Core's recovery sweep already releases on
     (`nothing-to-save`). Once any claim or writer was admitted none of this applies again.
 
-        Before, a claimed standby whose re-plan failed kept its placeholder captures queued forever
-        (`lease-lost`). Its final flush never completed, and the launch waited 12 minutes, failed and
-        needed a discard. Mend binds a `complete` answer to the lease epoch its claim took, so to act
-        on the answer itself it must read a claimed standby's answer under the placeholder's epoch and
-        its `standby:<id>` launch as nothing to save. Until then it sees the executor end.
+            Before, a claimed standby whose re-plan failed kept its placeholder captures queued forever
+            (`lease-lost`). Its final flush never completed, and the launch waited 12 minutes, failed and
+            needed a discard. Mend binds a `complete` answer to the lease epoch its claim took, so to act
+            on the answer itself it must read a claimed standby's answer under the placeholder's epoch and
+            its `standby:<id>` launch as nothing to save. Until then it sees the executor end.
 
   - **A base restores in its own formats (F4b).** When the plan's workspace class carries no
     `.git/config` or reftable tables (Mend's capture 0), the workspace sweep now leaves the ones
