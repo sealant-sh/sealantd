@@ -14,6 +14,9 @@ pub const SENTRY_DSN: &str = "SENTRY_DSN";
 pub const SENTRY_ENVIRONMENT: &str = "SENTRY_ENVIRONMENT";
 /// The release, `<sentry-project>@<version>`; the build's own when unset.
 pub const SENTRY_RELEASE: &str = "SENTRY_RELEASE";
+/// The release of a build that names none at build time (a local build): the workspace version,
+/// marked as a development build.
+pub const DEV_RELEASE: &str = concat!("sealantd@", env!("CARGO_PKG_VERSION"), "-dev");
 /// The share of new traces recorded, 0 to 1 (1 when unset). A caller's sampled flag still wins.
 pub const SENTRY_TRACES_SAMPLE_RATE: &str = "SENTRY_TRACES_SAMPLE_RATE";
 /// A collector's base URL, in place of the DSN's (`/v1/traces` is added).
@@ -125,11 +128,17 @@ impl Config {
         }
     }
 
-    /// The release to report when `SENTRY_RELEASE` is unset: the build's own.
+    /// The release to report when `SENTRY_RELEASE` is unset: the build's own, or, for a build
+    /// that names none (a local one), [`DEV_RELEASE`]. Every span then carries a release.
     #[must_use]
     pub fn with_default_release(mut self, release: Option<&str>) -> Self {
         if self.release.is_none() {
-            self.release = release.filter(|r| !r.is_empty()).map(str::to_owned);
+            self.release = Some(
+                release
+                    .filter(|r| !r.is_empty())
+                    .unwrap_or(DEV_RELEASE)
+                    .to_owned(),
+            );
         }
         self
     }
@@ -292,6 +301,12 @@ mod tests {
         assert_eq!(set.release.as_deref(), Some("sealantd@1.2.3"));
         let unset = config(&[]).with_default_release(Some("sealantd@0.0.1"));
         assert_eq!(unset.release.as_deref(), Some("sealantd@0.0.1"));
-        assert_eq!(config(&[]).with_default_release(Some("")).release, None);
+        let local = config(&[]).with_default_release(Some(""));
+        assert_eq!(local.release.as_deref(), Some(DEV_RELEASE));
+        assert_eq!(
+            config(&[]).with_default_release(None).release.as_deref(),
+            Some(DEV_RELEASE)
+        );
+        assert!(DEV_RELEASE.starts_with("sealantd@") && DEV_RELEASE.ends_with("-dev"));
     }
 }

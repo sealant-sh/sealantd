@@ -42,10 +42,17 @@ use tracing_subscriber::{Layer as _, Registry};
 
 pub use boot::{BootTrace, STAGE};
 pub use config::{
-    Config, OTEL_EXPORTER_OTLP_ENDPOINT, OTEL_EXPORTER_OTLP_HEADERS, SENTRY_DSN,
+    Config, DEV_RELEASE, OTEL_EXPORTER_OTLP_ENDPOINT, OTEL_EXPORTER_OTLP_HEADERS, SENTRY_DSN,
     SENTRY_ENVIRONMENT, SENTRY_RELEASE, SENTRY_TRACES_SAMPLE_RATE, VARIABLES,
 };
+pub use conventions::{CONTAINER_BOOT, GUEST_BOOT, VM_LAUNCH};
 
+/// How long one batch may keep trying to reach the collector: no new attempt starts after it,
+/// so one attempt already under way can end up to its own timeout later.
+/// A workspace's network can stall new connections for tens of seconds (seen on a check VM: 6 to
+/// 41 s); without retries, each export that met a stall lost its whole batch. Only the exporter's
+/// own thread waits: spans keep queueing behind it (bounded), and [`shutdown`] keeps its budget.
+const EXPORT_DEADLINE: Duration = Duration::from_secs(60);
 /// How long [`shutdown`] gives queued spans, then queued Sentry events.
 const FLUSH_SPANS: Duration = Duration::from_millis(1500);
 const FLUSH_EVENTS: Duration = Duration::from_millis(500);
@@ -124,6 +131,8 @@ pub fn start(config: &Config) {
     {
         return;
     }
+    // Every span and event names a release: the configured one, or a development build's.
+    let release = config.release.as_deref().unwrap_or(DEV_RELEASE);
     match &config.traces {
         Some(target) => match exporter(target) {
             Ok(exporter) => {
@@ -135,14 +144,11 @@ pub fn start(config: &Config) {
                             .build(),
                     )
                     .build();
-                let mut extra = vec![KeyValue::new(
-                    "deployment.environment.name",
-                    config.environment.clone(),
-                )];
-                if let Some(release) = &config.release {
-                    extra.push(KeyValue::new("service.version", release.clone()));
-                }
-                let common = conventions::release(&config.environment, config.release.as_deref());
+                let extra = vec![
+                    KeyValue::new("deployment.environment.name", config.environment.clone()),
+                    KeyValue::new("service.version", release.to_owned()),
+                ];
+                let common = conventions::release(&config.environment, release);
                 state.shared.run(batch, extra, common, config.sample_rate);
             }
             Err(error) => {
@@ -156,13 +162,7 @@ pub fn start(config: &Config) {
         let mut options = sentry::ClientOptions::default();
         options.dsn = Some(dsn.clone());
         // Always set: left unset, the SDK would take the image's `SENTRY_RELEASE`.
-        options.release = Some(
-            config
-                .release
-                .clone()
-                .unwrap_or_else(|| "unknown".to_owned())
-                .into(),
-        );
+        options.release = Some(release.to_owned().into());
         options.environment = Some(config.environment.clone().into());
         options.send_default_pii = false;
         options.max_breadcrumbs = 0;
@@ -185,6 +185,15 @@ pub fn start(config: &Config) {
     );
 }
 
+/// Retry a failed export (no answer, 429, 502, 503, 504) with backoff, 0.5 s doubling to 8 s,
+/// until [`EXPORT_DEADLINE`]. Any other answer is final.
+fn retry_policy() -> opentelemetry_otlp::RetryPolicy {
+    opentelemetry_otlp::RetryPolicy::recommended()
+        .with_max_retries(12)
+        .with_initial_delay(Duration::from_millis(500))
+        .with_max_delay(Duration::from_secs(8))
+}
+
 fn exporter(
     target: &config::TracesTarget,
 ) -> Result<opentelemetry_otlp::SpanExporter, opentelemetry_otlp::ExporterBuildError> {
@@ -193,8 +202,9 @@ fn exporter(
         .with_http_client(http::UreqClient::new(&target.headers))
         .with_endpoint(target.url.clone())
         .with_headers(target.headers.iter().cloned().collect::<HashMap<_, _>>())
-        .with_timeout(Duration::from_secs(5))
-        .with_retry_policy(opentelemetry_otlp::RetryPolicy::disabled())
+        // The retry deadline; each attempt is bounded by the client's own timeout (`http.rs`).
+        .with_timeout(EXPORT_DEADLINE)
+        .with_retry_policy(retry_policy())
         .build()
 }
 

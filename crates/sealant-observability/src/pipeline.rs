@@ -252,7 +252,7 @@ mod tests {
 
     #[test]
     fn a_health_check_records_only_inside_a_callers_sampled_trace() {
-        let health = "sealantd.control.runtime.health";
+        let health = "sealantd.control.runtime_health";
         assert_eq!(decide(health, None), SamplingDecision::Drop);
         assert_eq!(
             decide(health, Some(&Context::new())),
@@ -278,7 +278,7 @@ mod tests {
             decide("sealantd.process.spawn", Some(&caller(TraceFlags::SAMPLED))),
             SamplingDecision::RecordAndSample
         );
-        for name in ["sealantd.boot", "sealantd.control.exec"] {
+        for name in ["sealantd.workspace.boot", "sealantd.control.exec"] {
             assert_eq!(
                 decide(name, None),
                 SamplingDecision::RecordAndSample,

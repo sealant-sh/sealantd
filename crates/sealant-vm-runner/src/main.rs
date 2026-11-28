@@ -411,7 +411,7 @@ fn run(args: &Args, ready: Ready, started: SystemTime) -> Result<u8, Error> {
     // The launch, under the launcher's span; the guest's boot, under the launch.
     let staged = boot.telemetry.take().unwrap_or_default();
     let launch = BootTrace::begin(
-        "sealantd.vm.launch",
+        sealant_observability::VM_LAUNCH,
         started,
         staged
             .traceparent

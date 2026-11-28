@@ -489,7 +489,7 @@ impl SessionRuntime {
 
         // The durable output journal is a product guarantee (reattach + scrollback); a session
         // that cannot journal must not open.
-        let journal_span = tracing::info_span!("sealantd.session.journal").entered();
+        let journal_span = tracing::info_span!("sealantd.session.create_journal").entered();
         let journal_dir = self.config.session_journal_dir.clone().unwrap_or_else(|| {
             std::env::temp_dir().join(format!("sealantd-journals-{}", self.config.runtime_id))
         });

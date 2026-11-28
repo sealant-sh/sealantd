@@ -164,11 +164,9 @@ async fn handle(shared: Arc<Shared>, stream: UnixStream) {
     // body (brokered secrets among it) is never recorded: only which change it was.
     // Sentry shows each as an HTTP server span, `PUT /v1/policy`.
     let change = match (req.method.as_str(), path) {
-        ("PUT", "/v1/policy") => Some(("sealantd.proxy.admin.policy", "PUT", "/v1/policy")),
-        ("POST", "/v1/revoke") => Some(("sealantd.proxy.admin.revoke", "POST", "/v1/revoke")),
-        ("POST", "/v1/heartbeat") => {
-            Some(("sealantd.proxy.admin.heartbeat", "POST", "/v1/heartbeat"))
-        }
+        ("PUT", "/v1/policy") => Some(("PUT /v1/policy", "PUT", "/v1/policy")),
+        ("POST", "/v1/revoke") => Some(("POST /v1/revoke", "POST", "/v1/revoke")),
+        ("POST", "/v1/heartbeat") => Some(("POST /v1/heartbeat", "POST", "/v1/heartbeat")),
         _ => None,
     };
     let span = change.map_or_else(tracing::Span::none, |(name, method, route)| {

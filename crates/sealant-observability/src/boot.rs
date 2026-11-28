@@ -3,12 +3,12 @@
 //!
 //! Some stages end before the trace can begin (a microVM guest lays out its disks before the
 //! boot config that names its parent arrives), so a stage is recorded with the times it ran
-//! ([`BootTrace::stage`]). The others are measured from the boot's start ([`BootTrace::reached`]),
-//! or are ordinary spans made children of the boot ([`BootTrace::adopt`]). Every stage span
+//! ([`BootTrace::stage`]). The others run from where the stage before them ended to now
+//! ([`BootTrace::reached`]), so a boot's stages read as one step after another, or are ordinary
+//! spans made children of the boot ([`BootTrace::adopt`]). Every stage span
 //! carries `sealant.boot.stage`. Work the boot does itself, such as spawning its lifecycle steps
 //! and harness, runs in [`BootTrace::in_scope`] so its spans join the boot's trace.
 
-use std::borrow::Cow;
 use std::sync::Mutex;
 use std::sync::PoisonError;
 use std::time::SystemTime;
@@ -27,16 +27,18 @@ pub const STAGE: &str = "sealant.boot.stage";
 #[derive(Debug)]
 pub struct BootTrace {
     name: &'static str,
-    started: SystemTime,
     tracer: SdkTracer,
     /// The root span, until it ends.
     cx: Context,
     ended: Mutex<bool>,
+    /// Where the latest stage ended: the next [`BootTrace::reached`] starts there.
+    last: Mutex<SystemTime>,
 }
 
 impl BootTrace {
-    /// Begin `name` (`sealantd.vm.boot`), as started at `started`, as a child of the launcher's
-    /// `traceparent` when it names a span. None before [`crate::install`].
+    /// Begin `name` ([`crate::CONTAINER_BOOT`], [`crate::GUEST_BOOT`], [`crate::VM_LAUNCH`]), as
+    /// started at `started`, as a child of the launcher's `traceparent` when it names a span. None
+    /// before [`crate::install`].
     #[must_use]
     pub fn begin(
         name: &'static str,
@@ -59,16 +61,16 @@ impl BootTrace {
             .unwrap_or_else(PoisonError::into_inner) = Some(cx.span().span_context().clone());
         Some(Self {
             name,
-            started,
             tracer,
             cx,
             ended: Mutex::new(false),
+            last: Mutex::new(started),
         })
     }
 
     fn stage_span(&self, stage: &'static str, start: SystemTime) -> opentelemetry_sdk::trace::Span {
         self.tracer
-            .span_builder(Cow::Owned(format!("{}.{stage}", self.name)))
+            .span_builder(crate::conventions::stage_name(self.name, stage))
             .with_kind(SpanKind::Internal)
             .with_start_time(start)
             .with_attributes([KeyValue::new(STAGE, stage)])
@@ -78,11 +80,18 @@ impl BootTrace {
     /// A stage that ran from `start` to `end`, before the trace could begin or off its thread.
     pub fn stage(&self, stage: &'static str, start: SystemTime, end: SystemTime) {
         self.stage_span(stage, start).end_with_timestamp(end);
+        let mut last = self.last.lock().unwrap_or_else(PoisonError::into_inner);
+        *last = (*last).max(end);
     }
 
-    /// The boot reached `stage` now: a span from the boot's start to now.
+    /// The boot reached `stage` now: a span from where the stage before it ended (the boot's
+    /// start, for the first) to now.
     pub fn reached(&self, stage: &'static str) {
-        self.stage_span(stage, self.started).end();
+        let now = SystemTime::now();
+        let mut last = self.last.lock().unwrap_or_else(PoisonError::into_inner);
+        let start = (*last).min(now);
+        self.stage_span(stage, start).end_with_timestamp(now);
+        *last = now;
     }
 
     /// Make `span` (not yet entered) a stage of this boot.

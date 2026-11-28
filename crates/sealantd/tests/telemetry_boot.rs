@@ -1,5 +1,5 @@
 //! A container boot is one trace under the launcher's span (`SEALANT_TRACEPARENT`): a
-//! `sealantd.boot` span with a child per stage and per process it spawns, and an error during the
+//! `sealantd.workspace.boot` span with a child per stage and per process it spawns, and an error during the
 //! boot linked to it (SLNT-1351, SLNT-1386). `SEALANT_SENTRY_DSN` points the real `sealantd boot` at a loopback stand-in for
 //! Sentry, which keeps every byte it is sent.
 //!
@@ -118,14 +118,14 @@ fn a_boot_is_one_trace_with_a_span_per_stage() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let (status, log) = boot(tmp.path(), &collector, r#"[{"run":"true"}]"#);
     assert!(status.success(), "{status}: {log}");
-    let received = collected(&collector, b"sealantd.boot.harness_started");
+    let received = collected(&collector, b"sealantd.boot.start_harness");
     let spans = otlp(&received);
     for name in [
-        "sealantd.boot",
-        "sealantd.boot.clone",
-        "sealantd.boot.healthy",
-        "sealantd.boot.control_ready",
-        "sealantd.boot.harness_started",
+        "sealantd.workspace.boot",
+        "sealantd.boot.clone_repository",
+        "sealantd.boot.start_runtime",
+        "sealantd.boot.start_control_server",
+        "sealantd.boot.start_harness",
         "sealant.boot.stage",
     ] {
         assert!(contains(&spans, name.as_bytes()), "{name} was not exported");
@@ -139,20 +139,47 @@ fn a_boot_is_one_trace_with_a_span_per_stage() {
     assert_sentry_shows(&spans);
     let root = spans
         .iter()
-        .find(|s| s.name == "sealantd.boot")
+        .find(|s| s.name == "sealantd.workspace.boot")
         .expect("the boot's span");
-    assert_eq!(root.attribute("sentry.op"), Some("sealantd.boot"));
+    assert_eq!(root.attribute("sentry.op"), Some("sealantd.workspace"));
+    assert_eq!(
+        root.attribute("sentry.description"),
+        Some("boot workspace in a container")
+    );
     assert!(!root.failed);
     let healthy = spans
         .iter()
-        .find(|s| s.name == "sealantd.boot.healthy")
+        .find(|s| s.name == "sealantd.boot.start_runtime")
         .expect("the healthy stage");
-    assert_eq!(healthy.attribute("sentry.op"), Some("sealantd.boot.stage"));
+    assert_eq!(healthy.attribute("sentry.op"), Some("sealantd.boot"));
     assert_eq!(
         healthy.attribute("sentry.description"),
-        Some("runtime healthy")
+        Some("start runtime")
     );
+    assert_eq!(healthy.attribute("sealant.boot.stage"), Some("healthy"));
     assert_eq!(healthy.parent_span_id, root.span_id);
+    // The stages are one step after another: each starts where the one before it ended.
+    let stage = |name: &str| {
+        spans
+            .iter()
+            .find(|s| s.name == name)
+            .unwrap_or_else(|| panic!("no {name}"))
+    };
+    let order = [
+        "sealantd.boot.clone_repository",
+        "sealantd.boot.start_runtime",
+        "sealantd.boot.start_control_server",
+        "sealantd.boot.start_harness",
+    ];
+    for pair in order.windows(2) {
+        let (before, after) = (stage(pair[0]), stage(pair[1]));
+        assert!(
+            after.start >= before.end,
+            "{} starts before {} ends",
+            pair[1],
+            pair[0]
+        );
+    }
     // One trace: the setup step's and the harness's spawns are the boot's, not traces of their
     // own (SLNT-1386).
     let spawns: Vec<_> = spans
@@ -198,15 +225,17 @@ fn an_error_during_the_boot_is_linked_to_its_trace() {
         "the error is not linked to the boot's trace: {events}"
     );
     let spans = otlp(&received);
-    assert!(contains(&spans, b"sealantd.boot"));
+    assert!(contains(&spans, b"sealantd.workspace.boot"));
     assert!(
-        !contains(&spans, b"sealantd.boot.harness_started"),
+        !contains(&spans, b"sealantd.boot.start_harness"),
         "no harness started"
     );
     let spans = exported_spans(&received);
     assert_sentry_shows(&spans);
     assert!(
-        spans.iter().any(|s| s.name == "sealantd.boot" && s.failed),
+        spans
+            .iter()
+            .any(|s| s.name == "sealantd.workspace.boot" && s.failed),
         "the boot's span is not marked failed"
     );
 }

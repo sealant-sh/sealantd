@@ -732,7 +732,99 @@ impl Command {
             Self::RuntimeSyncClock { .. } => "runtime.syncClock",
         }
     }
+
+    /// How a trace names this command ([`Method`]).
+    #[must_use]
+    pub fn method(&self) -> &'static Method {
+        let name = self.name();
+        METHODS
+            .iter()
+            .find(|method| method.wire == name)
+            .unwrap_or(&UNLISTED)
+    }
 }
+
+/// How a trace shows one control method: the daemon's span is `sealantd.control.<operation>`,
+/// described by `description`, with the wire name kept in `rpc.method`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Method {
+    /// The wire `cmd` ([`Command::name`]).
+    pub wire: &'static str,
+    /// The wire name in lower snake case, its namespace folded in: `runtime.health` is
+    /// `runtime_health`, `writeStdin` is `write_stdin`.
+    pub operation: &'static str,
+    /// What the method does, in a few lower-case words.
+    pub description: &'static str,
+}
+
+const fn method(wire: &'static str, operation: &'static str, description: &'static str) -> Method {
+    Method {
+        wire,
+        operation,
+        description,
+    }
+}
+
+/// A method missing from [`METHODS`]; the protocol's tests keep it unused.
+const UNLISTED: Method = method("", "unknown", "handle control request");
+
+/// Every control method, in [`Command`]'s order.
+pub const METHODS: &[Method] = &[
+    method("runtime.health", "runtime_health", "check runtime health"),
+    method(
+        "runtime.getCapabilities",
+        "runtime_get_capabilities",
+        "report runtime capabilities",
+    ),
+    method(
+        "runtime.gracefulShutdown",
+        "runtime_graceful_shutdown",
+        "shut down runtime gracefully",
+    ),
+    method("runtime.kill", "runtime_kill", "kill runtime"),
+    method("execution.start", "execution_start", "start execution"),
+    method("execution.stop", "execution_stop", "stop execution"),
+    method("exec", "exec", "start process"),
+    method("signalProcess", "signal_process", "signal process"),
+    method("killProcess", "kill_process", "kill process"),
+    method("listProcesses", "list_processes", "list processes"),
+    method("writeStdin", "write_stdin", "write to stdin"),
+    method("closeStdin", "close_stdin", "close stdin"),
+    method("openSession", "open_session", "open session"),
+    method("closeSession", "close_session", "close session"),
+    method("resizePty", "resize_pty", "resize PTY"),
+    method("listSessions", "list_sessions", "list sessions"),
+    method("setFeatureState", "set_feature_state", "set feature state"),
+    method("bindMount", "bind_mount", "bind mount directory"),
+    method(
+        "getRuntimeMetrics",
+        "get_runtime_metrics",
+        "read runtime metrics",
+    ),
+    method("attachSession", "attach_session", "attach to session"),
+    method("detachSession", "detach_session", "detach from session"),
+    method("openForward", "open_forward", "open port forward"),
+    method("closeForward", "close_forward", "close port forward"),
+    method("openSftp", "open_sftp", "open SFTP channel"),
+    method("closeSftp", "close_sftp", "close SFTP channel"),
+    method("signalSession", "signal_session", "signal session"),
+    method(
+        "readSessionOutput",
+        "read_session_output",
+        "read session output",
+    ),
+    method("capture.now", "capture_now", "capture workspace now"),
+    method("capture.flush", "capture_flush", "flush capture"),
+    method("capture.status", "capture_status", "report capture status"),
+    method("lease.epoch", "lease_epoch", "check lease epoch"),
+    method("capture.replan", "capture_replan", "replan capture"),
+    method("dotfiles.apply", "dotfiles_apply", "apply dotfiles"),
+    method(
+        "runtime.syncClock",
+        "runtime_sync_clock",
+        "sync runtime clock",
+    ),
+];
 
 /// State of a single feature kill switch.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize, JsonSchema)]
@@ -1407,6 +1499,85 @@ mod tests {
         let back: Command = serde_json::from_value(value).expect("de");
         assert_eq!(back, cmd);
         assert_eq!(back.name(), "exec");
+    }
+
+    /// Every wire `cmd` the schema allows.
+    fn wire_names() -> Vec<String> {
+        let schema = serde_json::to_value(schemars::schema_for!(Command)).expect("schema");
+        let mut names = Vec::new();
+        let mut stack = vec![&schema];
+        while let Some(value) = stack.pop() {
+            match value {
+                serde_json::Value::Object(map) => {
+                    if let Some(cmd) = map.get("properties").and_then(|p| p.get("cmd")) {
+                        for name in cmd
+                            .get("enum")
+                            .and_then(serde_json::Value::as_array)
+                            .into_iter()
+                            .flatten()
+                        {
+                            names.push(name.as_str().expect("a name").to_owned());
+                        }
+                    }
+                    stack.extend(map.values());
+                }
+                serde_json::Value::Array(items) => stack.extend(items),
+                _ => {}
+            }
+        }
+        names.sort();
+        names.dedup();
+        names
+    }
+
+    fn snake_case(wire: &str) -> String {
+        let mut out = String::new();
+        for c in wire.chars() {
+            if c == '.' {
+                out.push('_');
+            } else if c.is_ascii_uppercase() {
+                out.push('_');
+                out.push(c.to_ascii_lowercase());
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn every_method_has_a_snake_case_operation_and_a_description_of_its_own() {
+        let mut listed: Vec<String> = METHODS.iter().map(|m| m.wire.to_owned()).collect();
+        listed.sort();
+        assert_eq!(listed, wire_names(), "METHODS lists every command once");
+        let mut descriptions = std::collections::HashSet::new();
+        for method in METHODS {
+            assert_eq!(method.operation, snake_case(method.wire), "{}", method.wire);
+            let words = method.description.split(' ').count();
+            assert!(
+                (2..=5).contains(&words),
+                "{}: {}",
+                method.wire,
+                method.description
+            );
+            assert!(
+                method
+                    .description
+                    .starts_with(|c: char| c.is_ascii_lowercase()),
+                "{}",
+                method.description
+            );
+            assert!(
+                descriptions.insert(method.description),
+                "{} shares its description",
+                method.wire
+            );
+        }
+        assert_eq!(Command::RuntimeHealth.method().operation, "runtime_health");
+        let stdin = Command::CloseStdin {
+            process_id: ProcessId::new("p"),
+        };
+        assert_eq!(stdin.method().description, "close stdin");
     }
 
     #[test]

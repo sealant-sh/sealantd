@@ -80,19 +80,23 @@ fn decode_inbound(body: &[u8]) -> Inbound {
 /// A request id longer than this is not recorded on its span: the client picks it.
 const MAX_RECORDED_REQUEST_ID: usize = 64;
 
-/// The span of one request, `sealantd.control.<method>`, a child of the caller's trace when the
-/// request carries one. It names the method and request id only: never an argument. Sentry
-/// shows it as an RPC server call, `sealantd.control/<method>` (OpenTelemetry's `rpc.*`).
+/// The span of one request, `sealantd.control.<operation>` (`sealantd.control.write_stdin`), a
+/// child of the caller's trace when the request carries one. It names the method and request id
+/// only: never an argument. `rpc.method` keeps the wire name (`writeStdin`), and Sentry shows the
+/// method's description ("write to stdin").
 fn request_span(request: &ControlRequest) -> tracing::Span {
     let method = request.command.name();
+    let named = request.command.method();
     let request_id = request.request_id.as_str();
     let span = tracing::info_span!(
         "sealantd.control",
-        otel.name = format!("sealantd.control.{method}"),
+        otel.name = format!("sealantd.control.{}", named.operation),
         otel.kind = "server",
         otel.status_code = tracing::field::Empty,
+        sentry.description = named.description,
         rpc.system.name = "sealantd",
-        rpc.method = format!("sealantd.control/{method}"),
+        rpc.service = "sealantd.control",
+        rpc.method = method,
         rpc.response.status_code = tracing::field::Empty,
         sealantd.method = method,
         sealantd.request_id = (request_id.len() <= MAX_RECORDED_REQUEST_ID).then_some(request_id),

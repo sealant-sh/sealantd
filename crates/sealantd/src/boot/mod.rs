@@ -56,7 +56,7 @@ pub fn run_boot(log_level: &str, recovery: bool) -> ExitCode {
     let parent = std::env::var(crate::telemetry::TRACEPARENT).ok();
     let state = std::env::var(crate::telemetry::TRACESTATE).unwrap_or_default();
     crate::telemetry::begin_boot(
-        "sealantd.boot",
+        sealant_observability::CONTAINER_BOOT,
         started,
         parent.as_deref().map(|parent| (parent, state.as_str())),
     );

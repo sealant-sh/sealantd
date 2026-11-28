@@ -1729,7 +1729,7 @@ impl Runtime {
             Command::AttachSession(args) => {
                 let channel_id = self.idgen.channel_id();
                 let subscribe = tracing::info_span!(
-                    "sealantd.session.subscribe",
+                    "sealantd.session.stream_output",
                     sealantd.replay = args.from_sequence.is_some(),
                 );
                 match self

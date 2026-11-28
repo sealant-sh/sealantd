@@ -7,6 +7,7 @@
 //! inside a traced span (log lines never become span events). The traced request and the error
 //! must still arrive, linked to the caller's trace, so the test cannot pass by sending nothing.
 
+#[allow(dead_code)]
 #[path = "support/collector.rs"]
 mod collector;
 
@@ -52,6 +53,7 @@ fn a_canary_never_reaches_the_exporters_and_the_trace_still_does() {
         "sealantd.control",
         otel.name = "sealantd.control.exec",
         otel.kind = "server",
+        sentry.description = "start process",
         sealantd.method = "exec",
         sealantd.request_id = "r1",
     );
@@ -110,10 +112,14 @@ fn a_canary_never_reaches_the_exporters_and_the_trace_still_does() {
         .iter()
         .find(|s| s.name == "sealantd.control.exec")
         .expect("the request's span");
-    assert_eq!(request.attribute("sentry.op"), Some("rpc.server"));
+    assert_eq!(request.attribute("sentry.op"), Some("sealantd.control"));
     assert_eq!(
         request.attribute("sentry.description"),
-        Some("sealantd.control/exec")
+        Some("start process")
+    );
+    assert_eq!(
+        request.attribute("sentry.release"),
+        Some(sealant_observability::DEV_RELEASE)
     );
     assert_eq!(request.attribute("sentry.environment"), Some("development"));
     assert!(!request.failed, "the request was answered");
@@ -122,7 +128,7 @@ fn a_canary_never_reaches_the_exporters_and_the_trace_still_does() {
         .iter()
         .find(|s| s.name == "sealantd.process.spawn")
         .expect("the spawn's span");
-    assert_eq!(spawn.attribute("sentry.op"), Some("subprocess.spawn"));
+    assert_eq!(spawn.attribute("sentry.op"), Some("sealantd.process"));
     assert_eq!(spawn.parent_span_id, request.span_id);
     for export in &traces {
         assert_eq!(
