@@ -47,7 +47,8 @@ pub use config::{
 };
 pub use conventions::{CONTAINER_BOOT, GUEST_BOOT, VM_LAUNCH};
 
-/// How long one batch may keep trying to reach the collector, every attempt and pause included.
+/// How long one batch may keep trying to reach the collector: no new attempt starts after it,
+/// so one attempt already under way can end up to its own timeout later.
 /// A workspace's network can stall new connections for tens of seconds (seen on a check VM: 6 to
 /// 41 s); without retries, each export that met a stall lost its whole batch. Only the exporter's
 /// own thread waits: spans keep queueing behind it (bounded), and [`shutdown`] keeps its budget.

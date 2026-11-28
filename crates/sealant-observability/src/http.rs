@@ -1,6 +1,6 @@
 //! The OTLP exporter's HTTP client: ureq on rustls with public roots, the stack the capture code
 //! already ships. The batch processor calls it on its own thread, so a blocking call is fine; the
-//! timeout bounds it.
+//! timeout bounds one attempt, and the exporter retries a failed one until its deadline.
 //!
 //! It sends only the headers it was built with and `content-type`. The exporter also merges in
 //! `OTEL_EXPORTER_OTLP_HEADERS` from the process environment, which in a workspace is the image's:
@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use opentelemetry_http::{Bytes, HttpClient, HttpError, Request, Response};
 
-/// How long one export may take, connect to last byte.
+/// How long one export attempt may take, connect to last byte.
 const TIMEOUT: Duration = Duration::from_secs(5);
 /// A collector's answer is a small protobuf; anything bigger is not one.
 const MAX_RESPONSE: u64 = 64 * 1024;
