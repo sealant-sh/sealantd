@@ -74,7 +74,7 @@ jobs:
           fetch-depth: 0 # the diff against the pull request's base, and the models' sync commits
       - id: tlx
         run: echo "commit=$(bash docs/formal/tlx.sh --commit)" >>"$GITHUB_OUTPUT"
-      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/sealantd-formal/tlx-${{ steps.tlx.outputs.commit }}
           key: tlx-${{ inputs.runner == 'box' && 'box' || 'ubuntu-24.04' }}-${{ runner.arch }}-${{ steps.tlx.outputs.commit }}
@@ -104,7 +104,7 @@ jobs:
       - run: scripts/ci-install-dotfiles-tools.sh
       # nextest runs the test binaries side by side, each test in its own process: cargo test ran
       # the 100 binaries one after another (~120 s of tests that take ~20 s side by side).
-      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
+      - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
         with:
           tool: cargo-nextest@0.9.146
       # ubuntu-24.04 is Linux, so this also runs the Linux-only tests (inotify, peer-cred, reaper).
@@ -137,7 +137,7 @@ jobs:
       - run: scripts/ci-install-dotfiles-tools.sh
       # nextest runs the test binaries side by side, each test in its own process: cargo test ran
       # the 100 binaries one after another (~120 s of tests that take ~20 s side by side).
-      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
+      - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
         with:
           tool: cargo-nextest@0.9.146
       - run: cargo nextest run --workspace --no-fail-fast
@@ -174,7 +174,7 @@ jobs:
         with:
           persist-credentials: false
       - run: corepack enable
-      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           # setup-node v6 restores a package-manager cache by itself when packageManager names npm.
           package-manager-cache: false
