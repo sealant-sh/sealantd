@@ -2568,22 +2568,33 @@ test("no workflow job is skipped behind a job its own path expected to skip, unl
 
 // The Version workflow approves the Version Packages PR's held pull_request run, so the required
 // `rust` and `node` checks run on it. A fake `gh` serves the PR and its runs through the step's
-// real `--jq` filters (with jq, which gh's filters match here) and records each approval.
+// real `--jq` filters (with jq, which gh's filters match here) and records each approval. Its
+// filtered run lists come back empty, as GitHub's did for minutes on 28 Nov while the unfiltered
+// list already held the run (SLNT-1413).
 const FAKE_GH = `#!/usr/bin/env bash
 set -euo pipefail
 jq_arg() { while [ $# -gt 0 ]; do [ "$1" = --jq ] && { printf '%s' "$2"; return; }; shift; done; }
 case "$1 $2" in
   "pr view") jq -r "$(jq_arg "$@")" "$FAKE_DIR/pr.json" ;;
   "api -X") echo "$4" >>"$FAKE_DIR/approved" ;;
+  api*\?*head_sha=*|api*\?*event=*|api*\?*branch=*|api*\?*status=*|api*\?*check_suite_id=*)
+    echo '{"workflow_runs":[]}' | jq -r "$(jq_arg "$@")" ;;
   api*) jq -r "$(jq_arg "$@")" "$FAKE_DIR/runs.json" ;;
   *) exit 64 ;;
 esac
 `;
 
 const VERSION_HEAD = "f".repeat(40);
-const versionRun = (id, file, conclusion, actor = "github-actions[bot]") => ({
+const versionRun = (
+  id,
+  file,
+  conclusion,
+  { actor = "github-actions[bot]", head = VERSION_HEAD, event = "pull_request" } = {},
+) => ({
   id,
   path: `.github/workflows/${file}`,
+  head_sha: head,
+  event,
   head_branch: "changeset-release/main",
   conclusion,
   actor: { login: actor },
@@ -2627,9 +2638,32 @@ test("Version approves only the held CI run its own push created", (t) => {
 });
 
 test("Version approves no held run that someone else triggered", (t) => {
-  const { status, approved } = approve(t, [versionRun(1, "ci.yml", "action_required", "someone")]);
+  const { status, approved } = approve(t, [versionRun(1, "ci.yml", "action_required", { actor: "someone" })]);
   assert.notEqual(status, 0);
   assert.deepEqual(approved, []);
+});
+
+test("Version finds the held CI run when GitHub's filtered run lists leave it out", (t) => {
+  assert.deepEqual(approve(t, [versionRun(1, "ci.yml", "action_required")]), {
+    status: 0,
+    approved: ["repos/sealant-sh/sealantd/actions/runs/1/approve"],
+  });
+});
+
+test("Version approves no CI run on another head or from another event", (t) => {
+  const other = "e".repeat(40);
+  assert.deepEqual(
+    approve(t, [
+      versionRun(3, "ci.yml", "action_required", { head: other }),
+      versionRun(2, "ci.yml", "action_required", { event: "push" }),
+      versionRun(1, "ci.yml", "action_required"),
+    ]),
+    { status: 0, approved: ["repos/sealant-sh/sealantd/actions/runs/1/approve"] },
+  );
+  assert.deepEqual(approve(t, [versionRun(1, "ci.yml", "action_required", { head: other })]), {
+    status: 1,
+    approved: [],
+  });
 });
 
 test("Version fails when CI never starts a run on the head", (t) => {

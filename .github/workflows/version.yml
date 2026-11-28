@@ -80,34 +80,29 @@ jobs:
             echo "::error::#$PR is not the Version Packages PR (head branch is not $branch)"
             exit 1
           fi
-          pending="ci.yml"
           for try in $(seq "$TRIES"); do
-            runs=$(gh api "repos/$GH_REPO/actions/runs?head_sha=$head&event=pull_request&per_page=50" \
-              --jq ".workflow_runs[] | select(.head_branch == \"$branch\")
-                | [.path, .id, .conclusion // \"none\", .actor.login] | @tsv")
-            left=""
-            for workflow in $pending; do
-              # Newest first: the run this push created.
-              run=$(printf '%s\n' "$runs" | awk -F '\t' -v path=".github/workflows/$workflow" \
-                '$1 == path { print; exit }')
-              if [ -z "$run" ]; then
-                left="$left $workflow"
-                continue
-              fi
-              IFS=$'\t' read -r _ id conclusion actor <<<"$run"
+            # GitHub's filtered run lists (head_sha, event, branch) can leave out a run it has
+            # already created, for minutes on end, so read ci.yml's newest runs unfiltered and match
+            # the head here. Newest first: the run this push created.
+            run=$(gh api "repos/$GH_REPO/actions/workflows/ci.yml/runs?per_page=100" \
+              --jq "[.workflow_runs[] | select(.path == \".github/workflows/ci.yml\"
+                  and .head_sha == \"$head\" and .event == \"pull_request\"
+                  and .head_branch == \"$branch\")][0] // empty
+                | [.id, .conclusion // \"none\", .actor.login] | @tsv")
+            if [ -n "$run" ]; then
+              IFS=$'\t' read -r id conclusion actor <<<"$run"
               if [ "$conclusion" != action_required ]; then
-                echo "$workflow run $id on $head is already started"
+                echo "ci.yml run $id on $head is already started"
               elif [ "$actor" != "github-actions[bot]" ]; then
-                echo "::error::$workflow run $id on $head waits for approval but $actor triggered it"
+                echo "::error::ci.yml run $id on $head waits for approval but $actor triggered it"
                 exit 1
               else
                 gh api -X POST "repos/$GH_REPO/actions/runs/$id/approve" >/dev/null
-                echo "Approved $workflow run $id on $head"
+                echo "Approved ci.yml run $id on $head"
               fi
-            done
-            pending=$left
-            [ -z "$pending" ] && exit 0
+              exit 0
+            fi
             [ "$try" -lt "$TRIES" ] && sleep "$POLL_SECONDS"
           done
-          echo "::error::No pull_request run of$pending appeared on $head"
+          echo "::error::No pull_request run of ci.yml appeared on $head"
           exit 1
