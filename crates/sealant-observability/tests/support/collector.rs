@@ -136,21 +136,39 @@ impl Received {
 pub(crate) struct Collector {
     pub(crate) port: u16,
     received: Arc<Mutex<Vec<Received>>>,
+    /// OTLP trace exports still to be refused with a 503, and how many were.
+    refuse: Arc<Mutex<(usize, usize)>>,
 }
 
 impl Collector {
     pub(crate) fn start() -> Self {
+        Self::refusing(0)
+    }
+
+    /// A collector that answers its first `traces` OTLP trace exports 503 (a collector that is
+    /// briefly unreachable or overloaded) and keeps only what it accepts.
+    pub(crate) fn refusing(traces: usize) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let port = listener.local_addr().expect("addr").port();
         let received = Arc::new(Mutex::new(Vec::new()));
-        let keep = received.clone();
+        let refuse = Arc::new(Mutex::new((traces, 0)));
+        let (keep, refusing) = (received.clone(), refuse.clone());
         std::thread::spawn(move || {
             for stream in listener.incoming().flatten() {
-                let keep = keep.clone();
-                std::thread::spawn(move || serve(stream, &keep));
+                let (keep, refusing) = (keep.clone(), refusing.clone());
+                std::thread::spawn(move || serve(stream, &keep, &refusing));
             }
         });
-        Self { port, received }
+        Self {
+            port,
+            received,
+            refuse,
+        }
+    }
+
+    /// How many trace exports were refused.
+    pub(crate) fn refused(&self) -> usize {
+        self.refuse.lock().expect("lock").1
     }
 
     /// A DSN for project 10 on this collector.
@@ -166,7 +184,7 @@ impl Collector {
     }
 }
 
-fn serve(stream: TcpStream, keep: &Mutex<Vec<Received>>) {
+fn serve(stream: TcpStream, keep: &Mutex<Vec<Received>>, refuse: &Mutex<(usize, usize)>) {
     let mut writer = stream.try_clone().expect("clone");
     let mut reader = BufReader::new(stream);
     loop {
@@ -205,6 +223,19 @@ fn serve(stream: TcpStream, keep: &Mutex<Vec<Received>>) {
         let mut body = vec![0; length];
         if reader.read_exact(&mut body).is_err() {
             return;
+        }
+        if path.ends_with("/otlp/v1/traces") {
+            let mut refuse = refuse.lock().expect("lock");
+            if refuse.0 > 0 {
+                refuse.0 -= 1;
+                refuse.1 += 1;
+                drop(refuse);
+                let answer = b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\n\r\n";
+                if writer.write_all(answer).is_err() {
+                    return;
+                }
+                continue;
+            }
         }
         keep.lock().expect("lock").push(Received {
             path,

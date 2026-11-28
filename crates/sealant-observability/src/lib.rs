@@ -47,6 +47,11 @@ pub use config::{
 };
 pub use conventions::{CONTAINER_BOOT, GUEST_BOOT, VM_LAUNCH};
 
+/// How long one batch may keep trying to reach the collector, every attempt and pause included.
+/// A workspace's network can stall new connections for tens of seconds (seen on a check VM: 6 to
+/// 41 s); without retries, each export that met a stall lost its whole batch. Only the exporter's
+/// own thread waits: spans keep queueing behind it (bounded), and [`shutdown`] keeps its budget.
+const EXPORT_DEADLINE: Duration = Duration::from_secs(60);
 /// How long [`shutdown`] gives queued spans, then queued Sentry events.
 const FLUSH_SPANS: Duration = Duration::from_millis(1500);
 const FLUSH_EVENTS: Duration = Duration::from_millis(500);
@@ -179,6 +184,15 @@ pub fn start(config: &Config) {
     );
 }
 
+/// Retry a failed export (no answer, 429, 502, 503, 504) with backoff, 0.5 s doubling to 8 s,
+/// until [`EXPORT_DEADLINE`]. Any other answer is final.
+fn retry_policy() -> opentelemetry_otlp::RetryPolicy {
+    opentelemetry_otlp::RetryPolicy::recommended()
+        .with_max_retries(12)
+        .with_initial_delay(Duration::from_millis(500))
+        .with_max_delay(Duration::from_secs(8))
+}
+
 fn exporter(
     target: &config::TracesTarget,
 ) -> Result<opentelemetry_otlp::SpanExporter, opentelemetry_otlp::ExporterBuildError> {
@@ -187,8 +201,9 @@ fn exporter(
         .with_http_client(http::UreqClient::new(&target.headers))
         .with_endpoint(target.url.clone())
         .with_headers(target.headers.iter().cloned().collect::<HashMap<_, _>>())
-        .with_timeout(Duration::from_secs(5))
-        .with_retry_policy(opentelemetry_otlp::RetryPolicy::disabled())
+        // The retry deadline; each attempt is bounded by the client's own timeout (`http.rs`).
+        .with_timeout(EXPORT_DEADLINE)
+        .with_retry_policy(retry_policy())
         .build()
 }
 
